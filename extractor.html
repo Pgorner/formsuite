@@ -39,6 +39,7 @@
         <span class="muted" id="status" style="margin-left:auto">Idle</span>
       </div>
 
+      <!-- Banner restored: will show whenever write not granted -->
       <div id="permNote" class="note warn" style="display:none;margin-top:10px">
         This DOCX was opened via picker but I don’t have write permission to the original file.
         Clicking <em>Save</em> will download a copy instead of writing back.
@@ -247,6 +248,7 @@
           gFileName = m.name || gFileName;
           gDocId = m.docId;
           await renderFromCurrentBytes('(switched by other tab) ');
+          await updateWriteAccessBanner(); // reflect state
         }
         if (m.type === 'doc-updated' && m.docId && m.docId === gDocId) {
           tr.step('doc-updated -> reload bytes for current doc');
@@ -255,6 +257,7 @@
           if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
           gArrayBuffer = bytes.buffer ?? bytes;
           await renderFromCurrentBytes('(updated by other tab) ');
+          await updateWriteAccessBanner();
         }
         if (m.type === 'schema-updated' && m.docId && m.docId === gDocId) {
           tr.step('schema-updated');
@@ -291,6 +294,7 @@
         gFileName = meta.name || gFileName;
         gDocId = meta.docId;
         await renderFromCurrentBytes('(switched by other tab) ');
+        await updateWriteAccessBanner();
       } finally { tr.end(); }
     });
 
@@ -329,7 +333,6 @@
       try {
         if (!gDocId) { tr.step('no docId'); return; }
 
-        // let OPFS/handles settle after focus/visible burst
         await new Promise(r => setTimeout(r, 120));
 
         let bytes = await safeGetBytes(gDocId);
@@ -342,26 +345,26 @@
         if (bytes) {
           gArrayBuffer = bytes.buffer ?? bytes;
           await renderFromCurrentBytes(`(${source} refreshed) `);
+          await updateWriteAccessBanner();
           tr.end('refreshed');
           return;
         }
 
-        // No new bytes. Keep current if we still have a buffer.
         if (gArrayBuffer?.byteLength) {
           setStatus(`Refresh skipped (${source}): no bytes yet; keeping current.`);
+          await updateWriteAccessBanner();
           tr.end('kept current buffer');
           return;
         }
 
-        // No buffer but still have a handle? Don’t clear — wait for explicit action.
         const h = await window.formSuitePersist.getHandle?.(gDocId);
         if (h) {
           setStatus(`Refresh postponed (${source}): handle exists; waiting for bytes.`);
+          await updateWriteAccessBanner();
           tr.end('postponed; has handle');
           return;
         }
 
-        // Truly nothing to work with — clear once.
         await hardResetDocContext('lost access');
         tr.end('hard reset');
       } catch (e) {
@@ -373,12 +376,48 @@
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') rehydrateOnForeground('visible');
-      // ignore 'hidden'
     });
 
     window.addEventListener('focus', () => {
       rehydrateOnForeground('focus');
     });
+
+    // =========================
+    // WRITE ACCESS BANNER / PROMPT
+    // =========================
+    async function updateWriteAccessBanner(opts = {}) {
+      const { tryPrompt = false } = opts;
+      const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: gDocId, supportsFS });
+      try {
+        if (!supportsFS || !gDocId) { permNote.style.display = 'none'; tr.end('unsupported or no doc'); return 'unsupported'; }
+
+        let handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
+        if (!handle || !handle.queryPermission) { permNote.style.display = 'none'; tr.end('no handle'); return 'no-handle'; }
+
+        let p = await handle.queryPermission({ mode: 'readwrite' });
+        tr.step('queryPermission', p);
+
+        if (p !== 'granted' && tryPrompt) {
+          try {
+            const r = await handle.requestPermission({ mode: 'readwrite' });
+            p = r || p;
+            tr.step('requestPermission', r);
+          } catch (e) {
+            tr.warn('requestPermission failed', e);
+          }
+        }
+
+        permNote.style.display = (p === 'granted') ? 'none' : 'block';
+        if (p === 'granted') gFileHandle = handle;
+
+        tr.end({ final: p });
+        return p || 'denied';
+      } catch (e) {
+        tr.error('updateWriteAccessBanner failed', e);
+        permNote.style.display = 'block';
+        return 'error';
+      }
+    }
 
     // =========================
     // TAG MAP / PREVIEW HELPERS
@@ -905,9 +944,9 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         tr.step('restored', { docId: gDocId, name: gFileName, len: gArrayBuffer?.byteLength, sha: await sha256Hex(gArrayBuffer) });
 
-        permNote.style.display = 'none';
-
         await renderFromCurrentBytes();
+        await updateWriteAccessBanner(); // reflect current permission without prompting
+
         btnSave.disabled = false; btnExport.disabled = false;
         if (btnSaveFromPreview) btnSaveFromPreview.disabled = false;
       } catch (e) { tr.error('boot failed', e); }
@@ -961,10 +1000,12 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         announceDocSwitch();
 
         await renderFromCurrentBytes();
+
+        // 👇 Prompt immediately (still within user gesture) to grant write
+        await updateWriteAccessBanner({ tryPrompt: true });
+
         btnSave.disabled = false; btnExport.disabled = false;
         if (btnSaveFromPreview) btnSaveFromPreview.disabled = false;
-
-        permNote.style.display = 'none';
       } catch (e) {
         if (e?.name === 'AbortError') { tr.step('user canceled'); return; }
         tr.error('open failed', e);
@@ -1025,13 +1066,13 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               await stream.write(updated);
               await stream.close();
               setStatus(`Saved back to "${handle.name || (gFileName + '.docx')}".`);
-              permNote.style.display = 'none';
               gFileHandle = handle;
               gDirty = false;
+              await updateWriteAccessBanner();
               tr.end('wrote back to original');
               return;
             } else {
-              permNote.style.display = 'block';
+              await updateWriteAccessBanner(); // shows banner
               tr.warn('permission denied; fallback to download');
             }
           }
@@ -1095,12 +1136,12 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               await stream.write(updated2);
               await stream.close();
               setStatus(`Exported back to "${handle.name || (gFileName + '.docx')}".`);
-              permNote.style.display = 'none';
               gFileHandle = handle;
               gDirty = false;
+              await updateWriteAccessBanner();
               tr.end('export wrote back'); return;
             } else {
-              permNote.style.display = 'block';
+              await updateWriteAccessBanner(); // shows banner
             }
           }
         }
@@ -1197,13 +1238,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     btnRegrant.addEventListener('click', async () => {
       const tr = TRACE('btnRegrant:click');
       try {
-        const h = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-        tr.step('handle?', { has: !!h, docId: gDocId });
-        if (!h) { permNote.style.display='block'; tr.end('no handle'); return; }
-        const res = await ensureWritePermission(h);
-        tr.step('ensureWritePermission', res);
-        permNote.style.display = (res === 'granted') ? 'none' : 'block';
-        if (res === 'granted') gFileHandle = h;
+        await updateWriteAccessBanner({ tryPrompt: true });
       } catch (e) { tr.error('regrant failed', e); permNote.style.display='block'; }
       finally { tr.end(); }
     });
