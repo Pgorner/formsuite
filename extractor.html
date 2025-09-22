@@ -39,7 +39,7 @@
         <span class="muted" id="status" style="margin-left:auto">Idle</span>
       </div>
 
-      <!-- ✅ Banner that can also trigger the permission prompt -->
+      <!-- Restored banner -->
       <div id="permNote" class="note warn" style="display:none;margin-top:10px">
         This DOCX was opened via picker but I don’t have write permission to the original file.
         Clicking <em>Save</em> will download a copy instead of writing back.
@@ -383,13 +383,11 @@
     // =========================
     // ✅ WRITE ACCESS BANNER / PROMPT
     // =========================
-    async function updateWriteAccessBanner(opts = {}) {
-      const { tryPrompt = false } = opts;
+    async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
       const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: gDocId, supportsFS });
       try {
         if (!supportsFS || !gDocId) { permNote.style.display = 'none'; tr.end('unsupported/no-doc'); return 'unsupported'; }
 
-        // Prefer in-memory handle; else fetch from persistence
         let handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
         if (!handle || !handle.queryPermission) { permNote.style.display = 'none'; tr.end('no-handle'); return 'no-handle'; }
 
@@ -416,6 +414,185 @@
         permNote.style.display = 'block';
         return 'error';
       }
+    }
+
+    // =========================
+    // TAG MAP / PREVIEW HELPERS
+    // =========================
+    async function getTagMapFor(docId) {
+      const tr = TRACE('getTagMapFor', { docId });
+      try {
+        const state = docId ? (await window.formSuitePersist.loadState(docId)) : null;
+        const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
+                    || (state?.cronos_payload?.tagMap)
+                    || (state?.CRONOS_PAYLOAD?.tagMap)
+                    || (state?.tagMap)
+                    || {};
+        tr.end({ tagCount: Object.keys(tagMap).length });
+        return tagMap;
+      } catch (e) { tr.error('failed', e); tr.end(); return {}; }
+    }
+
+    function loadSchemaFromLocalStorage() {
+      const tr = TRACE('loadSchemaFromLocalStorage');
+      try { const s = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); tr.end({ has:s?.fields?.length }); return s; }
+      catch (e) { tr.error('parse fail', e); tr.end(); return null; }
+    }
+
+    function collectFormValues(schema) {
+      const tr = TRACE('collectFormValues', { fieldCount: schema?.fields?.length || 0 });
+      try {
+        const form = document.getElementById('liveForm');
+        const out = {};
+        if (!form || !schema) { tr.end('no form/schema'); return out; }
+        for (const f of schema.fields) {
+          if (f.type === 'multichoice') {
+            const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
+            out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
+            continue;
+          }
+          const el = form.elements[f.id];
+          out[f.id] = el ? el.value : null;
+        }
+        tr.end({ keys: Object.keys(out).length });
+        return out;
+      } catch (e) { tr.error('failed', e); tr.end(); return {}; }
+    }
+
+    async function updatePreview(values) {
+      const tr = TRACE('updatePreview', { valueKeys: Object.keys(values||{}).length });
+      try {
+        if (!payloadEl) { tr.end('no payloadEl'); return; }
+        const tagMap = await getTagMapFor(gDocId);
+        const obj = { title: gSchema?.title || 'Form', fields: gSchema?.fields || [], values: values || {}, tagMap };
+        payloadEl.value = JSON.stringify(obj, null, 2);
+        tr.end({ ok:true });
+      } catch (e) { tr.error('failed', e); tr.end(); }
+    }
+
+    let previewTimer = null;
+    function schedulePreviewUpdate() {
+      const tr = TRACE('schedulePreviewUpdate');
+      try {
+        clearTimeout(previewTimer);
+        previewTimer = setTimeout(async () => {
+          const tr2 = TRACE('previewUpdate:tick');
+          try {
+            const vals = collectFormValues(gSchema);
+            if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: vals });
+            await updatePreview(vals);
+            gDirty = true;
+            setStatus('Unsaved changes — press Save to update DOCX.');
+          } catch (e) { tr2.error('tick failed', e); }
+          finally { tr2.end(); }
+        }, 250);
+      } finally { tr.end(); }
+    }
+
+    function buildForm(container, schema, values) {
+      const tr = TRACE('buildForm', { fields: schema?.fields?.length || 0 });
+      try {
+        container.innerHTML = '';
+        if (!schema || !Array.isArray(schema.fields) || schema.fields.length === 0) {
+          container.innerHTML = '<div class="empty">No manual schema. Create one in the Builder, or load a DOCX that already contains a payload schema.</div>';
+          tr.end('empty schema');
+          return;
+        }
+
+        const form = document.createElement('form');
+        form.id = 'liveForm';
+        form.noValidate = true;
+        form.style.display = 'grid';
+        form.style.gap = '12px';
+
+        if (schema.title) {
+          const h = document.createElement('h4');
+          h.textContent = schema.title;
+          h.style.margin = '0 0 6px';
+          form.appendChild(h);
+        }
+
+        for (const f of schema.fields) {
+          const w = TRACE('buildForm:field', f);
+          const wrap = document.createElement('div');
+          wrap.className = 'field';
+          const label = document.createElement('label');
+          label.htmlFor = f.id;
+          label.textContent = f.label || f.id || '(field)';
+          label.style.display = 'flex';
+          label.style.justifyContent = 'space-between';
+          label.style.alignItems = 'center';
+          if (f.required) {
+            const star = document.createElement('span');
+            star.textContent = '•'; star.title = 'required'; star.style.fontWeight = '600'; star.style.color = '#ef4444';
+            label.appendChild(star);
+          }
+          wrap.appendChild(label);
+
+          let input;
+          if (f.type === 'date') {
+            input = document.createElement('input'); input.type = 'text'; input.dataset.type = 'date'; input.dataset.format = f.dateFormat || 'Y-m-d';
+          } else if (f.type === 'select') {
+            input = document.createElement('select');
+            (f.options || []).forEach(opt => {
+              const o = document.createElement('option');
+              o.value = String(opt?.value ?? opt?.id ?? opt);
+              o.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
+              input.appendChild(o);
+            });
+          } else if (f.type === 'multichoice') {
+            const box = document.createElement('div');
+            box.style.display = 'grid'; box.style.gap = '6px';
+            (f.options || []).forEach(opt => {
+              const id = `${f.id}__${String(opt?.value ?? opt).replace(/\s+/g,'_')}`;
+              const row = document.createElement('label');
+              row.style.display = 'flex'; row.style.gap = '8px'; row.style.alignItems = 'center';
+              const cb = document.createElement('input');
+              cb.type = 'checkbox'; cb.name = f.id; cb.id = id; cb.value = String(opt?.value ?? opt);
+              if (Array.isArray(values?.[f.id]) && values[f.id].includes(cb.value)) cb.checked = true;
+              const span = document.createElement('span'); span.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
+              row.appendChild(cb); row.appendChild(span); box.appendChild(row);
+            });
+            wrap.appendChild(box);
+            box.addEventListener('change', schedulePreviewUpdate);
+            form.appendChild(wrap);
+            w.end();
+            continue;
+          } else {
+            input = document.createElement('input'); input.type = 'text';
+          }
+
+          input.id = f.id; input.name = f.id;
+          if (f.required) input.required = true;
+          if (values && values[f.id] != null) input.value = values[f.id];
+
+          input.addEventListener('change', schedulePreviewUpdate);
+          input.addEventListener('input', schedulePreviewUpdate);
+          wrap.appendChild(input);
+
+          if (f.type === 'date') {
+            setTimeout(() => {
+              const tt = TRACE('flatpickr:init', { id: input.id, format: input.dataset.format });
+              try {
+                if (window.flatpickr) {
+                  window.flatpickr(input, {
+                    dateFormat: input.dataset.format || 'Y-m-d',
+                    allowInput: true,
+                    onChange: schedulePreviewUpdate,
+                    onValueUpdate: schedulePreviewUpdate
+                  });
+                }
+              } finally { tt.end(); }
+            }, 0);
+          }
+
+          form.appendChild(wrap);
+          w.end();
+        }
+
+        container.appendChild(form);
+        tr.end('form built');
+      } catch (e) { tr.error('failed', e); tr.end(); }
     }
 
     // =========================
@@ -737,21 +914,19 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         if (!meta?.docId) { meta = readDocMeta(); tr.step('readDocMeta', meta); }
         if (!meta?.docId) { tr.end('no meta; idle'); return; }
 
-        // Try OPFS/current bytes first
         let bytes = await window.formSuitePersist.getBytes?.(meta.docId)
                  || await window.formSuitePersist.getCurrentDocBytes?.();
         tr.step('persistence bytes', { len: bytes?.byteLength || bytes?.length });
 
-        // Also recover the original handle (whether or not we already have bytes)
-        if (supportsFS) {
+        if (!bytes && supportsFS) {
           try {
             const h = await window.formSuitePersist.getHandle?.(meta.docId);
             tr.step('getHandle', { has: !!h });
-            if (h) gFileHandle = h;
-            if (!bytes && h) {
+            if (h) {
               try { await window.formSuitePersist.ensurePermission?.(h, 'read'); } catch (e) { tr.warn('ensurePermission failed', e); }
               const f = await h.getFile();
               bytes = new Uint8Array(await f.arrayBuffer());
+              gFileHandle = h;
               gFileName = f.name?.replace(/\.docx$/i,'') || meta.name || 'document';
               tr.step('handle.getFile ok', { name: gFileName, len: bytes.byteLength });
             }
@@ -767,7 +942,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         tr.step('restored', { docId: gDocId, name: gFileName, len: gArrayBuffer?.byteLength, sha: await sha256Hex(gArrayBuffer) });
 
         await renderFromCurrentBytes();
-        await updateWriteAccessBanner();   // 👈 reflect permission on Extractor page
+        await updateWriteAccessBanner();   // reflect permission status on load
 
         btnSave.disabled = false; btnExport.disabled = false;
         if (btnSaveFromPreview) btnSaveFromPreview.disabled = false;
@@ -804,6 +979,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     async function doOpen() {
       const tr = TRACE('doOpen');
       try {
+        // ✅ this uses the native picker — unchanged
         const [handle] = await showOpenFilePicker({
           multiple: false,
           types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }]
@@ -823,7 +999,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         await renderFromCurrentBytes();
 
-        // 👇 Immediately try to grant write (still inside user gesture)
+        // 👇 while still in a user gesture, try to grant write
         await updateWriteAccessBanner({ tryPrompt: true });
 
         btnSave.disabled = false; btnExport.disabled = false;
@@ -1059,9 +1235,8 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
     btnRegrant.addEventListener('click', async () => {
       const tr = TRACE('btnRegrant:click');
-      try {
-        await updateWriteAccessBanner({ tryPrompt: true });
-      } catch (e) { tr.error('regrant failed', e); permNote.style.display='block'; }
+      try { await updateWriteAccessBanner({ tryPrompt: true }); }
+      catch (e) { tr.error('regrant failed', e); permNote.style.display='block'; }
       finally { tr.end(); }
     });
 
