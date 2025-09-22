@@ -780,6 +780,46 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         console.error('Export failed (Open Form):', e); alert('Export failed: ' + (e?.message || e));
       }
     }
+
+
+    (function() {
+      const logo = document.querySelector('header .logo');
+      const header = document.querySelector('header .row');
+      if (!logo || !header) return;
+
+      let clickCount = 0;
+      let clickTimer = null;
+      let focusMode = false;
+
+      logo.addEventListener('click', () => {
+        clickCount++;
+        clearTimeout(clickTimer);
+        clickTimer = setTimeout(() => { clickCount = 0; }, 600); // reset if not triple fast
+
+        if (clickCount === 3) {
+          clickCount = 0;
+          focusMode = !focusMode;
+
+          if (focusMode) {
+            // hide all siblings of brand/logo except the current page title
+            header.querySelectorAll('a, span.muted').forEach(el => {
+              if (!el.closest('.brand')) {
+                el.style.display = 'none';
+              }
+            });
+            // navigate to index.html
+            if (!location.pathname.endsWith('index.html')) {
+              location.href = 'index.html';
+            }
+          } else {
+            // restore all
+            header.querySelectorAll('a, span.muted').forEach(el => {
+              el.style.display = '';
+            });
+          }
+        }
+      });
+    })();
   </script>
 </body>
 </html>
