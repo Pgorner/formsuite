@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Form Suite — Tag ↔ Field mapping</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="style.css">
+  <!-- Tiny helpers that don't affect page width -->
+  <style>
+    .nowrap { white-space: nowrap; }
+    .truncate { max-width: 420px; display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="persistence.js"></script>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <span class="brand logo-md">
+        <img src="logo.gif" alt="Form Suite logo" class="logo" />
+        <strong>Form Suite</strong>
+      </span>
+      <span class="muted">·</span><a href="index.html">Open Form</a>
+      <span class="muted">·</span><a href="builder.html">Form Builder</a>
+      <span class="muted">·</span><span class="muted">Tag Matcher</span>
+      <span class="muted">·</span><a href="extractor.html">Extractor</a>
+    </div>
+  </header>
+
+  <main>
+    <!-- Status row -->
+    <section class="panel">
+      <div class="row" style="justify-content:space-between; align-items:center;">
+        <div>
+          <span class="muted">Active schema:</span>
+          <span id="schema-pill" class="pill muted">—</span>
+        </div>
+        <div>
+          <span class="muted">Active DOCX:</span>
+          <span id="doc-pill" class="pill">—</span>
+        </div>
+      </div>
+      <div id="permNote" class="warn" style="margin-top:8px; display:none;">
+        Permission to the original file isn’t granted. You can still work from the cached copy.
+        <button id="btnRegrant" class="ghost" style="margin-left:8px;">Re-grant file access</button>
+      </div>
+    </section>
+
+    <!-- Mapping table -->
+    <section class="panel">
+      <h3 style="margin:0 0 8px;">Tag ↔ Field mapping</h3>
+      <div style="overflow:auto;">
+        <table id="map-table">
+          <thead>
+            <tr>
+              <th class="nowrap">#</th>
+              <th class="nowrap"><code>w:tag</code></th>
+              <th class="nowrap">alias</th>
+              <th>Current SDT text</th>
+              <th class="nowrap" style="width:320px">Map to field id</th>
+            </tr>
+          </thead>
+          <tbody id="tbody">
+            <tr><td colspan="5" class="empty">No document loaded. Open a DOCX in <strong>Extractor</strong> first.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = sel => document.querySelector(sel);
+    const supportsFS = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
+
+    // === DEBUG helpers ===
+    const _ts = () => new Date().toISOString().slice(11, 23);
+    const DBG = (...a) => console.log(`[Matcher ${_ts()}]`, ...a);
+    async function sha256Hex(bufOrU8) {
+      const ab = (bufOrU8 instanceof ArrayBuffer) ? bufOrU8
+                : (bufOrU8?.buffer instanceof ArrayBuffer) ? bufOrU8.buffer
+                : new Uint8Array(bufOrU8 || []).buffer;
+      const d = await crypto.subtle.digest('SHA-256', ab);
+      return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // ---- File-Guard: clear UI to avoid stale data ----
+    async function hardResetMatcher(reason = '') {
+      try {
+        // don't wipe shared OPFS state here; Extractor owns it
+      } catch {}
+      const tb = $('#tbody');
+      if (tb) {
+        tb.innerHTML = '';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 5;
+        td.className = 'empty';
+        td.innerHTML = 'No document loaded. Open a DOCX in <strong>Extractor</strong> first.';
+        tr.appendChild(td);
+        tb.appendChild(tr);
+      }
+      $('#schema-pill').textContent = '—';
+      $('#schema-pill').classList.add('muted');
+      $('#doc-pill').textContent = '—';
+      $('#permNote').style.display = 'none';
+      gDocId = null;
+      gSDTs = [];
+      DBG('hardResetMatcher:', reason || '(no reason)');
+    }
+
+    // ---- Bytes from persistence (prefer OPFS, fall back to handle) ----
+    async function getWorkingBytes(docId) {
+      // 1) OPFS copy (silent, preferred)
+      try {
+        const opfs = await window.formSuitePersist.getBytes(docId);
+        if (opfs && opfs.byteLength) return opfs;
+      } catch {}
+      // 2) Handle (if permission granted)
+      try {
+        const h = await window.formSuitePersist.getHandle(docId);
+        if (h?.getFile) {
+          let perm = 'prompt';
+          try { perm = await h.queryPermission?.({ mode: 'readwrite' }); } catch {}
+          if (perm !== 'granted') {
+            try { perm = await h.queryPermission?.({ mode: 'read' }); } catch {}
+          }
+          if (perm === 'granted') {
+            const file = await h.getFile();
+            return await file.arrayBuffer();
+          }
+        }
+      } catch {}
+      return null;
+    }
+
+    function xmlText(el) {
+      let s = '';
+      const rec = n => {
+        if (n.nodeType === 3) { s += n.nodeValue; return; }
+        if (n.nodeType === 1) {
+          if (n.localName === 'p' || n.localName === 'cr' || n.localName === 'br') s += '\n';
+          for (const ch of n.childNodes) rec(ch);
+        }
+      };
+      rec(el);
+      return s.replace(/\s+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+    }
+
+    async function readSDTsFromDocx(docBytes) {
+      if (!docBytes) { DBG('readSDTsFromDocx: no bytes'); return []; }
+
+      DBG('readSDTsFromDocx: bytes=', docBytes.byteLength, 'sha=', await sha256Hex(docBytes));
+
+      const zip = await JSZip.loadAsync(docBytes);
+      const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i);
+      DBG('Parts to scan:', parts.map(p => p.name));
+      if (!parts.length) return [];
+
+      const parser = new DOMParser();
+      const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+      const rows = [];
+      let totalSeen = 0, totalKept = 0;
+
+      for (const f of parts) {
+        const xmlTextContent = await f.async('string');
+        const xml = parser.parseFromString(xmlTextContent, "application/xml");
+        const sdts = Array.from(xml.getElementsByTagNameNS(W_NS, 'sdt'));
+        totalSeen += sdts.length;
+
+        DBG('Part:', f.name, 'SDTs found:', sdts.length);
+
+        sdts.forEach((sdt) => {
+          const pr = sdt.getElementsByTagNameNS(W_NS, 'sdtPr')[0];
+          const content = sdt.getElementsByTagNameNS(W_NS, 'sdtContent')[0] || sdt;
+          let tag = '', alias = '';
+          const tEl = pr ? pr.getElementsByTagNameNS(W_NS, 'tag')[0] : null;
+          if (tEl) tag = tEl.getAttributeNS(W_NS, 'val') || tEl.getAttribute('w:val') || '';
+          const aEl = pr ? pr.getElementsByTagNameNS(W_NS, 'alias')[0] : null;
+          if (aEl) alias = aEl.getAttributeNS(W_NS, 'val') || aEl.getAttribute('w:val') || '';
+
+          // only keep SDTs that have BOTH tag and alias (existing behavior)
+          if (tag && alias) {
+            totalKept++;
+            rows.push({
+              idx: rows.length + 1,
+              tag, alias,
+              text: xmlText(content),
+              sdtKey: tag
+            });
+          }
+        });
+      }
+
+      DBG('Total SDTs seen:', totalSeen, ' · kept (tag+alias):', totalKept);
+      return rows;
+    }
+
+    function deriveSchemaInfo(state) {
+      const schemaObj = state?.schema && typeof state.schema === 'object' ? state.schema : null;
+      const fieldsArr = Array.isArray(schemaObj?.fields) ? schemaObj.fields
+                        : Array.isArray(state?.schema) ? state.schema : [];
+      const title = schemaObj?.title || state?.schemaTitle || state?.title || 'Schema';
+
+      const fields = fieldsArr
+        .map(f => {
+          if (!f) return null;
+          const key = (f.id != null) ? String(f.id) : (f.key != null) ? String(f.key) : null;
+          return key ? { key, type: f.type || 'text' } : null;
+        })
+        .filter(Boolean);
+
+      return { title, fields, count: fields.length };
+    }
+
+    function renderSchemaPill(info) {
+      $('#schema-pill').textContent = `${info.title} · ${info.count} ${info.count===1?'field':'fields'}`;
+      if (info.count >= 0) $('#schema-pill').classList.remove('muted');
+    }
+    function renderDocPill(meta) {
+      $('#doc-pill').textContent = meta?.name || '—';
+    }
+
+    function buildFieldOptions(fields) {
+      const frag = document.createDocumentFragment();
+      const optNone = document.createElement('option');
+      optNone.value = '';
+      optNone.textContent = '— not mapped —';
+      frag.appendChild(optNone);
+      for (const f of fields) {
+        const opt = document.createElement('option');
+        opt.value = f.key;
+        opt.textContent = f.key;
+        frag.appendChild(opt);
+      }
+      return frag;
+    }
+
+    function renderRows(sdts, fields, tagMap, onChange) {
+      const tbody = $('#tbody');
+      tbody.innerHTML = '';
+      if (!sdts.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 5;
+        td.className = 'empty';
+        td.innerHTML = 'No SDTs with both <code>w:tag</code> and alias found.';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+
+      sdts.forEach((row, i) => {
+        const tr = document.createElement('tr');
+
+        const tdIdx = document.createElement('td');
+        tdIdx.textContent = String(i + 1);
+        tr.appendChild(tdIdx);
+
+        const tdTag = document.createElement('td');
+        tdTag.innerHTML = `<code>${escapeHtml(row.tag)}</code>`;
+        tr.appendChild(tdTag);
+
+        const tdAlias = document.createElement('td');
+        tdAlias.textContent = row.alias || '—';
+        tr.appendChild(tdAlias);
+
+        const tdText = document.createElement('td');
+        const spanText = document.createElement('span');
+        spanText.className = 'truncate';
+        spanText.title = row.text || '';
+        spanText.textContent = row.text || '';
+        tdText.appendChild(spanText);
+        tr.appendChild(tdText);
+
+        const tdMap = document.createElement('td');
+        const sel = document.createElement('select');
+        sel.appendChild(buildFieldOptions(fields));
+        sel.value = tagMap?.[row.sdtKey] || '';
+        sel.addEventListener('change', () => onChange(row.sdtKey, sel.value || ''));
+        tdMap.appendChild(sel);
+        tr.appendChild(tdMap);
+
+        tbody.appendChild(tr);
+      });
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function mergeTagMapIntoPayload(state, tagMap) {
+      const ns = 'CRONOS_PAYLOAD';
+      const lc = 'cronos_payload';
+
+      const next = { ...(state || {}) };
+
+      // legacy
+      next.tagMap = { ...(tagMap || {}) };
+
+      // nested payload (preferred)
+      next.payload = next.payload || {};
+      next.payload[ns] = { ...(next.payload[ns] || {}), tagMap: { ...(tagMap || {}) } };
+
+      // optional lowercase mirror
+      next[lc] = { ...(next[lc] || {}), tagMap: { ...(tagMap || {}) } };
+
+      return next;
+    }
+
+    // ---------- Live sync / guards ----------
+    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+
+    let gDocId = null;
+    let gSDTs = []; // cache to avoid re-parsing on schema-only updates
+
+    async function refreshAll(reason = '') {
+      const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+      if (!meta?.docId) { await hardResetMatcher('no meta'); return; }
+      gDocId = meta.docId;
+      renderDocPill(meta);
+
+      // Permission banner
+      try {
+        const h = await window.formSuitePersist.getHandle(gDocId);
+        if (supportsFS && h) {
+          let perm = await h.queryPermission?.({ mode: 'readwrite' });
+          $('#permNote').style.display = (perm === 'granted') ? 'none' : 'block';
+        } else {
+          // no handle → likely opened by upload or cached only
+          $('#permNote').style.display = 'block';
+        }
+      } catch {
+        $('#permNote').style.display = 'block';
+      }
+
+      // Ensure bytes; if not, clear UI
+      const bytes = await getWorkingBytes(gDocId);
+      if (!bytes) { await hardResetMatcher('no bytes / no permission'); return; }
+
+      // parse SDTs (or reuse if we already parsed these exact bytes? we can't easily hash compare cheaply)
+      try {
+        gSDTs = await readSDTsFromDocx(bytes);
+      } catch (e) {
+        console.warn('SDT scan failed:', e);
+        gSDTs = [];
+      }
+
+      // Load state -> derive schema + tagMap and render
+      const state = await window.formSuitePersist?.loadState?.(gDocId);
+      const { title, fields } = deriveSchemaInfo(state || {});
+      renderSchemaPill({ title, count: fields.length });
+
+      const payload = (state?.payload?.CRONOS_PAYLOAD)
+                   || (state?.cronos_payload)
+                   || state?.CRONOS_PAYLOAD
+                   || {};
+      let tagMap = payload.tagMap || state?.tagMap || {};
+
+      renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
+        const nextMap = { ...(tagMap || {}) };
+        if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
+
+        const nextState = mergeTagMapIntoPayload(state || {}, nextMap);
+        await window.formSuitePersist?.saveState?.(gDocId, nextState);
+        tagMap = nextMap;
+      });
+
+      DBG('refreshAll done', reason);
+    }
+
+    // Broadcast listeners
+    bc?.addEventListener('message', async (ev) => {
+      const m = ev?.data || {};
+      try {
+        if (m.type === 'doc-cleared') {
+          await hardResetMatcher('cleared by another tab');
+          return;
+        }
+        if (m.type === 'doc-switched') {
+          // follow switch
+          const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+          if (!meta?.docId || (m.docId && meta.docId !== m.docId)) return;
+          await refreshAll('doc-switched');
+          return;
+        }
+        if (m.type === 'doc-updated') {
+          const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+          if (!meta?.docId) return;
+          if (m.docId != null && m.docId !== meta.docId) return;
+          await refreshAll('doc-updated');
+          return;
+        }
+        if (m.type === 'schema-updated') {
+          const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+          if (meta?.docId) {
+            if (m.docId != null && m.docId !== meta.docId) return;
+            // just re-render with latest schema; reuse cached SDTs if any,
+            // but still verify bytes exist to avoid stale UI.
+            const bytes = await getWorkingBytes(meta.docId);
+            if (!bytes) { await hardResetMatcher('no bytes / no permission'); return; }
+            const state = await window.formSuitePersist?.loadState?.(meta.docId);
+            const { title, fields } = deriveSchemaInfo(state || {});
+            renderSchemaPill({ title, count: fields.length });
+
+            const payload = (state?.payload?.CRONOS_PAYLOAD)
+                         || (state?.cronos_payload)
+                         || state?.CRONOS_PAYLOAD
+                         || {};
+            let tagMap = payload.tagMap || state?.tagMap || {};
+
+            // If we don't have SDTs cached (e.g., first time), parse once
+            if (!Array.isArray(gSDTs) || !gSDTs.length) {
+              try { gSDTs = await readSDTsFromDocx(bytes); } catch { gSDTs = []; }
+            }
+
+            renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
+              const nextMap = { ...(tagMap || {}) };
+              if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
+              const nextState = mergeTagMapIntoPayload(state || {}, nextMap);
+              await window.formSuitePersist?.saveState?.(meta.docId, nextState);
+              tagMap = nextMap;
+            });
+          } else {
+            // no active doc; ensure no stale UI
+            await hardResetMatcher('no meta on schema-updated');
+          }
+          return;
+        }
+      } catch (e) {
+        console.warn('Matcher broadcast handling failed:', e);
+      }
+    });
+
+    // Visibility / focus guards
+    document.addEventListener('visibilitychange', async () => {
+      if (document.visibilityState !== 'visible') return;
+      await refreshAll('visibility');
+    });
+    window.addEventListener('focus', async () => { await refreshAll('focus'); });
+
+    // ---------- Boot ----------
+    (async function init() {
+      const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+      renderDocPill(meta);
+      if (!meta?.docId) { await hardResetMatcher('no meta at boot'); return; }
+      gDocId = meta.docId;
+
+      // Pre-show banner state
+      try {
+        const h = await window.formSuitePersist.getHandle(gDocId);
+        if (supportsFS && h) {
+          let perm = await h.queryPermission?.({ mode: 'readwrite' });
+          $('#permNote').style.display = (perm === 'granted') ? 'none' : 'block';
+        } else {
+          $('#permNote').style.display = 'block';
+        }
+      } catch { $('#permNote').style.display = 'block'; }
+
+      // Ensure bytes & render or reset
+      const bytes = await getWorkingBytes(gDocId);
+      if (!bytes) { await hardResetMatcher('no bytes / no permission'); return; }
+
+      // Parse SDTs + render once at boot
+      try { gSDTs = await readSDTsFromDocx(bytes); } catch { gSDTs = []; }
+      const state = await window.formSuitePersist?.loadState?.(gDocId);
+      const { title, fields } = deriveSchemaInfo(state || {});
+      renderSchemaPill({ title, count: fields.length });
+
+      const payload = (state?.payload?.CRONOS_PAYLOAD)
+                   || (state?.cronos_payload)
+                   || state?.CRONOS_PAYLOAD
+                   || {};
+      let tagMap = payload.tagMap || state?.tagMap || {};
+
+      renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
+        const nextMap = { ...(tagMap || {}) };
+        if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
+        const nextState = mergeTagMapIntoPayload(state || {}, nextMap);
+        await window.formSuitePersist?.saveState?.(gDocId, nextState);
+        tagMap = nextMap;
+      });
+    })();
+
+    // Re-grant button (user activation → safe to request permission)
+    document.getElementById('btnRegrant')?.addEventListener('click', async () => {
+      try {
+        if (!gDocId || !supportsFS) return;
+        const handle = await window.formSuitePersist.getHandle(gDocId);
+        if (!handle) return;
+
+        let perm = await handle.queryPermission?.({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          const res = await handle.requestPermission?.({ mode: 'readwrite' });
+          if (res !== 'granted') return;
+        }
+        // Hide banner once granted
+        document.getElementById('permNote').style.display = 'none';
+        // After permission grant, try refreshing bytes + view
+        await refreshAll('regrant');
+      } catch (e) {
+        console.warn('Re-grant failed (matcher):', e);
+      }
+    });
+  </script>
+</body>
+</html>
