@@ -83,53 +83,103 @@
       else setStatus(`No active document. Open one in the <a href="extractor.html">Extractor</a>.`);
     }
 
-    // ---------- BroadcastChannel (live sync + guards) ----------
-    const __openFormBC = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+// ---------- One Active-Doc Signal (unifier) ----------
+const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // <— canonical key used across the app
 
-    __openFormBC?.addEventListener('message', async (ev) => {
+function readActiveDocSync() {
+  // 1) Prefer persistence (if available in this tab)
+  const p =
+    window.formSuitePersist?.getCurrentDocMeta?.() ||
+    window.formSuitePersist?.getActiveDoc?.sync?.();
+  if (p?.docId) {
+    const meta = { docId: p.docId, name: p.name || p.docTitle || 'document' };
+    try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(meta)); } catch {}
+    return meta;
+  }
+
+  // 2) Canonical LS
+  try {
+    const v = localStorage.getItem(ACTIVE_DOC_KEY);
+    if (v) return JSON.parse(v);
+  } catch {}
+
+  // 3) Migration from older key (Extractor used this)
+  try {
+    const legacy = localStorage.getItem('FS_CURRENT_DOC_META');
+    if (legacy) {
+      const m = JSON.parse(legacy);
+      if (m?.docId) {
+        localStorage.setItem(ACTIVE_DOC_KEY, legacy);
+        return m;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+  // Broadcast + storage listener → normalize into ACTIVE_DOC_KEY
+  function installActiveDocListener(onChange) {
+    const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+    const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+
+    function emit(meta) {
+      // keep LS in sync so all tabs have a single source of truth
+      if (meta?.docId) {
+        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify({ docId: meta.docId, name: meta.name })); } catch {}
+      } else {
+        try { localStorage.removeItem(ACTIVE_DOC_KEY); } catch {}
+      }
+      onChange(meta || null);
+    }
+
+    bcLegacy?.addEventListener('message', async (ev) => {
       const m = ev?.data || {};
-      try {
-        if (m.type === 'doc-cleared') {
-          await hardResetOpenForm('cleared by another tab');
-          return;
-        }
-        if (m.type === 'doc-switched') {
-          // another tab switched the active doc; follow along
-          currentDoc = window.formSuitePersist.getCurrentDocMeta?.() || null;
-          if (!currentDoc?.docId || (m.docId && m.docId !== currentDoc.docId)) return;
-          const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-          schema = st?.schema || loadLS() || null;
-          values = st?.values || {};
-          renderForm();
-          return;
-        }
-        if (m.type === 'doc-updated') {
-          // bytes changed elsewhere; re-render (schema/values from workspace)
-          const meta = window.formSuitePersist.getCurrentDocMeta?.() || null;
-          if (!meta?.docId) return;
-          if (m.docId != null && m.docId !== meta.docId) return;
-          const st = await window.formSuitePersist.loadState?.(meta.docId);
-          schema = st?.schema || loadLS() || null;
-          values = st?.values || {};
-          renderForm();
-          return;
-        }
-        if (m.type === 'schema-updated') {
-          const meta = window.formSuitePersist.getCurrentDocMeta?.() || null;
-          if (meta?.docId) {
-            if (m.docId != null && m.docId !== meta.docId) return;
-            const st = await window.formSuitePersist.loadState?.(meta.docId);
-            if (st?.schema) { schema = st.schema; values = st.values || {}; renderForm(); }
-          } else {
-            const ls = loadLS();
-            if (ls) { schema = ls; renderForm(); }
-          }
-          return;
-        }
-      } catch (e) {
-        console.warn('Broadcast handling failed:', e);
+      // Map old messages to canonical event
+      if (m.type === 'doc-cleared') { emit(null); return; }
+      if (m.type === 'doc-switched' || m.type === 'doc-updated') {
+        emit((m.docId) ? { docId: m.docId, name: m.name } : readActiveDocSync());
+      }
+      if (m.type === 'schema-updated') {
+        // schema changed for current doc; keep meta unchanged but refresh state below via ensureActiveDocOrReset()
+        const meta = readActiveDocSync();
+        if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
       }
     });
+
+    bcCanon?.addEventListener('message', (ev) => {
+      const m = ev?.data || {};
+      if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
+      if (m.type === 'active:clear') emit(null);
+    });
+
+    window.addEventListener('storage', (e) => {
+      if (e.key === ACTIVE_DOC_KEY) {
+        const v = e.newValue ? JSON.parse(e.newValue) : null;
+        emit(v);
+      }
+      // one-time migration from legacy key if canonical not set yet
+      if (e.key === 'FS_CURRENT_DOC_META' && !localStorage.getItem(ACTIVE_DOC_KEY)) {
+        const v = e.newValue ? JSON.parse(e.newValue) : null;
+        if (v?.docId) {
+          try { localStorage.setItem(ACTIVE_DOC_KEY, e.newValue); } catch {}
+          emit(v);
+        }
+      }
+    });
+  }
+
+  // Hook it into this page
+  installActiveDocListener(async (meta) => {
+    currentDoc = meta;
+    if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
+    // Load the per-doc workspace schema/values and show
+    const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+    schema = st?.schema || null;
+    values = st?.values || {};
+    setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+    renderForm();
+  });
+
 
     // ---------- Focus/visibility refresh with guard ----------
     document.addEventListener('visibilitychange', async () => {
@@ -140,49 +190,25 @@
 
     async function ensureActiveDocOrReset() {
       try {
-        currentDoc = window.formSuitePersist.getCurrentDocMeta?.() || currentDoc;
-        if (!currentDoc?.docId) { await hardResetOpenForm('no meta'); return; }
+        // Always resolve from the single canonical source
+        currentDoc = readActiveDocSync() || currentDoc;
+        if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
 
-        // Try to see if bytes are still available
-        let b = null;
-        try { b = await window.formSuitePersist.getCurrentDocBytes?.(); } catch {}
-        if (!b || !b.byteLength) {
-          try { b = await window.formSuitePersist.getBytes?.(currentDoc.docId); } catch {}
-        }
-        if (!b || !b.byteLength) {
-          // maybe we can re-grant permission and fetch from handle
-          try {
-            const h = await window.formSuitePersist.getHandle?.(currentDoc.docId);
-            if (h?.getFile) {
-              let p = await window.formSuitePersist.ensurePermission?.(h, 'read');
-              if (p === 'granted') {
-                const f = await h.getFile();
-                const buf = await f.arrayBuffer();
-                if (buf && buf.byteLength) {
-                  // bytes present again; keep UI as-is
-                  return;
-                }
-              }
-            }
-          } catch {}
-          // Still no bytes -> clear UI to avoid stale data
-          await hardResetOpenForm('lost access');
-          return;
-        }
+        // If bytes are gone, clear UI to avoid stale export attempts
+        const bytes = await fetchWorkingDocBytes();
+        if (!bytes) { await hardResetOpenForm('lost access'); return; }
 
-        // We have bytes; ensure we have a schema to show
+        // Show per-doc workspace state (no localStorage fallback here)
         const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        schema = st?.schema || loadLS() || schema;
-        values = st?.values || values || {};
-        if (!schema) {
-          await hardResetOpenForm('no schema');
-          return;
-        }
-        renderForm(); // make sure Export button reflects availability
+        schema = st?.schema || null;
+        values = st?.values || {};
+        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+        renderForm();
       } catch (e) {
         console.warn('ensureActiveDocOrReset failed:', e);
       }
     }
+
 
     // ---------- Pyodide (robust) ----------
     let pyLoaded = false;
@@ -401,20 +427,26 @@ def write_sdts_by_tag(u8, tag_to_text_json):
     init().catch(console.error);
 
     async function init() {
-      currentDoc = window.formSuitePersist.getCurrentDocMeta?.() || null;
-      if (currentDoc) {
-        els.docStatus.innerHTML = `Active DOCX: <span class="kbd">${currentDoc.name}</span>`;
-        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        if (st?.schema) { schema = st.schema; values = st.values || {}; }
-        else { schema = loadLS(); values = {}; }
-        // Guard: ensure bytes actually exist; otherwise clear to avoid stale UI
+      // Resolve current doc once from the canonical place
+      currentDoc = readActiveDocSync();
+
+      if (currentDoc?.docId) {
         const bytes = await fetchWorkingDocBytes();
         if (!bytes) { await hardResetOpenForm('no bytes / no permission'); return; }
+
+        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+        schema = st?.schema || null;
+        values = st?.values || {};
+        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
       } else {
-        schema = loadLS(); values = {};
+        // No active doc → show local draft (optional UX)
+        schema = loadLS();
+        values = {};
       }
+
       renderForm();
     }
+
 
     // ---------- Robust bytes fetcher ----------
     async function fetchWorkingDocBytes() {

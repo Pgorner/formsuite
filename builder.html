@@ -246,7 +246,8 @@
 
   <script>
     // ---------- State ----------
-    const STORAGE_KEY = 'formSuite.builder.schema';
+    const STORAGE_KEY = 'FORM_SCHEMA_V1';
+    const OLD_STORAGE_KEY = 'formSuite.builder.schema';
     const els = {
       formTitle: document.getElementById('formTitle'),
       docStatus: document.getElementById('docStatus'),
@@ -274,22 +275,7 @@
       getValues() { return window.formSuitePersist?.getLastKnownValues?.(currentDoc?.docId) || {}; }
     };
 
-    /* >>> ADDED: Compatibility shim + Broadcast channel (additive only) <<< */
-    (function(){
-      const p = window.formSuitePersist || {};
-      if (!p.getActiveDoc) {
-        p.getActiveDoc = async () => p.getCurrentDocMeta?.() || null;
-        p.getActiveDoc.sync = () => p.getCurrentDocMeta?.() || null;
-      }
-      if (!p.getState) {
-        p.getState = async (docId) => p.loadState?.(docId);
-      }
-      window.formSuitePersist = p;
-    })();
-    const __builderBC = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-    /* >>> END ADDED <<< */
-
-    // ---------- File-Guard helpers (NEW) ----------
+    // ---------- File-Guard helpers ----------
     function loadDocStatus() {
       if (currentDoc?.docTitle || currentDoc?.name) {
         els.docStatus.textContent = `DOCX: ${currentDoc.docTitle || currentDoc.name}`;
@@ -306,14 +292,11 @@
     }
 
     async function hardResetBuilder(reason = '') {
-      try {
-        // do not wipe OPFS/global state; Extractor orchestrates that
-      } catch {}
-      // local UI reset to avoid stale display
+      try {} catch {}
       FORM_BUILDER.schema = { title: 'Untitled form', fields: [] };
       FORM_BUILDER.selectedIndex = -1;
       els.formTitle.value = '';
-      renderAll({ persist:false }); // don't overwrite LS with empty schema
+      renderAll({ persist:false });
       els.docStatus.innerHTML = reason ? `No DOCX active (${reason}).` : 'No DOCX active.';
       els.docStatus.classList.add('muted');
       setStatus('Cleared', true);
@@ -322,117 +305,140 @@
     // Check if we still have byte access to active doc; otherwise reset
     async function ensureActiveOrReset() {
       try {
-        currentDoc = window.formSuitePersist.getActiveDoc.sync?.() || currentDoc;
-        if (!currentDoc?.docId) { await hardResetBuilder('no meta'); return; }
-
-        let b = null;
-        try { b = await window.formSuitePersist.getCurrentDocBytes?.(); } catch {}
-        if (!b || !b.byteLength) {
-          try { b = await window.formSuitePersist.getBytes?.(currentDoc.docId); } catch {}
-        }
-        if (!b || !b.byteLength) {
-          try {
-            const h = await window.formSuitePersist.getHandle?.(currentDoc.docId);
-            if (h?.getFile) {
-              let p = await window.formSuitePersist.ensurePermission?.(h, 'read');
-              if (p === 'granted') {
-                const f = await h.getFile();
-                const buf = await f.arrayBuffer();
-                if (buf && buf.byteLength) {
-                  // access restored, keep current state
-                  return;
-                }
-              }
-            }
-          } catch {}
-          // Fallback to local backup instead of clearing
-          const ls = loadLS();
-          if (ls) {
-            FORM_BUILDER.schema = ls;
-            els.formTitle.value = ls?.title || '';
-            renderAll();          // OK to persist LS again
-            loadDocStatus();
-            return;
-          }
-          await hardResetBuilder('lost access');
+        currentDoc = readActiveDocSync() || currentDoc;
+        if (!currentDoc?.docId) {
+          const draft = loadLS() || { title: 'Untitled form', fields: [] };
+          FORM_BUILDER.schema = draft;
+          els.formTitle.value = draft.title || '';
+          renderAll({ persist:false });
+          els.docStatus.textContent = 'No DOCX active.';
+          els.docStatus.classList.add('muted');
           return;
         }
-        // ensure schema shown
-        const st = await window.formSuitePersist.getState(currentDoc.docId);
-        if (st?.schema) {
-          FORM_BUILDER.schema = st.schema;
-          els.formTitle.value = st.schema?.title || '';
-          renderAll();
-        } else {
-          // no schema in workspace; keep local one or blank
-          renderAll();
-        }
-        loadDocStatus();
+        // Active doc → reload workspace state (no LS fallback)
+        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+        FORM_BUILDER.schema = st?.schema || { title: 'Untitled form', fields: [] };
+        els.formTitle.value = FORM_BUILDER.schema.title || '';
+        renderAll({ persist:false });
+        els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
+        els.docStatus.classList.remove('muted');
       } catch (e) {
         console.warn('ensureActiveOrReset failed:', e);
       }
     }
 
-    // ---------- BroadcastChannel guards + sync ----------
-    __builderBC?.addEventListener('message', async (ev) => {
-      const m = ev?.data || {};
+    // ---------- One Active-Doc Signal (unifier) ----------
+    const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // canonical key (same as index.html)
+
+    // Read current active doc meta (pref: persistence → LS → legacy LS)
+    function readActiveDocSync() {
+      const p =
+        window.formSuitePersist?.getCurrentDocMeta?.() ||
+        window.formSuitePersist?.getActiveDoc?.sync?.();
+      if (p?.docId) {
+        const meta = { docId: p.docId, name: p.name || p.docTitle || 'document' };
+        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(meta)); } catch {}
+        return meta;
+      }
       try {
-        if (m.type === 'doc-cleared') {
-          await hardResetBuilder('cleared by another tab');
-          return;
-        }
-        if (m.type === 'doc-switched') {
-          currentDoc = window.formSuitePersist.getActiveDoc.sync?.() || null;
-          if (!currentDoc?.docId || (m.docId && m.docId !== currentDoc.docId)) return;
-          const st = await window.formSuitePersist.getState(currentDoc.docId);
-          if (st?.schema) {
-            FORM_BUILDER.schema = st.schema;
-            els.formTitle.value = st.schema?.title || '';
-            renderAll();
-          } else {
-            // keep local schema
-            renderAll();
+        const v = localStorage.getItem(ACTIVE_DOC_KEY);
+        if (v) return JSON.parse(v);
+      } catch {}
+      try {
+        const legacy = localStorage.getItem('FS_CURRENT_DOC_META');
+        if (legacy) {
+          const m = JSON.parse(legacy);
+          if (m?.docId) {
+            localStorage.setItem(ACTIVE_DOC_KEY, legacy);
+            return m;
           }
-          loadDocStatus();
-          return;
         }
-        if (m.type === 'doc-updated') {
-          const meta = window.formSuitePersist.getActiveDoc.sync?.();
-          if (!meta?.docId) return;
-          if (m.docId != null && m.docId !== meta.docId) return;
-          const st = await window.formSuitePersist.getState(meta.docId);
-          if (st?.schema) {
-            FORM_BUILDER.schema = st.schema;
-            els.formTitle.value = st.schema?.title || '';
-            renderAll();
-          }
-          loadDocStatus();
+      } catch {}
+      return null;
+    }
+
+    // Normalize all cross-tab signals into ACTIVE_DOC_KEY + callback
+    function installActiveDocListener(onChange) {
+      const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+      const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+
+      function emit(meta) {
+        if (meta?.docId) {
+          try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify({ docId: meta.docId, name: meta.name })); } catch {}
+        } else {
+          try { localStorage.removeItem(ACTIVE_DOC_KEY); } catch {}
+        }
+        onChange(meta || null);
+      }
+
+      // Map old messages → canonical
+      bcLegacy?.addEventListener('message', async (ev) => {
+        const m = ev?.data || {};
+        if (m.type === 'doc-cleared') { emit(null); return; }
+        if (m.type === 'doc-switched' || m.type === 'doc-updated') {
+          emit((m.docId) ? { docId: m.docId, name: m.name } : readActiveDocSync());
           return;
         }
         if (m.type === 'schema-updated') {
-          const meta = window.formSuitePersist.getActiveDoc.sync?.();
-          if (meta?.docId) {
-            if (m.docId != null && m.docId !== meta.docId) return;
-            const st = await window.formSuitePersist.getState(meta.docId);
-            if (st?.schema) {
-              FORM_BUILDER.schema = st.schema;
-              els.formTitle.value = st.schema?.title || '';
-              renderAll();
-            }
-            return;
-          } else {
-            // local-only schema updates from other tabs
-            const ls = loadLS();
-            if (ls) { FORM_BUILDER.schema = ls; els.formTitle.value = ls?.title || ''; renderAll(); }
-          }
-          return;
+          const meta = readActiveDocSync();
+          if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
         }
-      } catch (e) {
-        console.warn('Builder broadcast handling failed:', e);
+      });
+
+      // Canonical channel
+      bcCanon?.addEventListener('message', (ev) => {
+        const m = ev?.data || {};
+        if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
+        if (m.type === 'active:clear') emit(null);
+      });
+
+      // Storage sync (also migrates legacy key once)
+      window.addEventListener('storage', (e) => {
+        if (e.key === ACTIVE_DOC_KEY) {
+          const v = e.newValue ? JSON.parse(e.newValue) : null;
+          emit(v);
+        }
+        if (e.key === 'FS_CURRENT_DOC_META' && !localStorage.getItem(ACTIVE_DOC_KEY)) {
+          const v = e.newValue ? JSON.parse(e.newValue) : null;
+          if (v?.docId) {
+            try { localStorage.setItem(ACTIVE_DOC_KEY, e.newValue); } catch {}
+            emit(v);
+          }
+        }
+      });
+    }
+
+    // Drive Builder UI from the single signal
+    installActiveDocListener(async (meta) => {
+      currentDoc = meta;
+
+      if (!currentDoc?.docId) {
+        // No active doc → local draft
+        const draft = loadLS() || { title: 'Untitled form', fields: [] };
+        FORM_BUILDER.schema = draft;
+        els.formTitle.value = draft.title || '';
+        renderAll({ persist: false });
+        els.docStatus.textContent = 'No DOCX active.';
+        els.docStatus.classList.add('muted');
+        return;
       }
+
+      // Active doc → per-doc workspace state only (no LS fallback)
+      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      if (st?.schema) {
+        FORM_BUILDER.schema = st.schema;
+        els.formTitle.value = st.schema.title || '';
+      } else {
+        FORM_BUILDER.schema = { title: 'Untitled form', fields: [] };
+        els.formTitle.value = '';
+      }
+      renderAll({ persist: false });
+      els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
+      els.docStatus.classList.remove('muted');
     });
 
-    // Focus/visibility checks (NEW)
+
+    // Focus/visibility checks
     document.addEventListener('visibilitychange', async () => {
       if (document.visibilityState !== 'visible') return;
       await ensureActiveOrReset();
@@ -444,7 +450,17 @@
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(schema)); } catch {}
     }
     function loadLS() {
-      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { return null; }
+      try {
+        const v = localStorage.getItem(STORAGE_KEY);
+        if (v) return JSON.parse(v);
+        const old = localStorage.getItem(OLD_STORAGE_KEY);
+        if (old) {
+          const parsed = JSON.parse(old);
+          localStorage.setItem(STORAGE_KEY, old);
+          return parsed;
+        }
+      } catch {}
+      return null;
     }
     function escapeHtml(s){
       return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -967,58 +983,45 @@
 
     (async function boot(){
       try {
-        currentDoc = await window.formSuitePersist?.getActiveDoc?.();
-        loadDocStatus();
+        currentDoc = readActiveDocSync();
 
-        // Guard: only show doc-bound schema if bytes are accessible
-        let bytesOK = false;
-        try {
-          let b = await window.formSuitePersist.getCurrentDocBytes?.();
-          if (!b || !b.byteLength) b = currentDoc?.docId ? await window.formSuitePersist.getBytes?.(currentDoc.docId) : null;
-          bytesOK = !!(b && b.byteLength);
-        } catch { bytesOK = false; }
-
-        let state = null;
-        if (currentDoc?.docId && bytesOK) {
-          state = await window.formSuitePersist.getState(currentDoc.docId);
-          if (state?.schema) {
-            FORM_BUILDER.schema = state.schema;
-            els.formTitle.value = state.schema?.title || '';
+        if (currentDoc?.docId) {
+          const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+          if (st?.schema) {
+            FORM_BUILDER.schema = st.schema;
+            els.formTitle.value = st.schema.title || '';
+          } else {
+            FORM_BUILDER.schema = { title: 'Untitled form', fields: [] };
+            els.formTitle.value = '';
           }
-        }
-
-        if (!state?.schema) {
+          els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
+          els.docStatus.classList.remove('muted');
+        } else {
           const ls = loadLS();
-          if (ls) {
-            FORM_BUILDER.schema = ls;
-            els.formTitle.value = ls?.title || '';
-          }
+          if (ls) { FORM_BUILDER.schema = ls; els.formTitle.value = ls.title || ''; }
+          els.docStatus.textContent = 'No DOCX active.';
+          els.docStatus.classList.add('muted');
         }
 
-        if (currentDoc?.docId && !bytesOK) {
-          await hardResetBuilder('no bytes / no permission');
-          return;
-        }
+        renderAll({ persist:false });
 
-        renderAll();
-
+        // keep title mirrored
         els.formTitle.addEventListener('change', () => mirror(true));
 
-        window.addEventListener('storage', (e) => {
-          if (e.key === window.formSuitePersist?.ACTIVE_DOC_KEY) {
-            currentDoc = window.formSuitePersist?.getActiveDoc?.sync?.();
-            loadDocStatus();
-          }
+        // Focus/visibility refresh uses unified guard
+        document.addEventListener('visibilitychange', async () => {
+          if (document.visibilityState === 'visible') await ensureActiveOrReset();
         });
+        window.addEventListener('focus', async () => { await ensureActiveOrReset(); });
 
-        // NEW: best-effort backup on tab close
         window.addEventListener('beforeunload', () => {
-          try { saveLS(FORM_BUILDER.schema); } catch {}
+          try { if (!currentDoc?.docId) saveLS(FORM_BUILDER.schema); } catch {}
         });
       } catch (e) {
         console.warn('Builder boot failed', e);
       }
     })();
+
 
     // ---------- Wire-up ----------
     els.pType.addEventListener('change', renderTypeSpecific);
@@ -1027,6 +1030,7 @@
     els.btnCancel.addEventListener('click', cancelEditing);
     els.formTitle.addEventListener('input', () => mirror(false));
 
+    // Triple-click logo: focus mode + go to index, toggle header links
     (function() {
       const logo = document.querySelector('header .logo');
       const header = document.querySelector('header .row');
@@ -1039,28 +1043,21 @@
       logo.addEventListener('click', () => {
         clickCount++;
         clearTimeout(clickTimer);
-        clickTimer = setTimeout(() => { clickCount = 0; }, 600); // reset if not triple fast
+        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
 
         if (clickCount === 3) {
           clickCount = 0;
           focusMode = !focusMode;
 
           if (focusMode) {
-            // hide all siblings of brand/logo except the current page title
             header.querySelectorAll('a, span.muted').forEach(el => {
-              if (!el.closest('.brand')) {
-                el.style.display = 'none';
-              }
+              if (!el.closest('.brand')) el.style.display = 'none';
             });
-            // navigate to index.html
             if (!location.pathname.endsWith('index.html')) {
               location.href = 'index.html';
             }
           } else {
-            // restore all
-            header.querySelectorAll('a, span.muted').forEach(el => {
-              el.style.display = '';
-            });
+            header.querySelectorAll('a, span.muted').forEach(el => { el.style.display = ''; });
           }
         }
       });

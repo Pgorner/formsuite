@@ -195,21 +195,61 @@
     // =========================
     const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
     function persistDocMeta(meta) {
-      const tr = TRACE('persistDocMeta', meta);
-      try { localStorage.setItem(META_LS_KEY, JSON.stringify({ docId: meta?.docId, name: meta?.name })); }
-      finally { tr.end(); }
+      // Canonical key + legacy mirror
+      const CANON = 'FS_ACTIVE_DOC_META';
+      try { localStorage.setItem(CANON, JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
+      try { localStorage.setItem(META_LS_KEY, JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
+
+      // Canonical broadcast (+ keep legacy for backward-compat)
+      const bcCanon = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+      try { bcCanon?.postMessage({ type: 'active:set', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
+      try { bc?.postMessage?.({ type: 'doc-switched', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
     }
     function readDocMeta() {
-      const tr = TRACE('readDocMeta');
-      try { const v = JSON.parse(localStorage.getItem(META_LS_KEY) || 'null'); tr.end(v); return v; }
-      catch (e){ tr.error('parse fail', e); tr.end(); return null; }
+      const CANON = 'FS_ACTIVE_DOC_META';
+      try {
+        const v = localStorage.getItem(CANON) || localStorage.getItem(META_LS_KEY);
+        return v ? JSON.parse(v) : null;
+      } catch { return null; }
     }
-    function announceDocSwitch() { const tr = TRACE('announceDocSwitch', { docId:gDocId, name:gFileName }); try { bc?.postMessage({ type:'doc-switched', docId:gDocId, name:gFileName }); persistDocMeta({ docId:gDocId, name:gFileName }); } finally { tr.end(); } }
-    function announceDocUpdate() { const tr = TRACE('announceDocUpdate', { docId:gDocId, name:gFileName }); try { bc?.postMessage({ type:'doc-updated', docId:gDocId, name:gFileName, ts:Date.now() }); } finally { tr.end(); } }
+    function announceDocSwitch() {
+      // One call updates LS + notifies both channels
+      persistDocMeta({ docId: gDocId, name: gFileName });
+    }
+    function announceDocUpdate() {
+      // Keep the active meta fresh (fires storage listeners in other tabs)
+      persistDocMeta({ docId: gDocId, name: gFileName });
+
+      // Legacy “bytes changed” ping remains (Builder/Index already listen for this)
+      try { bc?.postMessage?.({ type: 'doc-updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
+    }
 
     function clearMetaLS() {
-      const tr = TRACE('clearMetaLS');
-      try { localStorage.removeItem(META_LS_KEY); } finally { tr.end(); }
+      const CANON = 'FS_ACTIVE_DOC_META';
+      try { localStorage.removeItem(CANON); } catch {}
+      try { localStorage.removeItem(META_LS_KEY); } catch {}
+
+      const bcCanon = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+      try { bcCanon?.postMessage({ type: 'active:clear', ts: Date.now() }); } catch {}
+      try { bc?.postMessage?.({ type: 'doc-cleared', ts: Date.now() }); } catch {}
+    }
+
+
+    function clearUiForNewDoc(message = 'Loading new document…') {
+      // Immediate, local-only UI reset to avoid showing stale schema/values
+      try {
+        tableBody.innerHTML = '<tr><td colspan="5" class="empty">Loading…</td></tr>';
+        formMount.innerHTML = '<div class="empty">No schema found.</div>';
+        payloadEl.value = '';
+        previewStatus.textContent = '';
+        btnSave.disabled = true; btnExport.disabled = true; btnSaveFromPreview.disabled = true;
+        permNote.style.display = 'none';
+        setStatus(message);
+      } catch {}
+      // Reset in-memory schema/values while we fetch the new file
+      gSchema = { title: 'Form', fields: [] };
+      gValues = {};
+      gDirty = false;
     }
 
     async function hardResetDocContext(reason = '') {
@@ -240,6 +280,8 @@
       try {
         const m = ev.data || {};
         if (m.type === 'doc-switched' && m.docId && m.docId !== gDocId) {
+          // Clear UI immediately to avoid bleed-through from previous doc
+          clearUiForNewDoc('Switching to another document…');
           tr.step('doc-switched -> fetch bytes');
           let bytes = await window.formSuitePersist.getBytes?.(m.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
           tr.step('bytes from persistence', { len: bytes?.byteLength || bytes?.length });
@@ -287,6 +329,7 @@
         const meta = JSON.parse(e.newValue || 'null');
         tr.step('parsed meta', meta);
         if (!meta?.docId || meta.docId === gDocId) return;
+        clearUiForNewDoc('Switching to another document…');
         let bytes = await window.formSuitePersist.getBytes?.(meta.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
         tr.step('bytes from persistence', { len: bytes?.byteLength || bytes?.length });
         if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
@@ -838,7 +881,6 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const wsState  = await window.formSuitePersist.loadState(gDocId);
         const wsSchema = wsState?.schema || null;
         const wsValues = wsState?.values || {};
-        const lsSchema = loadSchemaFromLocalStorage();
 
         function asTs(x){ const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; }
         const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
@@ -851,10 +893,9 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         } else if (pHasSchema) {
           chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
           statusSource = 'Loaded schema from DOCX payload.';
-        } else if (lsSchema && Array.isArray(lsSchema.fields)) {
-          chosenSchema = lsSchema; statusSource = 'No schema in DOCX. Using Builder (local) schema.';
         } else {
-          chosenSchema = { title: 'Form', fields: [] }; statusSource = 'No schema found.';
+          chosenSchema = { title: 'Form', fields: [] };
+          statusSource = 'No schema stored for this DOCX yet.';
         }
 
         const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
@@ -913,6 +954,8 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         tr.step('getCurrentDocMeta', meta);
         if (!meta?.docId) { meta = readDocMeta(); tr.step('readDocMeta', meta); }
         if (!meta?.docId) { tr.end('no meta; idle'); return; }
+
+        clearUiForNewDoc('Restoring document…');
 
         let bytes = await window.formSuitePersist.getBytes?.(meta.docId)
                  || await window.formSuitePersist.getCurrentDocBytes?.();
@@ -979,7 +1022,9 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     async function doOpen() {
       const tr = TRACE('doOpen');
       try {
-        // ✅ this uses the native picker — unchanged
+        // ✅ Clear everything immediately so old form/payload can't linger
+        clearUiForNewDoc('Opening…');
+
         const [handle] = await showOpenFilePicker({
           multiple: false,
           types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }]
