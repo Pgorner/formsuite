@@ -275,6 +275,15 @@
       getValues() { return window.formSuitePersist?.getLastKnownValues?.(currentDoc?.docId) || {}; }
     };
 
+    // ---------- Broadcast helper (schema-updated) ----------
+    const __bcastLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+    const __bcastCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+    function broadcastSchemaUpdated(docId) {
+      const msg = { type: 'schema-updated', docId: docId || null, ts: Date.now() };
+      try { __bcastLegacy?.postMessage(msg); } catch {}
+      try { __bcastCanon?.postMessage(msg); } catch {}
+    }
+
     // ---------- File-Guard helpers ----------
     function loadDocStatus() {
       if (currentDoc?.docTitle || currentDoc?.name) {
@@ -328,17 +337,16 @@
     }
 
     // ---------- One Active-Doc Signal (unifier) ----------
-    const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // canonical key (same as index.html)
+    const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // canonical key (same as index/extractor)
 
     // Read current active doc meta (pref: persistence → LS → legacy LS)
     function readActiveDocSync() {
-      const p =
-        window.formSuitePersist?.getCurrentDocMeta?.() ||
-        window.formSuitePersist?.getActiveDoc?.sync?.();
-      if (p?.docId) {
-        const meta = { docId: p.docId, name: p.name || p.docTitle || 'document' };
-        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(meta)); } catch {}
-        return meta;
+      const meta = window.formSuitePersist?.getActiveDocMeta?.()
+                || window.formSuitePersist?.getCurrentDocMeta?.();
+      if (meta?.docId) {
+        const m = { docId: meta.docId, name: meta.name || meta.docTitle || 'document' };
+        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(m)); } catch {}
+        return m;
       }
       try {
         const v = localStorage.getItem(ACTIVE_DOC_KEY);
@@ -390,6 +398,14 @@
         const m = ev?.data || {};
         if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
         if (m.type === 'active:clear') emit(null);
+        if (m.type === 'active:updated') {
+          const meta = readActiveDocSync();
+          if (meta?.docId) emit(meta);
+        }
+        if (m.type === 'schema-updated') {
+          const meta = readActiveDocSync();
+          if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
+        }
       });
 
       // Storage sync (also migrates legacy key once)
@@ -525,12 +541,12 @@
             </div>
           </div>
 
-          <!-- Kompatibilität: bleibt unsichtbar erhalten -->
+          <!-- Compatibility: keep legacy string mirror hidden -->
           <input id="pCols" type="hidden" />
         `;
         wrap.appendChild(div);
 
-        // Table Designer initialisieren
+        // Table Designer initialize
         window.TableDesigner?.destroy?.();
         window.TableDesigner = createTableDesigner({
           listEl: wrap.querySelector('#tdzList'),
@@ -680,6 +696,13 @@
           row.appendChild(cId);
           row.appendChild(cLabel);
           row.appendChild(cType);
+          // Add options area only for select
+          if (true) {
+            const optArea = document.createElement('div');
+            optArea.appendChild(optWrap);
+            optArea.appendChild(optAddWrap);
+            cOpts.appendChild(optArea);
+          }
           row.appendChild(cOpts);
           row.appendChild(actions);
 
@@ -710,7 +733,7 @@
 
         const tdGrip = document.createElement('td');
         tdGrip.className = 'mono dnd-handle';
-        tdGrip.title = 'Zum Verschieben ziehen';
+        tdGrip.title = 'Drag to reorder';
         tdGrip.textContent = '☰';
 
         const tdId = document.createElement('td');
@@ -973,10 +996,10 @@
           values: FORM_BUILDER.getValues() || {},
           schemaUpdatedAt: nowIso
         });
-        try { __builderBC?.postMessage({ type: 'schema-updated', docId: currentDoc.docId, ts: Date.now() }); } catch {}
+        broadcastSchemaUpdated(currentDoc.docId);
         if (notify) setStatus('Saved.', 1);
       } else {
-        try { __builderBC?.postMessage({ type: 'schema-updated', docId: null, ts: Date.now() }); } catch {}
+        broadcastSchemaUpdated(null);
         if (notify) setStatus('Saved locally.', 1);
       }
     }
@@ -1017,6 +1040,9 @@
         window.addEventListener('beforeunload', () => {
           try { if (!currentDoc?.docId) saveLS(FORM_BUILDER.schema); } catch {}
         });
+
+        // Ensure type-specific UI is visible on load
+        renderTypeSpecific();
       } catch (e) {
         console.warn('Builder boot failed', e);
       }

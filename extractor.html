@@ -121,7 +121,8 @@
     // =========================
     const STORAGE_KEY  = 'FORM_SCHEMA_V1';
     const PAYLOAD_KEY  = 'CRONOS_PAYLOAD';
-    const META_LS_KEY  = 'FS_CURRENT_DOC_META';
+    const META_LS_KEY  = 'FS_CURRENT_DOC_META';       // legacy mirror
+    const ACTIVE_LS_KEY= 'FS_ACTIVE_DOC_META';        // canonical
     const supportsFS   = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
 
     let gArrayBuffer   = null;
@@ -193,50 +194,38 @@
     // =========================
     // CROSS-TAB + LOCALSTORAGE
     // =========================
-    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-    function persistDocMeta(meta) {
-      // Canonical key + legacy mirror
-      const CANON = 'FS_ACTIVE_DOC_META';
-      try { localStorage.setItem(CANON, JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
-      try { localStorage.setItem(META_LS_KEY, JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
+    const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+    const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
 
-      // Canonical broadcast (+ keep legacy for backward-compat)
-      const bcCanon = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+    function persistActiveMeta(meta) {
+      try { localStorage.setItem(ACTIVE_LS_KEY, JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
+      try { localStorage.setItem(META_LS_KEY,   JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
       try { bcCanon?.postMessage({ type: 'active:set', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
-      try { bc?.postMessage?.({ type: 'doc-switched', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
+      try { bcLegacy?.postMessage({ type: 'doc-switched', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
     }
-    function readDocMeta() {
-      const CANON = 'FS_ACTIVE_DOC_META';
+    function readActiveMeta() {
       try {
-        const v = localStorage.getItem(CANON) || localStorage.getItem(META_LS_KEY);
+        const v = localStorage.getItem(ACTIVE_LS_KEY) || localStorage.getItem(META_LS_KEY);
         return v ? JSON.parse(v) : null;
       } catch { return null; }
     }
     function announceDocSwitch() {
-      // One call updates LS + notifies both channels
-      persistDocMeta({ docId: gDocId, name: gFileName });
+      // Single entry point for “this is the active doc now”
+      persistActiveMeta({ docId: gDocId, name: gFileName });
     }
     function announceDocUpdate() {
-      // Keep the active meta fresh (fires storage listeners in other tabs)
-      persistDocMeta({ docId: gDocId, name: gFileName });
-
-      // Legacy “bytes changed” ping remains (Builder/Index already listen for this)
-      try { bc?.postMessage?.({ type: 'doc-updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
+      // Bytes changed; keep meta as-is, but notify listeners
+      try { bcLegacy?.postMessage({ type: 'doc-updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
+      try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
     }
-
-    function clearMetaLS() {
-      const CANON = 'FS_ACTIVE_DOC_META';
-      try { localStorage.removeItem(CANON); } catch {}
+    function clearActiveMeta() {
+      try { localStorage.removeItem(ACTIVE_LS_KEY); } catch {}
       try { localStorage.removeItem(META_LS_KEY); } catch {}
-
-      const bcCanon = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
       try { bcCanon?.postMessage({ type: 'active:clear', ts: Date.now() }); } catch {}
-      try { bc?.postMessage?.({ type: 'doc-cleared', ts: Date.now() }); } catch {}
+      try { bcLegacy?.postMessage({ type: 'doc-cleared', ts: Date.now() }); } catch {}
     }
-
 
     function clearUiForNewDoc(message = 'Loading new document…') {
-      // Immediate, local-only UI reset to avoid showing stale schema/values
       try {
         tableBody.innerHTML = '<tr><td colspan="5" class="empty">Loading…</td></tr>';
         formMount.innerHTML = '<div class="empty">No schema found.</div>';
@@ -246,7 +235,6 @@
         permNote.style.display = 'none';
         setStatus(message);
       } catch {}
-      // Reset in-memory schema/values while we fetch the new file
       gSchema = { title: 'Form', fields: [] };
       gValues = {};
       gDirty = false;
@@ -261,7 +249,7 @@
         }
       } catch (e) { tr.error('saveState failed', e); }
       gArrayBuffer = null; gFileHandle = null; gFileName = null; gDocId = null; gSDTs = [];
-      clearMetaLS();
+      clearActiveMeta();
       try {
         tableBody.innerHTML = '<tr><td colspan="5" class="empty">No document loaded.</td></tr>';
         formMount.innerHTML = '<div class="empty">No schema found.</div>';
@@ -271,20 +259,17 @@
         permNote.style.display = 'none';
         setStatus(reason ? `Cleared: ${reason}` : 'Cleared.');
       } catch (e) { tr.warn('DOM reset failed', e); }
-      try { bc?.postMessage?.({ type: 'doc-cleared', ts: Date.now() }); } catch (e) { tr.warn('broadcast failed', e); }
       tr.end('reset complete');
     }
 
-    bc?.addEventListener?.('message', async (ev) => {
-      const tr = TRACE('BroadcastChannel:message', ev?.data);
+    // --- Broadcast listeners (legacy + canonical) ---
+    bcLegacy?.addEventListener?.('message', async (ev) => {
+      const tr = TRACE('BroadcastChannel(legacy):message', ev?.data);
       try {
         const m = ev.data || {};
         if (m.type === 'doc-switched' && m.docId && m.docId !== gDocId) {
-          // Clear UI immediately to avoid bleed-through from previous doc
           clearUiForNewDoc('Switching to another document…');
-          tr.step('doc-switched -> fetch bytes');
           let bytes = await window.formSuitePersist.getBytes?.(m.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
-          tr.step('bytes from persistence', { len: bytes?.byteLength || bytes?.length });
           if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
           gArrayBuffer = bytes.buffer ?? bytes;
           gFileName = m.name || gFileName;
@@ -293,19 +278,15 @@
           await updateWriteAccessBanner();
         }
         if (m.type === 'doc-updated' && m.docId && m.docId === gDocId) {
-          tr.step('doc-updated -> reload bytes for current doc');
           let bytes = await window.formSuitePersist.getBytes?.(gDocId) || await window.formSuitePersist.getCurrentDocBytes?.();
-          tr.step('bytes from persistence', { len: bytes?.byteLength || bytes?.length });
           if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
           gArrayBuffer = bytes.buffer ?? bytes;
           await renderFromCurrentBytes('(updated by other tab) ');
           await updateWriteAccessBanner();
         }
         if (m.type === 'schema-updated' && m.docId && m.docId === gDocId) {
-          tr.step('schema-updated');
           gLastSchemaPushTs = m.ts || Date.now();
           const st = await window.formSuitePersist.loadState(gDocId);
-          tr.step('workspace state', { hasSchema: !!st?.schema, hasValues: !!st?.values });
           if (st?.schema) {
             const domVals = collectFormValues(st.schema);
             const wsVals  = st.values || {};
@@ -322,22 +303,48 @@
       } finally { tr.end(); }
     });
 
+    bcCanon?.addEventListener?.('message', async (ev) => {
+      const tr = TRACE('BroadcastChannel(canon):message', ev?.data);
+      try {
+        const m = ev.data || {};
+        if (m.type === 'active:set') {
+          if (m.docId && m.docId !== gDocId) {
+            clearUiForNewDoc('Switching to another document…');
+            let bytes = await window.formSuitePersist.getBytes?.(m.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
+            if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
+            gArrayBuffer = bytes.buffer ?? bytes;
+            gFileName = m.name || gFileName;
+            gDocId = m.docId;
+            await renderFromCurrentBytes('(switched by other tab) ');
+            await updateWriteAccessBanner();
+          }
+        }
+        if (m.type === 'active:updated' && m.docId && m.docId === gDocId) {
+          let bytes = await window.formSuitePersist.getBytes?.(gDocId) || await window.formSuitePersist.getCurrentDocBytes?.();
+          if (!bytes) return;
+          gArrayBuffer = bytes.buffer ?? bytes;
+          await renderFromCurrentBytes('(updated by other tab) ');
+        }
+        if (m.type === 'active:clear') await hardResetDocContext('cleared by another tab');
+      } finally { tr.end(); }
+    });
+
+    // --- Storage listeners (canonical first, legacy as fallback) ---
     window.addEventListener('storage', async (e) => {
       const tr = TRACE('storage:event', { key:e.key, newValue: !!e.newValue });
       try {
-        if (e.key !== META_LS_KEY || !e.newValue) return;
-        const meta = JSON.parse(e.newValue || 'null');
-        tr.step('parsed meta', meta);
-        if (!meta?.docId || meta.docId === gDocId) return;
-        clearUiForNewDoc('Switching to another document…');
-        let bytes = await window.formSuitePersist.getBytes?.(meta.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
-        tr.step('bytes from persistence', { len: bytes?.byteLength || bytes?.length });
-        if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
-        gArrayBuffer = bytes.buffer ?? bytes;
-        gFileName = meta.name || gFileName;
-        gDocId = meta.docId;
-        await renderFromCurrentBytes('(switched by other tab) ');
-        await updateWriteAccessBanner();
+        if ((e.key === ACTIVE_LS_KEY || e.key === META_LS_KEY) && e.newValue) {
+          const meta = JSON.parse(e.newValue || 'null');
+          if (!meta?.docId || meta.docId === gDocId) return;
+          clearUiForNewDoc('Switching to another document…');
+          let bytes = await window.formSuitePersist.getBytes?.(meta.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
+          if (!bytes) { await hardResetDocContext('no bytes / no permission'); return; }
+          gArrayBuffer = bytes.buffer ?? bytes;
+          gFileName = meta.name || gFileName;
+          gDocId = meta.docId;
+          await renderFromCurrentBytes('(switched by other tab) ');
+          await updateWriteAccessBanner();
+        }
       } finally { tr.end(); }
     });
 
@@ -642,18 +649,29 @@
     // SDT PARSING (JS)
     // =========================
     const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    function xmlText(elem) {
-      let out = '';
-      const ts = elem.getElementsByTagNameNS(W_NS, 't');
-      for (let i = 0; i < ts.length; i++) out += ts[i].textContent || '';
-      return out;
+    function xmlText(el) {
+      // Normalize text similar to Matcher: preserve paragraphs / breaks a bit
+      let s = '';
+      const rec = n => {
+        if (!n) return;
+        if (n.nodeType === 3) { s += n.nodeValue; return; }
+        if (n.nodeType === 1) {
+          const ln = n.localName;
+          if (ln === 'p' || ln === 'cr' || ln === 'br') s += '\n';
+          for (const ch of n.childNodes) rec(ch);
+        }
+      };
+      rec(el);
+      return s.replace(/\s+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
     }
+
     async function parseSDTs_JS(arrayBuffer) {
       const tr = TRACE('parseSDTs_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
       try {
         if (!arrayBuffer) return { sdts: [], scan: [], total: 0 };
         const zip = await JSZip.loadAsync(arrayBuffer);
-        const parts = zip.file(/^word\/.*\.xml$/i) || [];
+        // Skip non-target parts for speed/parity with Matcher
+        const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
         tr.step('parts', parts.map(p => p.name));
         const parser = new DOMParser();
         const sdts = [];
@@ -752,29 +770,60 @@ def read_docvar_custom(doc_bytes: bytes, name: str) -> str | None:
         if v.tag.endswith("property") and v.attrib.get("name") == name:
             for c in v: return c.text or ""
     return None
+def _set_sdt_text(content_el, value):
+    texts = content_el.findall(".//w:t", {"w": _W_NS})
+    if texts:
+        first = True
+        for t in texts:
+            if first:
+                t.text = value
+                first = False
+            else:
+                t.text = ""
+        return
+    # If there's no text node, create a minimal run (respecting block vs inline)
+    has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
+    for ch in list(content_el): content_el.remove(ch)
+    if has_block:
+        p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
+    else:
+        r = ET.SubElement(content_el, _q("r"))
+    t = ET.SubElement(r, _q("t")); t.text = value
+    if (value.strip() != value) or ("\\n" in value) or ("  " in value):
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
-    import json as _json
-    mapping = _json.loads(mapping_json or "{}")
+    try: mapping = json.loads(mapping_json or "{}")
+    except Exception: mapping = {}
     f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
     with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        def is_target(name):
+            if not (name.startswith("word/") and name.endswith(".xml")): return False
+            skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
+            return name not in skip and not name.startswith("word/_rels/")
         for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename.startswith("word/") and item.filename.endswith(".xml"):
-                try:
-                    root = ET.fromstring(data)
-                    for sdt in root.findall(".//w:sdt", NS):
-                        props = sdt.find("w:sdtPr", NS); tag = None
-                        if props is not None:
-                            t = props.find("w:tag", NS)
-                            if t is not None: tag = t.attrib.get(_q("val"))
-                        if tag and tag in mapping:
-                            for tnode in sdt.findall(".//w:t", NS): tnode.text = ""
-                            body = sdt.find(".//w:r/w:t", NS)
-                            if body is not None: body.text = str(mapping[tag])
-                    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-                except ET.ParseError:
-                    pass
-            zout.writestr(item, data)
+            name = item.filename
+            data = zin.read(name)
+            if not is_target(name):
+                zout.writestr(name, data); continue
+            try:
+                root = ET.fromstring(data)
+            except ET.ParseError:
+                zout.writestr(name, data); continue
+            changed = False
+            for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
+                pr = sdt.find("w:sdtPr", {"w": _W_NS})
+                if pr is None: continue
+                tag_el = pr.find("w:tag", {"w": _W_NS})
+                tag_val = (tag_el.get(_q("val")) if tag_el is not None else "") or ""
+                if tag_val and tag_val in mapping:
+                    val = mapping.get(tag_val, "")
+                    if not isinstance(val, str):
+                        try: import json as _json; val = _json.dumps(val, ensure_ascii=False)
+                        except Exception: val = str(val)
+                    content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
+                    _set_sdt_text(content_el, val)
+                    changed = True
+            zout.writestr(name, ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else data)
     return out.getvalue()
         `);
         tr.end('pyodide ready');
@@ -819,6 +868,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         return txt;
       } catch (e) { tr.error('failed', e); tr.end(); return null; }
     }
+
 
     async function writeDocVarSettings(arrayBufferOrBytes, name, value) {
       const tr = TRACE('writeDocVarSettings', { name, valueLen: (value||'').length });
@@ -952,7 +1002,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       try {
         let meta = window.formSuitePersist?.getCurrentDocMeta?.();
         tr.step('getCurrentDocMeta', meta);
-        if (!meta?.docId) { meta = readDocMeta(); tr.step('readDocMeta', meta); }
+        if (!meta?.docId) { meta = readActiveMeta(); tr.step('readActiveMeta', meta); }
         if (!meta?.docId) { tr.end('no meta; idle'); return; }
 
         clearUiForNewDoc('Restoring document…');
@@ -1022,7 +1072,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     async function doOpen() {
       const tr = TRACE('doOpen');
       try {
-        // ✅ Clear everything immediately so old form/payload can't linger
+        // Clear immediately so old form/payload can't linger
         clearUiForNewDoc('Opening…');
 
         const [handle] = await showOpenFilePicker({
@@ -1039,12 +1089,12 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         const metaObj = await persistCurrentDoc(bytes, gFileHandle, gFileName);
         gDocId = metaObj.docId;
-        persistDocMeta(metaObj);
+        persistActiveMeta(metaObj);
         announceDocSwitch();
 
         await renderFromCurrentBytes();
 
-        // 👇 while still in a user gesture, try to grant write
+        // while still in a user gesture, try to grant write
         await updateWriteAccessBanner({ tryPrompt: true });
 
         btnSave.disabled = false; btnExport.disabled = false;
@@ -1095,7 +1145,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated);
         const metaObj = await persistCurrentDoc(updated, gFileHandle, gFileName);
         gDocId = metaObj.docId;
-        persistDocMeta(metaObj);
+        persistActiveMeta(metaObj);
         announceDocUpdate();
 
         if (supportsFS) {
@@ -1165,7 +1215,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2);
         const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName);
         gDocId = metaObj.docId;
-        persistDocMeta(metaObj);
+        persistActiveMeta(metaObj);
         announceDocUpdate();
 
         if (supportsFS) {
@@ -1235,7 +1285,8 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         await updatePreview(gValues);
 
         if (broadcast) {
-          try { bc?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch (e) { tr.warn('broadcast failed', e); }
+          try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch (e) { tr.warn('broadcast failed', e); }
+          try { bcCanon?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch (e) { tr.warn('canon broadcast failed', e); }
         }
 
         gDirty = true;
@@ -1291,12 +1342,14 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         if (!gDocId) { tr.end('no docId'); return; }
         const vals = collectFormValues(gSchema);
         await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: { ...(gValues||{}), ...vals } });
-        persistDocMeta({ docId: gDocId, name: gFileName });
+        persistActiveMeta({ docId: gDocId, name: gFileName });
       } catch (e) { tr.warn('beforeunload failed', e); }
       finally { tr.end(); }
     });
 
-
+    // =========================
+    // TRIPLE-CLICK FOCUS NAV
+    // =========================
     (function() {
       const logo = document.querySelector('header .logo');
       const header = document.querySelector('header .row');
@@ -1309,28 +1362,19 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       logo.addEventListener('click', () => {
         clickCount++;
         clearTimeout(clickTimer);
-        clickTimer = setTimeout(() => { clickCount = 0; }, 600); // reset if not triple fast
+        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
 
         if (clickCount === 3) {
           clickCount = 0;
           focusMode = !focusMode;
 
           if (focusMode) {
-            // hide all siblings of brand/logo except the current page title
             header.querySelectorAll('a, span.muted').forEach(el => {
-              if (!el.closest('.brand')) {
-                el.style.display = 'none';
-              }
+              if (!el.closest('.brand')) el.style.display = 'none';
             });
-            // navigate to index.html
-            if (!location.pathname.endsWith('index.html')) {
-              location.href = 'index.html';
-            }
+            if (!location.pathname.endsWith('index.html')) location.href = 'index.html';
           } else {
-            // restore all
-            header.querySelectorAll('a, span.muted').forEach(el => {
-              el.style.display = '';
-            });
+            header.querySelectorAll('a, span.muted').forEach(el => { el.style.display = ''; });
           }
         }
       });

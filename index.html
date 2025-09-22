@@ -46,6 +46,11 @@
       <div class="row" style="margin-top:8px;">
         <span id="docStatus" class="muted">No active document. Open one in the <a href="extractor.html">Extractor</a>.</span>
       </div>
+      <div id="permNote" class="note warn" style="display:none; margin-top:10px">
+        This DOCX was opened via picker but I don’t have write permission to the original file.
+        Exports will download a copy instead of writing back.
+        <button id="btnRegrant" class="ghost" style="margin-left:8px">Grant write access</button>
+      </div>
     </section>
 
     <section class="panel">
@@ -62,153 +67,168 @@
 
     const els = {
       docStatus: document.getElementById('docStatus'),
-      formMount: document.getElementById('formMount')
+      formMount: document.getElementById('formMount'),
+      permNote:  document.getElementById('permNote'),
+      btnRegrant:document.getElementById('btnRegrant'),
     };
 
     let currentDoc = null, schema = null, values = {};
     let btnExportMain = null;
 
-    // ---------- File-Guard helpers ----------
+    // ---------- Status + Hard Reset ----------
     function setStatus(s) { els.docStatus.innerHTML = s; }
     async function hardResetOpenForm(reason = '') {
-      try {
-        // try not to wipe workspace state here; Extractor handles that.
-      } catch {}
-      // local UI reset
+      try {} catch {}
       schema = null;
       values = {};
       if (els.formMount) els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
       if (btnExportMain) btnExportMain.disabled = true;
+      els.permNote.style.display = 'none';
       if (reason) setStatus(`No active document (${reason}). Open one in the <a href="extractor.html">Extractor</a>.`);
       else setStatus(`No active document. Open one in the <a href="extractor.html">Extractor</a>.`);
     }
 
-// ---------- One Active-Doc Signal (unifier) ----------
-const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // <— canonical key used across the app
+    // ---------- One Active-Doc Signal (canonical) ----------
+    const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // unified key across the app
 
-function readActiveDocSync() {
-  // 1) Prefer persistence (if available in this tab)
-  const p =
-    window.formSuitePersist?.getCurrentDocMeta?.() ||
-    window.formSuitePersist?.getActiveDoc?.sync?.();
-  if (p?.docId) {
-    const meta = { docId: p.docId, name: p.name || p.docTitle || 'document' };
-    try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(meta)); } catch {}
-    return meta;
-  }
-
-  // 2) Canonical LS
-  try {
-    const v = localStorage.getItem(ACTIVE_DOC_KEY);
-    if (v) return JSON.parse(v);
-  } catch {}
-
-  // 3) Migration from older key (Extractor used this)
-  try {
-    const legacy = localStorage.getItem('FS_CURRENT_DOC_META');
-    if (legacy) {
-      const m = JSON.parse(legacy);
-      if (m?.docId) {
-        localStorage.setItem(ACTIVE_DOC_KEY, legacy);
-        return m;
+    function readActiveDocSync() {
+      // Prefer live persistence info in this tab
+      const p = window.formSuitePersist?.getCurrentDocMeta?.()
+             || window.formSuitePersist?.getActiveDoc?.sync?.();
+      if (p?.docId) {
+        const meta = { docId: p.docId, name: p.name || p.docTitle || 'document' };
+        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(meta)); } catch {}
+        return meta;
       }
-    }
-  } catch {}
-  return null;
-}
-
-  // Broadcast + storage listener → normalize into ACTIVE_DOC_KEY
-  function installActiveDocListener(onChange) {
-    const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-    const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
-
-    function emit(meta) {
-      // keep LS in sync so all tabs have a single source of truth
-      if (meta?.docId) {
-        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify({ docId: meta.docId, name: meta.name })); } catch {}
-      } else {
-        try { localStorage.removeItem(ACTIVE_DOC_KEY); } catch {}
-      }
-      onChange(meta || null);
+      // Canonical LS
+      try { const v = localStorage.getItem(ACTIVE_DOC_KEY); if (v) return JSON.parse(v); } catch {}
+      // Legacy migration (older Extractor)
+      try {
+        const legacy = localStorage.getItem('FS_CURRENT_DOC_META');
+        if (legacy) {
+          const m = JSON.parse(legacy);
+          if (m?.docId) {
+            localStorage.setItem(ACTIVE_DOC_KEY, legacy);
+            return m;
+          }
+        }
+      } catch {}
+      return null;
     }
 
-    bcLegacy?.addEventListener('message', async (ev) => {
-      const m = ev?.data || {};
-      // Map old messages to canonical event
-      if (m.type === 'doc-cleared') { emit(null); return; }
-      if (m.type === 'doc-switched' || m.type === 'doc-updated') {
-        emit((m.docId) ? { docId: m.docId, name: m.name } : readActiveDocSync());
-      }
-      if (m.type === 'schema-updated') {
-        // schema changed for current doc; keep meta unchanged but refresh state below via ensureActiveDocOrReset()
-        const meta = readActiveDocSync();
-        if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
-      }
-    });
+    function installActiveDocListener(onChange) {
+      const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+      const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
 
-    bcCanon?.addEventListener('message', (ev) => {
-      const m = ev?.data || {};
-      if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
-      if (m.type === 'active:clear') emit(null);
-    });
-
-    window.addEventListener('storage', (e) => {
-      if (e.key === ACTIVE_DOC_KEY) {
-        const v = e.newValue ? JSON.parse(e.newValue) : null;
-        emit(v);
+      function emit(meta) {
+        if (meta?.docId) {
+          try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify({ docId: meta.docId, name: meta.name })); } catch {}
+        } else {
+          try { localStorage.removeItem(ACTIVE_DOC_KEY); } catch {}
+        }
+        onChange(meta || null);
       }
-      // one-time migration from legacy key if canonical not set yet
-      if (e.key === 'FS_CURRENT_DOC_META' && !localStorage.getItem(ACTIVE_DOC_KEY)) {
-        const v = e.newValue ? JSON.parse(e.newValue) : null;
-        if (v?.docId) {
-          try { localStorage.setItem(ACTIVE_DOC_KEY, e.newValue); } catch {}
+
+      bcLegacy?.addEventListener('message', (ev) => {
+        const m = ev?.data || {};
+        if (m.type === 'doc-cleared') { emit(null); return; }
+        if (m.type === 'doc-switched' || m.type === 'doc-updated') {
+          emit((m.docId) ? { docId: m.docId, name: m.name } : readActiveDocSync());
+        }
+        if (m.type === 'schema-updated') {
+          const meta = readActiveDocSync();
+          if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
+        }
+      });
+
+      bcCanon?.addEventListener('message', (ev) => {
+        const m = ev?.data || {};
+        if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
+        if (m.type === 'active:clear') emit(null);
+      });
+
+      window.addEventListener('storage', (e) => {
+        if (e.key === ACTIVE_DOC_KEY) {
+          const v = e.newValue ? JSON.parse(e.newValue) : null;
           emit(v);
         }
-      }
+        if (e.key === 'FS_CURRENT_DOC_META' && !localStorage.getItem(ACTIVE_DOC_KEY)) {
+          const v = e.newValue ? JSON.parse(e.newValue) : null;
+          if (v?.docId) {
+            try { localStorage.setItem(ACTIVE_DOC_KEY, e.newValue); } catch {}
+            emit(v);
+          }
+        }
+      });
+    }
+
+    installActiveDocListener(async (meta) => {
+      currentDoc = meta;
+      if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
+      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      schema = st?.schema || null;
+      values = st?.values || {};
+      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+      renderForm();
+      await updateWriteAccessBanner();
     });
-  }
 
-  // Hook it into this page
-  installActiveDocListener(async (meta) => {
-    currentDoc = meta;
-    if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
-    // Load the per-doc workspace schema/values and show
-    const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-    schema = st?.schema || null;
-    values = st?.values || {};
-    setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-    renderForm();
-  });
+    // ---------- Foreground refresh (coalesced) ----------
+    let __refreshLock = false;
+    let __refreshPending = false;
 
+    async function ensureActiveDocOrReset() {
+      if (__refreshLock) { __refreshPending = true; return; }
+      __refreshLock = true;
+      try {
+        currentDoc = readActiveDocSync() || currentDoc;
+        if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
 
-    // ---------- Focus/visibility refresh with guard ----------
+        const bytes = await fetchWorkingDocBytes();
+        if (!bytes) { await hardResetOpenForm('lost access'); return; }
+
+        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+        schema = st?.schema || null;
+        values = st?.values || {};
+        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+        renderForm();
+        await updateWriteAccessBanner();
+      } catch (e) {
+        console.warn('ensureActiveDocOrReset failed:', e);
+      } finally {
+        __refreshLock = false;
+        if (__refreshPending) { __refreshPending = false; ensureActiveDocOrReset(); }
+      }
+    }
+
     document.addEventListener('visibilitychange', async () => {
       if (document.visibilityState !== 'visible') return;
       await ensureActiveDocOrReset();
     });
     window.addEventListener('focus', async () => { await ensureActiveDocOrReset(); });
 
-    async function ensureActiveDocOrReset() {
+    // ---------- Permission banner ----------
+    async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
       try {
-        // Always resolve from the single canonical source
-        currentDoc = readActiveDocSync() || currentDoc;
-        if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
+        if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; return 'unsupported'; }
+        const h = await window.formSuitePersist.getHandle?.(currentDoc.docId);
+        if (!h?.queryPermission) { els.permNote.style.display = 'none'; return 'no-handle'; }
 
-        // If bytes are gone, clear UI to avoid stale export attempts
-        const bytes = await fetchWorkingDocBytes();
-        if (!bytes) { await hardResetOpenForm('lost access'); return; }
-
-        // Show per-doc workspace state (no localStorage fallback here)
-        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        schema = st?.schema || null;
-        values = st?.values || {};
-        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-        renderForm();
+        let p = await h.queryPermission({ mode: 'readwrite' });
+        if (p !== 'granted' && tryPrompt) {
+          try { p = await h.requestPermission({ mode: 'readwrite' }) || p; } catch {}
+        }
+        els.permNote.style.display = (p === 'granted') ? 'none' : 'block';
+        return p || 'denied';
       } catch (e) {
-        console.warn('ensureActiveDocOrReset failed:', e);
+        console.warn('updateWriteAccessBanner failed:', e);
+        els.permNote.style.display = 'block';
+        return 'error';
       }
     }
-
+    els.btnRegrant?.addEventListener('click', async () => {
+      await updateWriteAccessBanner({ tryPrompt: true });
+    });
 
     // ---------- Pyodide (robust) ----------
     let pyLoaded = false;
@@ -347,7 +367,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
       for (const f of fields) {
         const id = f.id;
         let v = vals?.[id];
-
         if (v == null) continue;
 
         if (f.type === 'multichoice') {
@@ -407,7 +426,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
           continue;
         }
 
-        // default: text/unknown -> string
         const s = String(v ?? '');
         if (s === '' && !f.required) continue;
         out[id] = s;
@@ -427,7 +445,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
     init().catch(console.error);
 
     async function init() {
-      // Resolve current doc once from the canonical place
       currentDoc = readActiveDocSync();
 
       if (currentDoc?.docId) {
@@ -438,15 +455,14 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         schema = st?.schema || null;
         values = st?.values || {};
         setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+        await updateWriteAccessBanner();
       } else {
-        // No active doc → show local draft (optional UX)
         schema = loadLS();
         values = {};
       }
 
       renderForm();
     }
-
 
     // ---------- Robust bytes fetcher ----------
     async function fetchWorkingDocBytes() {
@@ -470,7 +486,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
       mount.innerHTML = '';
       if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
         mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-        // if there's no schema, also disable Export
         if (btnExportMain) btnExportMain.disabled = true;
         return;
       }
@@ -501,14 +516,14 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         if (f.type === 'text') {
           const input = document.createElement('input'); input.type='text'; input.id=f.id; input.name=f.id; input.style.width='100%';
           if (f.required) input.required=true; if (values[f.id]!=null) input.value=values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; saveState(); });
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
 
         } else if (f.type === 'select') {
           const input = document.createElement('select'); input.id=f.id; input.name=f.id; input.style.width='100%';
           (f.options||[]).forEach(v => { const o=document.createElement('option'); o.value=String(v); o.textContent=String(v); input.appendChild(o); });
           if (f.required) input.required=true; if (values[f.id]!=null) input.value=values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; saveState(); });
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
 
         } else if (f.type === 'multichoice') {
@@ -531,7 +546,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
             cb.addEventListener('change', () => {
               const boxes = group.querySelectorAll(`input[name="${CSS.escape(f.id)}"]`);
               values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
-              saveState();
+              scheduleSaveState();
             });
 
             const txt = document.createElement('span'); txt.textContent = String(opt);
@@ -546,7 +561,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
           if (f.required) input.required=true; if (values[f.id]!=null) input.value=values[f.id];
           wrap.appendChild(input);
           const fmt = input.dataset.format || 'Y-m-d';
-          flatpickr(input, { dateFormat: fmt, allowInput:true, onChange: () => { values[f.id] = input.value; saveState(); } });
+          flatpickr(input, { dateFormat: fmt, allowInput:true, onChange: () => { values[f.id] = input.value; scheduleSaveState(); } });
 
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
@@ -554,7 +569,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         } else {
           const input = document.createElement('input'); input.type='text'; input.id=f.id; input.name=f.id; input.style.width='100%';
           if (values[f.id]!=null) input.value=values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; saveState(); });
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
         }
         form.appendChild(wrap);
@@ -563,7 +578,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
       // bottom bar with Export…
       const bar = document.createElement('div'); bar.className='bar';
       btnExportMain = document.createElement('button'); btnExportMain.type='button'; btnExportMain.className='secondary'; btnExportMain.textContent='Export…';
-      // Enable only when active doc AND we (likely) have bytes
       btnExportMain.disabled = !currentDoc;
       btnExportMain.addEventListener('click', onExportFromOpenForm);
       bar.appendChild(btnExportMain); form.appendChild(bar);
@@ -702,13 +716,13 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         const max = Math.max(0, parseInt(field.maxRows || 0, 10));
         if (max && data.length >= max) return;
         data.push({ ...editorState });
-        resetEditor(); clearSelection(); drawTable(); saveState();
+        resetEditor(); clearSelection(); drawTable(); scheduleSaveState();
         status.textContent = 'Zeile hinzugefügt.';
       });
       btnSave.addEventListener('click', () => {
         if (selectedIndex < 0 || selectedIndex >= data.length) return;
         data[selectedIndex] = { ...editorState };
-        drawTable(); saveState();
+        drawTable(); scheduleSaveState();
         status.textContent = 'Änderungen gespeichert.';
       });
       btnDelete.addEventListener('click', () => {
@@ -716,7 +730,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         if (selectedIndex < 0) return;
         if (min && data.length <= min) return;
         data.splice(selectedIndex, 1);
-        clearSelection(); drawTable(); saveState();
+        clearSelection(); drawTable(); scheduleSaveState();
         status.textContent = 'Zeile gelöscht.';
       });
 
@@ -726,20 +740,27 @@ def write_sdts_by_tag(u8, tag_to_text_json):
 
     function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
 
+    // Debounced state save
+    let __saveTimer = null;
+    function scheduleSaveState() {
+      clearTimeout(__saveTimer);
+      __saveTimer = setTimeout(saveState, 150);
+    }
     function saveState() {
       if (!currentDoc?.docId) return;
-      // sanitize vor dem Persistieren
       const cleanValues = sanitizeValues(schema, values);
       window.formSuitePersist.saveState(currentDoc.docId, { schema, values: cleanValues });
     }
     function saveLS(s) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s||{})); } catch {} }
     function loadLS() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||'null'); } catch { return null; } }
+    window.addEventListener('beforeunload', () => {
+      try { if (currentDoc?.docId) saveState(); else if (schema) saveLS(schema); } catch {}
+    });
 
     // ---------- Export (Open Form) ----------
     async function onExportFromOpenForm() {
       if (!currentDoc?.docId) { alert('No active document. Open or pick a DOCX first.'); return; }
 
-      // Guard: check again that bytes are accessible before proceeding.
       const canBytes = await fetchWorkingDocBytes();
       if (!canBytes) { await hardResetOpenForm('no bytes / no permission'); return; }
 
@@ -754,7 +775,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
                     || (state?.tagMap)
                     || {};
 
-        // --- sanitize values & tagMap before building payload ---
         const validIds = new Set((schema?.fields || []).map(f => f.id));
         const safeValues = sanitizeValues(schema, values || {});
         const cleanTagMap = sanitizeTagMap(tagMap, validIds);
@@ -768,7 +788,6 @@ def write_sdts_by_tag(u8, tag_to_text_json):
 
         const updated = await writeDocVar(docBytes, PAYLOAD_KEY, payload);
 
-        // SDT mapping aus bereinigten Daten
         const sdtMap = {};
         for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
           let v = safeValues?.[fieldId];
@@ -781,6 +800,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
         // keep OPFS in sync for the workspace
         await window.formSuitePersist.putBytes?.(currentDoc.docId, updated2);
 
+        // If we have write access to the original, offer "Save As…" anyway to avoid silent overwrites here
         if (supportsFS && window.showSaveFilePicker) {
           try {
             const suggested = (currentDoc.name?.replace(/\.docx$/i,'') || 'document') + ' (export).docx';
@@ -813,7 +833,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
       }
     }
 
-
+    // ---------- Logo triple-click: focus mode ----------
     (function() {
       const logo = document.querySelector('header .logo');
       const header = document.querySelector('header .row');
@@ -826,28 +846,21 @@ def write_sdts_by_tag(u8, tag_to_text_json):
       logo.addEventListener('click', () => {
         clickCount++;
         clearTimeout(clickTimer);
-        clickTimer = setTimeout(() => { clickCount = 0; }, 600); // reset if not triple fast
+        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
 
         if (clickCount === 3) {
           clickCount = 0;
           focusMode = !focusMode;
 
           if (focusMode) {
-            // hide all siblings of brand/logo except the current page title
             header.querySelectorAll('a, span.muted').forEach(el => {
-              if (!el.closest('.brand')) {
-                el.style.display = 'none';
-              }
+              if (!el.closest('.brand')) el.style.display = 'none';
             });
-            // navigate to index.html
             if (!location.pathname.endsWith('index.html')) {
               location.href = 'index.html';
             }
           } else {
-            // restore all
-            header.querySelectorAll('a, span.muted').forEach(el => {
-              el.style.display = '';
-            });
+            header.querySelectorAll('a, span.muted').forEach(el => { el.style.display = ''; });
           }
         }
       });
