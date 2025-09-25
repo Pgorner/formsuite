@@ -484,6 +484,11 @@
     // =========================
     // TAG MAP / PREVIEW HELPERS
     // =========================
+    // Keep rules as-is (we could prune invalid targets later if needed)
+    function normalizeRules(rules){
+      return Array.isArray(rules) ? rules : [];
+    }
+
     function normalizeForSchema(schema, values, tagMap) {
       const fieldIds = new Set((schema?.fields || []).map(f => String(f.id)));
       const prunedValues = {};
@@ -545,8 +550,8 @@
         if (!payloadEl) { tr.end('no payloadEl'); return; }
 
         const tagMapRaw = await getTagMapFor(gDocId);
-        const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-        const rules = Array.isArray(wsState?.rules) ? wsState.rules : [];
+        const wsState   = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        const rules     = normalizeRules(wsState?.rules);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, values || {}, tagMapRaw);
@@ -559,7 +564,7 @@
           rules
         }, null, 2);
 
-        tr.end({ ok:true, prunedKeys: Object.keys(values||{}).length - Object.keys(prunedValues).length });
+        tr.end({ ok:true });
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
 
@@ -963,12 +968,12 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       try {
         tr.step('buffer sha', await sha256Hex(gArrayBuffer));
 
-        // SDTs
+        // 1) SDTs
         const parsed = await parseSDTs_JS(gArrayBuffer);
         gSDTs = parsed.sdts || [];
         renderSDTsView(parsed);
 
-        // Headings
+        // 2) Headings
         let headingsParsed = { flat: [], tree: [], count: 0 };
         try {
           headingsParsed = await parseHeadings_JS(gArrayBuffer);
@@ -978,7 +983,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
           try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
         }
 
-        // Payload (schema + values)
+        // 3) Payload (schema/values/tagMap/rules)
         let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
         if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
 
@@ -988,20 +993,18 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const wsState   = await window.formSuitePersist.loadState(gDocId);
         const wsSchema  = wsState?.schema || null;
         const wsValues  = wsState?.values || {};
-        const wsRules   = Array.isArray(wsState?.rules) ? wsState.rules : [];
+        const wsRules   = normalizeRules(wsState?.rules);
+        const wsTagMap  = wsState?.tagMap || {};
 
-        const asTs = (x) => { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
+        const asTs = (x)=> { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
         const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
         const pUpdatedTs = asTs(payload?.updatedAt);
         const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
 
+        // prefer workspace schema if newer (or if payload has none)
         let chosenSchema, statusSource;
-        if (gPreferDocOnNextLoad && pHasSchema) {
-          chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
-          statusSource = 'Loaded schema from DOCX payload.';
-        } else if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
-          chosenSchema = wsSchema;
-          statusSource = 'Using newer schema from Builder/workspace.';
+        if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
+          chosenSchema = wsSchema; statusSource = 'Using newer schema from Builder/workspace.';
         } else if (pHasSchema) {
           chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
           statusSource = 'Loaded schema from DOCX payload.';
@@ -1010,40 +1013,47 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
           statusSource = 'No schema stored for this DOCX yet.';
         }
 
-        // Merge then normalize to drop orphan keys
+        // values/tagMap/rules: merge with workspace (workspace wins)
         const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
-        const tagMapRaw = await getTagMapFor(gDocId);
+        const mergedTagMap = { ...(payload?.tagMap || {}), ...(wsTagMap || {}) };
+        const mergedRules  = wsRules.length ? wsRules : normalizeRules(payload?.rules);
+
+        // prune values/tagMap against the final schema
         const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(chosenSchema, mergedValues, tagMapRaw);
+          normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
 
         gSchema = chosenSchema;
         gValues = prunedValues;
 
+        // 4) Persist everything (also headings for cross-tab use)
         await window.formSuitePersist.saveState(gDocId, {
           schema: gSchema,
           values: gValues,
-          rules: Array.isArray(payload?.rules) ? payload.rules : wsRules,
           tagMap: prunedTagMap,
+          rules:  mergedRules,
           headings: headingsParsed.flat,
           headingsTree: headingsParsed.tree,
           headingsUpdatedAt: new Date().toISOString()
         });
 
+        // Broadcast headings availability
         try { bcLegacy?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
         try { bcCanon?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
 
+        // 5) Build live form + preview
         buildForm(formMount, gSchema, gValues);
         await updatePreview(gValues);
         gDirty = false;
 
+        // 6) Enable actions
         btnSave.disabled = false;
         btnExport.disabled = false;
         btnSaveFromPreview.disabled = false;
 
+        // 7) Status
         setStatus(`${prefix}${statusSource} SDTs: ${gSDTs.length}. Fields: ${gSchema.fields.length}. Headings: ${headingsParsed.count}.`);
         tr.end({ sdtCount: gSDTs.length, fieldCount: gSchema.fields.length, headings: headingsParsed.count, statusSource });
-      } catch (e) { tr.error('failed', e); throw e; }
-      finally { gPreferDocOnNextLoad = false; }
+      } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
 
 
@@ -1223,29 +1233,27 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
         if (restored?.schema) gSchema = restored.schema;
 
-        const domVals = collectFormValues(gSchema);
-        const baseVals = restored?.values || {};
-        const merged = { ...baseVals, ...domVals };
-
-        const tagMapRaw = await getTagMapFor(gDocId);
-        const rules     = Array.isArray(restored?.rules) ? restored.rules : [];
+        const domVals  = collectFormValues(gSchema);
+        const baseVals = (restored && restored.values) ? restored.values : {};
+        const rules    = normalizeRules(restored?.rules);
+        const tagMapRaw= restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, merged, tagMapRaw);
+          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
 
         gValues = prunedValues;
+        await updatePreview(gValues);
+
+        setStatus('Writing payload to DOCX (settings.xml)…');
 
         const payload = JSON.stringify({
           title:  gSchema.title || 'Form',
           fields: gSchema.fields || [],
-          values: gValues,
+          values: gValues || {},
           tagMap: prunedTagMap,
           rules,
           updatedAt: new Date().toISOString()
         });
-
-        await updatePreview(gValues);
-        setStatus('Writing payload to DOCX (settings.xml)…');
 
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
         gArrayBuffer = updated.buffer;
@@ -1257,6 +1265,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         persistActiveMeta(metaObj);
         announceDocUpdate();
 
+        // try write-back, else download
         if (supportsFS) {
           const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
           if (handle?.createWritable) {
@@ -1269,7 +1278,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               gFileHandle = handle;
               gDirty = false;
               await updateWriteAccessBanner();
-              return;
+              tr.end('wrote back'); return;
             } else {
               await updateWriteAccessBanner();
             }
@@ -1283,9 +1292,11 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         document.body.appendChild(a); a.click(); a.remove();
         setStatus('Saved: downloaded updated DOCX.');
         gDirty = false;
+        tr.end('downloaded copy');
       } catch (e) { tr.error('save failed', e); setStatus(`Error saving: ${e.message || e}`); }
       finally { tr.end(); }
     }
+
 
     async function doExport() {
       const tr = TRACE('doExport', { hasBuf: !!gArrayBuffer, docId: gDocId });
@@ -1294,32 +1305,29 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
         if (restored?.schema) gSchema = restored.schema;
 
-        const domVals = collectFormValues(gSchema);
-        const baseVals = restored?.values || {};
-        const merged = { ...baseVals, ...domVals };
-
-        const tagMapRaw = await getTagMapFor(gDocId);
-        const rules     = Array.isArray(restored?.rules) ? restored.rules : [];
+        const domVals  = collectFormValues(gSchema);
+        const baseVals = (restored && restored.values) ? restored.values : {};
+        const rules    = normalizeRules(restored?.rules);
+        const tagMapRaw= restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, merged, tagMapRaw);
+          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
 
         gValues = prunedValues;
-
         setStatus('Preparing export…');
 
-        // 1) Write payload (normalized)
         const payload = JSON.stringify({
           title:  gSchema.title || 'Form',
           fields: gSchema.fields || [],
-          values: gValues,
+          values: gValues || {},
           tagMap: prunedTagMap,
           rules,
           updatedAt: new Date().toISOString()
         });
+
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
 
-        // 2) Replace SDTs using normalized tagMap/values
+        // SDT replacements
         const sdtMap = {};
         for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
           let v = gValues?.[fieldId];
@@ -1378,10 +1386,12 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       const tr = TRACE('applyPayloadObject', { broadcast, save, keys: Object.keys(obj||{}).length });
       try {
         if (!obj || typeof obj !== 'object') { tr.warn('no object'); return; }
+
         const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
         const nextValues = (obj.values && typeof obj.values === 'object') ? obj.values : {};
         const nextTagMap = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
-        const nowIso = new Date().toISOString();
+        const nextRules  = normalizeRules(obj.rules);
+        const nowIso     = new Date().toISOString();
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(nextSchema, nextValues, nextTagMap);
@@ -1394,7 +1404,10 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
             schema: gSchema,
             values: gValues,
             tagMap: prunedTagMap,
-            payload: { CRONOS_PAYLOAD: { ...obj, fields: gSchema.fields, values: gValues, tagMap: prunedTagMap } },
+            rules:  nextRules,
+            payload: { CRONOS_PAYLOAD: {
+              title: gSchema.title, fields: gSchema.fields, values: gValues, tagMap: prunedTagMap, rules: nextRules
+            }},
             schemaUpdatedAt: nowIso
           });
         } else {
@@ -1415,7 +1428,6 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         tr.end('applied');
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
-
 
 
     if (payloadEl) {
