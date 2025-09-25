@@ -1040,9 +1040,10 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     (async function boot() {
       const tr = TRACE('boot');
       try {
-        let meta = window.formSuitePersist?.getCurrentDocMeta?.();
-        tr.step('getCurrentDocMeta', meta);
-        if (!meta?.docId) { meta = readActiveMeta(); tr.step('readActiveMeta', meta); }
+        // Prefer ACTIVE_LS_KEY mirror first, then persistence meta (restores across pages reliably)
+        let meta = readActiveMeta();
+        tr.step('readActiveMeta', meta);
+        if (!meta?.docId) { meta = window.formSuitePersist?.getCurrentDocMeta?.(); tr.step('getCurrentDocMeta', meta); }
         if (!meta?.docId) { tr.end('no meta; idle'); return; }
 
         clearUiForNewDoc('Restoring document…');
@@ -1051,6 +1052,23 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
                  || await window.formSuitePersist.getCurrentDocBytes?.();
         tr.step('persistence bytes', { len: bytes?.byteLength || bytes?.length });
 
+        // If no bytes yet, try OPFS handle (e.g., first navigation into this page)
+        if (!bytes && supportsFS) {
+          try {
+            const h = await window.formSuitePersist.getHandle?.(meta.docId);
+            tr.step('getHandle (2nd chance)', { has: !!h });
+            if (h?.getFile) {
+              try { await window.formSuitePersist.ensurePermission?.(h, 'read'); } catch {}
+              const f = await h.getFile();
+              bytes = new Uint8Array(await f.arrayBuffer());
+              gFileHandle = h;
+              if (!gFileName) gFileName = f.name?.replace(/\.docx$/i,'') || meta.name || 'document';
+              tr.step('2nd chance handle.getFile ok', { size: bytes.byteLength });
+            }
+          } catch (e) {
+            tr.warn('2nd chance via handle failed', e);
+          }
+        }
         if (!bytes && supportsFS) {
           try {
             const h = await window.formSuitePersist.getHandle?.(meta.docId);
@@ -1117,7 +1135,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         const [handle] = await showOpenFilePicker({
           multiple: false,
-          types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }]
+          types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm'] } }]
         });
         gFileHandle = handle;
         const file = await handle.getFile();

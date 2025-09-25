@@ -2,49 +2,506 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Form Suite — Open Form</title>
+  <title>Form Suite — Rules</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css">
+  <script src="persistence.js"></script>
   <style>
-    /* Compact editor layout for table rows */
-    .compact-editor { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:flex-start; }
-    .compact-editor .pair {
-      display:flex; align-items:center; gap:6px;
-      padding:6px 8px;
-      background:var(--card,#fff); border-radius:8px;
-    }
-    .compact-editor .pair .lbl { white-space:nowrap; font-size:0.95rem; color:var(--ink,#0f172a); }
-    .compact-editor .pair input, .compact-editor .pair select {
-      width:auto; min-width:120px; max-width:360px;
-    }
-    .table-card table { width:100%; table-layout:auto; border-collapse:collapse; }
-    .table-card th, .table-card td { padding:6px 8px; border-bottom:1px solid var(--border,#e5e7eb); }
-    .table-card tbody tr { cursor:pointer; }
-    .table-card tbody tr[data-sel="1"] { background:#f0f9ff; }
-    .right { margin-left:auto; }
-    .btn-primary, .btn-secondary, .btn-danger { margin-right:6px; }
+    .pills { display:flex; gap:6px; flex-wrap:wrap; }
+    .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid var(--border-strong); border-radius:999px; background:var(--card); }
+    .pill > button { border:none; background:transparent; cursor:pointer; padding:0 2px; font-weight:600; }
+    .checkgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px}
+    .check{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;background:var(--card)}
+    .check input[type="checkbox"]{transform:translateY(-1px)}
+    .rule-card{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--card);box-shadow:var(--shadow-sm);display:grid;gap:12px}
+    .rule-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+    .pair{display:flex;gap:6px;align-items:center}
+    .pair>label{color:var(--muted);min-width:72px}
+    .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--border-strong);border-radius:999px;background:var(--ghost-bg);color:var(--ghost-ink);font-size:.9rem}
+    .pill button{all:unset;cursor:pointer;padding:0 4px;line-height:1;color:var(--muted);font-weight:700}
+    .rules-list .item{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+    .rules-list .item:last-child{border-bottom:0}
+    .empty{color:var(--muted)}
+    .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--border-strong);background:var(--card);cursor:pointer}
+    .btn-primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+    .btn-danger{background:#ef4444;color:#fff;border-color:transparent}
+    .btn-ghost{background:var(--ghost-bg);color:var(--ghost-ink);border-color:var(--border-strong)}
+    select,input{padding:8px 10px;border:1px solid var(--border-strong);border-radius:8px;background:var(--card);color:var(--ink)}
+    .value-select{min-width:220px}
+    .value-multi{min-width:260px}
+    .muted-note{color:var(--muted);font-size:.9rem}
+    code{background:var(--ghost-bg);padding:2px 6px;border-radius:6px;border:1px solid var(--border-strong)}
   </style>
 </head>
-<body>
-  <header>
-    <div class="row">
-      <span class="brand logo-md">
-        <img src="logo.gif" alt="Form Suite logo" class="logo" />
-        <strong>Form Suite</strong>
-      </span>
-      <span class="muted">·</span><span class="muted">Open Form</span>
-      <span class="muted">·</span><a href="builder.html">Form Builder</a>
-      <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
-      <span class="muted">·</span><span class="muted">Rules</span>
-      <span class="muted">·</span><a href="extractor.html">Extractor</a>
+<body class="rules">
+<header>
+  <div class="row">
+    <span class="brand logo-md">
+      <img src="logo.gif" alt="Form Suite logo" class="logo" />
+      <strong>Form Suite</strong>
+    </span>
+    <span class="muted">·</span><a href="index.html">Open Form</a>
+    <span class="muted">·</span><a href="builder.html">Form Builder</a>
+    <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
+    <span class="muted">·</span><span class="muted">Rules</span>
+    <span class="muted">·</span><a href="extractor.html">Extractor</a>
+  </div>
+</header>
 
+<main>
+  <section class="panel">
+    <div class="row" style="justify-content:space-between; align-items:center">
+      <h2 style="margin:0">Rules</h2>
+      <div class="row">
+        <div class="row">
+          <span id="status" class="muted" style="margin-right:10px"></span>
+          <button id="btnAddRule" class="btn btn-primary">Add rule</button>
+        </div>
+      </div>
     </div>
-  </header>
+    <div class="muted-note" style="margin-top:6px">
+      SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).
+    </div>
+  </section>
 
-  <main>
-    <section class="panel">
-      <div class="title-row"></div>
-    </section>
-  </main>
+  <section class="panel" id="editorMount">
+    <div class="empty">No rules yet — click “Add rule”.</div>
+  </section>
+
+  <section class="panel">
+    <h3 style="margin-top:0">Existing rules</h3>
+    <div id="rulesList" class="rules-list">
+      <div class="empty">None.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+  // ========== debug ==========
+  const DEBUG = { seq:0 };
+  const _t = () => new Date().toISOString().slice(11,23);
+  const tag = name => "%c[Rules "+_t()+" #"+(++DEBUG.seq)+"] "+name;
+  const tagStyle = "color:#6b7280;font-weight:600";
+  function TRACE(name, details){
+    const label = name+" :: "+_t()+" :: #"+(DEBUG.seq+1);
+    console.groupCollapsed(tag(name), tagStyle, details || "");
+    console.time(label);
+    return {
+      step:(m,d)=>console.log(tag("  -> "+m),tagStyle,d||""),
+      warn:(m,d)=>console.warn(tag("  ! "+m),tagStyle,d||""),
+      error:(m,e)=>console.error(tag("  x "+m),tagStyle,e),
+      end:(x)=>{ if(x) console.log(tag("done"),tagStyle,x); console.timeEnd(label); console.groupEnd(); }
+    };
+  }
+
+  // ========== constants & state ==========
+  const ACTIVE_LS_KEY= "FS_ACTIVE_DOC_META";
+  const statusEl   = document.getElementById("status");
+  const btnAddRule = document.getElementById("btnAddRule");
+  const editorMount= document.getElementById("editorMount");
+  const rulesList  = document.getElementById("rulesList");
+
+  const bcLegacy = ("BroadcastChannel" in window) ? new BroadcastChannel("form-suite-doc") : null;
+  const bcCanon  = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-active-doc") : null;
+
+  let gDocId   = null;
+  let gSchema  = { title:"Form", fields:[] };
+  let gHeadingsTree = [];
+  let gRules   = []; // [{id, action, fieldId, op, values:[...], targets:[{key,label}]}]
+
+  function setStatus(t){ if (statusEl) statusEl.textContent = t; }
+
+  // ========== ensure persistence shim (safety) ==========
+  (function ensurePersist(){
+    if (window.formSuitePersist) return;
+    let _meta=null, _state={};
+    window.formSuitePersist = {
+      getCurrentDocMeta(){ return _meta; },
+      setCurrentDocFromBytes: async (_b,meta)=>{ _meta={docId:"inline-"+Date.now(), name:(meta&&meta.name)||"document"}; return _meta; },
+      loadState: async (_)=>_state,
+      saveState: async (_,obj)=>{ _state = Object.assign({}, _state, obj||{}); }
+    };
+  })();
+
+  // ========== helpers ==========
+  function readActiveMeta(){
+    try { const v = localStorage.getItem(ACTIVE_LS_KEY); return v ? JSON.parse(v) : null; }
+    catch { return null; }
+  }
+
+  // normalize field options → [{value,label}]
+  function normOptions(field){
+    const raw = field && field.options || [];
+    return raw.map(o => {
+      if (o && typeof o === "object") {
+        const value = (o.value ?? o.id ?? o.key ?? o.code ?? String(o));
+        const label = (o.label ?? o.text ?? o.name ?? String(value));
+        return { value:String(value), label:String(label) };
+      }
+      return { value:String(o), label:String(o) };
+    });
+  }
+
+  // Only choice-like fields
+  function getChoiceFields(schema){
+    const CHOICE_TYPES = new Set(["select","multichoice","radio","dropdown","singlechoice","choice","single","options","combobox","list"]);
+    return (schema?.fields||[]).filter(f => CHOICE_TYPES.has(String(f.type||"").toLowerCase()));
+  }
+
+  // flatten headings with outline numbers 1., 1.1., …
+  function flattenWithNumbers(tree){
+    const out=[], counters=[];
+    function walk(nodes, depth){
+      counters[depth]=0;
+      for (const n of (nodes||[])){
+        counters[depth]++;
+        const number = counters.slice(0, depth+1).join(".");
+        const label = (n.label?.trim?.() ? n.label : n.text) || "";
+        out.push({ key:String(n.idx ?? (number+"|"+label)), label:number+" "+label, level:n.level || (depth+1) });
+        if (n.children?.length) walk(n.children, depth+1);
+      }
+    }
+    walk(tree||[],0);
+    return out;
+  }
+
+  // ========== renderers ==========
+    function renderEditors(){
+      const tr = TRACE("renderEditors", { rules:gRules.length, fields:gSchema.fields.length, headings:gHeadingsTree.length });
+      try{
+        editorMount.innerHTML = "";
+        if (!gRules.length){
+          editorMount.innerHTML = '<div class="empty">No rules yet — click “Add rule”.</div>';
+          return;
+        }
+
+        const allHeadings = flattenWithNumbers(gHeadingsTree);
+        const fields = getChoiceFields(gSchema);
+
+        // helper: label for a value
+        const labelFor = (opts, val) => (opts.find(o => String(o.value) === String(val))?.label ?? String(val));
+
+        gRules.forEach(rule => {
+          const field = fields.find(f => f.id === rule.fieldId) || fields[0];
+          if (!rule.fieldId && field) rule.fieldId = field.id;
+
+          const card = document.createElement("div");
+          card.className = "rule-card";
+          card.dataset.id = rule.id;
+
+          // ── Row 1: Action + Field ───────────────────────────────────────────────
+          const row1 = document.createElement("div");
+          row1.className = "rule-row";
+
+          // Action
+          const pAction = document.createElement("div"); pAction.className="pair";
+          const lblA = document.createElement("label"); lblA.textContent="Action";
+          const selA = document.createElement("select");
+          ["SHOW","HIDE"].forEach(a => {
+            const o=document.createElement("option"); o.value=a; o.textContent=a; if(rule.action===a) o.selected=true; selA.appendChild(o);
+          });
+          selA.addEventListener("change", () => { rule.action = selA.value; persistRules(); renderList(); });
+          pAction.appendChild(lblA); pAction.appendChild(selA);
+          row1.appendChild(pAction);
+
+          // Field
+          const pField = document.createElement("div"); pField.className="pair";
+          const lblF = document.createElement("label"); lblF.textContent="Field";
+          const selF = document.createElement("select");
+          if (!fields.length){
+            const o=document.createElement("option"); o.value=""; o.textContent="(no choice fields)"; selF.appendChild(o);
+          } else {
+            fields.forEach(f=>{
+              const o=document.createElement("option");
+              o.value=f.id; o.textContent=f.label||f.id; if(rule.fieldId===f.id) o.selected=true; selF.appendChild(o);
+            });
+          }
+          selF.addEventListener("change", () => {
+            rule.fieldId = selF.value;
+            const f = fields.find(x=>x.id===rule.fieldId);
+            rule.values = [];
+            rule.op = String(f?.type||"").toLowerCase()==="multichoice" ? "anyOf" : "equals";
+            persistRules(); renderEditors(); renderList();
+          });
+          pField.appendChild(lblF); pField.appendChild(selF);
+          row1.appendChild(pField);
+
+          card.appendChild(row1);
+
+          // ── Row 2: Condition (operator + value(s)) ─────────────────────────────
+          const row2 = document.createElement("div"); row2.className="rule-row";
+          const pCond = document.createElement("div"); pCond.className="pair";
+          const lblC = document.createElement("label"); lblC.textContent="Condition";
+          pCond.appendChild(lblC);
+
+          const fieldType = String((field && field.type) || "").toLowerCase();
+          const isMulti = fieldType === "multichoice";
+          const options = normOptions(field||{options:[]});
+          if (!rule.op) rule.op = isMulti ? "anyOf" : "equals";
+          if (!Array.isArray(rule.values)) rule.values = [];
+
+          if (isMulti){
+          // operator (ANY/ALL)
+          const selOp = document.createElement("select");
+          selOp.className = "select-compact";
+          [{v:"anyOf", t:"contains ANY of"},{v:"allOf", t:"contains ALL of"}].forEach(it=>{
+            const o=document.createElement("option"); o.value=it.v; o.textContent=it.t;
+            if(rule.op===it.v) o.selected=true;
+            selOp.appendChild(o);
+          });
+          selOp.addEventListener("change", ()=>{ rule.op = selOp.value; persistRules(); renderList(); });
+
+          // add-value dropdown (only remaining options)
+          const chosen = new Set(rule.values.map(String));
+          const remaining = options.filter(o => !chosen.has(String(o.value)));
+
+          const selAdd = document.createElement("select");
+          selAdd.className = "select-add";
+          const def=document.createElement("option"); def.value=""; def.textContent="Add"; selAdd.appendChild(def);
+          remaining.forEach(opt => {
+            const o = document.createElement("option");
+            o.value = opt.value; o.textContent = opt.label; selAdd.appendChild(o);
+          });
+          selAdd.addEventListener("change", ()=>{
+            const v = selAdd.value;
+            if (!v) return;
+            if (!rule.values.includes(v)) rule.values.push(v);
+            persistRules(); renderEditors(); renderList();
+          });
+
+          // line: operator + Add
+          const condBar = document.createElement("div");
+          condBar.className = "rule-cond";
+          const lbl = document.createElement("span"); lbl.className="muted"; lbl.textContent="Condition";
+          condBar.appendChild(lbl);
+          condBar.appendChild(selOp);
+          condBar.appendChild(selAdd);
+
+          // selected values as pills
+          const pills = document.createElement("div"); pills.className="pills";
+          if (!rule.values.length){
+            const none=document.createElement("span"); none.className="muted"; none.textContent="(no values selected)";
+            pills.appendChild(none);
+          } else {
+            rule.values.forEach(v=>{
+              const pill = document.createElement("span"); pill.className="pill"; pill.title=String(v);
+              pill.appendChild(document.createTextNode(labelFor(options, v)));
+              const x = document.createElement("button"); x.setAttribute("aria-label","Remove"); x.textContent="×";
+              x.addEventListener("click", ()=>{
+                rule.values = rule.values.filter(xv => String(xv)!==String(v));
+                persistRules(); renderEditors(); renderList();
+              });
+              pill.appendChild(x);
+              pills.appendChild(pill);
+            });
+          }
+          condBar.appendChild(pills);
+
+          pCond.appendChild(condBar);
+
+
+          } else {
+            // single equals editor
+            const spanEq = document.createElement("span"); spanEq.className="muted"; spanEq.textContent="equals";
+            const selVal = document.createElement("select");
+            selVal.className = "value-select";
+            const def=document.createElement("option"); def.value=""; def.textContent="Select value…"; selVal.appendChild(def);
+            options.forEach(opt=>{
+              const o=document.createElement("option");
+              o.value = opt.value; o.textContent = opt.label;
+              if (rule.values[0] === opt.value) o.selected = true;
+              selVal.appendChild(o);
+            });
+            selVal.addEventListener("change", ()=>{
+              rule.values = selVal.value ? [selVal.value] : [];
+              rule.op = "equals";
+              persistRules(); renderList();
+            });
+            pCond.appendChild(spanEq);
+            pCond.appendChild(selVal);
+          }
+
+          row2.appendChild(pCond);
+          card.appendChild(row2);
+
+          // ── Row 3: Headings selector ───────────────────────────────────────────
+          const row3 = document.createElement("div"); row3.className="rule-row";
+          const pHead = document.createElement("div"); pHead.className="pair";
+          const lblH = document.createElement("label"); lblH.textContent="Add heading";
+          const chosenKeys = new Set((rule.targets||[]).map(t=>t.key));
+          const remainingHeads = flattenWithNumbers(gHeadingsTree).filter(h => !chosenKeys.has(h.key));
+          const selH = document.createElement("select");
+          const defH = document.createElement("option"); defH.value=""; defH.textContent="Select…"; selH.appendChild(defH);
+          remainingHeads.forEach(h=>{ const o=document.createElement("option"); o.value=h.key; o.textContent=h.label; selH.appendChild(o); });
+          selH.addEventListener("change", ()=>{
+            const key = selH.value; if (!key) return;
+            const h = allHeadings.find(x=>x.key===key);
+            if (!h) return;
+            rule.targets = rule.targets || [];
+            rule.targets.push({ key:h.key, label:h.label });
+            persistRules(); renderEditors(); renderList();
+          });
+          pHead.appendChild(lblH); pHead.appendChild(selH);
+          row3.appendChild(pHead);
+          card.appendChild(row3);
+
+          // ── Row 4: Selected headings pills ─────────────────────────────────────
+          const row4 = document.createElement("div"); row4.className="rule-row";
+          const lblSel = document.createElement("div"); lblSel.className="muted"; lblSel.textContent="Selected headings:";
+          const hpills = document.createElement("div"); hpills.className="pills";
+          (rule.targets||[]).forEach(t=>{
+            const pill = document.createElement("span"); pill.className="pill"; pill.title=t.key;
+            const txt = document.createElement("span"); txt.textContent=t.label;
+            const x = document.createElement("button"); x.setAttribute("aria-label","Remove"); x.textContent="×";
+            x.addEventListener("click", ()=>{
+              rule.targets = (rule.targets||[]).filter(z=>z.key!==t.key);
+              persistRules(); renderEditors(); renderList();
+            });
+            pill.appendChild(txt); pill.appendChild(x);
+            hpills.appendChild(pill);
+          });
+          if (!hpills.children.length){
+            const none=document.createElement("span"); none.className="muted"; none.textContent="(none)";
+            hpills.appendChild(none);
+          }
+          row4.appendChild(lblSel); row4.appendChild(hpills);
+          card.appendChild(row4);
+
+          // delete rule
+          const actions = document.createElement("div"); actions.className="row"; actions.style.justifyContent="flex-end";
+          const del = document.createElement("button"); del.className="btn btn-danger"; del.textContent="Remove rule";
+          del.addEventListener("click", ()=>{
+            gRules = gRules.filter(r=>r.id!==rule.id);
+            persistRules(); renderEditors(); renderList();
+          });
+          actions.appendChild(del);
+          card.appendChild(actions);
+
+          editorMount.appendChild(card);
+        });
+
+      } finally { tr.end(); }
+    }
+
+  function summarizeCondition(rule){
+    const fields = getChoiceFields(gSchema);
+    const field = fields.find(f=>f.id===rule.fieldId);
+    const fname = field ? (field.label || field.id) : "(field)";
+    const options = normOptions(field||{});
+    const valLabel = v => (options.find(o=>o.value===v)?.label ?? v);
+
+    if (!field) return `when ${fname} (missing)`;
+    const isMulti = String(field.type||"").toLowerCase()==="multichoice";
+    if (!isMulti){
+      const v = rule.values?.[0];
+      return v ? `when ${fname} equals "${valLabel(v)}"` : `when ${fname} has no value`;
+    } else {
+      const vs = (rule.values||[]).map(valLabel);
+      if (!vs.length) return `when ${fname} (no values)`;
+      return rule.op === "allOf"
+        ? `when ${fname} contains ALL of [${vs.map(v=>`"${v}"`).join(", ")}]`
+        : `when ${fname} contains ANY of [${vs.map(v=>`"${v}"`).join(", ")}]`;
+    }
+  }
+
+  function renderList(){
+    rulesList.innerHTML = "";
+    if (!gRules.length){
+      rulesList.innerHTML = '<div class="empty">None.</div>';
+      return;
+    }
+    const headings = flattenWithNumbers(gHeadingsTree);
+    gRules.forEach(r=>{
+      const div=document.createElement("div"); div.className="item";
+      const left=document.createElement("div");
+      const targets = (r.targets||[]).map(t=>t.label).join(", ") || "(no headings selected)";
+      left.innerHTML = `<strong>${r.action}</strong> — <em>${targets}</em> <span class="muted"> ${summarizeCondition(r)}</span>`;
+      const right=document.createElement("div");
+      const edit=document.createElement("button"); edit.className="btn btn-ghost"; edit.textContent="Edit";
+      edit.addEventListener("click", ()=>{
+        const card = editorMount.querySelector('.rule-card[data-id="'+r.id+'"]');
+        if (card) card.scrollIntoView({behavior:"smooth", block:"center"});
+      });
+      right.appendChild(edit);
+      div.appendChild(left); div.appendChild(right);
+      rulesList.appendChild(div);
+    });
+  }
+
+  function persistRules(){
+    if (!gDocId) return;
+    window.formSuitePersist?.saveState?.(gDocId, { rules: gRules });
+    setStatus(`Rules saved — ${gRules.length}`);
+  }
+
+  // ========== sync & state ==========
+  async function reloadState(reason){
+    const tr = TRACE("reloadState",{reason, docId:gDocId});
+    try {
+      if (!gDocId) return;
+      const st = await window.formSuitePersist?.loadState?.(gDocId);
+      if (!st) return;
+      if (st.schema) gSchema = st.schema;
+      if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
+      if (Array.isArray(st.rules)) gRules = st.rules;
+      setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, rules: ${gRules.length}`);
+      renderEditors(); renderList();
+    } catch(e){ tr.error("failed", e); }
+    finally{ tr.end(); }
+  }
+
+  function hookSync(){
+    bcLegacy?.addEventListener("message",(ev)=>{
+      const m = ev?.data || {};
+      if (m.type==="schema-updated"   && m.docId===gDocId) reloadState("schema-updated");
+      if (m.type==="headings-updated" && m.docId===gDocId) reloadState("headings-updated");
+      if (m.type==="doc-updated"      && m.docId===gDocId) reloadState("doc-updated");
+      if (m.type==="doc-switched"     && m.docId && m.docId!==gDocId){ gDocId=m.docId; reloadState("doc-switched"); }
+      if (m.type==="doc-cleared"){ gDocId=null; setStatus("Cleared."); editorMount.innerHTML='<div class="empty">No rules yet — click “Add rule”.</div>'; rulesList.innerHTML='<div class="empty">None.</div>'; }
+    });
+    bcCanon?.addEventListener("message",(ev)=>{
+      const m = ev?.data || {};
+      if (m.type==="active:set"){ if (m.docId && m.docId!==gDocId){ gDocId=m.docId; reloadState("active:set"); } }
+      if (m.type==="active:updated"){ if (m.docId===gDocId) reloadState("active:updated"); }
+      if (m.type==="active:clear"){ gDocId=null; setStatus("Cleared."); }
+    });
+    window.addEventListener("storage",(e)=>{
+      if (e.key===ACTIVE_LS_KEY && e.newValue){
+        const meta = JSON.parse(e.newValue||"null");
+        if (meta?.docId && meta.docId!==gDocId){ gDocId=meta.docId; reloadState("storage switch"); }
+      }
+    });
+  }
+
+  // ========== add rule ==========
+  btnAddRule.addEventListener("click", ()=>{
+    const id = "r_"+Math.random().toString(36).slice(2,8);
+    const fields = getChoiceFields(gSchema);
+    const field = fields[0] || null;
+    const isMulti = field ? String(field.type||"").toLowerCase()==="multichoice" : false;
+    gRules.push({
+      id,
+      action:"SHOW",
+      fieldId: field ? field.id : "",
+      op: isMulti ? "anyOf" : "equals",
+      values: [],
+      targets: []
+    });
+    persistRules(); renderEditors(); renderList();
+  });
+
+  // ========== boot ==========
+  (async function boot(){
+    const tr = TRACE("boot");
+    try{
+      hookSync();
+      let meta = window.formSuitePersist?.getCurrentDocMeta?.() || readActiveMeta();
+      if (!meta?.docId){ setStatus("No active document. Open one first."); return; }
+      gDocId = meta.docId;
+      await reloadState("boot");
+    } catch(e){ tr.error("boot failed", e); setStatus("Failed to load state."); }
+    finally{ tr.end(); }
+  })();
+</script>
 </body>
+</html>

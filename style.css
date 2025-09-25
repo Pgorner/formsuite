@@ -366,6 +366,34 @@ details[open] summary::before { transform: rotate(90deg); }
 .mono b, .mono strong { font-weight: 600; }
 code { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
 
+/* keep operator & Add selects from stretching */
+.select-compact {
+  flex: 0 0 auto;
+  width: max-content;    /* size to text */
+  min-width: 12ch;       /* but not too tiny */
+}
+
+/* slimmer “Add value …” dropdown */
+.select-add {
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 10ch;
+  max-width: 22ch;       /* never huge */
+}
+
+/* make the condition row layout stable */
+.rule-cond {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;       /* pills can wrap */
+}
+
+.rule-cond .pills {
+  flex: 1 1 100%;        /* pills drop to next line when needed */
+  min-width: 0;
+}
+
 /* ============ ANIMATIONS (helpers) ============ */
 @keyframes fs-pulse { 0%,100%{box-shadow:0 0 0 0 rgba(48,136,255,.0)} 50%{box-shadow:0 0 0 6px rgba(48,136,255,.08)} }
 .pulse-once { animation: fs-pulse 1.2s var(--ease) 1; }
