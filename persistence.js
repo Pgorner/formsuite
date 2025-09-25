@@ -408,3 +408,307 @@
   window.formSuitePersist = api;
   window.formSuiteUtils = Object.freeze(utils);
 })();
+
+/* --------------------------------------------------------------------------
+ * Active Document Guard (global)
+ * - Auto-mounts on every page that includes persistence.js
+ * - Detects lost DOCX (no bytes/handle/permission) and blocks UI with a modal
+ * - Offers: Open DOCX…, Try again, or Clear workspace
+ * -------------------------------------------------------------------------- */
+(function () {
+  const ACTIVE_LS_KEY = 'FS_ACTIVE_DOC_META';
+  const supportsFS = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
+  const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+  const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+
+  // Minimal console tag
+  const tag = (m) => ["%c[DocGuard]", "color:#6b7280;font-weight:600", m];
+
+  // Safe JSON parse
+  const jget = (k) => {
+    try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; }
+    catch { return null; }
+  };
+
+  // Broadcast active meta to all tabs/pages
+  function broadcastActive(meta) {
+    try { localStorage.setItem(ACTIVE_LS_KEY, JSON.stringify({ docId: meta?.docId || null, name: meta?.name || null })); } catch {}
+    try { bcCanon?.postMessage({ type: 'active:set', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
+    try { bcLegacy?.postMessage({ type: 'doc-switched', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
+  }
+  function broadcastClear() {
+    try { localStorage.removeItem(ACTIVE_LS_KEY); } catch {}
+    try { bcCanon?.postMessage({ type: 'active:clear', ts: Date.now() }); } catch {}
+    try { bcLegacy?.postMessage({ type: 'doc-cleared', ts: Date.now() }); } catch {}
+  }
+  function broadcastUpdated(meta) {
+    try { bcCanon?.postMessage({ type: 'active:updated', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
+    try { bcLegacy?.postMessage({ type: 'doc-updated', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
+  }
+
+  // Small DOM helper
+  function el(tag, attrs = {}, children = []) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'style' && v && typeof v === 'object') Object.assign(n.style, v);
+      else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
+      else if (v != null) n.setAttribute(k, v);
+    }
+    for (const c of (Array.isArray(children) ? children : [children])) {
+      if (c == null) continue;
+      n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
+    return n;
+  }
+
+  // Create the modal overlay once
+  let overlay = null;
+  let visible = false;
+
+  function ensureOverlay() {
+    if (overlay) return overlay;
+
+    const css = `
+.fs-docguard-overlay{position:fixed;inset:0;background:rgba(17,24,39,.66);backdrop-filter:saturate(120%) blur(2px);z-index:999999}
+.fs-docguard-card{position:fixed;inset:auto;left:50%;top:12%;transform:translateX(-50%);
+  width:min(720px,92vw);background:var(--card,#fff);color:var(--ink,#111827);border:1px solid var(--border,#e5e7eb);
+  border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.2);padding:16px;display:grid;gap:12px;z-index:1000000}
+.fs-docguard-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.fs-docguard-actions{display:flex;gap:8px;justify-content:flex-end}
+.fs-docguard-btn{padding:8px 12px;border-radius:8px;border:1px solid var(--border-strong,#d1d5db);background:var(--card,#fff);cursor:pointer;color:var(--ink,#111827)}
+.fs-docguard-btn.primary{background:var(--accent,#2563eb);color:var(--accent-ink,#fff);border-color:transparent}
+.fs-docguard-btn.ghost{background:var(--ghost-bg,#f3f4f6);color:var(--ghost-ink,#111827)}
+.fs-docguard-btn.danger{background:#ef4444;color:#fff;border-color:transparent}
+.fs-docguard-badge{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;border:1px solid var(--border,#e5e7eb);background:var(--ghost-bg,#f3f4f6);font-size:.85rem}
+`;
+    const style = el('style', {}, css);
+
+    const title = el('div', { class: 'fs-docguard-row' }, [
+      el('strong', {}, 'Document connection lost'),
+      el('span', { class: 'fs-docguard-badge', id: 'fsdgDocName' }, '(no name)'),
+    ]);
+
+    const body = el('div', {}, [
+      'The active DOCX is no longer available (bytes/handle/permission not accessible). ',
+      'To keep things safe, editing is paused until you reconnect or clear the workspace.',
+    ]);
+
+    const status = el('div', { id: 'fsdgStatus', style: { color: 'var(--muted,#6b7280)', fontSize: '.9rem' } }, '');
+
+    const btnOpen = el('button', { class: 'fs-docguard-btn primary', id: 'fsdgOpen' }, 'Open DOCX…');
+    const btnRetry = el('button', { class: 'fs-docguard-btn ghost', id: 'fsdgRetry' }, 'Try again');
+    const btnClear = el('button', { class: 'fs-docguard-btn danger', id: 'fsdgClear' }, 'Clear workspace');
+
+    const actions = el('div', { class: 'fs-docguard-actions' }, [btnClear, btnRetry, btnOpen]);
+    const card = el('div', { class: 'fs-docguard-card' }, [title, body, status, actions]);
+    overlay = el('div', { class: 'fs-docguard-overlay', style: { display: 'none' } }, [style, card]);
+    document.documentElement.appendChild(overlay);
+
+    // Wire actions
+    btnOpen.addEventListener('click', async () => {
+      setStatus('Opening picker…');
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          multiple: false,
+          types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm'] } }]
+        });
+        const f = await handle.getFile();
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        const nameNoExt = f.name?.replace(/\.docx$/i, '') || 'document';
+
+        // Persist into our storage layer
+        let meta;
+        if (window.formSuitePersist?.setCurrentDoc) {
+          meta = await window.formSuitePersist.setCurrentDoc({ bytes, handle, name: nameNoExt + '.docx' });
+        } else if (window.formSuitePersist?.setCurrentDocFromBytes) {
+          meta = await window.formSuitePersist.setCurrentDocFromBytes(bytes, { name: nameNoExt + '.docx', handle });
+        } else {
+          meta = { docId: 'inline-' + Date.now(), name: nameNoExt + '.docx' };
+        }
+
+        // Broadcast new active doc so every page rehydrates
+        broadcastActive(meta);
+        try { await window.formSuitePersist?.putBytes?.(meta.docId, bytes); } catch {}
+
+        // Small “updated” ping
+        broadcastUpdated(meta);
+
+        // Unblock UI
+        hide();
+        console.log(...tag('opened + broadcasted'));
+      } catch (e) {
+        setStatus('Open canceled or failed.');
+        console.warn(...tag('open failed'), e);
+      }
+    });
+
+    btnRetry.addEventListener('click', async () => {
+      setStatus('Rechecking access…');
+      try {
+        const ok = await checkAccess(true);
+        setStatus(ok ? 'Reconnected.' : 'Still not available.');
+        if (ok) hide();
+      } catch (e) {
+        setStatus('Retry failed.');
+      }
+    });
+
+    btnClear.addEventListener('click', async () => {
+      try {
+        // Attempt to clear persisted state safely (best-effort; pages will handle UI reset)
+        const meta = jget(ACTIVE_LS_KEY);
+        if (meta?.docId) {
+          try { await window.formSuitePersist?.saveState?.(meta.docId, {}); } catch {}
+          try { await window.formSuitePersist?.putBytes?.(meta.docId, new Uint8Array()); } catch {}
+        }
+      } finally {
+        broadcastClear();
+        hide();
+      }
+    });
+
+    function setStatus(s) { status.textContent = s || ''; }
+    overlay._setStatus = setStatus;
+    overlay._setDocName = (n) => {
+      const badge = overlay.querySelector('#fsdgDocName');
+      if (badge) badge.textContent = n || '(no name)';
+    };
+
+    return overlay;
+  }
+
+  function show(name) {
+    const ov = ensureOverlay();
+    ov._setDocName(name || jget(ACTIVE_LS_KEY)?.name || '(no name)');
+    ov.style.display = 'block';
+    visible = true;
+    // Prevent page interaction behind
+    document.documentElement.style.overflow = 'hidden';
+  }
+  function hide() {
+    if (!overlay) return;
+    overlay.style.display = 'none';
+    visible = false;
+    document.documentElement.style.overflow = '';
+  }
+  function setStatus(s) { ensureOverlay()._setStatus?.(s); }
+
+  // Access checker: returns true if we can read bytes (or will be able to imminently)
+  async function checkAccess(tryHandleFallback = false) {
+    const meta = jget(ACTIVE_LS_KEY);
+    const docId = meta?.docId;
+    if (!docId) return false;
+
+    try {
+      // 1) Try OPFS bytes
+      let bytes = await window.formSuitePersist?.getBytes?.(docId);
+      if (bytes?.byteLength) return true;
+
+      // 2) Try currentDocBytes mirror
+      bytes = await window.formSuitePersist?.getCurrentDocBytes?.();
+      if (bytes?.byteLength) return true;
+
+      // 3) Optional: try handle→file path
+      if (tryHandleFallback) {
+        const h = await window.formSuitePersist?.getHandle?.(docId);
+        if (h?.getFile) {
+          // Try read permission
+          try {
+            const p = await h.queryPermission?.({ mode: 'read' });
+            if (p !== 'granted') await h.requestPermission?.({ mode: 'read' });
+          } catch {}
+          const f = await h.getFile();
+          const ab = await f.arrayBuffer();
+          if (ab?.byteLength) {
+            // Re-seed bytes into persistence for other tabs
+            const u8 = new Uint8Array(ab);
+            try { await window.formSuitePersist?.putBytes?.(docId, u8); } catch {}
+            return true;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(...tag('checkAccess error'), e);
+    }
+    return false;
+  }
+
+  // Detection strategy:
+  //  - on focus / visibilitychange: re-check
+  //  - on broadcast "active:clear" or legacy "doc-cleared": show
+  //  - on storage change removing ACTIVE_LS_KEY: show
+  //  - periodic light heartbeat while visible=false (rare)
+  async function evaluateAndMaybeShow(source) {
+    const meta = jget(ACTIVE_LS_KEY);
+    const hasDoc = !!meta?.docId;
+    if (!hasDoc) {
+      show('(no document)');
+      setStatus('No active document.');
+      console.log(...tag(`lost (no meta) via ${source}`));
+      return;
+    }
+    const ok = await checkAccess(false);
+    if (!ok) {
+      show(meta?.name || '(no name)');
+      setStatus('Lost access to current DOCX.');
+      console.log(...tag(`lost (no access) via ${source}`));
+    } else if (visible) {
+      hide();
+    }
+  }
+
+  // Broadcast listeners
+  bcCanon?.addEventListener('message', (ev) => {
+    const m = ev?.data || {};
+    if (m.type === 'active:clear') {
+      show('(cleared)');
+      setStatus('Workspace cleared.');
+    }
+    if (m.type === 'active:set') {
+      // New doc set elsewhere → hide if we can access it
+      evaluateAndMaybeShow('bcCanon active:set');
+    }
+    if (m.type === 'active:updated') {
+      evaluateAndMaybeShow('bcCanon active:updated');
+    }
+  });
+  bcLegacy?.addEventListener('message', (ev) => {
+    const m = ev?.data || {};
+    if (m.type === 'doc-cleared') {
+      show('(cleared)');
+      setStatus('Workspace cleared.');
+    }
+    if (m.type === 'doc-switched' || m.type === 'doc-updated') {
+      evaluateAndMaybeShow('bcLegacy ' + m.type);
+    }
+  });
+
+  // Storage listener (cross-tab)
+  window.addEventListener('storage', (e) => {
+    if (e.key === ACTIVE_LS_KEY) {
+      evaluateAndMaybeShow('storage');
+    }
+  });
+
+  // Foreground triggers
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') evaluateAndMaybeShow('visibilitychange');
+  });
+  window.addEventListener('focus', () => evaluateAndMaybeShow('focus'));
+
+  // Light heartbeat: check every ~25s (only if not already visible)
+  setInterval(() => { if (!visible) evaluateAndMaybeShow('heartbeat'); }, 25000);
+
+  // Initial mount
+  window.addEventListener('DOMContentLoaded', () => {
+    evaluateAndMaybeShow('DOMContentLoaded');
+  });
+
+  // Expose (optional) API if you need to force it
+  window.fsDocGuard = {
+    show, hide,
+    ping: () => evaluateAndMaybeShow('manual'),
+    open: () => ensureOverlay().querySelector('#fsdgOpen')?.click(),
+    clear: () => ensureOverlay().querySelector('#fsdgClear')?.click(),
+  };
+})();
