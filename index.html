@@ -228,162 +228,153 @@
           s.onload = res; s.onerror = rej; document.head.appendChild(s);
         });
         py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/" });
+
         await py.runPythonAsync(`
-    import io, zipfile, json
-    import xml.etree.ElementTree as ET
-    _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    def _q(local): return "{%s}%s" % (_W_NS, local)
+import io, zipfile, json
+import xml.etree.ElementTree as ET
 
-    # ---------------------- existing functions ----------------------
-    def write_docvar(u8, var_name, value):
-        data = bytes(u8); outbuf = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
-            try: names = set(zfin.namelist())
-            except: names = set()
-            if "word/settings.xml" in names:
-                try: root = ET.fromstring(zfin.read("word/settings.xml"))
-                except ET.ParseError: root = ET.Element(_q("settings"))
-            else: root = ET.Element(_q("settings"))
-            doc_vars = root.find("{%s}docVars" % _W_NS)
-            if doc_vars is None: doc_vars = ET.SubElement(root, _q("docVars"))
-            target = None
-            for dv in doc_vars.findall("{%s}docVar" % _W_NS):
-                if dv.get(_q("name")) == var_name: target = dv; break
-            if target is None:
-                target = ET.SubElement(doc_vars, _q("docVar"), {_q("name"): var_name, _q("val"): value})
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+def _q(local): return "{%s}%s" % (_W_NS, local)
+
+# ---------------------- existing functions ----------------------
+def write_docvar(u8, var_name, value):
+    data = bytes(u8); outbuf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
+        try: names = set(zfin.namelist())
+        except: names = set()
+        if "word/settings.xml" in names:
+            try: root = ET.fromstring(zfin.read("word/settings.xml"))
+            except ET.ParseError: root = ET.Element(_q("settings"))
+        else:
+            root = ET.Element(_q("settings"))
+        doc_vars = root.find(_q("docVars"))
+        if doc_vars is None:
+            doc_vars = ET.SubElement(root, _q("docVars"))
+        target = None
+        for dv in doc_vars.findall(_q("docVar")):
+            if dv.get(_q("name")) == var_name:
+                target = dv; break
+        if target is None:
+            target = ET.SubElement(doc_vars, _q("docVar"), {_q("name"): var_name, _q("val"): value})
+        else:
+            target.set(_q("val"), value)
+        settings_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        for n in zfin.namelist():
+            if n == "word/settings.xml": continue
+            zfout.writestr(n, zfin.read(n))
+        zfout.writestr("word/settings.xml", settings_bytes)
+    return outbuf.getvalue()
+
+def _set_sdt_text(content_el, value):
+    texts = content_el.findall(".//w:t", {"w": _W_NS})
+    if texts:
+        first = True
+        for t in texts:
+            if first:
+                t.text = value
+                first = False
             else:
-                target.set(_q("val"), value)
-            settings_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-            for n in zfin.namelist():
-                if n == "word/settings.xml": continue
-                zfout.writestr(n, zfin.read(n))
-            zfout.writestr("word/settings.xml", settings_bytes)
-        return outbuf.getvalue()
+                t.text = ""
+        return
+    has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
+    for ch in list(content_el): content_el.remove(ch)
+    if has_block:
+        p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
+    else:
+        r = ET.SubElement(content_el, _q("r"))
+    t = ET.SubElement(r, _q("t")); t.text = value
+    if (value.strip() != value) or ("\\n" in value) or ("  " in value):
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
-    def _set_sdt_text(content_el, value):
-        texts = content_el.findall(".//w:t", {"w": _W_NS})
-        if texts:
-            first = True
-            for t in texts:
-                if first: t.text = value; first = False
-                else: t.text = ""
-            return
-        has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
-        for ch in list(content_el): content_el.remove(ch)
-        if has_block:
-            p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
-        else:
-            r = ET.SubElement(content_el, _q("r"))
-        t = ET.SubElement(r, _q("t")); t.text = value
-        if (value.strip() != value) or ("\\n" in value) or ("  " in value):
-            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+def write_sdts_by_tag(u8, tag_to_text_json):
+    try: mapping = json.loads(tag_to_text_json or "{}")
+    except Exception: mapping = {}
+    if not mapping: return u8
+    data = bytes(u8); outbuf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
+        names = zfin.namelist()
+        def is_target(name):
+            if not (name.startswith("word/") and name.endswith(".xml")): return False
+            skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
+            return name not in skip and not name.startswith("word/_rels/")
+        for n in names:
+            if not is_target(n):
+                zfout.writestr(n, zfin.read(n)); continue
+            try:
+                root = ET.fromstring(zfin.read(n))
+            except ET.ParseError:
+                zfout.writestr(n, zfin.read(n)); continue
+            changed = False
+            for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
+                pr = sdt.find("w:sdtPr", {"w": _W_NS})
+                if pr is None: continue
+                tag_el = pr.find("w:tag", {"w": _W_NS})
+                tag_val = tag_el.get(_q("val")) if tag_el is not None else ""
+                if not tag_val or tag_val not in mapping: continue
+                content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
+                val = mapping.get(tag_val, "")
+                if not isinstance(val, str):
+                    try: val = json.dumps(val, ensure_ascii=False)
+                    except Exception: val = str(val)
+                _set_sdt_text(content_el, val); changed = True
+            out_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else zfin.read(n)
+            zfout.writestr(n, out_xml)
+    return outbuf.getvalue()
 
-    def write_sdts_by_tag(u8, tag_to_text_json):
-        try: mapping = json.loads(tag_to_text_json or "{}")
-        except Exception: mapping = {}
-        if not mapping: return u8
-        data = bytes(u8); outbuf = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
-            names = zfin.namelist()
-            def is_target(name):
-                if not (name.startswith("word/") and name.endswith(".xml")): return False
-                skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
-                return name not in skip and not name.startswith("word/_rels/")
-            for n in names:
-                if not is_target(n):
-                    zfout.writestr(n, zfin.read(n)); continue
-                try: root = ET.fromstring(zfin.read(n))
-                except ET.ParseError:
-                    zfout.writestr(n, zfin.read(n)); continue
-                changed = False
-                for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
-                    pr = sdt.find("w:sdtPr", {"w": _W_NS})
-                    if pr is None: continue
-                    tag_el = pr.find("w:tag", {"w": _W_NS})
-                    tag_val = tag_el.get(_q("val")) if tag_el is not None else ""
-                    if not tag_val or tag_val not in mapping: continue
-                    content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
-                    val = mapping.get(tag_val, "")
-                    if not isinstance(val, str):
-                        try: val = json.dumps(val, ensure_ascii=False)
-                        except Exception: val = str(val)
-                    _set_sdt_text(content_el, val); changed = True
-                out_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else zfin.read(n)
-                zfout.writestr(n, out_xml)
-        return outbuf.getvalue()
+# ---------------------- NEW: visibility tooling ----------------------
+def _ensure_fsHidden_style(zfin, zfout, names):
+    if "word/styles.xml" in names:
+        try: root = ET.fromstring(zfin.read("word/styles.xml"))
+        except ET.ParseError: root = ET.Element(_q("styles"))
+    else:
+        root = ET.Element(_q("styles"))
+    have = False
+    for st in root.findall(_q("style")):
+        if st.get(_q("type")) == "character" and st.get(_q("styleId")) == "fsHidden":
+            have = True; break
+    if not have:
+        st = ET.Element(_q("style"), {_q("type"): "character", _q("styleId"): "fsHidden"})
+        ET.SubElement(st, _q("name"), {_q("val"): "fsHidden"})
+        rpr = ET.SubElement(st, _q("rPr"))
+        ET.SubElement(rpr, _q("vanish"))
+        root.append(st)
+    zfout.writestr("word/styles.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
-    # ---------------------- NEW: visibility tooling ----------------------
-    def _ensure_fsHidden_style(zfin, zfout, names):
-        # read styles.xml (or create)
-        if "word/styles.xml" in names:
-            try: root = ET.fromstring(zfin.read("word/styles.xml"))
-            except ET.ParseError: root = ET.Element(_q("styles"))
-        else:
-            root = ET.Element(_q("styles"))
-        # style present?
-        have = False
-        for st in root.findall("{%s}style" % _W_NS):
-            if st.get(_q("type")) == "character" and st.get(_q("styleId")) == "fsHidden":
-                have = True; break
-        if not have:
-            st = ET.Element(_q("style"), {_q("type"): "character", _q("styleId"): "fsHidden"})
-            ET.SubElement(st, _q("name"), {_q("val"): "fsHidden"})
-            rpr = ET.SubElement(st, _q("rPr"))
-            ET.SubElement(rpr, _q("vanish"))
-            root.append(st)
-        zfout.writestr("word/styles.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
+def _heading_level(p_el):
+    ppr = p_el.find(_q("pPr"))
+    if ppr is not None:
+        ol = ppr.find(_q("outlineLvl"))
+        if ol is not None and ol.get(_q("val")) is not None:
+            try: return int(ol.get(_q("val"))) + 1
+            except: pass
+        ps = ppr.find(_q("pStyle"))
+        if ps is not None and ps.get(_q("val")):
+            v = ps.get(_q("val")).lower()
+            if v.startswith("heading"):
+                try: return int(v.replace("heading","").strip())
+                except: return None
+    return None
 
-    def _heading_level(p_el):
-        # try outlineLvl first
-        ppr = p_el.find(_q("pPr"))
-        if ppr is not None:
-            ol = ppr.find(_q("outlineLvl"))
-            if ol is not None and ol.get(_q("val")) is not None:
-                try:
-                    return int(ol.get(_q("val"))) + 1
-                except: pass
-            ps = ppr.find(_q("pStyle"))
-            if ps is not None and ps.get(_q("val")):
-                v = ps.get(_q("val")).lower()
-                if v.startswith("heading"):
-                    try:
-                        return int(v.replace("heading","").strip())
-                    except: return None
-        return None
+def _apply_rStyle_hidden_to_runs(el):
+    for r in el.findall(".//w:r", {"w": _W_NS}):
+        rpr = r.find(_q("rPr"))
+        if rpr is None:
+            rpr = ET.SubElement(r, _q("rPr"))
+        has = False
+        for rs in rpr.findall(_q("rStyle")):
+            if rs.get(_q("val")) == "fsHidden":
+                has = True; break
+        if not has:
+            ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
 
-    def _apply_rStyle_hidden_to_runs(el):
-        # apply rStyle=fsHidden to all runs under el
-        for r in el.findall(".//w:r", {"w": _W_NS}):
-            rpr = r.find(_q("rPr"))
-            if rpr is None:
-                rpr = ET.SubElement(r, _q("rPr"))
-            # check for existing rStyle
-            has = False
-            for rs in rpr.findall(_q("rStyle")):
-                if rs.get(_q("val")) == "fsHidden":
-                    has = True; break
-            if not has:
-                ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
-
-    def _remove_rStyle_hidden_from_runs(el):
-        for r in el.findall(".//w:r", {"w": _W_NS}):
-            rpr = r.find(_q("rPr"))
-            if rpr is None: continue
-            for rs in list(rpr.findall(_q("rStyle"))):
-                if rs.get(_q("val")) == "fsHidden":
-                    rpr.remove(rs)
-            # don't aggressively remove empty rPr; leave as-is
-
-    def apply_visibility(u8, idx_to_action_json):
+def apply_visibility(u8, idx_to_action_json):
     """
     idx_to_action_json: {"12":"HIDE","13":"SHOW", ...}
     Semantics:
       - First, remove ALL occurrences of our own rStyle=fsHidden (global reset).
       - Then, apply HIDE to current target ranges.
-      - SHOW in the map is accepted but not required, since the reset already unhides.
-      - Result: if a prior export hid 3.1 and now the condition is false, 3.1 is visible again.
+      - SHOW is accepted but redundant post-reset.
     """
-    import json, io, zipfile, xml.etree.ElementTree as ET
     try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
     except Exception: idx_to_action = {}
     data = bytes(u8)
@@ -391,12 +382,11 @@
     with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
         names = zfin.namelist()
 
-        # Copy everything except styles.xml (we will rewrite it after ensuring fsHidden exists)
+        # Copy everything except styles.xml (we rewrite after ensuring fsHidden)
         for n in names:
             if n == "word/styles.xml": continue
             zfout.writestr(n, zfin.read(n))
 
-        # Ensure fsHidden style exists
         _ensure_fsHidden_style(zfin, zfout, set(names))
 
         def is_doc_part(n):
@@ -404,7 +394,7 @@
             skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
             return n not in skip and not n.startswith("word/_rels/")
 
-        # ------------- PASS 1: GLOBAL RESET (remove our fsHidden everywhere) -------------
+        # PASS 1: global reset (remove fsHidden rStyle everywhere)
         parts_roots = {}
         for n in names:
             if not is_doc_part(n): continue
@@ -413,35 +403,25 @@
             except ET.ParseError:
                 parts_roots[n] = None
                 continue
-            # strip our rStyle from all runs
             for r in root.findall(".//w:r", {"w": _W_NS}):
                 rpr = r.find(_q("rPr"))
                 if rpr is None: continue
                 for rs in list(rpr.findall(_q("rStyle"))):
                     if rs.get(_q("val")) == "fsHidden":
                         rpr.remove(rs)
-            parts_roots[n] = root  # keep for pass 2 write-back
+            parts_roots[n] = root
 
-        # ------------- PASS 2: APPLY CURRENT HIDE RANGES -------------
-        global_idx = 0  # sequential heading index across parts
-
-        def write_back(n, root):
-            if root is None:
-                # was parse error; keep original (already copied)
-                return
-            zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
-
+        # PASS 2: apply current HIDE ranges
+        global_idx = 0
         for n in names:
             if not is_doc_part(n): continue
             root = parts_roots.get(n)
-            if root is None:
-                continue
+            if root is None: continue
 
             body = root.find(_q("body"))
             if body is None:
-                write_back(n, root); continue
+                zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
 
-            # linearize elements under body
             elems = []
             for ch in list(body):
                 if ch.tag == _q("p"):
@@ -452,20 +432,15 @@
                 else:
                     elems.append((ch, "other", None))
 
-            # collect heading positions with running global indices
             heading_positions = []
-            for i,(el, t, lvl) in enumerate(elems):
+            for i,(el,t,lvl) in enumerate(elems):
                 if t == "p" and lvl is not None:
                     global_idx += 1
                     heading_positions.append((i, lvl, global_idx))
 
-            if not heading_positions:
-                write_back(n, root); continue
-
-            # compute and apply HIDE ranges for any idx with HIDE (SHOW is redundant post-reset)
             for h_i, (pos, lvl, idx) in enumerate(heading_positions):
                 act = idx_to_action.get(idx)
-                if act != "HIDE":  # SHOW/no action: already unhidden by reset
+                if act != "HIDE":
                     continue
                 start = pos + 1
                 if h_i + 1 < len(heading_positions):
@@ -477,20 +452,19 @@
                             break
                 else:
                     end = len(elems)
-
                 for j in range(start, end):
                     el, t, _lvl = elems[j]
-                    if t == "p" or t == "tbl":
+                    if t in ("p","tbl"):
                         _apply_rStyle_hidden_to_runs(el)
 
-            write_back(n, root)
+            zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
     return outbuf.getvalue()
-    `);
+        `);
+
         pyLoaded = true;
       }
     }
-
 
     async function writeDocVar(bytes, name, value) {
       await ensurePy();
@@ -1008,9 +982,93 @@
       }
     }
 
+    // ---------- Rules → Visibility map (SHOW supersedes HIDE) ----------
+    function loadRulesForDoc(state) {
+      return (
+        state?.rules ||
+        state?.payload?.rules ||
+        state?.CRONOS_RULES ||
+        state?.cronos_rules ||
+        []
+      );
+    }
 
+    function ruleMatchesValue(op, expected, actual) {
+      const a = actual;
+      if (op === 'equals')    return String(a) === String(expected);
+      if (op === 'notEquals') return String(a) !== String(expected);
+      if (op === 'anyOf') {
+        const arr = Array.isArray(expected) ? expected.map(String) : [String(expected)];
+        if (Array.isArray(a)) return a.map(String).some(v => arr.includes(v));
+        return arr.includes(String(a));
+      }
+      if (op === 'allOf') {
+        const arr = Array.isArray(expected) ? expected.map(String) : [String(expected)];
+        if (!Array.isArray(a)) return false;
+        const aset = new Set(a.map(String));
+        return arr.every(v => aset.has(v));
+      }
+      if (op === 'contains') {
+        return String(a ?? '').toLowerCase().includes(String(expected ?? '').toLowerCase());
+      }
+      return false;
+    }
 
-    // ---------- Logo triple-click: focus mode ----------
+    function evaluateRulesToVisibility(schema, values, rules) {
+      const out = Object.create(null);
+      if (!Array.isArray(rules) || !rules.length) return out;
+
+      const cleanVals = sanitizeValues(schema, values || {});
+      const getVal = (fid) => cleanVals[fid];
+
+      for (const r of rules) {
+        if (!r) continue;
+        const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
+                    : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
+                    : null;
+        if (!action) continue;
+
+        const fieldId = r.fieldId || r.field || r.whenField;
+        const op      = r.op || r.operator || 'equals';
+        theExp = r.values ?? r.value ?? r.expected;
+        const exp = theExp;
+        const targets = Array.isArray(r.targets) ? r.targets : [];
+
+        const actual  = getVal(fieldId);
+        if (!ruleMatchesValue(op, exp, actual)) continue;
+
+        for (const t of targets) {
+          const key = t?.key ?? t?.idx ?? t?.id;
+          if (key == null) continue;
+          const idx = Number(key);
+          if (!Number.isFinite(idx)) continue;
+          const prev = out[idx];
+          if (action === 'SHOW') out[idx] = 'SHOW';
+          else if (action === 'HIDE' && prev !== 'SHOW') out[idx] = 'HIDE';
+        }
+      }
+      return out;
+    }
+
+    // ---------- Bridge to Python: apply visibility using fsHidden ----------
+    async function applyVisibilityByRules(bytesU8, visibilityMap) {
+      if (!visibilityMap || !Object.keys(visibilityMap).length) return bytesU8;
+      await ensurePy();
+      const fn = py.globals.get('apply_visibility');
+      const pyBytes = py.toPy(bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8));
+      const pyMap   = py.toPy(JSON.stringify(visibilityMap));
+      let pyOut;
+      try { pyOut = fn(pyBytes, pyMap); }
+      finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
+      let u8;
+      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+      else u8 = new Uint8Array([]);
+      try { pyOut.destroy?.(); } catch {}
+      return u8;
+    }
+
+    // ---------- Logo triple-click: focus mode (kept minimal) ----------
     (function() {
       const logo = document.querySelector('header .logo');
       const header = document.querySelector('header .row');
@@ -1041,103 +1099,6 @@
           }
         }
       });
-
-      // ---------- Rules → Visibility map (SHOW supersedes HIDE) ----------
-      function loadRulesForDoc(state) {
-        // Support several possible storage shapes
-        return (
-          state?.rules ||
-          state?.payload?.rules ||
-          state?.CRONOS_RULES ||
-          state?.cronos_rules ||
-          []
-        );
-      }
-
-      // Basic evaluator for common ops. Extend as needed.
-      function ruleMatchesValue(op, expected, actual) {
-        const a = actual;
-        if (op === 'equals')           return String(a) === String(expected);
-        if (op === 'notEquals')        return String(a) !== String(expected);
-        if (op === 'anyOf') {
-          const arr = Array.isArray(expected) ? expected.map(String) : [String(expected)];
-          if (Array.isArray(a)) return a.map(String).some(v => arr.includes(v));
-          return arr.includes(String(a));
-        }
-        if (op === 'allOf') {
-          const arr = Array.isArray(expected) ? expected.map(String) : [String(expected)];
-          if (!Array.isArray(a)) return false;
-          const aset = new Set(a.map(String));
-          return arr.every(v => aset.has(v));
-        }
-        if (op === 'contains') {
-          // for text fields
-          return String(a ?? '').toLowerCase().includes(String(expected ?? '').toLowerCase());
-        }
-        return false; // unknown op → no match
-      }
-
-      function evaluateRulesToVisibility(schema, values, rules) {
-        // result: { [idx:number]: 'HIDE' | 'SHOW' }
-        const out = Object.create(null);
-        if (!Array.isArray(rules) || !rules.length) return out;
-
-        // coerce values for comparisons
-        const cleanVals = sanitizeValues(schema, values || {});
-        const getVal = (fid) => cleanVals[fid];
-
-        for (const r of rules) {
-          if (!r) continue;
-          const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
-                      : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
-                      : null;
-          if (!action) continue;
-          const fieldId = r.fieldId || r.field || r.whenField;
-          const op      = r.op || r.operator || 'equals';
-          const exp     = r.values ?? r.value ?? r.expected;
-          const targets = Array.isArray(r.targets) ? r.targets : [];
-
-          const actual  = getVal(fieldId);
-          const matched = ruleMatchesValue(op, exp, actual);
-
-          if (!matched) continue;
-
-          for (const t of targets) {
-            const key = t?.key ?? t?.idx ?? t?.id;
-            if (key == null) continue;
-            const idx = Number(key);
-            if (!Number.isFinite(idx)) continue;
-
-            // SHOW supersedes HIDE
-            const prev = out[idx];
-            if (action === 'SHOW') {
-              out[idx] = 'SHOW';
-            } else if (action === 'HIDE') {
-              if (prev !== 'SHOW') out[idx] = 'HIDE';
-            }
-          }
-        }
-        return out;
-      }
-
-      // ---------- Bridge to Python: apply visibility using fsHidden ----------
-      async function applyVisibilityByRules(bytesU8, visibilityMap) {
-        if (!visibilityMap || !Object.keys(visibilityMap).length) return bytesU8;
-        await ensurePy();
-        const fn = py.globals.get('apply_visibility');
-        const pyBytes = py.toPy(bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8));
-        const pyMap   = py.toPy(JSON.stringify(visibilityMap));
-        let pyOut;
-        try { pyOut = fn(pyBytes, pyMap); }
-        finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
-        let u8;
-        if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
-        else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
-        else u8 = new Uint8Array([]);
-        try { pyOut.destroy?.(); } catch {}
-        return u8;
-      }
-
     })();
   </script>
 </body>
