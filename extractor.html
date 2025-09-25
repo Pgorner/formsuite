@@ -142,6 +142,8 @@
     let gDirty         = false;
     let gSDTs          = [];
     let gLastSchemaPushTs = 0;
+    let gPreferDocOnNextLoad = false;   // prefer DOCX payload only right after doOpen()
+
 
     // UI refs
     const btnOpen   = document.getElementById('btnOpen');
@@ -156,6 +158,7 @@
     const btnSaveFromPreview = document.getElementById('btnSaveFromPreview');
     const previewStatus = document.getElementById('previewStatus');
     const headersTreeEl = document.getElementById('headersTree');
+    
 
     async function sha256Hex(bufOrU8) {
       const tr = TRACE('sha256Hex', { type: (bufOrU8?.constructor?.name), len: bufOrU8?.byteLength || bufOrU8?.length });
@@ -481,6 +484,21 @@
     // =========================
     // TAG MAP / PREVIEW HELPERS
     // =========================
+    function normalizeForSchema(schema, values, tagMap) {
+      const fieldIds = new Set((schema?.fields || []).map(f => String(f.id)));
+      const prunedValues = {};
+      for (const [k, v] of Object.entries(values || {})) {
+        if (fieldIds.has(String(k))) prunedValues[k] = v;
+      }
+      // Optional: keep tagMap only if it points to an existing field id
+      const prunedTagMap = {};
+      for (const [tag, fieldId] of Object.entries(tagMap || {})) {
+        if (fieldIds.has(String(fieldId))) prunedTagMap[tag] = fieldId;
+      }
+      return { values: prunedValues, tagMap: prunedTagMap };
+    }
+
+
     async function getTagMapFor(docId) {
       const tr = TRACE('getTagMapFor', { docId });
       try {
@@ -525,12 +543,26 @@
       const tr = TRACE('updatePreview', { valueKeys: Object.keys(values||{}).length });
       try {
         if (!payloadEl) { tr.end('no payloadEl'); return; }
-        const tagMap = await getTagMapFor(gDocId);
-        const obj = { title: gSchema?.title || 'Form', fields: gSchema?.fields || [], values: values || {}, tagMap };
-        payloadEl.value = JSON.stringify(obj, null, 2);
-        tr.end({ ok:true });
+
+        const tagMapRaw = await getTagMapFor(gDocId);
+        const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        const rules = Array.isArray(wsState?.rules) ? wsState.rules : [];
+
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(gSchema, values || {}, tagMapRaw);
+
+        payloadEl.value = JSON.stringify({
+          title:  gSchema?.title || 'Form',
+          fields: gSchema?.fields || [],
+          values: prunedValues,
+          tagMap: prunedTagMap,
+          rules
+        }, null, 2);
+
+        tr.end({ ok:true, prunedKeys: Object.keys(values||{}).length - Object.keys(prunedValues).length });
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
+
 
     let previewTimer = null;
     function schedulePreviewUpdate() {
@@ -927,85 +959,92 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     // RENDER FROM CURRENT BYTES
     // =========================
     async function renderFromCurrentBytes(prefix = '') {
-    const tr = TRACE('renderFromCurrentBytes', { prefix, hasBuf: !!gArrayBuffer, len: gArrayBuffer?.byteLength });
-    try {
-      tr.step('buffer sha', await sha256Hex(gArrayBuffer));
-
-      // 1) SDTs
-      const parsed = await parseSDTs_JS(gArrayBuffer);
-      gSDTs = parsed.sdts || [];
-      renderSDTsView(parsed);
-
-      // 2) HEADINGS (H1..H9) — parse + render tree (kept separate from payload)
-      let headingsParsed = { flat: [], tree: [], count: 0 };
+      const tr = TRACE('renderFromCurrentBytes', { prefix, hasBuf: !!gArrayBuffer, len: gArrayBuffer?.byteLength });
       try {
-        headingsParsed = await parseHeadings_JS(gArrayBuffer);
-        renderHeadingsTreeView(headingsParsed.tree);
-      } catch (e) {
-        tr.warn('headings parse/render failed', e);
-        try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
-      }
+        tr.step('buffer sha', await sha256Hex(gArrayBuffer));
 
-      // 3) Payload (schema + values) source selection
-      let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
-      if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
+        // SDTs
+        const parsed = await parseSDTs_JS(gArrayBuffer);
+        gSDTs = parsed.sdts || [];
+        renderSDTsView(parsed);
 
-      let payload = null;
-      try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
+        // Headings
+        let headingsParsed = { flat: [], tree: [], count: 0 };
+        try {
+          headingsParsed = await parseHeadings_JS(gArrayBuffer);
+          renderHeadingsTreeView(headingsParsed.tree);
+        } catch (e) {
+          tr.warn('headings parse/render failed', e);
+          try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
+        }
 
-      const wsState  = await window.formSuitePersist.loadState(gDocId);
-      const wsSchema = wsState?.schema || null;
-      const wsValues = wsState?.values || {};
+        // Payload (schema + values)
+        let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
+        if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
 
-      function asTs(x){ const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; }
-      const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
-      const pUpdatedTs = asTs(payload?.updatedAt);
-      const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
+        let payload = null;
+        try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
 
-      let chosenSchema, statusSource;
-      if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
-        chosenSchema = wsSchema; statusSource = 'Using newer schema from Builder/workspace.';
-      } else if (pHasSchema) {
-        chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
-        statusSource = 'Loaded schema from DOCX payload.';
-      } else {
-        chosenSchema = { title: 'Form', fields: [] };
-        statusSource = 'No schema stored for this DOCX yet.';
-      }
+        const wsState   = await window.formSuitePersist.loadState(gDocId);
+        const wsSchema  = wsState?.schema || null;
+        const wsValues  = wsState?.values || {};
+        const wsRules   = Array.isArray(wsState?.rules) ? wsState.rules : [];
 
-      const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
+        const asTs = (x) => { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
+        const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
+        const pUpdatedTs = asTs(payload?.updatedAt);
+        const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
 
-      gSchema = chosenSchema;
-      gValues = mergedValues;
+        let chosenSchema, statusSource;
+        if (gPreferDocOnNextLoad && pHasSchema) {
+          chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
+          statusSource = 'Loaded schema from DOCX payload.';
+        } else if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
+          chosenSchema = wsSchema;
+          statusSource = 'Using newer schema from Builder/workspace.';
+        } else if (pHasSchema) {
+          chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
+          statusSource = 'Loaded schema from DOCX payload.';
+        } else {
+          chosenSchema = { title: 'Form', fields: [] };
+          statusSource = 'No schema stored for this DOCX yet.';
+        }
 
-      // 4) Persist (schema/values + headings for cross-tab use; headings NOT in CRONOS_PAYLOAD)
-      await window.formSuitePersist.saveState(gDocId, {
-        schema: gSchema,
-        values: gValues,
-        headings: headingsParsed.flat,
-        headingsTree: headingsParsed.tree,
-        headingsUpdatedAt: new Date().toISOString()
-      });
+        // Merge then normalize to drop orphan keys
+        const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
+        const tagMapRaw = await getTagMapFor(gDocId);
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(chosenSchema, mergedValues, tagMapRaw);
 
-      // Broadcast headings availability to other tabs (optional, harmless if no listeners)
-      try { bcLegacy?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
-      try { bcCanon?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
+        gSchema = chosenSchema;
+        gValues = prunedValues;
 
-      // 5) Build live form + preview (unchanged behavior)
-      buildForm(formMount, gSchema, gValues);
-      await updatePreview(gValues);
-      gDirty = false;
+        await window.formSuitePersist.saveState(gDocId, {
+          schema: gSchema,
+          values: gValues,
+          rules: Array.isArray(payload?.rules) ? payload.rules : wsRules,
+          tagMap: prunedTagMap,
+          headings: headingsParsed.flat,
+          headingsTree: headingsParsed.tree,
+          headingsUpdatedAt: new Date().toISOString()
+        });
 
-      // 6) Enable actions
-      btnSave.disabled = false;
-      btnExport.disabled = false;
-      btnSaveFromPreview.disabled = false;
+        try { bcLegacy?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
+        try { bcCanon?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
 
-      // 7) Status (add headings count; keeps original info)
-      setStatus(`${prefix}${statusSource} SDTs: ${gSDTs.length}. Fields: ${gSchema.fields.length}. Headings: ${headingsParsed.count}.`);
-      tr.end({ sdtCount: gSDTs.length, fieldCount: gSchema.fields.length, headings: headingsParsed.count, statusSource });
-    } catch (e) { tr.error('failed', e); tr.end(); throw e; }
-  }
+        buildForm(formMount, gSchema, gValues);
+        await updatePreview(gValues);
+        gDirty = false;
+
+        btnSave.disabled = false;
+        btnExport.disabled = false;
+        btnSaveFromPreview.disabled = false;
+
+        setStatus(`${prefix}${statusSource} SDTs: ${gSDTs.length}. Fields: ${gSchema.fields.length}. Headings: ${headingsParsed.count}.`);
+        tr.end({ sdtCount: gSDTs.length, fieldCount: gSchema.fields.length, headings: headingsParsed.count, statusSource });
+      } catch (e) { tr.error('failed', e); throw e; }
+      finally { gPreferDocOnNextLoad = false; }
+    }
 
 
     function renderSDTsView(parsed) {
@@ -1149,7 +1188,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         gDocId = metaObj.docId;
         persistActiveMeta(metaObj);
         announceDocSwitch();
-
+        gPreferDocOnNextLoad = true; 
         await renderFromCurrentBytes();
 
         // while still in a user gesture, try to grant write
@@ -1182,16 +1221,28 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       try {
         if (!gArrayBuffer) { tr.warn('no buffer'); return; }
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-        tr.step('restored state', { hasSchema: !!restored?.schema, hasValues: !!restored?.values });
         if (restored?.schema) gSchema = restored.schema;
 
-        const __domVals = collectFormValues(gSchema);
-        const __baseVals = (restored && restored.values) ? restored.values : {};
-        gValues = Object.assign({}, __baseVals, __domVals);
+        const domVals = collectFormValues(gSchema);
+        const baseVals = restored?.values || {};
+        const merged = { ...baseVals, ...domVals };
 
-        const tagMap = await getTagMapFor(gDocId);
+        const tagMapRaw = await getTagMapFor(gDocId);
+        const rules     = Array.isArray(restored?.rules) ? restored.rules : [];
 
-        const payload = JSON.stringify({ title: gSchema.title || 'Form', fields: gSchema.fields || [], values: gValues || {}, tagMap, updatedAt: new Date().toISOString() });
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(gSchema, merged, tagMapRaw);
+
+        gValues = prunedValues;
+
+        const payload = JSON.stringify({
+          title:  gSchema.title || 'Form',
+          fields: gSchema.fields || [],
+          values: gValues,
+          tagMap: prunedTagMap,
+          rules,
+          updatedAt: new Date().toISOString()
+        });
 
         await updatePreview(gValues);
         setStatus('Writing payload to DOCX (settings.xml)…');
@@ -1199,7 +1250,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
         gArrayBuffer = updated.buffer;
 
-        if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues });
+        if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues, rules, tagMap: prunedTagMap });
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated);
         const metaObj = await persistCurrentDoc(updated, gFileHandle, gFileName);
         gDocId = metaObj.docId;
@@ -1208,10 +1259,8 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         if (supportsFS) {
           const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-          tr.step('writeback handle?', { has: !!handle });
           if (handle?.createWritable) {
             const perm = await ensureWritePermission(handle);
-            tr.step('ensureWritePermission', perm);
             if (perm === 'granted') {
               const stream = await handle.createWritable();
               await stream.write(updated);
@@ -1220,11 +1269,9 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               gFileHandle = handle;
               gDirty = false;
               await updateWriteAccessBanner();
-              tr.end('wrote back to original');
               return;
             } else {
-              await updateWriteAccessBanner(); // shows banner
-              tr.warn('permission denied; fallback to download');
+              await updateWriteAccessBanner();
             }
           }
         }
@@ -1236,7 +1283,6 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         document.body.appendChild(a); a.click(); a.remove();
         setStatus('Saved: downloaded updated DOCX.');
         gDirty = false;
-        tr.end('downloaded copy');
       } catch (e) { tr.error('save failed', e); setStatus(`Error saving: ${e.message || e}`); }
       finally { tr.end(); }
     }
@@ -1246,21 +1292,36 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       try {
         if (!gArrayBuffer) { tr.warn('no buffer'); return; }
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-        tr.step('restored state', { hasSchema: !!restored?.schema, hasValues: !!restored?.values });
         if (restored?.schema) gSchema = restored.schema;
 
-        const __domVals2 = collectFormValues(gSchema);
-        const __baseVals2 = (restored && restored.values) ? restored.values : {};
-        gValues = Object.assign({}, __baseVals2, __domVals2);
+        const domVals = collectFormValues(gSchema);
+        const baseVals = restored?.values || {};
+        const merged = { ...baseVals, ...domVals };
 
-        const tagMap = await getTagMapFor(gDocId);
+        const tagMapRaw = await getTagMapFor(gDocId);
+        const rules     = Array.isArray(restored?.rules) ? restored.rules : [];
+
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(gSchema, merged, tagMapRaw);
+
+        gValues = prunedValues;
+
         setStatus('Preparing export…');
 
-        const payload = JSON.stringify({ title: gSchema.title || 'Form', fields: gSchema.fields || [], values: gValues || {}, tagMap, updatedAt: new Date().toISOString() });
+        // 1) Write payload (normalized)
+        const payload = JSON.stringify({
+          title:  gSchema.title || 'Form',
+          fields: gSchema.fields || [],
+          values: gValues,
+          tagMap: prunedTagMap,
+          rules,
+          updatedAt: new Date().toISOString()
+        });
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
 
+        // 2) Replace SDTs using normalized tagMap/values
         const sdtMap = {};
-        for (const [tag, fieldId] of Object.entries(tagMap)) {
+        for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
           let v = gValues?.[fieldId];
           if (v == null) v = '';
           if (typeof v === 'object') { try { v = JSON.stringify(v); } catch { v = String(v); } }
@@ -1269,7 +1330,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const updated2 = await writeSDTs(updated, sdtMap);
         gArrayBuffer = updated2.buffer;
 
-        if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues });
+        if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues, rules, tagMap: prunedTagMap });
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2);
         const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName);
         gDocId = metaObj.docId;
@@ -1278,10 +1339,8 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         if (supportsFS) {
           const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-          tr.step('writeback handle?', { has: !!handle });
           if (handle?.createWritable) {
             const perm = await ensureWritePermission(handle);
-            tr.step('ensureWritePermission', perm);
             if (perm === 'granted') {
               const stream = await handle.createWritable();
               await stream.write(updated2);
@@ -1290,9 +1349,9 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               gFileHandle = handle;
               gDirty = false;
               await updateWriteAccessBanner();
-              tr.end('export wrote back'); return;
+              return;
             } else {
-              await updateWriteAccessBanner(); // shows banner
+              await updateWriteAccessBanner();
             }
           }
         }
@@ -1304,10 +1363,10 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         document.body.appendChild(a); a.click(); a.remove();
         setStatus('Exported: downloaded copy.');
         gDirty = false;
-        tr.end('downloaded export');
       } catch (e) { tr.error('export failed', e); setStatus(`Error exporting: ${e.message || e}`); }
       finally { tr.end(); }
     }
+
 
     // =========================
     // PAYLOAD PREVIEW (editable)
@@ -1324,35 +1383,40 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const nextTagMap = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
         const nowIso = new Date().toISOString();
 
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(nextSchema, nextValues, nextTagMap);
+
         gSchema = nextSchema;
-        gValues = nextValues;
+        gValues = prunedValues;
 
         if (gDocId && save) {
           await window.formSuitePersist.saveState(gDocId, {
             schema: gSchema,
             values: gValues,
-            tagMap: nextTagMap,
-            payload: { CRONOS_PAYLOAD: obj },
+            tagMap: prunedTagMap,
+            payload: { CRONOS_PAYLOAD: { ...obj, fields: gSchema.fields, values: gValues, tagMap: prunedTagMap } },
             schemaUpdatedAt: nowIso
           });
         } else {
-          try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields })); } catch (e) { tr.warn('ls set failed', e); }
+          try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields })); } catch {}
         }
 
         buildForm(document.getElementById('formMount'), gSchema, gValues);
         await updatePreview(gValues);
 
         if (broadcast) {
-          try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch (e) { tr.warn('broadcast failed', e); }
-          try { bcCanon?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch (e) { tr.warn('canon broadcast failed', e); }
+          try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
+          try { bcCanon?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
         }
 
         gDirty = true;
-        setStatus('Payload applied (overrides schema & values). Not yet saved to DOCX.');
+        setStatus('Payload applied (normalized). Not yet saved to DOCX.');
         if (previewStatus) { previewStatus.textContent = 'Applied'; setTimeout(()=> previewStatus.textContent='', 1200); }
         tr.end('applied');
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
+
+
 
     if (payloadEl) {
       payloadEl.addEventListener('input', () => {
