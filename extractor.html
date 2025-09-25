@@ -25,6 +25,7 @@
       <span class="muted">·</span><a href="index.html">Open Form</a>
       <span class="muted">·</span><a href="builder.html" id="openBuilder">Form Builder</a>
       <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
+      <span class="muted">·</span><a href="rules.html">Rules</a>
       <span class="muted">·</span><span class="muted">Extractor</span>
     </div>
   </header>
@@ -49,7 +50,7 @@
 
     <div class="grid-3">
       <section class="panel">
-        <details open>
+        <details close>
           <summary><strong>Found SDTs</strong></summary>
           <div style="overflow:auto;">
             <table id="sdt-table">
@@ -69,7 +70,7 @@
       </section>
 
       <section class="panel">
-        <details open>
+        <details close>
           <summary><strong>CRONOS_PAYLOAD Preview</strong></summary>
           <textarea id="payloadPreview" spellcheck="false" style="min-height:420px"></textarea>
           <div class="row" style="margin-top:6px; gap:8px;">
@@ -80,7 +81,14 @@
       </section>
 
       <section class="panel">
-        <details open>
+        <details close>
+          <summary><strong>Headers/Subheaders</strong></summary>
+          <div id="headersTree" class="tree" style="max-height:420px;overflow:auto;padding:6px 4px;"></div>
+        </details>
+      </section>
+
+      <section class="panel">
+        <details close>
           <summary><strong>Live Form (from payload schema)</strong></summary>
           <div id="formMount"></div>
         </details>
@@ -147,6 +155,7 @@
     const btnRegrant= document.getElementById('btnRegrant');
     const btnSaveFromPreview = document.getElementById('btnSaveFromPreview');
     const previewStatus = document.getElementById('previewStatus');
+    const headersTreeEl = document.getElementById('headersTree');
 
     async function sha256Hex(bufOrU8) {
       const tr = TRACE('sha256Hex', { type: (bufOrU8?.constructor?.name), len: bufOrU8?.byteLength || bufOrU8?.length });
@@ -231,6 +240,7 @@
         formMount.innerHTML = '<div class="empty">No schema found.</div>';
         payloadEl.value = '';
         previewStatus.textContent = '';
+        if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
         btnSave.disabled = true; btnExport.disabled = true; btnSaveFromPreview.disabled = true;
         permNote.style.display = 'none';
         setStatus(message);
@@ -239,6 +249,7 @@
       gValues = {};
       gDirty = false;
     }
+
 
     async function hardResetDocContext(reason = '') {
       const tr = TRACE('hardResetDocContext:start', { reason, docId: gDocId });
@@ -259,6 +270,7 @@
         permNote.style.display = 'none';
         setStatus(reason ? `Cleared: ${reason}` : 'Cleared.');
       } catch (e) { tr.warn('DOM reset failed', e); }
+      try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
       tr.end('reset complete');
     }
 
@@ -915,58 +927,86 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
     // RENDER FROM CURRENT BYTES
     // =========================
     async function renderFromCurrentBytes(prefix = '') {
-      const tr = TRACE('renderFromCurrentBytes', { prefix, hasBuf: !!gArrayBuffer, len: gArrayBuffer?.byteLength });
+    const tr = TRACE('renderFromCurrentBytes', { prefix, hasBuf: !!gArrayBuffer, len: gArrayBuffer?.byteLength });
+    try {
+      tr.step('buffer sha', await sha256Hex(gArrayBuffer));
+
+      // 1) SDTs
+      const parsed = await parseSDTs_JS(gArrayBuffer);
+      gSDTs = parsed.sdts || [];
+      renderSDTsView(parsed);
+
+      // 2) HEADINGS (H1..H9) — parse + render tree (kept separate from payload)
+      let headingsParsed = { flat: [], tree: [], count: 0 };
       try {
-        tr.step('buffer sha', await sha256Hex(gArrayBuffer));
-        const parsed = await parseSDTs_JS(gArrayBuffer);
-        gSDTs = parsed.sdts || [];
-        renderSDTsView(parsed);
+        headingsParsed = await parseHeadings_JS(gArrayBuffer);
+        renderHeadingsTreeView(headingsParsed.tree);
+      } catch (e) {
+        tr.warn('headings parse/render failed', e);
+        try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
+      }
 
-        let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
-        if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
+      // 3) Payload (schema + values) source selection
+      let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
+      if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
 
-        let payload = null;
-        try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
+      let payload = null;
+      try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
 
-        const wsState  = await window.formSuitePersist.loadState(gDocId);
-        const wsSchema = wsState?.schema || null;
-        const wsValues = wsState?.values || {};
+      const wsState  = await window.formSuitePersist.loadState(gDocId);
+      const wsSchema = wsState?.schema || null;
+      const wsValues = wsState?.values || {};
 
-        function asTs(x){ const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; }
-        const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
-        const pUpdatedTs = asTs(payload?.updatedAt);
-        const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
+      function asTs(x){ const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; }
+      const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
+      const pUpdatedTs = asTs(payload?.updatedAt);
+      const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
 
-        let chosenSchema, statusSource;
-        if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
-          chosenSchema = wsSchema; statusSource = 'Using newer schema from Builder/workspace.';
-        } else if (pHasSchema) {
-          chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
-          statusSource = 'Loaded schema from DOCX payload.';
-        } else {
-          chosenSchema = { title: 'Form', fields: [] };
-          statusSource = 'No schema stored for this DOCX yet.';
-        }
+      let chosenSchema, statusSource;
+      if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
+        chosenSchema = wsSchema; statusSource = 'Using newer schema from Builder/workspace.';
+      } else if (pHasSchema) {
+        chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
+        statusSource = 'Loaded schema from DOCX payload.';
+      } else {
+        chosenSchema = { title: 'Form', fields: [] };
+        statusSource = 'No schema stored for this DOCX yet.';
+      }
 
-        const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
+      const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
 
-        gSchema = chosenSchema;
-        gValues = mergedValues;
+      gSchema = chosenSchema;
+      gValues = mergedValues;
 
-        await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues });
+      // 4) Persist (schema/values + headings for cross-tab use; headings NOT in CRONOS_PAYLOAD)
+      await window.formSuitePersist.saveState(gDocId, {
+        schema: gSchema,
+        values: gValues,
+        headings: headingsParsed.flat,
+        headingsTree: headingsParsed.tree,
+        headingsUpdatedAt: new Date().toISOString()
+      });
 
-        buildForm(formMount, gSchema, gValues);
-        await updatePreview(gValues);
-        gDirty = false;
+      // Broadcast headings availability to other tabs (optional, harmless if no listeners)
+      try { bcLegacy?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
+      try { bcCanon?.postMessage({ type: 'headings-updated', docId: gDocId, ts: Date.now() }); } catch {}
 
-        btnSave.disabled = false;
-        btnExport.disabled = false;
-        btnSaveFromPreview.disabled = false;
+      // 5) Build live form + preview (unchanged behavior)
+      buildForm(formMount, gSchema, gValues);
+      await updatePreview(gValues);
+      gDirty = false;
 
-        setStatus(`${prefix}${statusSource} SDTs: ${gSDTs.length}. Fields: ${gSchema.fields.length}.`);
-        tr.end({ sdtCount: gSDTs.length, fieldCount: gSchema.fields.length, statusSource });
-      } catch (e) { tr.error('failed', e); tr.end(); throw e; }
-    }
+      // 6) Enable actions
+      btnSave.disabled = false;
+      btnExport.disabled = false;
+      btnSaveFromPreview.disabled = false;
+
+      // 7) Status (add headings count; keeps original info)
+      setStatus(`${prefix}${statusSource} SDTs: ${gSDTs.length}. Fields: ${gSchema.fields.length}. Headings: ${headingsParsed.count}.`);
+      tr.end({ sdtCount: gSDTs.length, fieldCount: gSchema.fields.length, headings: headingsParsed.count, statusSource });
+    } catch (e) { tr.error('failed', e); tr.end(); throw e; }
+  }
+
 
     function renderSDTsView(parsed) {
       const tr = TRACE('renderSDTsView', { total: parsed?.total, rows: parsed?.sdts?.length });
@@ -1379,6 +1419,293 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         }
       });
     })();
+
+    // =========================
+    // HEADINGS (H1..H9) PARSING & TREE
+    // =========================
+
+    function levelFromStyleHint(str) {
+      if (!str) return 0;
+      const s = String(str).trim().toLowerCase();
+
+      // Language-agnostic heuristics on styleId or UI name
+      const patterns = [
+        /heading\s*([1-9])/,          // English "Heading 1"
+        /überschrift\s*([1-9])/,      // German "Überschrift 1"
+        /titre\s*([1-9])/,            // French "Titre 1"
+        /t[ií]tulo\s*([1-9])/,        // Spanish/Portuguese "Título 1" / "Titulo 1"
+        /encabezado\s*([1-9])/,       // Spanish "Encabezado 1"
+        /rubrik\s*([1-9])/,           // Swedish "Rubrik 1"
+        /zagolovok\s*([1-9])/,        // Transliteration "Zagolovok 1"
+        /заголовок\s*([1-9])/,        // Russian "Заголовок 1"
+      ];
+      for (const re of patterns) {
+        const m = s.match(re);
+        if (m) return parseInt(m[1], 10);
+      }
+      // Also accept canonical Word style IDs like "Heading1"
+      const m2 = s.match(/^heading([1-9])$/i);
+      if (m2) return parseInt(m2[1], 10);
+
+      return 0;
+    }
+
+    async function buildStyleOutlineMap(arrayBuffer) {
+      const tr = TRACE('buildStyleOutlineMap');
+      try {
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        const stylesFile = zip.file('word/styles.xml');
+        if (!stylesFile) { tr.end('no styles.xml'); return {}; }
+
+        const xmlTextContent = await stylesFile.async('string');
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlTextContent, "application/xml");
+
+        // Collect basic info per style
+        const byId = {};  // id -> { id, name, basedOn, rawLevel }
+        const styles = xml.getElementsByTagNameNS(W_NS, 'style');
+        for (let i = 0; i < styles.length; i++) {
+          const st = styles[i];
+          if ((st.getAttributeNS(W_NS, 'type') || st.getAttribute('w:type')) !== 'paragraph') continue;
+
+          const id = st.getAttributeNS(W_NS, 'styleId') || st.getAttribute('w:styleId') || '';
+          if (!id) continue;
+
+          const nameEl = st.getElementsByTagNameNS(W_NS, 'name')[0];
+          const name = nameEl ? (nameEl.getAttributeNS(W_NS, 'val') || nameEl.getAttribute('w:val') || '') : '';
+
+          const basedEl = st.getElementsByTagNameNS(W_NS, 'basedOn')[0];
+          const basedOn = basedEl ? (basedEl.getAttributeNS(W_NS, 'val') || basedEl.getAttribute('w:val') || '') : '';
+
+          let rawLevel = 0;
+          const pPr = st.getElementsByTagNameNS(W_NS, 'pPr')[0];
+          if (pPr) {
+            const outline = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
+            if (outline) {
+              const v = outline.getAttributeNS(W_NS, 'val') || outline.getAttribute('w:val') || null;
+              if (v != null && v !== '') {
+                const n = parseInt(v, 10);
+                if (Number.isFinite(n)) rawLevel = Math.min(Math.max(n + 1, 1), 9); // 0-based → 1..9
+              }
+            }
+          }
+
+          // Heuristic from id or UI name if outlineLvl missing
+          if (!rawLevel) {
+            rawLevel = levelFromStyleHint(id) || levelFromStyleHint(name) || 0;
+          }
+
+          byId[id] = { id, name, basedOn, rawLevel };
+        }
+
+        // Resolve via basedOn chain (inherit heading level)
+        const resolved = {};
+        const resolveLevel = (id, depth = 0) => {
+          if (!id || !byId[id] || depth > 12) return 0;
+          if (resolved[id] != null) return resolved[id];
+          const info = byId[id];
+          if (info.rawLevel) { resolved[id] = info.rawLevel; return info.rawLevel; }
+          const parent = info.basedOn;
+          const lvl = resolveLevel(parent, depth + 1);
+          resolved[id] = lvl || 0;
+          return resolved[id];
+        };
+
+        Object.keys(byId).forEach(id => resolveLevel(id));
+
+        tr.end({ styles: Object.keys(byId).length, mapped: Object.keys(resolved).length });
+        return resolved; // styleId -> level (1..9) or 0
+      } catch (e) {
+        tr.error('buildStyleOutlineMap failed', e); tr.end();
+        return {};
+      }
+    }
+
+
+    function paraText(pEl) {
+      // Extract visible text from a paragraph (joins runs; preserves soft line breaks a little)
+      const ts = pEl.getElementsByTagNameNS(W_NS, 't');
+      let s = '';
+      for (let i = 0; i < ts.length; i++) s += ts[i].textContent;
+      return s.trim();
+    }
+
+    function detectHeadingLevel(pEl, styleMap) {
+      // 1) Direct outline level on the paragraph (0-based in DOCX)
+      const pPr = pEl.getElementsByTagNameNS(W_NS, 'pPr')[0];
+      if (pPr) {
+        const outline = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
+        if (outline) {
+          const v = outline.getAttributeNS(W_NS, 'val') || outline.getAttribute('w:val') || null;
+          if (v != null && v !== '') {
+            const n = parseInt(v, 10);
+            if (Number.isFinite(n)) return Math.min(Math.max(n + 1, 1), 9);
+          }
+        }
+        // 2) Paragraph style → level via styleMap
+        const pStyle = pPr.getElementsByTagNameNS(W_NS, 'pStyle')[0];
+        if (pStyle) {
+          const styleId = pStyle.getAttributeNS(W_NS, 'val') || pStyle.getAttribute('w:val') || '';
+          const lvl = styleMap?.[styleId];
+          if (lvl && Number.isFinite(lvl)) return lvl;
+        }
+      }
+      return 0;
+    }
+
+    // Assign Word-like outline numbers to the heading tree in document order.
+    // Mutates each node by adding `num` (e.g., "3.1.2") and returns the same tree.
+    function numberHeadingsTree(tree) {
+      const walk = (nodes, prefix=[]) => {
+        for (let i = 0; i < nodes.length; i++) {
+          const n = nodes[i];
+          const current = [...prefix, i + 1];          // sibling index → 1-based
+          n.num = current.join('.');                   // e.g., "2.3.1"
+          if (Array.isArray(n.children) && n.children.length) {
+            walk(n.children, current);
+          }
+        }
+      };
+      walk(tree, []);
+      return tree;
+    }
+
+
+    async function parseHeadings_JS(arrayBuffer) {
+      const tr = TRACE('parseHeadings_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
+      try {
+        if (!arrayBuffer) return { flat: [], tree: [], count: 0 };
+
+        // ✅ Build style → outline level map from styles.xml
+        const styleMap = await buildStyleOutlineMap(arrayBuffer);
+        tr.step('styleMap', { entries: Object.keys(styleMap || {}).length });
+
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        // Scan the same content parts as SDT parser
+        const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
+        const parser = new DOMParser();
+        const out = [];
+        let idx = 0;
+
+        for (const f of parts) {
+          const pf = TRACE('parseHeadings_JS:file', f.name);
+          const xmlTextContent = await f.async('string');
+          try {
+            const xml = parser.parseFromString(xmlTextContent, "application/xml");
+            const paras = xml.getElementsByTagNameNS(W_NS, 'p');
+            for (let i = 0; i < paras.length; i++) {
+              const p = paras[i];
+              // ✅ pass styleMap so custom/localized heading styles resolve
+              const lvl = detectHeadingLevel(p, styleMap);
+              if (!lvl) continue;
+              const text = paraText(p);
+              if (!text) continue;
+              out.push({
+                idx: ++idx,
+                level: lvl,
+                text,
+                part: f.name.split('/').pop().replace('.xml','')
+              });
+            }
+            pf.end({ added: idx });
+          } catch (e) {
+            pf.warn('xml parse error', e);
+            pf.end({ added: 0, error: String(e?.message || e) });
+          }
+        }
+
+        const tree = buildHeadingTree(out);
+        tr.end({ count: out.length, rootChildren: tree.length });
+        return { flat: out, tree, count: out.length };
+      } catch (e) {
+        tr.error('failed', e); tr.end();
+        return { flat: [], tree: [], count: 0 };
+      }
+    }
+
+    
+
+    function buildHeadingTree(list) {
+      const root = [];
+      const stack = []; // stack of nodes
+      for (const h of list) {
+        const node = { level: h.level, text: h.text, part: h.part, idx: h.idx, children: [] };
+        // Pop until parent has lower level
+        while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
+        if (!stack.length) {
+          root.push(node);
+        } else {
+          stack[stack.length - 1].children.push(node);
+        }
+        stack.push(node);
+      }
+      return root;
+    }
+
+    function renderHeadingsTreeView(tree) {
+      const tr = TRACE('renderHeadingsTreeView', { nodes: tree?.length || 0 });
+      try {
+        if (!headersTreeEl) return;
+        headersTreeEl.innerHTML = '';
+        if (!tree || !tree.length) {
+          headersTreeEl.innerHTML = '<div class="empty">No headings found (no paragraphs styled as headings).</div>';
+          tr.end('empty'); return;
+        }
+
+        // ✅ Add outline numbers (1, 1.1, 1.1.1, …) in document order
+        numberHeadingsTree(tree);
+
+        const mk = (nodes) => {
+          const ul = document.createElement('ul');
+          ul.style.margin = '0 0 0 1rem';
+          ul.style.padding = '0.1rem 0 0.1rem 0.6rem';
+          for (const n of nodes) {
+            const li = document.createElement('li');
+            li.style.listStyle = 'none'; // we render our own numbers
+
+            const line = document.createElement('div');
+            line.style.display = 'flex';
+            line.style.gap = '6px';
+            line.style.alignItems = 'baseline';
+
+            // Outline number (matches Navigation behavior)
+            const num = document.createElement('span');
+            num.textContent = n.num;            // e.g., "3.1.12"
+            num.style.minWidth = '4ch';
+            num.style.textAlign = 'right';
+            num.style.fontVariantNumeric = 'tabular-nums';
+            num.style.opacity = '0.9';
+            num.style.fontWeight = n.level <= 2 ? '700' : '600';
+
+            // Heading text
+            const text = document.createElement('span');
+            text.textContent = n.text;
+            text.title = `${n.part} • H${n.level}`;
+            text.style.fontWeight = n.level <= 2 ? '600' : '400';
+
+            // Part (document xml part)
+            const part = document.createElement('span');
+            part.textContent = `· ${n.part}`;
+            part.className = 'muted';
+            part.style.fontSize = '0.75rem';
+
+            line.appendChild(num);
+            line.appendChild(text);
+            line.appendChild(part);
+            li.appendChild(line);
+
+            if (n.children?.length) li.appendChild(mk(n.children));
+            ul.appendChild(li);
+          }
+          return ul;
+        };
+
+        headersTreeEl.appendChild(mk(tree));
+        tr.end('rendered');
+      } catch (e) { tr.error('failed', e); tr.end(); }
+    }
+
+
   </script>
 </body>
 </html>

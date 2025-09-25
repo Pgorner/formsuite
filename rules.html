@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Form Suite — Open Form</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    /* Compact editor layout for table rows */
+    .compact-editor { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:flex-start; }
+    .compact-editor .pair {
+      display:flex; align-items:center; gap:6px;
+      padding:6px 8px;
+      background:var(--card,#fff); border-radius:8px;
+    }
+    .compact-editor .pair .lbl { white-space:nowrap; font-size:0.95rem; color:var(--ink,#0f172a); }
+    .compact-editor .pair input, .compact-editor .pair select {
+      width:auto; min-width:120px; max-width:360px;
+    }
+    .table-card table { width:100%; table-layout:auto; border-collapse:collapse; }
+    .table-card th, .table-card td { padding:6px 8px; border-bottom:1px solid var(--border,#e5e7eb); }
+    .table-card tbody tr { cursor:pointer; }
+    .table-card tbody tr[data-sel="1"] { background:#f0f9ff; }
+    .right { margin-left:auto; }
+    .btn-primary, .btn-secondary, .btn-danger { margin-right:6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <span class="brand logo-md">
+        <img src="logo.gif" alt="Form Suite logo" class="logo" />
+        <strong>Form Suite</strong>
+      </span>
+      <span class="muted">·</span><span class="muted">Open Form</span>
+      <span class="muted">·</span><a href="builder.html">Form Builder</a>
+      <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
+      <span class="muted">·</span><span class="muted">Rules</span>
+      <span class="muted">·</span><a href="extractor.html">Extractor</a>
+
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="title-row"></div>
+    </section>
+  </main>
+</body>
