@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Form Suite — Extractor (DEBUG)</title>
+  <title>Form Suite — Extractor</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
 
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
@@ -22,7 +22,7 @@
         <img src="logo.gif" alt="Form Suite logo" class="logo" />
         <strong>Form Suite</strong>
       </span>
-      <span class="muted">·</span><a href="index.html">Open Form</a>
+      <span class="muted">·</span><a href="index.html">Form</a>
       <span class="muted">·</span><a href="builder.html" id="openBuilder">Form Builder</a>
       <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
       <span class="muted">·</span><a href="rules.html">Rules</a>
@@ -143,6 +143,7 @@
     let gSDTs          = [];
     let gLastSchemaPushTs = 0;
     let gPreferDocOnNextLoad = false;   // prefer DOCX payload only right after doOpen()
+    let gFileExt = 'docx'; // 'docx' | 'docm' | 'dotx' | 'dotm'
 
 
     // UI refs
@@ -159,6 +160,24 @@
     const previewStatus = document.getElementById('previewStatus');
     const headersTreeEl = document.getElementById('headersTree');
     
+
+    function splitNameAndExt(fileName) {
+      const m = String(fileName).match(/\.(docx|docm|dotx|dotm)$/i);
+      return {
+        base: String(fileName).replace(/\.(docx|docm|dotx|dotm)$/i, ''),
+        ext:  (m ? m[1] : 'docx').toLowerCase()
+      };
+    }
+
+    function wordMimeFor(ext) {
+      switch ((ext || '').toLowerCase()) {
+        case 'docm': return 'application/vnd.ms-word.document.macroEnabled.12';
+        case 'dotx': return 'application/vnd.openxmlformats-officedocument.wordprocessingml.template';
+        case 'dotm': return 'application/vnd.ms-word.template.macroEnabled.12';
+        default:     return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      }
+    }
+
 
     async function sha256Hex(bufOrU8) {
       const tr = TRACE('sha256Hex', { type: (bufOrU8?.constructor?.name), len: bufOrU8?.byteLength || bufOrU8?.length });
@@ -1098,7 +1117,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         clearUiForNewDoc('Restoring document…');
 
         let bytes = await window.formSuitePersist.getBytes?.(meta.docId)
-                 || await window.formSuitePersist.getCurrentDocBytes?.();
+                || await window.formSuitePersist.getCurrentDocBytes?.();
         tr.step('persistence bytes', { len: bytes?.byteLength || bytes?.length });
 
         // If no bytes yet, try OPFS handle (e.g., first navigation into this page)
@@ -1111,7 +1130,11 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               const f = await h.getFile();
               bytes = new Uint8Array(await f.arrayBuffer());
               gFileHandle = h;
-              if (!gFileName) gFileName = f.name?.replace(/\.docx$/i,'') || meta.name || 'document';
+              if (!gFileName) {
+                const { base, ext } = splitNameAndExt(f.name || meta.name || 'document.docx');
+                gFileName = base || 'document';
+                gFileExt  = ext || 'docx';
+              }
               tr.step('2nd chance handle.getFile ok', { size: bytes.byteLength });
             }
           } catch (e) {
@@ -1127,8 +1150,10 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               const f = await h.getFile();
               bytes = new Uint8Array(await f.arrayBuffer());
               gFileHandle = h;
-              gFileName = f.name?.replace(/\.docx$/i,'') || meta.name || 'document';
-              tr.step('handle.getFile ok', { name: gFileName, len: bytes.byteLength });
+              const { base, ext } = splitNameAndExt(f.name || meta.name || 'document.docx');
+              gFileName = base || 'document';
+              gFileExt  = ext || 'docx';
+              tr.step('handle.getFile ok', { name: `${gFileName}.${gFileExt}`, len: bytes.byteLength });
             }
           } catch (e) { tr.warn('handle path failed', e); }
         }
@@ -1136,10 +1161,16 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         if (!bytes) { await hardResetDocContext('no bytes / no permission'); tr.end('no bytes'); return; }
 
         gArrayBuffer = bytes.buffer ?? bytes;
-        gFileName = gFileName || meta.name || 'document';
+
+        // If name/ext still unset, derive from meta.name (or default)
+        if (!gFileName) {
+          const { base, ext } = splitNameAndExt(meta.name || 'document.docx');
+          gFileName = base || 'document';
+          gFileExt  = ext || 'docx';
+        }
         gDocId = meta.docId;
 
-        tr.step('restored', { docId: gDocId, name: gFileName, len: gArrayBuffer?.byteLength, sha: await sha256Hex(gArrayBuffer) });
+        tr.step('restored', { docId: gDocId, name: `${gFileName}.${gFileExt}`, len: gArrayBuffer?.byteLength, sha: await sha256Hex(gArrayBuffer) });
 
         await renderFromCurrentBytes();
         await updateWriteAccessBanner();   // reflect permission status on load
@@ -1150,13 +1181,16 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       finally { tr.end(); }
     })();
 
+
+
     // =========================
     // PERSIST WRAPPER
     // =========================
-    async function persistCurrentDoc(bytesU8, handle, nameNoExt) {
-      const tr = TRACE('persistCurrentDoc', { hasBytes: !!bytesU8, handle: !!handle, nameNoExt });
+    async function persistCurrentDoc(bytesU8, handle, nameNoExt, ext = 'docx') {
+      const tr = TRACE('persistCurrentDoc', { hasBytes: !!bytesU8, handle: !!handle, nameNoExt, ext });
       try {
-        const name = (nameNoExt || 'document').replace(/\.docx$/i,'') + '.docx';
+        const safeExt = (ext || 'docx').toLowerCase();
+        const name = `${(nameNoExt || 'document').replace(/\.(docx|docm|dotx|dotm)$/i,'')}.${safeExt}`;
         tr.step('computed name', name);
         tr.step('hash', await sha256Hex(bytesU8));
         if (window.formSuitePersist?.setCurrentDoc) {
@@ -1173,35 +1207,46 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
 
+
     // =========================
     // FILE OPEN / SAVE / EXPORT
     // =========================
     async function doOpen() {
       const tr = TRACE('doOpen');
       try {
-        // Clear immediately so old form/payload can't linger
         clearUiForNewDoc('Opening…');
 
         const [handle] = await showOpenFilePicker({
           multiple: false,
-          types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm'] } }]
+          types: [{
+            description: 'Word document',
+            accept: {
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+              'application/vnd.ms-word.document.macroEnabled.12': ['.docm'],
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.template': ['.dotx'],
+              'application/vnd.ms-word.template.macroEnabled.12': ['.dotm']
+            }
+          }]
         });
+
         gFileHandle = handle;
         const file = await handle.getFile();
-        gFileName = file.name.replace(/\.docx$/i,'') || 'document';
+        const { base, ext } = splitNameAndExt(file.name || 'document.docx');
+        gFileName = base || 'document';
+        gFileExt  = ext;
+
         const bytes = new Uint8Array(await file.arrayBuffer());
         gArrayBuffer = bytes.buffer;
 
-        tr.step('opened', { name: gFileName, size: bytes.byteLength, sha: await sha256Hex(bytes) });
+        tr.step('opened', { name: `${gFileName}.${gFileExt}`, size: bytes.byteLength, sha: await sha256Hex(bytes) });
 
-        const metaObj = await persistCurrentDoc(bytes, gFileHandle, gFileName);
+        const metaObj = await persistCurrentDoc(bytes, gFileHandle, gFileName, gFileExt);
         gDocId = metaObj.docId;
         persistActiveMeta(metaObj);
         announceDocSwitch();
-        gPreferDocOnNextLoad = true; 
+        gPreferDocOnNextLoad = true;
         await renderFromCurrentBytes();
 
-        // while still in a user gesture, try to grant write
         await updateWriteAccessBanner({ tryPrompt: true });
 
         btnSave.disabled = false; btnExport.disabled = false;
@@ -1212,6 +1257,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         setStatus(`Error opening file: ${e.message || e}`);
       } finally { tr.end(); }
     }
+
 
     async function ensureWritePermission(handle) {
       const tr = TRACE('ensureWritePermission', { haveHandle: !!handle });
@@ -1260,7 +1306,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
 
         if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues, rules, tagMap: prunedTagMap });
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated);
-        const metaObj = await persistCurrentDoc(updated, gFileHandle, gFileName);
+        const metaObj = await persistCurrentDoc(updated, gFileHandle, gFileName, gFileExt);
         gDocId = metaObj.docId;
         persistActiveMeta(metaObj);
         announceDocUpdate();
@@ -1274,7 +1320,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
               const stream = await handle.createWritable();
               await stream.write(updated);
               await stream.close();
-              setStatus(`Saved back to "${handle.name || (gFileName + '.docx')}".`);
+              setStatus(`Saved back to "${handle.name || (gFileName + '.' + gFileExt)}".`);
               gFileHandle = handle;
               gDirty = false;
               await updateWriteAccessBanner();
@@ -1285,30 +1331,32 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
           }
         }
 
-        const blob = new Blob([updated], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+        // Fallback: download copy with correct extension + MIME
+        const mime = wordMimeFor(gFileExt);
+        const blob = new Blob([updated], { type: mime });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = (gFileName || 'document') + '.docx';
+        a.download = `${gFileName}.${gFileExt}`;
         document.body.appendChild(a); a.click(); a.remove();
-        setStatus('Saved: downloaded updated DOCX.');
+        setStatus('Saved: downloaded updated copy.');
         gDirty = false;
         tr.end('downloaded copy');
       } catch (e) { tr.error('save failed', e); setStatus(`Error saving: ${e.message || e}`); }
       finally { tr.end(); }
     }
 
-
     async function doExport() {
       const tr = TRACE('doExport', { hasBuf: !!gArrayBuffer, docId: gDocId });
       try {
         if (!gArrayBuffer) { tr.warn('no buffer'); return; }
+
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
         if (restored?.schema) gSchema = restored.schema;
 
-        const domVals  = collectFormValues(gSchema);
-        const baseVals = (restored && restored.values) ? restored.values : {};
-        const rules    = normalizeRules(restored?.rules);
-        const tagMapRaw= restored?.tagMap || await getTagMapFor(gDocId);
+        const domVals   = collectFormValues(gSchema);
+        const baseVals  = (restored && restored.values) ? restored.values : {};
+        const rules     = normalizeRules(restored?.rules);
+        const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
@@ -1316,6 +1364,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         gValues = prunedValues;
         setStatus('Preparing export…');
 
+        // 1) write CRONOS_PAYLOAD to settings.xml
         const payload = JSON.stringify({
           title:  gSchema.title || 'Form',
           fields: gSchema.fields || [],
@@ -1324,10 +1373,9 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
           rules,
           updatedAt: new Date().toISOString()
         });
-
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
 
-        // SDT replacements
+        // 2) replace SDTs using tagMap → values
         const sdtMap = {};
         for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
           let v = gValues?.[fieldId];
@@ -1338,42 +1386,55 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         const updated2 = await writeSDTs(updated, sdtMap);
         gArrayBuffer = updated2.buffer;
 
+        // 3) persist state + bytes in workspace (unchanged)
         if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues, rules, tagMap: prunedTagMap });
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2);
-        const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName);
+        const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName, gFileExt);
         gDocId = metaObj.docId;
         persistActiveMeta(metaObj);
         announceDocUpdate();
 
+        // 4) ALWAYS "Save As…" a new copy (match Index behavior)
+        const suggested = `${gFileName} (export).${gFileExt}`;
+
         if (supportsFS) {
-          const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-          if (handle?.createWritable) {
-            const perm = await ensureWritePermission(handle);
-            if (perm === 'granted') {
-              const stream = await handle.createWritable();
-              await stream.write(updated2);
-              await stream.close();
-              setStatus(`Exported back to "${handle.name || (gFileName + '.docx')}".`);
-              gFileHandle = handle;
-              gDirty = false;
-              await updateWriteAccessBanner();
-              return;
-            } else {
-              await updateWriteAccessBanner();
-            }
+          try {
+            const handle = await showSaveFilePicker({
+              suggestedName: suggested,
+              types: [{
+                description: 'Word document',
+                accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] }
+              }]
+            });
+            const stream = await handle.createWritable();
+            await stream.write(updated2);
+            await stream.close();
+            setStatus(`Exported as “${handle.name || suggested}”.`);
+            gDirty = false;
+            return;
+          } catch (e) {
+            if (e?.name === 'AbortError') { setStatus('Export canceled.'); return; }
+            tr.warn('showSaveFilePicker failed, falling back', e);
           }
         }
 
-        const blob = new Blob([updated2], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+        // Fallback (no File System Access API): download copy
+        const mime = wordMimeFor(gFileExt);
+        const blob = new Blob([updated2], { type: mime });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = (gFileName || 'document').replace(/\.docx$/i, '') + ' (export).docx';
+        a.download = suggested;
         document.body.appendChild(a); a.click(); a.remove();
         setStatus('Exported: downloaded copy.');
         gDirty = false;
-      } catch (e) { tr.error('export failed', e); setStatus(`Error exporting: ${e.message || e}`); }
-      finally { tr.end(); }
+      } catch (e) {
+        tr.error('export failed', e);
+        setStatus(`Error exporting: ${e.message || e}`);
+      } finally {
+        tr.end();
+      }
     }
+
 
 
     // =========================
