@@ -787,119 +787,264 @@
         const py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/" });
         tr.step('pyodide loaded');
         await py.runPythonAsync(`
-import io, zipfile, json
-import xml.etree.ElementTree as ET
-_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-NS = {"w": _W_NS}
-def _q(local): return f"{{{_W_NS}}}{local}"
-def read_docvar_settings(doc_bytes: bytes, name: str) -> str | None:
-    f = io.BytesIO(doc_bytes)
-    with zipfile.ZipFile(f) as z:
-        try: data = z.read("word/settings.xml")
-        except KeyError: return None
-    try: root = ET.fromstring(data)
-    except ET.ParseError: return None
-    docVars = root.find("w:docVars", NS)
-    if docVars is None: return None
-    for dv in docVars.findall("w:docVar", NS):
-        if dv.attrib.get(_q("name")) == name:
-            return dv.attrib.get(_q("val"), "") or ""
-    return None
-def write_docvar_settings(doc_bytes: bytes, name: str, value: str) -> bytes:
-    f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
-    with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
-        try: settings_xml = zin.read("word/settings.xml")
-        except KeyError:
-            settings_xml = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
-        for item in zin.infolist():
-            if item.filename != "word/settings.xml":
-                zout.writestr(item, zin.read(item.filename))
-        root = ET.fromstring(settings_xml)
+    import io, zipfile, json
+    import xml.etree.ElementTree as ET
+    _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    NS = {"w": _W_NS}
+    def _q(local): return f"{{{_W_NS}}}{local}"
+
+    # -------- existing helpers --------
+    def read_docvar_settings(doc_bytes: bytes, name: str) -> str | None:
+        f = io.BytesIO(doc_bytes)
+        with zipfile.ZipFile(f) as z:
+            try: data = z.read("word/settings.xml")
+            except KeyError: return None
+        try: root = ET.fromstring(data)
+        except ET.ParseError: return None
         docVars = root.find("w:docVars", NS)
-        if docVars is None: 
-            docVars = ET.SubElement(root, _q("docVars"))
-        target = None
+        if docVars is None: return None
         for dv in docVars.findall("w:docVar", NS):
-            if dv.attrib.get(_q("name")) == name: 
-                target = dv; break
-        if target is None:
-            ET.SubElement(docVars, _q("docVar"), {_q("name"): name, _q("val"): value or ""})
-        else:
-            target.set(_q("val"), value or "")
-        data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        zout.writestr("word/settings.xml", data)
-    return out.getvalue()
-def read_docvar_custom(doc_bytes: bytes, name: str) -> str | None:
-    f = io.BytesIO(doc_bytes)
-    with zipfile.ZipFile(f) as z:
-        try: docprops = z.read("docProps/custom.xml")
-        except KeyError: return None
-    try: root = ET.fromstring(docprops)
-    except ET.ParseError: return None
-    for v in root:
-        if v.tag.endswith("property") and v.attrib.get("name") == name:
-            for c in v: return c.text or ""
-    return None
-def _set_sdt_text(content_el, value):
-    texts = content_el.findall(".//w:t", {"w": _W_NS})
-    if texts:
-        first = True
-        for t in texts:
-            if first:
-                t.text = value
-                first = False
+            if dv.attrib.get(_q("name")) == name:
+                return dv.attrib.get(_q("val"), "") or ""
+        return None
+
+    def write_docvar_settings(doc_bytes: bytes, name: str, value: str) -> bytes:
+        f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
+        with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            try: settings_xml = zin.read("word/settings.xml")
+            except KeyError:
+                settings_xml = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+            for item in zin.infolist():
+                if item.filename != "word/settings.xml":
+                    zout.writestr(item, zin.read(item.filename))
+            root = ET.fromstring(settings_xml)
+            docVars = root.find("w:docVars", NS)
+            if docVars is None: 
+                docVars = ET.SubElement(root, _q("docVars"))
+            target = None
+            for dv in docVars.findall("w:docVar", NS):
+                if dv.attrib.get(_q("name")) == name: 
+                    target = dv; break
+            if target is None:
+                ET.SubElement(docVars, _q("docVar"), {_q("name"): name, _q("val"): value or ""})
             else:
-                t.text = ""
-        return
-    # If there's no text node, create a minimal run (respecting block vs inline)
-    has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
-    for ch in list(content_el): content_el.remove(ch)
-    if has_block:
-        p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
-    else:
-        r = ET.SubElement(content_el, _q("r"))
-    t = ET.SubElement(r, _q("t")); t.text = value
-    if (value.strip() != value) or ("\\n" in value) or ("  " in value):
-        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
-    try: mapping = json.loads(mapping_json or "{}")
-    except Exception: mapping = {}
-    f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
-    with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
-        def is_target(name):
-            if not (name.startswith("word/") and name.endswith(".xml")): return False
-            skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
-            return name not in skip and not name.startswith("word/_rels/")
-        for item in zin.infolist():
-            name = item.filename
-            data = zin.read(name)
-            if not is_target(name):
-                zout.writestr(name, data); continue
-            try:
-                root = ET.fromstring(data)
-            except ET.ParseError:
-                zout.writestr(name, data); continue
-            changed = False
-            for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
-                pr = sdt.find("w:sdtPr", {"w": _W_NS})
-                if pr is None: continue
-                tag_el = pr.find("w:tag", {"w": _W_NS})
-                tag_val = (tag_el.get(_q("val")) if tag_el is not None else "") or ""
-                if tag_val and tag_val in mapping:
-                    val = mapping.get(tag_val, "")
-                    if not isinstance(val, str):
-                        try: import json as _json; val = _json.dumps(val, ensure_ascii=False)
-                        except Exception: val = str(val)
-                    content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
-                    _set_sdt_text(content_el, val)
-                    changed = True
-            zout.writestr(name, ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else data)
-    return out.getvalue()
+                target.set(_q("val"), value or "")
+            data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            zout.writestr("word/settings.xml", data)
+        return out.getvalue()
+
+    def read_docvar_custom(doc_bytes: bytes, name: str) -> str | None:
+        f = io.BytesIO(doc_bytes)
+        with zipfile.ZipFile(f) as z:
+            try: docprops = z.read("docProps/custom.xml")
+            except KeyError: return None
+        try: root = ET.fromstring(docprops)
+        except ET.ParseError: return None
+        for v in root:
+            if v.tag.endswith("property") and v.attrib.get("name") == name:
+                for c in v: return c.text or ""
+        return None
+
+    def _set_sdt_text(content_el, value):
+        texts = content_el.findall(".//w:t", {"w": _W_NS})
+        if texts:
+            first = True
+            for t in texts:
+                if first:
+                    t.text = value
+                    first = False
+                else:
+                    t.text = ""
+            return
+        has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
+        for ch in list(content_el): content_el.remove(ch)
+        if has_block:
+            p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
+        else:
+            r = ET.SubElement(content_el, _q("r"))
+        t = ET.SubElement(r, _q("t")); t.text = value
+        if (value.strip() != value) or ("\\n" in value) or ("  " in value):
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+    def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
+        try: mapping = json.loads(mapping_json or "{}")
+        except Exception: mapping = {}
+        f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
+        with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            def is_target(name):
+                if not (name.startswith("word/") and name.endswith(".xml")): return False
+                skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
+                return name not in skip and not name.startswith("word/_rels/")
+            for item in zin.infolist():
+                name = item.filename
+                data = zin.read(name)
+                if not is_target(name):
+                    zout.writestr(name, data); continue
+                try:
+                    root = ET.fromstring(data)
+                except ET.ParseError:
+                    zout.writestr(name, data); continue
+                changed = False
+                for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
+                    pr = sdt.find("w:sdtPr", {"w": _W_NS})
+                    if pr is None: continue
+                    tag_el = pr.find("w:tag", {"w": _W_NS})
+                    tag_val = (tag_el.get(_q("val")) if tag_el is not None else "") or ""
+                    if tag_val and tag_val in mapping:
+                        val = mapping.get(tag_val, "")
+                        if not isinstance(val, str):
+                            try: import json as _json; val = _json.dumps(val, ensure_ascii=False)
+                            except Exception: val = str(val)
+                        content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
+                        _set_sdt_text(content_el, val)
+                        changed = True
+                zout.writestr(name, ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else data)
+        return out.getvalue()
+
+    # -------- NEW: visibility helpers + apply_visibility (reset-first) --------
+    def _ensure_fsHidden_style(zfin, zfout, names):
+        if "word/styles.xml" in names:
+            try: root = ET.fromstring(zfin.read("word/styles.xml"))
+            except ET.ParseError: root = ET.Element(_q("styles"))
+        else:
+            root = ET.Element(_q("styles"))
+        have = False
+        for st in root.findall(_q("style")):
+            if st.get(_q("type")) == "character" and st.get(_q("styleId")) == "fsHidden":
+                have = True; break
+        if not have:
+            st = ET.Element(_q("style"), {_q("type"): "character", _q("styleId"): "fsHidden"})
+            ET.SubElement(st, _q("name"), {_q("val"): "fsHidden"})
+            rpr = ET.SubElement(st, _q("rPr"))
+            ET.SubElement(rpr, _q("vanish"))
+            root.append(st)
+        zfout.writestr("word/styles.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+    def _heading_level(p_el):
+        ppr = p_el.find(_q("pPr"))
+        if ppr is not None:
+            ol = ppr.find(_q("outlineLvl"))
+            if ol is not None and ol.get(_q("val")) is not None:
+                try: return int(ol.get(_q("val"))) + 1
+                except: pass
+            ps = ppr.find(_q("pStyle"))
+            if ps is not None and ps.get(_q("val")):
+                v = ps.get(_q("val")).lower()
+                if v.startswith("heading"):
+                    try: return int(v.replace("heading","").strip())
+                    except: return None
+        return None
+
+    def _apply_rStyle_hidden_to_runs(el):
+        for r in el.findall(".//w:r", {"w": _W_NS}):
+            rpr = r.find(_q("rPr"))
+            if rpr is None:
+                rpr = ET.SubElement(r, _q("rPr"))
+            has = False
+            for rs in rpr.findall(_q("rStyle")):
+                if rs.get(_q("val")) == "fsHidden":
+                    has = True; break
+            if not has:
+                ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
+
+    def apply_visibility(u8, idx_to_action_json):
+        """
+        idx_to_action_json: {"12":"HIDE","13":"SHOW", ...}
+        Export semantics:
+          1) Remove our own rStyle=fsHidden everywhere (global reset → previously hidden becomes visible).
+          2) Apply HIDE to current target ranges (SHOW is effectively redundant post-reset).
+            Range = from the heading paragraph to just before next heading with level <= current level.
+        """
+        try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
+        except Exception: idx_to_action = {}
+        data = bytes(u8)
+        outbuf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+            names = zfin.namelist()
+
+            # copy everything except styles (we rewrite after ensuring fsHidden)
+            for n in names:
+                if n == "word/styles.xml": continue
+                zfout.writestr(n, zfin.read(n))
+
+            _ensure_fsHidden_style(zfin, zfout, set(names))
+
+            def is_doc_part(n):
+                if not (n.startswith("word/") and n.endswith(".xml")): return False
+                skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
+                return n not in skip and not n.startswith("word/_rels/")
+
+            # PASS 1: global reset (remove fsHidden rStyle everywhere)
+            parts_roots = {}
+            for n in names:
+                if not is_doc_part(n): continue
+                try: root = ET.fromstring(zfin.read(n))
+                except ET.ParseError:
+                    parts_roots[n] = None
+                    continue
+                for r in root.findall(".//w:r", {"w": _W_NS}):
+                    rpr = r.find(_q("rPr"))
+                    if rpr is None: continue
+                    for rs in list(rpr.findall(_q("rStyle"))):
+                        if rs.get(_q("val")) == "fsHidden":
+                            rpr.remove(rs)
+                parts_roots[n] = root
+
+            # PASS 2: apply current HIDE ranges
+            global_idx = 0
+            for n in names:
+                if not is_doc_part(n): continue
+                root = parts_roots.get(n)
+                if root is None: continue
+                body = root.find(_q("body"))
+                if body is None:
+                    zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
+
+                elems = []
+                for ch in list(body):
+                    if ch.tag == _q("p"):
+                        lvl = _heading_level(ch)
+                        elems.append((ch, "p", lvl))
+                    elif ch.tag == _q("tbl"):
+                        elems.append((ch, "tbl", None))
+                    else:
+                        elems.append((ch, "other", None))
+
+                heading_positions = []
+                for i,(el,t,lvl) in enumerate(elems):
+                    if t == "p" and lvl is not None:
+                        global_idx += 1
+                        heading_positions.append((i, lvl, global_idx))
+
+                for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                    act = idx_to_action.get(idx)
+                    if act != "HIDE":  # SHOW/no action = already visible post-reset
+                        continue
+                    start = pos + 1
+                    if h_i + 1 < len(heading_positions):
+                        end = len(elems)
+                        for j in range(h_i+1, len(heading_positions)):
+                            np, nl, _ = heading_positions[j]
+                            if nl <= lvl:
+                                end = np
+                                break
+                    else:
+                        end = len(elems)
+                    for j in range(start, end):
+                        el, t, _lvl = elems[j]
+                        if t in ("p","tbl"):
+                            _apply_rStyle_hidden_to_runs(el)
+
+                zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+        return outbuf.getvalue()
         `);
         tr.end('pyodide ready');
         return py;
       } catch (e) { tr.error('bootstrap failed', e); tr.end(); throw e; }
     })();
+
+    
 
     async function readDocVarSettings(arrayBufferOrBytes, name) {
       const tr = TRACE('readDocVarSettings', { name });
@@ -1209,6 +1354,90 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
       } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
 
+    // ---------- Rules → Visibility map (SHOW supersedes HIDE) ----------
+    function loadRulesForDoc(state) {
+      return (
+        state?.rules ||
+        state?.payload?.rules ||
+        state?.CRONOS_RULES ||
+        state?.cronos_rules ||
+        []
+      );
+    }
+
+    function ruleMatchesValue(op, expected, actual) {
+      const a = actual;
+      if (op === 'equals')    return String(a) === String(expected);
+      if (op === 'notEquals') return String(a) !== String(expected);
+      if (op === 'anyOf') {
+        const arr = Array.isArray(expected) ? expected.map(String) : [String(expected)];
+        if (Array.isArray(a)) return a.map(String).some(v => arr.includes(v));
+        return arr.includes(String(a));
+      }
+      if (op === 'allOf') {
+        const arr = Array.isArray(expected) ? expected.map(String) : [String(expected)];
+        if (!Array.isArray(a)) return false;
+        const aset = new Set(a.map(String));
+        return arr.every(v => aset.has(v));
+      }
+      if (op === 'contains')  return String(a ?? '').toLowerCase().includes(String(expected ?? '').toLowerCase());
+      return false;
+    }
+
+    function evaluateRulesToVisibility(schema, values, rules) {
+      const out = Object.create(null);
+      if (!Array.isArray(rules) || !rules.length) return out;
+
+      // reuse your sanitizeValues behavior from Form page (Extractor uses plain values)
+      const cleanVals = values || {};
+      const getVal = (fid) => cleanVals[fid];
+
+      for (const r of rules) {
+        if (!r) continue;
+        const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
+                    : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
+                    : null;
+        if (!action) continue;
+
+        const fieldId = r.fieldId || r.field || r.whenField;
+        const op      = r.op || r.operator || 'equals';
+        const exp     = r.values ?? r.value ?? r.expected;
+        const targets = Array.isArray(r.targets) ? r.targets : [];
+
+        const actual  = getVal(fieldId);
+        if (!ruleMatchesValue(op, exp, actual)) continue;
+
+        for (const t of targets) {
+          const key = t?.key ?? t?.idx ?? t?.id;
+          if (key == null) continue;
+          const idx = Number(key);
+          if (!Number.isFinite(idx)) continue;
+          const prev = out[idx];
+          if (action === 'SHOW') out[idx] = 'SHOW';
+          else if (action === 'HIDE' && prev !== 'SHOW') out[idx] = 'HIDE';
+        }
+      }
+      return out;
+    }
+
+    // ---------- Bridge to Python: apply visibility using fsHidden ----------
+    async function applyVisibilityByRules(bytesU8, visibilityMap) {
+      if (!visibilityMap || !Object.keys(visibilityMap).length) return bytesU8;
+      const py = await pyodideReady;
+      const fn = py.globals.get('apply_visibility');
+      const pyBytes = py.toPy(bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8));
+      const pyMap   = py.toPy(JSON.stringify(visibilityMap));
+      let pyOut;
+      try { pyOut = fn(pyBytes, pyMap); }
+      finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
+      let u8;
+      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+      else u8 = new Uint8Array([]);
+      try { pyOut.destroy?.(); } catch {}
+      return u8;
+    }
+
 
     // =========================
     // FILE OPEN / SAVE / EXPORT
@@ -1385,10 +1614,19 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
           if (typeof v === 'object') { try { v = JSON.stringify(v); } catch { v = String(v); } }
           sdtMap[tag] = String(v);
         }
-        const updated2 = await writeSDTs(updated, sdtMap);
+        let updated2 = await writeSDTs(updated, sdtMap);
         gArrayBuffer = updated2.buffer;
 
-        // 3) persist state + bytes in workspace (unchanged)
+        // 3.5) evaluate rules → visibility map (SHOW supersedes HIDE)
+        const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, loadRulesForDoc(restored));
+
+        // 4) apply visibility (reset all fsHidden, then apply current HIDE ranges)
+        if (Object.keys(visibilityMap).length) {
+          updated2 = await applyVisibilityByRules(updated2, visibilityMap);
+          gArrayBuffer = updated2.buffer;
+        }
+
+        // 5) persist state + bytes in workspace (unchanged)
         if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues, rules, tagMap: prunedTagMap });
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2);
         const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName, gFileExt);
@@ -1396,7 +1634,7 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         persistActiveMeta(metaObj);
         announceDocUpdate();
 
-        // 4) ALWAYS "Save As…" a new copy (match Index behavior)
+        // 6) ALWAYS "Save As…" a new copy (match Index behavior)
         const suggested = `${gFileName} (export).${gFileExt}`;
 
         if (supportsFS) {
@@ -1436,7 +1674,6 @@ def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
         tr.end();
       }
     }
-
 
 
     // =========================

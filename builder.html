@@ -328,6 +328,115 @@
     });
     window.addEventListener('focus', async () => { await ensureActiveOrReset(); });
 
+    // ---------- Schema-aware pruning & migration (NEW) ----------
+
+    function getValidFieldIds(schema) {
+      const ids = new Set();
+      for (const f of (schema?.fields || [])) {
+        if (f?.id) ids.add(String(f.id));
+      }
+      return ids;
+    }
+
+    // Defensive copy
+    function deepClone(o) {
+      return (o && typeof o === 'object') ? JSON.parse(JSON.stringify(o)) : o;
+    }
+
+    /**
+     * Prune values, tagMap, and rules so they only reference fields present in `schema`.
+     * Returns { values, tagMap, rules } (all pruned) without saving; caller should persist.
+     */
+    async function pruneWorkspaceOnSchemaChange(docId, schema) {
+      if (!docId || !window.formSuitePersist?.loadState) {
+        // No per-doc workspace yet → nothing to prune at this layer
+        return {
+          values: FORM_BUILDER.getValues?.() || {},
+          tagMap: {},
+          rules: []
+        };
+      }
+
+      const st = await window.formSuitePersist.loadState(docId) || {};
+      const valid = getValidFieldIds(schema);
+
+      // values: keep only keys that are valid field ids
+      const values = {};
+      const srcValues = st.values || {};
+      Object.keys(srcValues || {}).forEach(k => {
+        if (valid.has(k)) values[k] = srcValues[k];
+      });
+
+      // tagMap: drop any tag → fieldId mapping pointing at a deleted field
+      const tagMap = {};
+      const srcTagMap = st.tagMap || {};
+      Object.keys(srcTagMap || {}).forEach(tag => {
+        const fid = srcTagMap[tag];
+        if (valid.has(fid)) tagMap[tag] = fid;
+      });
+
+      // rules: drop any rule whose primary fieldId is gone.
+      // Also defensively prune rule.conditions entries that reference deleted fields.
+      const srcRules = Array.isArray(st.rules) ? st.rules : [];
+      const rules = [];
+      for (const r of srcRules) {
+        const rr = deepClone(r);
+        if (!rr || !valid.has(String(rr.fieldId || ''))) continue; // drop entire rule
+
+        if (Array.isArray(rr.conditions)) {
+          rr.conditions = rr.conditions.filter(c => {
+            if (!c) return false;
+            // If a condition targets another field, drop if that field is gone.
+            const refId = c.fieldId || c.leftFieldId || c.rightFieldId;
+            return !refId || valid.has(String(refId));
+          });
+        }
+        rules.push(rr);
+      }
+
+      return { values, tagMap, rules };
+    }
+
+    /**
+     * Migrate workspace state when a field was renamed from oldId → newId.
+     * We update values, tagMap, and rules (field targets & condition references).
+     * Returns { values, tagMap, rules } (migrated) without saving; caller should persist.
+     */
+    async function migrateWorkspaceOnFieldRename(docId, oldId, newId) {
+      if (!docId || !oldId || !newId || oldId === newId) return null;
+      const st = await window.formSuitePersist.loadState?.(docId) || {};
+
+      // values
+      const values = deepClone(st.values || {});
+      if (Object.prototype.hasOwnProperty.call(values, oldId) && !Object.prototype.hasOwnProperty.call(values, newId)) {
+        values[newId] = values[oldId];
+        delete values[oldId];
+      }
+
+      // tagMap
+      const tagMap = deepClone(st.tagMap || {});
+      Object.keys(tagMap).forEach(tag => {
+        if (tagMap[tag] === oldId) tagMap[tag] = newId;
+      });
+
+      // rules
+      const rules = Array.isArray(st.rules) ? deepClone(st.rules) : [];
+      for (const r of rules) {
+        if (r?.fieldId === oldId) r.fieldId = newId;
+        if (Array.isArray(r?.conditions)) {
+          r.conditions.forEach(c => {
+            if (!c) return;
+            if (c.fieldId === oldId) c.fieldId = newId;
+            if (c.leftFieldId === oldId) c.leftFieldId = newId;
+            if (c.rightFieldId === oldId) c.rightFieldId = newId;
+          });
+        }
+      }
+
+      return { values, tagMap, rules };
+    }
+
+
     // ---------- Helpers ----------
     function saveLS(schema) {
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(schema)); } catch {}
@@ -786,13 +895,17 @@
       return f;
     }
 
-    function upsertField() {
+    async function upsertField() {
       const f = parseFieldFromInputs();
       if (!f) return;
+
       const i = FORM_BUILDER.selectedIndex;
-      if (i >= 0) {
-        // Update
-        const oldId = FORM_BUILDER.schema.fields[i].id;
+      const isUpdate = i >= 0;
+
+      let oldId = null;
+      if (isUpdate) {
+        oldId = FORM_BUILDER.schema.fields[i].id;
+        // Uniqueness check (allow same index to keep its id)
         if (f.id !== oldId && FORM_BUILDER.schema.fields.some(x => x.id === f.id)) {
           alert('Field id must be unique.');
           return;
@@ -800,7 +913,6 @@
         FORM_BUILDER.schema.fields[i] = f;
         setStatus('Field updated', true);
       } else {
-        // Add
         if (FORM_BUILDER.schema.fields.some(x => x.id === f.id)) {
           alert('Field id must be unique.');
           return;
@@ -808,19 +920,26 @@
         FORM_BUILDER.schema.fields.push(f);
         setStatus('Field added', true);
       }
+
       clearEditor();
       renderFields();
-      mirror(true);
+
+      // Single save path with migrate (if rename) and prune
+      await mirror(true, { renamedFrom: oldId, renamedTo: isUpdate ? f.id : null });
     }
 
-    function deleteSelected() {
+    async function deleteSelected() {
       const i = FORM_BUILDER.selectedIndex;
       if (i < 0) return;
+
       FORM_BUILDER.schema.fields.splice(i, 1);
       clearEditor();
       renderFields();
-      mirror(true);
+
+      // mirror() will prune values/tagMap/rules for removed fields
+      await mirror(true);
     }
+
 
     function clearEditor() {
       FORM_BUILDER.selectedIndex = -1;
@@ -848,28 +967,49 @@
     }
 
     // ---------- Persistence ----------
-    async function mirror(notify) {
+    async function mirror(notify, opts = {}) {
       if (els.formTitle.value && FORM_BUILDER.schema) {
         FORM_BUILDER.schema.title = els.formTitle.value;
       }
       const nowIso = new Date().toISOString();
 
-      // Always keep a local backup copy
+      // Always keep a local backup copy of the schema
       saveLS(FORM_BUILDER.schema);
 
-      if (currentDoc?.docId) {
-        await window.formSuitePersist.saveState(currentDoc.docId, {
-          schema: FORM_BUILDER.getSchema(),
-          values: FORM_BUILDER.getValues() || {},
-          schemaUpdatedAt: nowIso
-        });
-        broadcastSchemaUpdated(currentDoc.docId);
-        if (notify) setStatus('Saved.', 1);
-      } else {
+      if (!currentDoc?.docId) {
+        // No active doc → schema only (values/rules live in per-doc workspaces)
         broadcastSchemaUpdated(null);
         if (notify) setStatus('Saved locally.', 1);
+        return;
       }
+
+      // If we renamed a field, migrate state first (values/tagMap/rules)
+      let migrated = null;
+      if (opts?.renamedFrom && opts?.renamedTo && opts.renamedFrom !== opts.renamedTo) {
+        migrated = await migrateWorkspaceOnFieldRename(currentDoc.docId, opts.renamedFrom, opts.renamedTo);
+      }
+
+      // Then prune everything against the new schema
+      const pruned = await pruneWorkspaceOnSchemaChange(currentDoc.docId, FORM_BUILDER.getSchema());
+
+      // Prefer migrated (if present), then prune again to be safe (order matters)
+      const valuesToSave = (migrated?.values) ? migrated.values : pruned.values;
+      const tagMapToSave = (migrated?.tagMap) ? migrated.tagMap : pruned.tagMap;
+      const rulesToSave  = (migrated?.rules)  ? migrated.rules  : pruned.rules;
+
+      await window.formSuitePersist.saveState(currentDoc.docId, {
+        schema: FORM_BUILDER.getSchema(),
+        values: valuesToSave || {},
+        tagMap: tagMapToSave || {},
+        rules:  rulesToSave  || [],
+        schemaUpdatedAt: nowIso
+      });
+
+      broadcastSchemaUpdated(currentDoc.docId);
+      if (notify) setStatus('Saved.', 1);
     }
+
+
 
     (async function boot(){
       try {
