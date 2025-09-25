@@ -505,6 +505,53 @@
     // =========================
     // TAG MAP / PREVIEW HELPERS
     // =========================
+
+    // ---------- Rules pruning against schema (NEW) ----------
+    function getValidFieldIdSet(schema) {
+      return new Set((schema?.fields || []).map(f => String(f.id)));
+    }
+
+    /**
+     * Keep only rules whose `fieldId` exists in the schema.
+     * Also prune condition references to non-existing fields.
+     * Targets (heading indices) are kept if they look numeric.
+     */
+    function normalizeRulesForSchema(schema, rulesIn) {
+      const rules = Array.isArray(rulesIn) ? rulesIn : [];
+      const valid = getValidFieldIdSet(schema);
+      const out = [];
+
+      for (const r of rules) {
+        if (!r) continue;
+        const fieldId = String(r.fieldId ?? r.field ?? r.whenField ?? '');
+        if (!fieldId || !valid.has(fieldId)) continue; // drop whole rule
+
+        const rr = JSON.parse(JSON.stringify(r)); // safe clone
+
+        if (Array.isArray(rr.conditions)) {
+          rr.conditions = rr.conditions.filter(c => {
+            if (!c) return false;
+            const ref = c.fieldId ?? c.leftFieldId ?? c.rightFieldId;
+            return !ref || valid.has(String(ref));
+          });
+        }
+
+        // Keep only numeric-like targets (heading indices)
+        if (Array.isArray(rr.targets)) {
+          rr.targets = rr.targets.filter(t => {
+            const key = t?.key ?? t?.idx ?? t?.id;
+            if (key == null) return false;
+            const n = Number(key);
+            return Number.isFinite(n) && n > 0;
+          });
+        }
+
+        out.push(rr);
+      }
+      return out;
+    }
+
+
     // Keep rules as-is (we could prune invalid targets later if needed)
     function normalizeRules(rules){
       return Array.isArray(rules) ? rules : [];
@@ -572,7 +619,9 @@
 
         const tagMapRaw = await getTagMapFor(gDocId);
         const wsState   = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-        const rules     = normalizeRules(wsState?.rules);
+
+        const rawRules  = normalizeRules(wsState?.rules);
+        const rules     = normalizeRulesForSchema(gSchema, rawRules);   // ✅ prune here
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, values || {}, tagMapRaw);
@@ -588,6 +637,7 @@
         tr.end({ ok:true });
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
+
 
 
     let previewTimer = null;
@@ -1183,6 +1233,7 @@
         const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
         const mergedTagMap = { ...(payload?.tagMap || {}), ...(wsTagMap || {}) };
         const mergedRules  = wsRules.length ? wsRules : normalizeRules(payload?.rules);
+        const prunedRules  = normalizeRulesForSchema(chosenSchema, mergedRules);   // ✅ prune
 
         // prune values/tagMap against the final schema
         const { values: prunedValues, tagMap: prunedTagMap } =
@@ -1191,12 +1242,12 @@
         gSchema = chosenSchema;
         gValues = prunedValues;
 
-        // 4) Persist everything (also headings for cross-tab use)
+        // 4) Persist everything (also headings...)
         await window.formSuitePersist.saveState(gDocId, {
           schema: gSchema,
           values: gValues,
           tagMap: prunedTagMap,
-          rules:  mergedRules,
+          rules:  prunedRules,             // ✅ save pruned rules
           headings: headingsParsed.flat,
           headingsTree: headingsParsed.tree,
           headingsUpdatedAt: new Date().toISOString()
@@ -1512,7 +1563,8 @@
 
         const domVals  = collectFormValues(gSchema);
         const baseVals = (restored && restored.values) ? restored.values : {};
-        const rules    = normalizeRules(restored?.rules);
+        const rawRules = normalizeRules(restored?.rules);
+        const rules    = normalizeRulesForSchema(gSchema, rawRules);        // ✅ prune here
         const tagMapRaw= restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
@@ -1586,7 +1638,8 @@
 
         const domVals   = collectFormValues(gSchema);
         const baseVals  = (restored && restored.values) ? restored.values : {};
-        const rules     = normalizeRules(restored?.rules);
+        const rawRules  = normalizeRules(restored?.rules);
+        const rules     = normalizeRulesForSchema(gSchema, rawRules);        // ✅ prune here
         const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
@@ -1595,7 +1648,7 @@
         gValues = prunedValues;
         setStatus('Preparing export…');
 
-        // 1) write CRONOS_PAYLOAD to settings.xml
+        // 1) write CRONOS_PAYLOAD
         const payload = JSON.stringify({
           title:  gSchema.title || 'Form',
           fields: gSchema.fields || [],
@@ -1690,7 +1743,8 @@
         const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
         const nextValues = (obj.values && typeof obj.values === 'object') ? obj.values : {};
         const nextTagMap = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
-        const nextRules  = normalizeRules(obj.rules);
+        const rawRules   = normalizeRules(obj.rules);
+        const nextRules  = normalizeRulesForSchema(nextSchema, rawRules);   // ✅ prune here
         const nowIso     = new Date().toISOString();
 
         const { values: prunedValues, tagMap: prunedTagMap } =
