@@ -627,11 +627,18 @@ def apply_visibility(u8, idx_to_action_json):
         if (btnExportMain) btnExportMain.disabled = true;
         return;
       }
-      const form = document.createElement('form');
-      form.style.display='grid'; form.style.gap='12px';
-      if (schema.title) { const h=document.createElement('h4'); h.textContent=schema.title; form.appendChild(h); }
 
-      // hydrate table defaults
+      const form = document.createElement('form');
+      form.style.display = 'grid';
+      form.style.gap = '12px';
+
+      if (schema.title) {
+        const h = document.createElement('h4');
+        h.textContent = schema.title;
+        form.appendChild(h);
+      }
+
+      // hydrate table defaults (✅ fix spreads)
       schema.fields.forEach(f => {
         if (f.type === 'table') {
           if (!Array.isArray(values[f.id])) {
@@ -639,35 +646,49 @@ def apply_visibility(u8, idx_to_action_json):
             const rows = Math.max(min, 0);
             values[f.id] = Array.from({ length: rows }, () => emptyRow(f));
           } else {
-            values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...r }));
+            // ensure every row has all defined columns
+            values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
           }
         }
       });
 
       // fields
       schema.fields.forEach(f => {
-        const wrap = document.createElement('div'); wrap.className='field';
-        const label = document.createElement('label'); label.htmlFor=f.id; label.textContent=f.label||f.id;
-        if (f.required){ const star=document.createElement('span'); star.textContent=' *'; star.style.color='#ef4444'; label.appendChild(star); }
+        const wrap = document.createElement('div');
+        wrap.className = 'field';
+
+        const label = document.createElement('label');
+        label.htmlFor = f.id;
+        label.textContent = f.label || f.id;
+        if (f.required) {
+          const star = document.createElement('span');
+          star.textContent = ' *';
+          star.style.color = '#ef4444';
+          label.appendChild(star);
+        }
         wrap.appendChild(label);
 
         if (f.type === 'text') {
-          const input = document.createElement('input'); input.type='text'; input.id=f.id; input.name=f.id; input.style.width='100%';
-          if (f.required) input.required=true; if (values[f.id]!=null) input.value=values[f.id];
+          const input = document.createElement('input');
+          input.type = 'text'; input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (f.required) input.required = true;
+          if (values[f.id] != null) input.value = values[f.id];
           input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
 
         } else if (f.type === 'select') {
-          const input = document.createElement('select'); input.id=f.id; input.name=f.id; input.style.width='100%';
-          (f.options||[]).forEach(v => { const o=document.createElement('option'); o.value=String(v); o.textContent=String(v); input.appendChild(o); });
-          if (f.required) input.required=true; if (values[f.id]!=null) input.value=values[f.id];
+          const input = document.createElement('select');
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          (f.options || []).forEach(v => { const o = document.createElement('option'); o.value = String(v); o.textContent = String(v); input.appendChild(o); });
+          if (f.required) input.required = true;
+          if (values[f.id] != null) input.value = values[f.id];
           input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
 
         } else if (f.type === 'multichoice') {
-          const group = document.createElement('div'); group.className='mc-group';
+          const group = document.createElement('div'); group.className = 'mc-group';
           const cur = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
-          (f.options||[]).forEach((opt, idx) => {
+          (f.options || []).forEach((opt, idx) => {
             const row = document.createElement('label');
             row.style.display = (f.layout === 'inline') ? 'inline-flex' : 'flex';
             row.style.alignItems = 'center';
@@ -691,31 +712,37 @@ def apply_visibility(u8, idx_to_action_json):
             row.appendChild(cb); row.appendChild(txt);
             group.appendChild(row);
           });
-          wrap.appendChild(group)
+          wrap.appendChild(group);
 
         } else if (f.type === 'date') {
-          const input = document.createElement('input'); input.type='text'; input.dataset.type='date'; input.dataset.format=f.dateFormat||'Y-m-d';
-          input.id=f.id; input.name=f.id; input.style.width='100%';
-          if (f.required) input.required=true; if (values[f.id]!=null) input.value=values[f.id];
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.dataset.type = 'date';
+          input.dataset.format = f.dateFormat || 'Y-m-d';
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (f.required) input.required = true;
+          if (values[f.id] != null) input.value = values[f.id];
           wrap.appendChild(input);
           const fmt = input.dataset.format || 'Y-m-d';
-          flatpickr(input, { dateFormat: fmt, allowInput:true, onChange: () => { values[f.id] = input.value; scheduleSaveState(); } });
+          flatpickr(input, { dateFormat: fmt, allowInput: true, onChange: () => { values[f.id] = input.value; scheduleSaveState(); } });
 
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
 
         } else {
-          const input = document.createElement('input'); input.type='text'; input.id=f.id; input.name=f.id; input.style.width='100%';
-          if (values[f.id]!=null) input.value=values[f.id];
+          const input = document.createElement('input');
+          input.type = 'text'; input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (values[f.id] != null) input.value = values[f.id];
           input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
         }
+
         form.appendChild(wrap);
       });
 
       // bottom bar with Export…
-      const bar = document.createElement('div'); bar.className='bar';
-      btnExportMain = document.createElement('button'); btnExportMain.type='button'; btnExportMain.className='secondary'; btnExportMain.textContent='Export…';
+      const bar = document.createElement('div'); bar.className = 'bar';
+      btnExportMain = document.createElement('button'); btnExportMain.type = 'button'; btnExportMain.className = 'secondary'; btnExportMain.textContent = 'Export…';
       btnExportMain.disabled = !currentDoc;
       btnExportMain.addEventListener('click', onExportFromOpenForm);
       bar.appendChild(btnExportMain); form.appendChild(bar);
@@ -723,87 +750,124 @@ def apply_visibility(u8, idx_to_action_json):
       mount.appendChild(form);
     }
 
+
+
     // ----- TABLE FIELD -----
     function renderTableField(container, field) {
       if (!Array.isArray(values[field.id])) values[field.id] = [];
       const data = values[field.id];
 
-      const card = document.createElement('div'); card.className='table-card'; card.style.display='grid'; card.style.gap='10px';
+      // --- Inline editor (no special card/container) ---
+      const editorWrap = document.createElement('div');
+      editorWrap.style.display = 'flex';
+      editorWrap.style.flexWrap = 'wrap';
+      editorWrap.style.gap = '10px';
 
-      const h2 = document.createElement('h4');
-      h2.textContent = (field.label || field.id) + ' — Editor';
-      h2.style.margin = '6px 0 0';
-      card.appendChild(h2);
-
-      const editorWrap = document.createElement('div'); editorWrap.className = 'compact-editor';
       const editorInputs = {};
       let editorState = emptyRow(field);
 
+      // small helper to size inputs decently without extra CSS
       const measurer = document.createElement('canvas').getContext('2d');
       function textPx(str) {
         try { measurer.font = getComputedStyle(document.body).font; } catch {}
-        const m = measurer.measureText(String(str||'')); return Math.ceil(m.width);
+        return Math.ceil(measurer.measureText(String(str || '')).width);
       }
-      function longest(arr) { return arr.reduce((a,b)=> (String(b).length > String(a).length ? String(b) : String(a)), ''); }
+      function longest(arr) {
+        return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
+      }
 
       (field.columns || []).forEach(col => {
-        const pair = document.createElement('div'); pair.className='pair';
-        const lbl = document.createElement('span'); lbl.className='lbl'; lbl.textContent = col.label || col.id;
-        let el;
+        const pair = document.createElement('label');
+        pair.style.display = 'flex';
+        pair.style.alignItems = 'center';
+        pair.style.gap = '8px';
 
+        const lbl = document.createElement('span');
+        lbl.textContent = col.label || col.id;
+
+        let el;
         if (col.type === 'select') {
           el = document.createElement('select');
-          const options = (col.options || []);
-          const emptyOpt = document.createElement('option'); emptyOpt.value=''; emptyOpt.textContent='— wählen —'; el.appendChild(emptyOpt);
-          options.forEach(opt => { const o=document.createElement('option'); o.value=String(opt); o.textContent=String(opt); el.appendChild(o); });
-          const w = Math.max(140, Math.min(360, textPx(longest(options))+24+32));
-          el.style.minWidth = w + 'px';
+          const opts = (col.options || []);
+          const empty = document.createElement('option'); empty.value = ''; empty.textContent = '— wählen —';
+          el.appendChild(empty);
+          opts.forEach(opt => {
+            const o = document.createElement('option');
+            o.value = String(opt); o.textContent = String(opt);
+            el.appendChild(o);
+          });
+          el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
           el.addEventListener('change', () => { editorState[col.id] = el.value; });
-
         } else if (col.type === 'date') {
-          el = document.createElement('input'); el.type='text';
-          const w = Math.max(140, Math.min(360, textPx('YYYY-MM-DD')+20));
-          el.style.minWidth = w + 'px';
-          setTimeout(() => { flatpickr(el, { allowInput:true, dateFormat:'Y-m-d', onChange: () => { editorState[col.id] = el.value; } }); }, 0);
+          el = document.createElement('input');
+          el.type = 'text';
+          el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
+          setTimeout(() => {
+            flatpickr(el, { allowInput: true, dateFormat: 'Y-m-d', onChange: () => { editorState[col.id] = el.value; } });
+          }, 0);
           el.addEventListener('change', () => { editorState[col.id] = el.value; });
-
         } else if (col.type === 'number') {
-          el = document.createElement('input'); el.type='number';
-          const w = Math.max(120, Math.min(360, textPx('000000')+20));
-          el.style.minWidth = w + 'px';
+          el = document.createElement('input');
+          el.type = 'number';
+          el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
           el.addEventListener('change', () => { editorState[col.id] = el.value; });
-
         } else {
-          el = document.createElement('input'); el.type='text';
-          const w = Math.max(160, Math.min(360, textPx(lbl.textContent)+20));
-          el.style.minWidth = w + 'px';
+          el = document.createElement('input');
+          el.type = 'text';
+          el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
           el.addEventListener('change', () => { editorState[col.id] = el.value; });
         }
 
         editorInputs[col.id] = el;
-        pair.appendChild(lbl); pair.appendChild(el);
+        pair.appendChild(lbl);
+        pair.appendChild(el);
         editorWrap.appendChild(pair);
       });
 
-      card.appendChild(editorWrap);
+      // --- Toolbar (inline, same look/feel as other form bits) ---
+      const toolbar = document.createElement('div');
+      toolbar.className = 'row';
+      toolbar.style.gap = '8px';
 
-      const toolbar = document.createElement('div'); toolbar.className='row';
-      const btnAdd = document.createElement('button'); btnAdd.type='button'; btnAdd.className='btn-primary'; btnAdd.textContent='Zeile hinzufügen';
-      const btnSave = document.createElement('button'); btnSave.type='button'; btnSave.className='btn-secondary'; btnSave.textContent='Änderungen speichern';
-      const btnDelete = document.createElement('button'); btnDelete.type='button'; btnDelete.className='btn-danger'; btnDelete.textContent='Zeile löschen';
-      toolbar.appendChild(btnAdd); toolbar.appendChild(btnSave); toolbar.appendChild(btnDelete);
-      card.appendChild(toolbar);
+      const btnAdd = document.createElement('button');
+      btnAdd.type = 'button';
+      btnAdd.textContent = 'Zeile hinzufügen';
 
-      const status = document.createElement('div'); status.className='muted'; status.style.minHeight='1.2em'; status.style.marginTop='-4px';
-      card.appendChild(status);
+      const btnSave = document.createElement('button');
+      btnSave.type = 'button';
+      btnSave.className = 'secondary';
+      btnSave.textContent = 'Änderungen speichern';
 
-      const tableWrap = document.createElement('div'); tableWrap.style.overflow='auto';
-      const table = document.createElement('table'); table.style.width='100%'; tableWrap.appendChild(table);
-      const thead = document.createElement('thead'); const trh = document.createElement('tr'); thead.appendChild(trh); table.appendChild(thead);
-      const tbody = document.createElement('tbody'); table.appendChild(tbody);
+      const btnDelete = document.createElement('button');
+      btnDelete.type = 'button';
+      btnDelete.className = 'ghost';
+      btnDelete.textContent = 'Zeile löschen';
+
+      toolbar.appendChild(btnAdd);
+      toolbar.appendChild(btnSave);
+      toolbar.appendChild(btnDelete);
+
+      const status = document.createElement('div');
+      status.className = 'muted';
+      status.style.minHeight = '1.2em';
+
+      // --- Live table preview (now actually appended) ---
+      const tableWrap = document.createElement('div');
+      tableWrap.style.overflow = 'auto';
+      const table = document.createElement('table');
+      table.style.width = '100%';
+      const thead = document.createElement('thead');
+      const trh = document.createElement('tr');
+      thead.appendChild(trh);
+      const tbody = document.createElement('tbody');
+      table.appendChild(thead);
+      table.appendChild(tbody);
+      tableWrap.appendChild(table);
 
       (field.columns || []).forEach(col => {
-        const th = document.createElement('th'); th.textContent = col.label || col.id; trh.appendChild(th);
+        const th = document.createElement('th');
+        th.textContent = col.label || col.id;
+        trh.appendChild(th);
       });
 
       let selectedIndex = -1;
@@ -811,10 +875,17 @@ def apply_visibility(u8, idx_to_action_json):
       function drawTable() {
         tbody.innerHTML = '';
         data.forEach((row, idx) => {
-          const tr = document.createElement('tr'); tr.dataset.sel = (idx === selectedIndex) ? '1' : '';
-          tr.addEventListener('click', () => { selectedIndex = (selectedIndex === idx ? -1 : idx); drawTable(); if (selectedIndex>=0) loadIntoEditor(idx); });
+          const tr = document.createElement('tr');
+          tr.dataset.sel = (idx === selectedIndex) ? '1' : '';
+          tr.addEventListener('click', () => {
+            selectedIndex = (selectedIndex === idx ? -1 : idx);
+            drawTable();
+            if (selectedIndex >= 0) loadIntoEditor(idx);
+          });
           (field.columns || []).forEach(col => {
-            const td = document.createElement('td'); td.textContent = row[col.id] || ''; tr.appendChild(td);
+            const td = document.createElement('td');
+            td.textContent = row[col.id] || '';
+            tr.appendChild(td);
           });
           tbody.appendChild(tr);
         });
@@ -832,49 +903,70 @@ def apply_visibility(u8, idx_to_action_json):
 
       function loadIntoEditor(i) {
         const rec = data[i] || emptyRow(field);
-        for (const c of (field.columns || [])) { const el = editorInputs[c.id]; if (!el) continue; el.value = rec[c.id] || ''; }
+        for (const c of (field.columns || [])) {
+          const el = editorInputs[c.id];
+          if (!el) continue;
+          el.value = rec[c.id] || '';
+        }
         editorState = { ...rec };
         updateToolbar();
       }
 
-      if (Array.isArray(values[field.id]) && values[field.id].length) {
-        selectedIndex = 0; loadIntoEditor(0);
-      } else {
-        const min = Math.max(0, parseInt(field.minRows || 0, 10));
-        for (let i=0;i<min;i++) data.push(emptyRow(field));
-        drawTable();
-      }
-
       function resetEditor() {
         editorState = emptyRow(field);
-        for (const c of (field.columns || [])) { const el = editorInputs[c.id]; if (!el) continue; el.value = ''; }
+        for (const c of (field.columns || [])) {
+          const el = editorInputs[c.id];
+          if (!el) continue;
+          el.value = '';
+        }
       }
 
+      // initial rows (respect minRows) + first draw
+      if (!data.length) {
+        const min = Math.max(0, parseInt(field.minRows || 0, 10));
+        for (let i = 0; i < min; i++) data.push(emptyRow(field));
+      }
+      drawTable();
+      if (data.length) { selectedIndex = 0; loadIntoEditor(0); }
+
+      // actions
       btnAdd.addEventListener('click', () => {
         const max = Math.max(0, parseInt(field.maxRows || 0, 10));
         if (max && data.length >= max) return;
         data.push({ ...editorState });
-        resetEditor(); clearSelection(); drawTable(); scheduleSaveState();
+        resetEditor();
+        clearSelection();
+        drawTable();
+        scheduleSaveState();
         status.textContent = 'Zeile hinzugefügt.';
       });
+
       btnSave.addEventListener('click', () => {
         if (selectedIndex < 0 || selectedIndex >= data.length) return;
         data[selectedIndex] = { ...editorState };
-        drawTable(); scheduleSaveState();
+        drawTable();
+        scheduleSaveState();
         status.textContent = 'Änderungen gespeichert.';
       });
+
       btnDelete.addEventListener('click', () => {
         const min = Math.max(0, parseInt(field.minRows || 0, 10));
         if (selectedIndex < 0) return;
         if (min && data.length <= min) return;
         data.splice(selectedIndex, 1);
-        clearSelection(); drawTable(); scheduleSaveState();
+        clearSelection();
+        drawTable();
+        scheduleSaveState();
         status.textContent = 'Zeile gelöscht.';
       });
 
-      container.appendChild(card);
-      drawTable();
+      // append in this exact order so preview appears BELOW the buttons
+      container.appendChild(editorWrap);
+      container.appendChild(toolbar);
+      container.appendChild(status);
+      container.appendChild(tableWrap);
     }
+
 
     function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
 

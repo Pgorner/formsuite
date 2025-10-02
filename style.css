@@ -579,6 +579,84 @@ code { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
     .tdz-opts { display:flex; gap:8px; align-items:center; }
     .tdz-muted { color:var(--muted); font-size:12px; }
 
+/* --- Unified button class mapping (readable in all themes) --- */
+:root{
+  --btn-primary-bg: var(--accent, #3b82f6);
+  --btn-primary-fg: #ffffff;
+  --btn-primary-bg-hover: #2563eb;
+  --btn-primary-border: transparent;
+
+  --btn-secondary-bg: var(--accent-weak, #374151);
+  --btn-secondary-fg: var(--accent-weak-ink, #ffffff);
+  --btn-secondary-bg-hover: #2b3445;
+  --btn-secondary-border: transparent;
+
+  --btn-danger-bg: #ef4444;
+  --btn-danger-fg: #ffffff;
+  --btn-danger-bg-hover: #dc2626;
+  --btn-danger-border: transparent;
+}
+
+/* PRIMARY (covers .btn-primary and .btn .btn-primary) */
+.btn-primary,
+.btn.btn-primary,
+button.btn-primary {
+  background-color: var(--btn-primary-bg) !important;
+  color: var(--btn-primary-fg) !important;
+  border: 1px solid var(--btn-primary-border) !important;
+}
+.btn-primary:hover:not(:disabled),
+.btn.btn-primary:hover:not(:disabled),
+button.btn-primary:hover:not(:disabled) {
+  background-color: var(--btn-primary-bg-hover) !important;
+}
+
+/* SECONDARY */
+.btn-secondary,
+.btn.btn-secondary,
+button.btn-secondary {
+  background-color: var(--btn-secondary-bg) !important;
+  color: var(--btn-secondary-fg) !important;
+  border: 1px solid var(--btn-secondary-border) !important;
+}
+.btn-secondary:hover:not(:disabled),
+.btn.btn-secondary:hover:not(:disabled),
+button.btn-secondary:hover:not(:disabled) {
+  background-color: var(--btn-secondary-bg-hover) !important;
+}
+
+/* DANGER */
+.btn-danger,
+.btn.btn-danger,
+button.btn-danger {
+  background-color: var(--btn-danger-bg) !important;
+  color: var(--btn-danger-fg) !important;
+  border: 1px solid var(--btn-danger-border) !important;
+}
+.btn-danger:hover:not(:disabled),
+.btn.btn-danger:hover:not(:disabled),
+button.btn-danger:hover:not(:disabled) {
+  background-color: var(--btn-danger-bg-hover) !important;
+}
+
+/* Disabled state */
+.btn-primary:disabled,
+.btn.btn-primary:disabled,
+button.btn-primary:disabled,
+.btn-secondary:disabled,
+.btn.btn-secondary:disabled,
+button.btn-secondary:disabled,
+.btn-danger:disabled,
+.btn.btn-danger:disabled,
+button.btn-danger:disabled {
+  opacity: 0.6 !important;
+  cursor: not-allowed !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+/* Keep RULES page spacing helper */
+.btn-primary, .btn-secondary, .btn-danger { margin-right: 6px; }
 
 /* -------------------------------------------------------------
    END
