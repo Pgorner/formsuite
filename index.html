@@ -44,6 +44,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <script src="persistence.js"></script>
+  <script src="address-autocomplete.js"></script>
   <script>
     const STORAGE_KEY = 'FORM_SCHEMA_V1';
     const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
@@ -507,6 +508,29 @@ def apply_visibility(u8, idx_to_action_json):
         let v = vals?.[id];
         if (v == null) continue;
 
+        // ✅ ADDRESS: keep a structured object (upgrade legacy string -> { formatted })
+        if (f.type === 'address') {
+          if (typeof v === 'string') {
+            const s = v.trim();
+            if (s === '' && !f.required) continue;
+            out[id] = s ? { formatted: s } : { formatted: '' };
+          } else if (typeof v === 'object') {
+            const o = {
+              formatted: v.formatted || '',
+              street: v.street || '',
+              houseNumber: v.houseNumber || '',
+              postcode: v.postcode || '',
+              city: v.city || '',
+              country: v.country || '',
+              lat: (v.lat ?? null),
+              lon: (v.lon ?? null)
+            };
+            if (!o.formatted && !f.required) continue;
+            out[id] = o;
+          }
+          continue;
+        }
+
         if (f.type === 'multichoice') {
           let arr = Array.isArray(v) ? v.slice() : (typeof v === 'string' ? v.split(',') : []);
           arr = arr.map(x => String(x).trim()).filter(Boolean);
@@ -570,6 +594,7 @@ def apply_visibility(u8, idx_to_action_json):
       }
       return out;
     }
+
 
     function sanitizeTagMap(tagMap, validIds) {
       const out = {};
@@ -638,7 +663,7 @@ def apply_visibility(u8, idx_to_action_json):
         form.appendChild(h);
       }
 
-      // hydrate table defaults (✅ fix spreads)
+      // hydrate table defaults
       schema.fields.forEach(f => {
         if (f.type === 'table') {
           if (!Array.isArray(values[f.id])) {
@@ -646,7 +671,6 @@ def apply_visibility(u8, idx_to_action_json):
             const rows = Math.max(min, 0);
             values[f.id] = Array.from({ length: rows }, () => emptyRow(f));
           } else {
-            // ensure every row has all defined columns
             values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
           }
         }
@@ -657,16 +681,19 @@ def apply_visibility(u8, idx_to_action_json):
         const wrap = document.createElement('div');
         wrap.className = 'field';
 
-        const label = document.createElement('label');
-        label.htmlFor = f.id;
-        label.textContent = f.label || f.id;
-        if (f.required) {
-          const star = document.createElement('span');
-          star.textContent = ' *';
-          star.style.color = '#ef4444';
-          label.appendChild(star);
+        // ✅ Only render our own label for non-address fields (AddressAuto renders its own label)
+        if (f.type !== 'address') {
+          const label = document.createElement('label');
+          label.htmlFor = f.id;
+          label.textContent = f.label || f.id;
+          if (f.required) {
+            const star = document.createElement('span');
+            star.textContent = ' *';
+            star.style.color = '#ef4444';
+            label.appendChild(star);
+          }
+          wrap.appendChild(label);
         }
-        wrap.appendChild(label);
 
         if (f.type === 'text') {
           const input = document.createElement('input');
@@ -728,6 +755,28 @@ def apply_visibility(u8, idx_to_action_json):
 
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
+
+        } else if (f.type === 'address') {
+          // AddressAuto renders its own label, so we skipped the outer label above.
+          const mountDiv = document.createElement('div');
+          mountDiv.className = 'address-field';
+          wrap.appendChild(mountDiv);
+
+          const initial =
+            typeof values[f.id] === 'string'
+              ? { formatted: values[f.id] }
+              : (values[f.id] || null);
+
+          AddressAuto.mount(mountDiv, {
+            id: f.id,
+            label: f.label || 'Address',
+            required: !!f.required,
+            value: initial || null,
+            onChange: (val) => {
+              values[f.id] = val; // structured object or null
+              scheduleSaveState();
+            }
+          });
 
         } else {
           const input = document.createElement('input');
@@ -1019,12 +1068,14 @@ def apply_visibility(u8, idx_to_action_json):
         // 1) write CRONOS_PAYLOAD → settings.xml
         const updated = await writeDocVar(docBytes, PAYLOAD_KEY, payload);
 
-        // 2) fill SDTs
+        // 2) fill SDTs (prefer formatted string for address objects)
         const sdtMap = {};
         for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
           let v = safeValues?.[fieldId];
           if (v == null) v = '';
-          if (typeof v === 'object') { try { v = JSON.stringify(v); } catch { v = String(v); } }
+          if (typeof v === 'object') {
+            v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
+          }
           sdtMap[tag] = String(v);
         }
         let updated2 = await writeSDTs(updated, sdtMap);

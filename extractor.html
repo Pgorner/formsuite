@@ -16,6 +16,8 @@
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <!-- JSZip for JS-based SDT scanning (parity with Tag Matcher) -->
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <!-- for the autocompletion of the adress-->
+  <script src="address-autocomplete.js"></script>
 </head>
 <body>
   <header>
@@ -147,6 +149,8 @@
     let gPreferDocOnNextLoad = false;   // prefer DOCX payload only right after doOpen()
     let gFileExt = 'docx'; // 'docx' | 'docm' | 'dotx' | 'dotm'
 
+    // NEW: hold structured address values while editing
+    const __addressValues = Object.create(null);
 
     // UI refs
     const btnOpen   = document.getElementById('btnOpen');
@@ -161,7 +165,6 @@
     const btnSaveFromPreview = document.getElementById('btnSaveFromPreview');
     const previewStatus = document.getElementById('previewStatus');
     const headersTreeEl = document.getElementById('headersTree');
-    
 
     function splitNameAndExt(fileName) {
       const m = String(fileName).match(/\.(docx|docm|dotx|dotm)$/i);
@@ -179,7 +182,6 @@
         default:     return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
       }
     }
-
 
     async function sha256Hex(bufOrU8) {
       const tr = TRACE('sha256Hex', { type: (bufOrU8?.constructor?.name), len: bufOrU8?.byteLength || bufOrU8?.length });
@@ -243,11 +245,9 @@
       } catch { return null; }
     }
     function announceDocSwitch() {
-      // Single entry point for “this is the active doc now”
       persistActiveMeta({ docId: gDocId, name: gFileName });
     }
     function announceDocUpdate() {
-      // Bytes changed; keep meta as-is, but notify listeners
       try { bcLegacy?.postMessage({ type: 'doc-updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
       try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
     }
@@ -273,7 +273,6 @@
       gValues = {};
       gDirty = false;
     }
-
 
     async function hardResetDocContext(reason = '') {
       const tr = TRACE('hardResetDocContext:start', { reason, docId: gDocId });
@@ -551,8 +550,6 @@
       return out;
     }
 
-
-    // Keep rules as-is (we could prune invalid targets later if needed)
     function normalizeRules(rules){
       return Array.isArray(rules) ? rules : [];
     }
@@ -570,7 +567,6 @@
       }
       return { values: prunedValues, tagMap: prunedTagMap };
     }
-
 
     async function getTagMapFor(docId) {
       const tr = TRACE('getTagMapFor', { docId });
@@ -592,6 +588,8 @@
       catch (e) { tr.error('parse fail', e); tr.end(); return null; }
     }
 
+    // Collect values from the live form.
+    // NEW: returns structured address objects from __addressValues.
     function collectFormValues(schema) {
       const tr = TRACE('collectFormValues', { fieldCount: schema?.fields?.length || 0 });
       try {
@@ -602,6 +600,10 @@
           if (f.type === 'multichoice') {
             const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
             out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
+            continue;
+          }
+          if (f.type === 'address') {
+            out[f.id] = __addressValues[f.id] ?? null;
             continue;
           }
           const el = form.elements[f.id];
@@ -637,8 +639,6 @@
         tr.end({ ok:true });
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
-
-
 
     let previewTimer = null;
     function schedulePreviewUpdate() {
@@ -700,17 +700,8 @@
           wrap.appendChild(label);
 
           let input;
-          if (f.type === 'date') {
-            input = document.createElement('input'); input.type = 'text'; input.dataset.type = 'date'; input.dataset.format = f.dateFormat || 'Y-m-d';
-          } else if (f.type === 'select') {
-            input = document.createElement('select');
-            (f.options || []).forEach(opt => {
-              const o = document.createElement('option');
-              o.value = String(opt?.value ?? opt?.id ?? opt);
-              o.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
-              input.appendChild(o);
-            });
-          } else if (f.type === 'multichoice') {
+
+          if (f.type === 'multichoice') {
             const box = document.createElement('div');
             box.style.display = 'grid'; box.style.gap = '6px';
             (f.options || []).forEach(opt => {
@@ -728,6 +719,49 @@
             form.appendChild(wrap);
             w.end();
             continue;
+
+          } else if (f.type === 'select') {
+            input = document.createElement('select');
+            (f.options || []).forEach(opt => {
+              const o = document.createElement('option');
+              o.value = String(opt?.value ?? opt?.id ?? opt);
+              o.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
+              input.appendChild(o);
+            });
+
+          } else if (f.type === 'date') {
+            input = document.createElement('input'); input.type = 'text'; input.dataset.type = 'date'; input.dataset.format = f.dateFormat || 'Y-m-d';
+
+          // NEW: Address field mounts AddressAuto and stores structured value in __addressValues
+          } else if (f.type === 'address') {
+            const mountDiv = document.createElement('div');
+            mountDiv.className = 'address-field';
+            wrap.appendChild(mountDiv);
+
+            // Initial structured value (or upgrade from legacy string)
+            const initial =
+              typeof values?.[f.id] === 'string'
+                ? { formatted: values[f.id] }
+                : (values?.[f.id] || null);
+
+            // seed local state for collectFormValues()
+            __addressValues[f.id] = initial || null;
+
+            AddressAuto.mount(mountDiv, {
+              id: f.id,
+              label: f.label || 'Address',
+              required: !!f.required,
+              value: initial || null,
+              onChange: (val) => {
+                __addressValues[f.id] = val;     // keep full object
+                schedulePreviewUpdate();          // reflect in preview + persistence
+              }
+            });
+
+            form.appendChild(wrap);
+            w.end();
+            continue;
+
           } else {
             input = document.createElement('input'); input.type = 'text';
           }
@@ -770,7 +804,6 @@
     // =========================
     const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     function xmlText(el) {
-      // Normalize text similar to Matcher: preserve paragraphs / breaks a bit
       let s = '';
       const rec = n => {
         if (!n) return;
@@ -790,7 +823,6 @@
       try {
         if (!arrayBuffer) return { sdts: [], scan: [], total: 0 };
         const zip = await JSZip.loadAsync(arrayBuffer);
-        // Skip non-target parts for speed/parity with Matcher
         const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
         tr.step('parts', parts.map(p => p.name));
         const parser = new DOMParser();
@@ -843,7 +875,6 @@
     NS = {"w": _W_NS}
     def _q(local): return f"{{{_W_NS}}}{local}"
 
-    # -------- existing helpers --------
     def read_docvar_settings(doc_bytes: bytes, name: str) -> str | None:
         f = io.BytesIO(doc_bytes)
         with zipfile.ZipFile(f) as z:
@@ -951,7 +982,6 @@
                 zout.writestr(name, ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else data)
         return out.getvalue()
 
-    # -------- NEW: visibility helpers + apply_visibility (reset-first) --------
     def _ensure_fsHidden_style(zfin, zfout, names):
         if "word/styles.xml" in names:
             try: root = ET.fromstring(zfin.read("word/styles.xml"))
@@ -998,33 +1028,20 @@
                 ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
 
     def apply_visibility(u8, idx_to_action_json):
-        """
-        idx_to_action_json: {"12":"HIDE","13":"SHOW", ...}
-        Export semantics:
-          1) Remove our own rStyle=fsHidden everywhere (global reset → previously hidden becomes visible).
-          2) Apply HIDE to current target ranges (SHOW is effectively redundant post-reset).
-            Range = from the heading paragraph to just before next heading with level <= current level.
-        """
         try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
         except Exception: idx_to_action = {}
         data = bytes(u8)
         outbuf = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
             names = zfin.namelist()
-
-            # copy everything except styles (we rewrite after ensuring fsHidden)
             for n in names:
                 if n == "word/styles.xml": continue
                 zfout.writestr(n, zfin.read(n))
-
             _ensure_fsHidden_style(zfin, zfout, set(names))
-
             def is_doc_part(n):
                 if not (n.startswith("word/") and n.endswith(".xml")): return False
                 skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
                 return n not in skip and not n.startswith("word/_rels/")
-
-            # PASS 1: global reset (remove fsHidden rStyle everywhere)
             parts_roots = {}
             for n in names:
                 if not is_doc_part(n): continue
@@ -1039,8 +1056,6 @@
                         if rs.get(_q("val")) == "fsHidden":
                             rpr.remove(rs)
                 parts_roots[n] = root
-
-            # PASS 2: apply current HIDE ranges
             global_idx = 0
             for n in names:
                 if not is_doc_part(n): continue
@@ -1049,7 +1064,6 @@
                 body = root.find(_q("body"))
                 if body is None:
                     zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
-
                 elems = []
                 for ch in list(body):
                     if ch.tag == _q("p"):
@@ -1059,16 +1073,14 @@
                         elems.append((ch, "tbl", None))
                     else:
                         elems.append((ch, "other", None))
-
                 heading_positions = []
                 for i,(el,t,lvl) in enumerate(elems):
                     if t == "p" and lvl is not None:
                         global_idx += 1
                         heading_positions.append((i, lvl, global_idx))
-
                 for h_i, (pos, lvl, idx) in enumerate(heading_positions):
                     act = idx_to_action.get(idx)
-                    if act != "HIDE":  # SHOW/no action = already visible post-reset
+                    if act != "HIDE":
                         continue
                     start = pos + 1
                     if h_i + 1 < len(heading_positions):
@@ -1084,17 +1096,13 @@
                         el, t, _lvl = elems[j]
                         if t in ("p","tbl"):
                             _apply_rStyle_hidden_to_runs(el)
-
                 zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
-
         return outbuf.getvalue()
         `);
         tr.end('pyodide ready');
         return py;
       } catch (e) { tr.error('bootstrap failed', e); tr.end(); throw e; }
     })();
-
-    
 
     async function readDocVarSettings(arrayBufferOrBytes, name) {
       const tr = TRACE('readDocVarSettings', { name });
@@ -1133,7 +1141,6 @@
         return txt;
       } catch (e) { tr.error('failed', e); tr.end(); return null; }
     }
-
 
     async function writeDocVarSettings(arrayBufferOrBytes, name, value) {
       const tr = TRACE('writeDocVarSettings', { name, valueLen: (value||'').length });
@@ -1217,7 +1224,6 @@
         const pUpdatedTs = asTs(payload?.updatedAt);
         const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
 
-        // prefer workspace schema if newer (or if payload has none)
         let chosenSchema, statusSource;
         if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
           chosenSchema = wsSchema; statusSource = 'Using newer schema from Builder/workspace.';
@@ -1229,25 +1235,23 @@
           statusSource = 'No schema stored for this DOCX yet.';
         }
 
-        // values/tagMap/rules: merge with workspace (workspace wins)
         const mergedValues = { ...(payload?.values || {}), ...(wsValues || {}) };
         const mergedTagMap = { ...(payload?.tagMap || {}), ...(wsTagMap || {}) };
         const mergedRules  = wsRules.length ? wsRules : normalizeRules(payload?.rules);
-        const prunedRules  = normalizeRulesForSchema(chosenSchema, mergedRules);   // ✅ prune
+        const prunedRules  = normalizeRulesForSchema(chosenSchema, mergedRules);
 
-        // prune values/tagMap against the final schema
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
 
         gSchema = chosenSchema;
         gValues = prunedValues;
 
-        // 4) Persist everything (also headings...)
+        // 4) Persist everything
         await window.formSuitePersist.saveState(gDocId, {
           schema: gSchema,
           values: gValues,
           tagMap: prunedTagMap,
-          rules:  prunedRules,             // ✅ save pruned rules
+          rules:  prunedRules,
           headings: headingsParsed.flat,
           headingsTree: headingsParsed.tree,
           headingsUpdatedAt: new Date().toISOString()
@@ -1272,7 +1276,6 @@
         tr.end({ sdtCount: gSDTs.length, fieldCount: gSchema.fields.length, headings: headingsParsed.count, statusSource });
       } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
-
 
     function renderSDTsView(parsed) {
       const tr = TRACE('renderSDTsView', { total: parsed?.total, rows: parsed?.sdts?.length });
@@ -1306,7 +1309,6 @@
     (async function boot() {
       const tr = TRACE('boot');
       try {
-        // Prefer ACTIVE_LS_KEY mirror first, then persistence meta (restores across pages reliably)
         let meta = readActiveMeta();
         tr.step('readActiveMeta', meta);
         if (!meta?.docId) { meta = window.formSuitePersist?.getCurrentDocMeta?.(); tr.step('getCurrentDocMeta', meta); }
@@ -1318,7 +1320,6 @@
                 || await window.formSuitePersist.getCurrentDocBytes?.();
         tr.step('persistence bytes', { len: bytes?.byteLength || bytes?.length });
 
-        // If no bytes yet, try OPFS handle (e.g., first navigation into this page)
         if (!bytes && supportsFS) {
           try {
             const h = await window.formSuitePersist.getHandle?.(meta.docId);
@@ -1360,7 +1361,6 @@
 
         gArrayBuffer = bytes.buffer ?? bytes;
 
-        // If name/ext still unset, derive from meta.name (or default)
         if (!gFileName) {
           const { base, ext } = splitNameAndExt(meta.name || 'document.docx');
           gFileName = base || 'document';
@@ -1371,15 +1371,13 @@
         tr.step('restored', { docId: gDocId, name: `${gFileName}.${gFileExt}`, len: gArrayBuffer?.byteLength, sha: await sha256Hex(gArrayBuffer) });
 
         await renderFromCurrentBytes();
-        await updateWriteAccessBanner();   // reflect permission status on load
+        await updateWriteAccessBanner();
 
         btnSave.disabled = false; btnExport.disabled = false;
         if (btnSaveFromPreview) btnSaveFromPreview.disabled = false;
       } catch (e) { tr.error('boot failed', e); }
       finally { tr.end(); }
     })();
-
-
 
     // =========================
     // PERSIST WRAPPER
@@ -1439,7 +1437,6 @@
       const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
 
-      // reuse your sanitizeValues behavior from Form page (Extractor uses plain values)
       const cleanVals = values || {};
       const getVal = (fid) => cleanVals[fid];
 
@@ -1488,7 +1485,6 @@
       try { pyOut.destroy?.(); } catch {}
       return u8;
     }
-
 
     // =========================
     // FILE OPEN / SAVE / EXPORT
@@ -1540,7 +1536,6 @@
       } finally { tr.end(); }
     }
 
-
     async function ensureWritePermission(handle) {
       const tr = TRACE('ensureWritePermission', { haveHandle: !!handle });
       try {
@@ -1564,7 +1559,7 @@
         const domVals  = collectFormValues(gSchema);
         const baseVals = (restored && restored.values) ? restored.values : {};
         const rawRules = normalizeRules(restored?.rules);
-        const rules    = normalizeRulesForSchema(gSchema, rawRules);        // ✅ prune here
+        const rules    = normalizeRulesForSchema(gSchema, rawRules);
         const tagMapRaw= restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
@@ -1594,7 +1589,6 @@
         persistActiveMeta(metaObj);
         announceDocUpdate();
 
-        // try write-back, else download
         if (supportsFS) {
           const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
           if (handle?.createWritable) {
@@ -1614,7 +1608,6 @@
           }
         }
 
-        // Fallback: download copy with correct extension + MIME
         const mime = wordMimeFor(gFileExt);
         const blob = new Blob([updated], { type: mime });
         const a = document.createElement('a');
@@ -1639,7 +1632,7 @@
         const domVals   = collectFormValues(gSchema);
         const baseVals  = (restored && restored.values) ? restored.values : {};
         const rawRules  = normalizeRules(restored?.rules);
-        const rules     = normalizeRulesForSchema(gSchema, rawRules);        // ✅ prune here
+        const rules     = normalizeRulesForSchema(gSchema, rawRules);
         const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
@@ -1664,7 +1657,10 @@
         for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
           let v = gValues?.[fieldId];
           if (v == null) v = '';
-          if (typeof v === 'object') { try { v = JSON.stringify(v); } catch { v = String(v); } }
+          if (typeof v === 'object') {
+            // Prefer a clean line for address objects
+            v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
+          }
           sdtMap[tag] = String(v);
         }
         let updated2 = await writeSDTs(updated, sdtMap);
@@ -1679,7 +1675,7 @@
           gArrayBuffer = updated2.buffer;
         }
 
-        // 5) persist state + bytes in workspace (unchanged)
+        // 5) persist state + bytes in workspace
         if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: gValues, rules, tagMap: prunedTagMap });
         if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2);
         const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName, gFileExt);
@@ -1687,7 +1683,7 @@
         persistActiveMeta(metaObj);
         announceDocUpdate();
 
-        // 6) ALWAYS "Save As…" a new copy (match Index behavior)
+        // 6) Save As…
         const suggested = `${gFileName} (export).${gFileExt}`;
 
         if (supportsFS) {
@@ -1711,7 +1707,6 @@
           }
         }
 
-        // Fallback (no File System Access API): download copy
         const mime = wordMimeFor(gFileExt);
         const blob = new Blob([updated2], { type: mime });
         const a = document.createElement('a');
@@ -1728,7 +1723,6 @@
       }
     }
 
-
     // =========================
     // PAYLOAD PREVIEW (editable)
     // =========================
@@ -1744,7 +1738,7 @@
         const nextValues = (obj.values && typeof obj.values === 'object') ? obj.values : {};
         const nextTagMap = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
         const rawRules   = normalizeRules(obj.rules);
-        const nextRules  = normalizeRulesForSchema(nextSchema, rawRules);   // ✅ prune here
+        const nextRules  = normalizeRulesForSchema(nextSchema, rawRules);
         const nowIso     = new Date().toISOString();
 
         const { values: prunedValues, tagMap: prunedTagMap } =
@@ -1782,7 +1776,6 @@
         tr.end('applied');
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
-
 
     if (payloadEl) {
       payloadEl.addEventListener('input', () => {
@@ -1871,30 +1864,25 @@
     // =========================
     // HEADINGS (H1..H9) PARSING & TREE
     // =========================
-
     function levelFromStyleHint(str) {
       if (!str) return 0;
       const s = String(str).trim().toLowerCase();
-
-      // Language-agnostic heuristics on styleId or UI name
       const patterns = [
-        /heading\s*([1-9])/,          // English "Heading 1"
-        /überschrift\s*([1-9])/,      // German "Überschrift 1"
-        /titre\s*([1-9])/,            // French "Titre 1"
-        /t[ií]tulo\s*([1-9])/,        // Spanish/Portuguese "Título 1" / "Titulo 1"
-        /encabezado\s*([1-9])/,       // Spanish "Encabezado 1"
-        /rubrik\s*([1-9])/,           // Swedish "Rubrik 1"
-        /zagolovok\s*([1-9])/,        // Transliteration "Zagolovok 1"
-        /заголовок\s*([1-9])/,        // Russian "Заголовок 1"
+        /heading\s*([1-9])/,
+        /überschrift\s*([1-9])/,
+        /titre\s*([1-9])/,
+        /t[ií]tulo\s*([1-9])/,
+        /encabezado\s*([1-9])/,
+        /rubrik\s*([1-9])/,
+        /zagolovok\s*([1-9])/,
+        /заголовок\s*([1-9])/,
       ];
       for (const re of patterns) {
         const m = s.match(re);
         if (m) return parseInt(m[1], 10);
       }
-      // Also accept canonical Word style IDs like "Heading1"
       const m2 = s.match(/^heading([1-9])$/i);
       if (m2) return parseInt(m2[1], 10);
-
       return 0;
     }
 
@@ -1909,8 +1897,7 @@
         const parser = new DOMParser();
         const xml = parser.parseFromString(xmlTextContent, "application/xml");
 
-        // Collect basic info per style
-        const byId = {};  // id -> { id, name, basedOn, rawLevel }
+        const byId = {};
         const styles = xml.getElementsByTagNameNS(W_NS, 'style');
         for (let i = 0; i < styles.length; i++) {
           const st = styles[i];
@@ -1933,20 +1920,16 @@
               const v = outline.getAttributeNS(W_NS, 'val') || outline.getAttribute('w:val') || null;
               if (v != null && v !== '') {
                 const n = parseInt(v, 10);
-                if (Number.isFinite(n)) rawLevel = Math.min(Math.max(n + 1, 1), 9); // 0-based → 1..9
+                if (Number.isFinite(n)) rawLevel = Math.min(Math.max(n + 1, 1), 9);
               }
             }
           }
-
-          // Heuristic from id or UI name if outlineLvl missing
           if (!rawLevel) {
             rawLevel = levelFromStyleHint(id) || levelFromStyleHint(name) || 0;
           }
-
           byId[id] = { id, name, basedOn, rawLevel };
         }
 
-        // Resolve via basedOn chain (inherit heading level)
         const resolved = {};
         const resolveLevel = (id, depth = 0) => {
           if (!id || !byId[id] || depth > 12) return 0;
@@ -1958,20 +1941,17 @@
           resolved[id] = lvl || 0;
           return resolved[id];
         };
-
         Object.keys(byId).forEach(id => resolveLevel(id));
 
         tr.end({ styles: Object.keys(byId).length, mapped: Object.keys(resolved).length });
-        return resolved; // styleId -> level (1..9) or 0
+        return resolved;
       } catch (e) {
         tr.error('buildStyleOutlineMap failed', e); tr.end();
         return {};
       }
     }
 
-
     function paraText(pEl) {
-      // Extract visible text from a paragraph (joins runs; preserves soft line breaks a little)
       const ts = pEl.getElementsByTagNameNS(W_NS, 't');
       let s = '';
       for (let i = 0; i < ts.length; i++) s += ts[i].textContent;
@@ -1979,7 +1959,6 @@
     }
 
     function detectHeadingLevel(pEl, styleMap) {
-      // 1) Direct outline level on the paragraph (0-based in DOCX)
       const pPr = pEl.getElementsByTagNameNS(W_NS, 'pPr')[0];
       if (pPr) {
         const outline = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
@@ -1990,7 +1969,6 @@
             if (Number.isFinite(n)) return Math.min(Math.max(n + 1, 1), 9);
           }
         }
-        // 2) Paragraph style → level via styleMap
         const pStyle = pPr.getElementsByTagNameNS(W_NS, 'pStyle')[0];
         if (pStyle) {
           const styleId = pStyle.getAttributeNS(W_NS, 'val') || pStyle.getAttribute('w:val') || '';
@@ -2001,14 +1979,12 @@
       return 0;
     }
 
-    // Assign Word-like outline numbers to the heading tree in document order.
-    // Mutates each node by adding `num` (e.g., "3.1.2") and returns the same tree.
     function numberHeadingsTree(tree) {
       const walk = (nodes, prefix=[]) => {
         for (let i = 0; i < nodes.length; i++) {
           const n = nodes[i];
-          const current = [...prefix, i + 1];          // sibling index → 1-based
-          n.num = current.join('.');                   // e.g., "2.3.1"
+          const current = [...prefix, i + 1];
+          n.num = current.join('.');
           if (Array.isArray(n.children) && n.children.length) {
             walk(n.children, current);
           }
@@ -2018,18 +1994,15 @@
       return tree;
     }
 
-
     async function parseHeadings_JS(arrayBuffer) {
       const tr = TRACE('parseHeadings_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
       try {
         if (!arrayBuffer) return { flat: [], tree: [], count: 0 };
 
-        // ✅ Build style → outline level map from styles.xml
         const styleMap = await buildStyleOutlineMap(arrayBuffer);
         tr.step('styleMap', { entries: Object.keys(styleMap || {}).length });
 
         const zip = await JSZip.loadAsync(arrayBuffer);
-        // Scan the same content parts as SDT parser
         const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
         const parser = new DOMParser();
         const out = [];
@@ -2043,7 +2016,6 @@
             const paras = xml.getElementsByTagNameNS(W_NS, 'p');
             for (let i = 0; i < paras.length; i++) {
               const p = paras[i];
-              // ✅ pass styleMap so custom/localized heading styles resolve
               const lvl = detectHeadingLevel(p, styleMap);
               if (!lvl) continue;
               const text = paraText(p);
@@ -2071,14 +2043,11 @@
       }
     }
 
-    
-
     function buildHeadingTree(list) {
       const root = [];
-      const stack = []; // stack of nodes
+      const stack = [];
       for (const h of list) {
         const node = { level: h.level, text: h.text, part: h.part, idx: h.idx, children: [] };
-        // Pop until parent has lower level
         while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
         if (!stack.length) {
           root.push(node);
@@ -2100,7 +2069,6 @@
           tr.end('empty'); return;
         }
 
-        // ✅ Add outline numbers (1, 1.1, 1.1.1, …) in document order
         numberHeadingsTree(tree);
 
         const mk = (nodes) => {
@@ -2109,29 +2077,26 @@
           ul.style.padding = '0.1rem 0 0.1rem 0.6rem';
           for (const n of nodes) {
             const li = document.createElement('li');
-            li.style.listStyle = 'none'; // we render our own numbers
+            li.style.listStyle = 'none';
 
             const line = document.createElement('div');
             line.style.display = 'flex';
             line.style.gap = '6px';
             line.style.alignItems = 'baseline';
 
-            // Outline number (matches Navigation behavior)
             const num = document.createElement('span');
-            num.textContent = n.num;            // e.g., "3.1.12"
+            num.textContent = n.num;
             num.style.minWidth = '4ch';
             num.style.textAlign = 'right';
             num.style.fontVariantNumeric = 'tabular-nums';
             num.style.opacity = '0.9';
             num.style.fontWeight = n.level <= 2 ? '700' : '600';
 
-            // Heading text
             const text = document.createElement('span');
             text.textContent = n.text;
             text.title = `${n.part} • H${n.level}`;
             text.style.fontWeight = n.level <= 2 ? '600' : '400';
 
-            // Part (document xml part)
             const part = document.createElement('span');
             part.textContent = `· ${n.part}`;
             part.className = 'muted';
@@ -2152,7 +2117,6 @@
         tr.end('rendered');
       } catch (e) { tr.error('failed', e); tr.end(); }
     }
-
 
   </script>
 </body>
