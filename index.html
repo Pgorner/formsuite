@@ -503,83 +503,114 @@ def apply_visibility(u8, idx_to_action_json):
     function sanitizeValues(schema, vals) {
       const out = {};
       const fields = Array.isArray(schema?.fields) ? schema.fields : [];
+
       for (const f of fields) {
         const id = f.id;
         let v = vals?.[id];
-        if (v == null) {
-          // special case: datediff left empty -> skip
-          if (f.type === 'datediff') continue;
-          continue;
-        }
 
         if (f.type === 'datediff') {
-          // Keep structured object so exports can use .formatted,
-          // and rules can read .days/.months/.years if needed.
-          if (v && typeof v === 'object') {
+          const d = vals?.[id];
+          if (d && typeof d === 'object') {
             const outObj = {
-              days: Number(v.days ?? 0),
-              months: Number(v.months ?? 0),
-              years: Number(v.years ?? 0),
-              formatted: String(v.formatted ?? '')
+              days: Number(d.days ?? 0),
+              months: Number(d.months ?? 0),
+              years: Number(d.years ?? 0),
+              formatted: String(d.formatted ?? '')
             };
-            // if nothing valid, skip
-            if (!outObj.formatted) continue;
-            out[id] = outObj;
-          } else if (Number.isFinite(Number(v))) {
-            // legacy: only days number
-            const d = Number(v);
-            out[id] = { days: d, months: 0, years: 0, formatted: `${d}-0-0 (${d})` };
+            if (outObj.formatted) out[id] = outObj;
+          } else if (Number.isFinite(Number(d))) {
+            const n = Number(d);
+            out[id] = { days: n, months: 0, years: 0, formatted: `${n}-0-0 (${n})` };
           }
+          // continue loop
           continue;
         }
-
 
         // ADDRESS
         if (f.type === 'address') {
-          if (typeof v === 'string') {
-            const s = v.trim();
-            if (s === '' && !f.required) continue;
-            out[id] = s ? { formatted: s } : { formatted: '' };
-          } else if (typeof v === 'object') {
+          const vv = vals?.[id];
+          if (typeof vv === 'string') {
+            const s = vv.trim();
+            if (s || f.required) out[id] = s ? { formatted: s } : { formatted: '' };
+          } else if (vv && typeof vv === 'object') {
             const o = {
-              formatted: v.formatted || '',
-              street: v.street || '',
-              houseNumber: v.houseNumber || '',
-              postcode: v.postcode || '',
-              city: v.city || '',
-              country: v.country || '',
-              lat: (v.lat ?? null),
-              lon: (v.lon ?? null)
+              formatted: vv.formatted || '',
+              street: vv.street || '',
+              houseNumber: vv.houseNumber || '',
+              postcode: vv.postcode || '',
+              city: vv.city || '',
+              country: vv.country || '',
+              lat: (vv.lat ?? null),
+              lon: (vv.lon ?? null)
             };
-            if (!o.formatted && !f.required) continue;
-            out[id] = o;
+            if (o.formatted || f.required) out[id] = o;
           }
           continue;
         }
 
+        // MULTICHOICE (now: options + conditional fields)
         if (f.type === 'multichoice') {
+          // 1) the main value remains an array of selected option values
           let arr = Array.isArray(v) ? v.slice() : (typeof v === 'string' ? v.split(',') : []);
           arr = arr.map(x => String(x).trim()).filter(Boolean);
+
+          // If classic f.options is present, filter against it; if grouped (f.mc) exists, allow any of those
+          let allowed = null;
           if (Array.isArray(f.options) && f.options.length) {
-            const allowed = new Set(f.options.map(String));
-            arr = arr.filter(x => allowed.has(String(x)));
+            allowed = new Set(f.options.map(String));
+          } else if (f.mc && Array.isArray(f.mc.groups)) {
+            allowed = new Set(
+              f.mc.groups.flatMap(g => (g.items || []).map(it => String(it.value || '')))
+            );
           }
-          if (!arr.length) continue;
-          out[id] = arr;
+          if (allowed) arr = arr.filter(x => allowed.has(String(x)));
+          if (arr.length) out[id] = arr;
+          else if (f.required) out[id] = [];
+
+          // 2) Conditional extras: persist under synthesized ids
+          if (f.mc && Array.isArray(f.mc.groups)) {
+            for (const g of f.mc.groups) {
+              for (const it of (g.items || [])) {
+                const optVal = String(it?.value || '');
+                const extras = Array.isArray(it?.fields) ? it.fields : [];
+                for (const ex of extras) {
+                  const exType = (ex?.type === 'date' || ex?.type === 'number' || ex?.type === 'text') ? ex.type : 'text';
+                  const exId   = String(ex?.id || '');
+                  if (!exId) continue;
+                  const k = mcExtraKey(f.id, optVal, exId);
+                  const raw = vals?.[k];
+
+                  if (exType === 'date') {
+                    const s = String(raw ?? '');
+                    if (s) out[k] = s; // ISO string (we already keep it as text)
+                  } else if (exType === 'number') {
+                    if (raw === '' || raw == null) continue;
+                    const num = (typeof raw === 'number') ? raw : Number(String(raw).replace(',', '.'));
+                    if (Number.isFinite(num)) out[k] = num;
+                  } else { // text
+                    const s = String(raw ?? '');
+                    if (s) out[k] = s;
+                  }
+                }
+              }
+            }
+          }
           continue;
         }
 
+        // SELECT
         if (f.type === 'select') {
           let s = Array.isArray(v) ? String(v[0] ?? '') : String(v ?? '');
           if (Array.isArray(f.options) && f.options.length) {
             const allowed = new Set(f.options.map(String));
             if (!allowed.has(s)) s = '';
           }
-          if (s === '') { if (f.required) out[id] = s; continue; }
-          out[id] = s;
+          if (s === '') { if (f.required) out[id] = s; }
+          else out[id] = s;
           continue;
         }
 
+        // NUMBER
         if (f.type === 'number') {
           if (v === '' || v == null) continue;
           const num = (typeof v === 'number') ? v : Number(String(v).replace(',', '.'));
@@ -587,11 +618,10 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        if (f.type === 'date') {
-          out[id] = String(v ?? '');
-          continue;
-        }
+        // DATE
+        if (f.type === 'date') { out[id] = String(v ?? ''); continue; }
 
+        // TABLE
         if (f.type === 'table') {
           const cols = Array.isArray(f.columns) ? f.columns : [];
           const colIds = cols.map(c => c.id);
@@ -609,18 +639,18 @@ def apply_visibility(u8, idx_to_action_json):
           while (cleaned.length < min) {
             const empty = {}; colIds.forEach(cid => empty[cid] = ''); cleaned.push(empty);
           }
-          if (!cleaned.length) continue;
-          out[id] = cleaned;
+          if (cleaned.length) out[id] = cleaned;
+          else if (f.required) out[id] = [];
           continue;
         }
 
+        // TEXT-ish default
         const s = String(v ?? '');
-        if (s === '' && !f.required) continue;
-        out[id] = s;
+        if (s || f.required) out[id] = s;
       }
+
       return out;
     }
-
 
     function sanitizeTagMap(tagMap, validIds) {
       const out = {};
@@ -752,9 +782,35 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
 
+    // --- MC helpers: stable key for a conditional sub-field of a multichoice option
+    function slugifyMc(s) {
+      return String(s || '')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+    }
+    function mcExtraKey(fieldId, optionValue, extraId) {
+      return `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
+    }
+
     // ---------- Render whole form ----------
 
     function renderForm() {
+      // local fallbacks in case helpers weren't injected elsewhere
+      const __slugifyMc = (window.slugifyMc) ? window.slugifyMc : function (s) {
+        return String(s || '')
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^a-zA-Z0-9]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .toLowerCase();
+      };
+      const __mcExtraKey = (window.mcExtraKey) ? window.mcExtraKey : function (fieldId, optionValue, extraId) {
+        return `${fieldId}__${__slugifyMc(optionValue)}__${__slugifyMc(extraId)}`;
+      };
+
       const mount = els.formMount;
       mount.innerHTML = '';
       if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
@@ -777,7 +833,7 @@ def apply_visibility(u8, idx_to_action_json):
 
       // ---------- build form container (responsive grid) ----------
       const form = document.createElement('form');
-      form.classList.add('form-grid'); // CSS: grid-template-columns: repeat(auto-fit, minmax(280px,1fr)); gap:12px 16px;
+      form.classList.add('form-grid');
 
       if (schema.title) {
         const h = document.createElement('h4');
@@ -795,10 +851,10 @@ def apply_visibility(u8, idx_to_action_json):
         const wrap = document.createElement('div');
         wrap.className = 'field';
 
-        // width hints per type (can be overridden by schema flags on fields)
+        // width hints per type
         if (f.type === 'address' || f.type === 'datediff') wrap.classList.add('span-2');
         if (f.type === 'table') wrap.classList.add('full', 'field--table');
-        if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice'); // full-row
+        if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice');
         if (f.wide === true) wrap.classList.add('span-2');
         if (f.full === true) wrap.classList.add('full');
 
@@ -853,43 +909,217 @@ def apply_visibility(u8, idx_to_action_json):
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
-        // ---- MULTICHOICE (full-row, responsive grid of checkboxes) ----
+        // ---- MULTICHOICE (groups + conditional fields + preselect/locked) ----
         } else if (f.type === 'multichoice') {
-          const group = document.createElement('div');
-          group.className = 'mc-group mc-grid'; // CSS: display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px 16px;
-
+          const host = document.createElement('div');
+          host.className = 'mc-group';
+          host.style.display = 'grid';
+          host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
+          host.style.gap = '8px 16px';
           if (Number.isFinite(+f.columns) && +f.columns > 0) {
-            group.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
+            host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
           }
 
-          const cur = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
-          (f.options || []).forEach((opt, idx) => {
-            const row = document.createElement('label');
-            row.className = 'mc-item'; // CSS: display:flex; gap:8px; align-items:flex-start; line-height:1.35;
+          // normalize items from schema
+          const items = [];
+          if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
+            f.mc.groups.forEach(g => (g.items || []).forEach(it =>
+              items.push({
+                value: String(it.value ?? it.label ?? ''),
+                alwaysSelected: !!it.alwaysSelected,
+                preselected: !!it.preselected,
+                fields: Array.isArray(it.fields) ? it.fields : []
+              })
+            ));
+          } else if (Array.isArray(f.options)) {
+            f.options.forEach(v => {
+              if (v && typeof v === 'object') {
+                items.push({
+                  value: String(v.value ?? v.label ?? ''),
+                  alwaysSelected: !!v.alwaysSelected,
+                  preselected: !!v.preselected,
+                  fields: Array.isArray(v.fields) ? v.fields : []
+                });
+              } else {
+                items.push({ value: String(v), alwaysSelected: false, preselected: false, fields: [] });
+              }
+            });
+          }
+
+          // 1) PRESELECT on first load (only when there's no saved selection yet)
+          if (!Array.isArray(values[f.id])) {
+            const initial = items
+              .filter(it => it.alwaysSelected || it.preselected)
+              .map(it => it.value);
+            if (initial.length) values[f.id] = initial.slice();
+          }
+
+          const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
+
+          function persistMainSelection() {
+            const boxes = host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
+            values[f.id] = Array.from(boxes)
+              .filter(b => b.checked)
+              .map(b => b.value);
+            scheduleSaveState();
+          }
+
+          function drawOption(item) {
+            const optVal = item.value;
+            const optId  = `${f.id}__${__slugifyMc(optVal)}`;
+            const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
+
+            // wrapper card
+            const card = document.createElement('div');
+            card.className = 'mc-item';
+            card.style.display = 'block';
+            card.style.background = 'var(--card)';
+            card.style.border = '1px solid var(--border-strong)';
+            card.style.borderRadius = '8px';
+            card.style.padding = '10px 10px';
+
+            // line 1: checkbox + label
+            const row1 = document.createElement('div');
+            row1.className = 'row';
+            row1.style.alignItems = 'center';
+            row1.style.justifyContent = 'space-between';
+            row1.style.gap = '10px';
+
+            const left = document.createElement('label');
+            left.className = 'row';
+            left.style.alignItems = 'center';
+            left.style.gap = '8px';
+            left.style.cursor = 'pointer';
+            left.setAttribute('for', optId);
 
             const cb = document.createElement('input');
             cb.type = 'checkbox';
+            cb.dataset.mc = '1';
             cb.name = f.id;
-            cb.id = `${f.id}__${idx}`;
-            cb.value = String(opt);
-            if (cur.has(String(opt))) cb.checked = true;
+            cb.id = optId;
+            cb.value = optVal;
 
-            cb.addEventListener('change', () => {
-              const boxes = group.querySelectorAll(`input[name="${CSS.escape(f.id)}"]`);
-              values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
-              scheduleSaveState();
-              if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs();
-            });
+            // 2) IMMER AUSGEWÄHLT (locked) + preselect logic
+            const locked = !!item.alwaysSelected;
+            const isPreselected = !!item.preselected;
+            cb.checked = locked || selected.has(optVal) || (!selected.size && isPreselected);
+            if (locked) cb.disabled = true;
 
             const txt = document.createElement('span');
-            txt.textContent = String(opt);
+            txt.textContent = optVal;
 
-            row.appendChild(cb);
-            row.appendChild(txt);
-            group.appendChild(row);
-          });
+            left.appendChild(cb);
+            left.appendChild(txt);
+            row1.appendChild(left);
 
-          wrap.appendChild(group);
+            // line 2: conditional fields (only render if option defines extras)
+            let extrasWrap = null;
+            if (hasExtras) {
+              extrasWrap = document.createElement('div');
+              // 4) no gap if no extras or when hidden
+              extrasWrap.style.marginTop = '0';
+              extrasWrap.style.display = (cb.checked || locked) ? '' : 'none';
+
+              function mountExtraFields() {
+                extrasWrap.innerHTML = '';
+                if (!item.fields.length) return;
+
+                // only add vertical spacing when we actually place extras
+                extrasWrap.style.marginTop = (cb.checked || locked) ? '8px' : '0';
+
+                item.fields.forEach(ex => {
+                  const exType = (ex?.type === 'date' || ex?.type === 'number' || ex?.type === 'text') ? ex.type : 'text';
+                  const exId   = String(ex?.id || '');
+                  if (!exId) return;
+                  const exKey  = __mcExtraKey(f.id, optVal, exId);
+
+                  const line = document.createElement('div');
+                  line.className = 'row';
+                  line.style.gap = '8px';
+                  line.style.alignItems = 'center';
+
+                  const lab = document.createElement('label');
+                  lab.textContent = String(ex?.label || exId);
+                  lab.style.minWidth = '120px';
+                  lab.style.color = 'var(--muted)';
+
+                  if (exType === 'date') {
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.dataset.type = 'date';
+                    input.style.minWidth = '180px';
+
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(input);
+
+                    const fp = createPrettyDatepicker(input, {
+                      dateFormat: 'Y-m-d',
+                      altInput: true,
+                      altFormat: 'D, j M Y',
+                      defaultDate: values[exKey] || null,
+                      onChange: () => { values[exKey] = input.value; scheduleSaveState(); },
+                      onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); }
+                    });
+                    fp.set('allowInput', false);
+                    if (fp.altInput) fp.altInput.readOnly = true;
+                    return;
+                  }
+
+                  const input = document.createElement('input');
+                  if (exType === 'number') {
+                    input.type = 'number';
+                    input.value = values[exKey] ?? '';
+                    input.addEventListener('change', () => {
+                      values[exKey] = Number(input.value);
+                      scheduleSaveState();
+                    });
+                  } else {
+                    input.type = 'text';
+                    input.value = values[exKey] ?? '';
+                    input.addEventListener('change', () => {
+                      values[exKey] = input.value;
+                      scheduleSaveState();
+                    });
+                  }
+
+                  extrasWrap.appendChild(line);
+                  line.appendChild(lab);
+                  line.appendChild(input);
+                });
+              }
+
+              mountExtraFields();
+
+              // 3) toggle extras visibility with selection
+              cb.addEventListener('change', () => {
+                if (locked) { cb.checked = true; return; }
+                persistMainSelection();
+                const show = cb.checked || locked;
+                extrasWrap.style.display = show ? '' : 'none';
+                extrasWrap.style.marginTop = (show && item.fields.length) ? '8px' : '0';
+              });
+            } else {
+              // no extras: still persist selection changes; ensure no gap
+              cb.addEventListener('change', () => {
+                if (locked) { cb.checked = true; return; }
+                persistMainSelection();
+              });
+            }
+
+            card.appendChild(row1);
+            if (extrasWrap) card.appendChild(extrasWrap);
+            host.appendChild(card);
+          }
+
+          items.forEach(drawOption);
+          // keep persisted array updated after initial draw (covers preselect defaults)
+          values[f.id] = Array.from(host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
+            .filter(b => b.checked)
+            .map(b => b.value);
+          scheduleSaveState();
+
+          wrap.appendChild(host);
 
         // ---- DATE ----
         } else if (f.type === 'date') {
@@ -915,7 +1145,7 @@ def apply_visibility(u8, idx_to_action_json):
           if (fp.altInput) fp.altInput.readOnly = true;
           inputRefs[f.id] = input;
 
-        // ---- ADDRESS (compact; AddressAuto draws its own label) ----
+        // ---- ADDRESS ----
         } else if (f.type === 'address') {
           const host = document.createElement('div');
           host.className = 'addr-host';
@@ -934,18 +1164,18 @@ def apply_visibility(u8, idx_to_action_json):
             onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
           });
 
-        // ---- TABLE (leave behavior untouched) ----
+        // ---- TABLE ----
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
 
-        // ---- DATEDIFF (compact readout) ----
+        // ---- DATEDIFF ----
         } else if (f.type === 'datediff') {
           const fromId = f.fromId || f.from || '';
           const toId   = f.toId   || f.to   || '';
 
           const out = document.createElement('div');
           out.id = f.id;
-          out.className = 'datediff-out'; // CSS: small padded chip style
+          out.className = 'datediff-out';
           out.setAttribute('role', 'status');
           out.setAttribute('aria-live', 'polite');
           out.textContent = '—';
@@ -953,7 +1183,7 @@ def apply_visibility(u8, idx_to_action_json):
 
           datediffRefs.push({ field: f, outEl: out, fromId, toId });
 
-        // ---- DEFAULT (text-ish) ----
+        // ---- DEFAULT ----
         } else {
           const input = document.createElement('input');
           input.type = 'text';
