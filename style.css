@@ -448,21 +448,33 @@ tr.dragging { opacity: 0.5 }
 }
 .tdz-col > input::placeholder { color:#9ca3af }
 .tdz-col > input:focus, .tdz-col > select:focus { background:#fff; border-color: var(--focus-border); box-shadow: 0 0 0 3px var(--focus-ring) }
+.tdz-col--opts { grid-column: 1 / -1; }
 .tdz-grow { flex:1 1 auto }
 .tdz-actions { align-items:center; display:flex; gap:8px; justify-content:flex-end }
 .tdz-chipwrap { display:flex; flex-wrap:wrap; gap:6px }
 .tdz-chip {
-  background:#fff;
-  border:1.5px solid var(--border);
-  border-radius:999px;
-  box-shadow: 0 1px 0 rgba(0,0,0,.02);
-  display:inline-flex;
-  gap:6px;
-  line-height: 22px;
-  padding:2px 10px;
-  align-items:center;
+  line-height: 20px;
+  padding: 2px 6px;
+  gap: 6px;
 }
-.tdz-chip button { background:transparent; border:none; cursor:pointer; font-size: 16px; line-height: 1 }
+
+.tdz-chip button {
+  background: #ef4444;       /* red */
+  color: #fff;                /* white X */
+  border: none;
+  width: 18px;                /* just a bit larger than the glyph */
+  height: 18px;
+  border-radius: 4px;
+  padding: 0;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.tdz-chip button:hover { filter: brightness(0.95); }
 .tdz-opts { align-items:center; display:flex; gap:8px }
 .tdz-muted { color:var(--muted); font-size:12px }
 

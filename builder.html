@@ -644,6 +644,7 @@
       function render() {
         if (cfg.countEl) cfg.countEl.textContent = model.length ? `· ${model.length} Spalten` : '· keine Spalten';
         if (cfg.listEl) cfg.listEl.innerHTML = '';
+
         model.forEach((col, idx) => {
           const row = document.createElement('div');
           row.className = 'tdz-row';
@@ -666,77 +667,222 @@
           const cType = document.createElement('div'); cType.className = 'tdz-col';
           cType.innerHTML = `<label class="small">Typ</label>`;
           const sel = document.createElement('select');
-          TYPES.forEach(t => { const o=document.createElement('option'); o.value=t; o.textContent=t; sel.appendChild(o); });
+          TYPES.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t; sel.appendChild(o); });
           sel.value = col.type;
           cType.appendChild(sel);
 
-          // Optionen (nur Select)
-          const cOpts = document.createElement('div'); cOpts.className = 'tdz-col tdz-grow';
+          // Actions (row-level)
+          const actions = document.createElement('div'); actions.className = 'tdz-actions';
+          const up = document.createElement('button');   up.type='button';   up.textContent='▲'; up.title='Hoch';
+          const down = document.createElement('button'); down.type='button'; down.textContent='▼'; down.title='Runter';
+          const del = document.createElement('button');  del.type='button';  del.className='danger'; del.textContent='Löschen';
+          up.addEventListener('click',   () => api.move(idx, -1));
+          down.addEventListener('click', () => api.move(idx, +1));
+          del.addEventListener('click',  () => api.remove(idx));
+          actions.appendChild(up); actions.appendChild(down); actions.appendChild(del);
+
+          // Compose header cells
+          row.appendChild(cId);
+          row.appendChild(cLabel);
+          row.appendChild(cType);
+          row.appendChild(actions);
+
+          // ===== OPTIONS (INSIDE THIS ROW, FULL-WIDTH BELOW) =====
+          const cOpts = document.createElement('div');
+          cOpts.className = 'tdz-col tdz-grow tdz-col--opts';
+          cOpts.style.gridColumn = '1 / -1';
           cOpts.innerHTML = `<label class="small">Optionen (nur bei Select)</label>`;
+
           const optWrap = document.createElement('div'); optWrap.className = 'tdz-chipwrap';
           const optAddWrap = document.createElement('div'); optAddWrap.className = 'tdz-opts';
+
           const inOpt = document.createElement('input'); inOpt.placeholder = 'Option eingeben…';
+          // Buttons: Add | Save | Cancel (Cancel visible via border)
           const btnAddOpt = document.createElement('button'); btnAddOpt.type='button'; btnAddOpt.textContent='Hinzufügen';
+
+          const btnSave = document.createElement('button'); btnSave.type='button'; btnSave.textContent='Speichern';
+          btnSave.style.display = 'none';
+
+          const btnCancel = document.createElement('button'); btnCancel.type='button'; btnCancel.textContent='Abbrechen';
+          btnCancel.style.display = 'none';
+          // make cancel a bordered "ghost" so it never blends into white
+          btnCancel.style.background = 'transparent';
+          btnCancel.style.border = '1px solid var(--border, #e5e7eb)';
+          btnCancel.style.color = 'var(--ink, #0f172a)';
+
+          let editIdx = -1;
+          function enterEdit(i) {
+            editIdx = i;
+            inOpt.value = col.options[i] ?? '';
+            btnAddOpt.style.display = 'none';
+            btnSave.style.display = '';
+            btnCancel.style.display = '';
+            inOpt.focus(); inOpt.select();
+          }
+          function exitEdit() {
+            editIdx = -1;
+            inOpt.value = '';
+            btnAddOpt.style.display = '';
+            btnSave.style.display = 'none';
+            btnCancel.style.display = 'none';
+          }
+
           btnAddOpt.addEventListener('click', () => {
-            const v = (inOpt.value||'').trim();
+            const v = (inOpt.value || '').trim();
             if (!v) return;
-            col.options = Array.from(new Set([...(col.options||[]), v]));
+            col.options = Array.from(new Set([...(col.options || []), v]));
             inOpt.value = '';
             drawChips();
             api.serializeToHidden();
           });
-          optAddWrap.appendChild(inOpt); optAddWrap.appendChild(btnAddOpt);
+          btnSave.addEventListener('click', () => {
+            const v = (inOpt.value || '').trim();
+            if (editIdx < 0 || !v) return;
+            col.options[editIdx] = v;
+            drawChips();
+            api.serializeToHidden();
+            exitEdit();
+          });
+          btnCancel.addEventListener('click', () => exitEdit());
 
+          optAddWrap.appendChild(inOpt);
+          optAddWrap.appendChild(btnAddOpt);
+          optAddWrap.appendChild(btnSave);
+          optAddWrap.appendChild(btnCancel);
+
+          // ---- chips (square-ish pill + drag reorder) ----
           function drawChips() {
             optWrap.innerHTML = '';
-            (col.options||[]).forEach((o, i) => {
-              const chip = document.createElement('span'); chip.className='tdz-chip';
-              chip.innerHTML = `<span>${escapeHtml(o)}</span>`;
-              const x = document.createElement('button'); x.type='button'; x.setAttribute('aria-label', 'Option entfernen'); x.textContent='×';
-              x.addEventListener('click', () => { col.options.splice(i,1); drawChips(); api.serializeToHidden(); });
-              chip.appendChild(x); optWrap.appendChild(chip);
+
+            let dragFrom = null;
+
+            (col.options || []).forEach((o, i) => {
+              const chip = document.createElement('span');
+              chip.className = 'tdz-chip';
+              // square-ish pill with visible gray outline
+              chip.style.borderRadius = '6px';
+              chip.style.border = '1px solid var(--border, #e5e7eb)';
+              chip.style.background = '#fff';
+              chip.style.padding = '2px 8px';
+              chip.style.display = 'inline-flex';
+              chip.style.alignItems = 'center';
+              chip.style.gap = '6px';
+
+              chip.setAttribute('draggable', 'true');
+              chip.dataset.idx = String(i);
+
+              const label = document.createElement('span');
+              label.textContent = o;
+              label.style.cursor = 'text';
+              label.addEventListener('click', () => enterEdit(i));
+
+              // compact "x" with outline (always visible)
+              const x = document.createElement('button');
+              x.type = 'button';
+              x.setAttribute('aria-label', 'Option entfernen');
+              x.textContent = '×';
+              x.style.background = 'transparent';
+              x.style.border = '1px solid var(--border, #e5e7eb)';
+              x.style.borderRadius = '4px';
+              x.style.width = '20px';
+              x.style.height = '20px';
+              x.style.lineHeight = '18px';
+              x.style.fontSize = '14px';
+              x.style.padding = '0';
+              x.style.cursor = 'pointer';
+              x.style.color = '#000';                      // black by default
+              x.addEventListener('mouseenter', () => { x.style.color = '#6b7280'; });   // grey on hover
+              x.addEventListener('mouseleave', () => { x.style.color = '#000'; });
+
+              x.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                col.options.splice(i, 1);
+                drawChips();
+                api.serializeToHidden();
+              });
+
+
+              // Drag handlers
+              chip.addEventListener('dragstart', (e) => {
+                dragFrom = i;
+                chip.classList.add('dragging');
+                try { e.dataTransfer.setData('text/plain', String(i)); } catch {}
+                e.dataTransfer.effectAllowed = 'move';
+              });
+              chip.addEventListener('dragend', () => {
+                dragFrom = null;
+                chip.classList.remove('dragging');
+                Array.from(optWrap.children).forEach(c => c.classList.remove('drop-before','drop-after'));
+              });
+              chip.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                const rect = chip.getBoundingClientRect();
+                const before = (e.clientX - rect.left) < rect.width / 2;
+                Array.from(optWrap.children).forEach(c => c.classList.remove('drop-before','drop-after'));
+                chip.classList.add(before ? 'drop-before' : 'drop-after');
+              });
+              chip.addEventListener('dragleave', () => {
+                chip.classList.remove('drop-before','drop-after');
+              });
+              chip.addEventListener('drop', (e) => {
+                e.preventDefault();
+                const from = dragFrom ?? Number(e.dataTransfer.getData('text/plain') || -1);
+                const toIdx = Number(chip.dataset.idx);
+                if (!Number.isFinite(from) || !Number.isFinite(toIdx)) return;
+
+                const rect = chip.getBoundingClientRect();
+                const before = (e.clientX - rect.left) < rect.width / 2;
+                let to = toIdx + (before ? 0 : 1);
+
+                if (from === to || from + 1 === to) { chip.classList.remove('drop-before','drop-after'); return; }
+                const arr = col.options;
+                const [moved] = arr.splice(from, 1);
+                if (to > from) to -= 1;
+                arr.splice(to, 0, moved);
+
+                chip.classList.remove('drop-before','drop-after');
+                drawChips();
+                api.serializeToHidden();
+              });
+
+              chip.appendChild(label);
+              chip.appendChild(x);
+              optWrap.appendChild(chip);
             });
+
+            // inline helper styles for drop hints
+            Array.from(optWrap.children).forEach(el => { el.style.position = 'relative'; });
+            const styleEl = document.createElement('style');
+            styleEl.textContent = `
+              .tdz-chip.drop-before { box-shadow: inset 3px 0 0 0 rgba(59,130,246,.35); }
+              .tdz-chip.drop-after  { box-shadow: inset -3px 0 0 0 rgba(59,130,246,.35); }
+              .tdz-chip.dragging    { opacity: .6; }
+            `;
+            optWrap.querySelector('style')?.remove();
+            optWrap.appendChild(styleEl);
           }
           drawChips();
 
-          // Sichtbarkeit steuern
+          // Toggle visibility of options panel based on type
           function toggleOpts() {
             cOpts.style.display = (sel.value === 'select') ? '' : 'none';
           }
           sel.addEventListener('change', () => { col.type = sel.value; toggleOpts(); api.serializeToHidden(); });
           toggleOpts();
 
-          // Actions
-          const actions = document.createElement('div'); actions.className = 'tdz-actions';
-          const up = document.createElement('button'); up.type='button'; up.textContent='▲'; up.title='Hoch';
-          const down = document.createElement('button'); down.type='button'; down.textContent='▼'; down.title='Runter';
-          const del = document.createElement('button'); del.type='button'; del.className='danger'; del.textContent='Löschen';
-
-          up.addEventListener('click', () => api.move(idx, -1));
-          down.addEventListener('click', () => api.move(idx, +1));
-          del.addEventListener('click', () => api.remove(idx));
-
-          actions.appendChild(up); actions.appendChild(down); actions.appendChild(del);
-
-          // Compose
-          row.appendChild(cId);
-          row.appendChild(cLabel);
-          row.appendChild(cType);
-          // Add options area only for select
-          if (true) {
-            const optArea = document.createElement('div');
-            optArea.appendChild(optWrap);
-            optArea.appendChild(optAddWrap);
-            cOpts.appendChild(optArea);
-          }
+          // Mount options INSIDE this row
+          cOpts.appendChild(optWrap);
+          cOpts.appendChild(optAddWrap);
           row.appendChild(cOpts);
-          row.appendChild(actions);
 
+          // Add row to list
           cfg.listEl.appendChild(row);
         });
 
         api.serializeToHidden();
       }
+
+
 
       cfg.addBtn?.addEventListener('click', () => api.addEmpty());
       return api;
