@@ -610,22 +610,36 @@ select, input { background:var(--card); border:1px solid var(--border-strong); b
 /* Multichoice */
 .field--multichoice .mc-group { display: grid; gap: 6px; grid-template-columns: 1fr }
 @media (min-width: 800px) { .field--multichoice .mc-group { grid-template-columns: repeat(2, minmax(0, 1fr)) } }
-.field--multichoice .mc-group.mc-grid { align-items: start; display: grid; gap: 8px 16px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)) }
-/* Single-line multichoice: tighter gap + perfect vertical alignment */
+/* Multichoice grid: consistent row height + centered cells */
+.field--multichoice .mc-group.mc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px 6px;
+
+  /* NEW: every row has the same min height; rows grow if any item wraps */
+  grid-auto-rows: minmax(44px, auto);
+
+  /* NEW: center each cell’s content within that row */
+  align-items: center;
+}
+
 .field--multichoice .mc-item {
-  display: inline-flex;        /* avoid baseline quirks */
-  align-items: center;         /* center control vs. text */
-  gap: 6px;                    /* a little less space (was 8px) */
-  line-height: 1.25;           /* stable text box height */
+  display: grid;
+  grid-template-columns: 1.25rem 1fr; /* checkbox column + text */
+  align-items: center;                 /* vertical centering for both */
+  gap: 2px;                            /* tighter box↔text spacing */
+  line-height: 1.35;
+  margin: 0;
 }
 
 .field--multichoice .mc-item input[type="checkbox"] {
-  margin: 0;                   /* kill default top margin */
-  position: relative;
-  top: 1px;                    /* nudge down to align with text */
-  /* If still a touch high/low, tweak to 0px or 2px for your platform */
+  margin: 0;
+  align-self: center;
 }
 
+.field--multichoice .mc-item > span {
+  align-self: center;
+}
 
 /* Datediff output chip */
 .field .datediff-out {
