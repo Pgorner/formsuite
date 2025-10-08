@@ -622,7 +622,7 @@ select, input { background:var(--card); border:1px solid var(--border-strong); b
   display: flex;              /* perfect vertical centering */
   align-items: center;
   gap: 6px;                   /* space between the box and its text */
-  line-height: 1.3;
+  line-height: 1.1;
   width: 100%;                /* stretch to full column */
   padding-right: 2px;         /* <-- keeps text from touching next column */
   box-sizing: border-box;     /* padding doesn't change layout math */
