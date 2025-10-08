@@ -826,51 +826,33 @@ def apply_visibility(u8, idx_to_action_json):
             input.dataset.type = 'date';
             input.id = f.id; input.name = f.id; input.style.width = '100%';
 
-            // keep required semantics
             if (f.required) input.required = true;
-
-            // we store ISO (Y-m-d); display uses altFormat (must include day number)
-            const displayFmt = (f.dateFormat && /[dj]/.test(f.dateFormat)) ? f.dateFormat : 'D-d-M-Y';
-
             wrap.appendChild(input);
 
             const fp = flatpickr(input, {
-              // value that we persist
-              dateFormat: 'Y-m-d',
-              // pretty, non-editable display
+              dateFormat: 'Y-m-d',     // stored value
               altInput: true,
-              altFormat: displayFmt,
-              allowInput: false,
+              altFormat: 'D-d-M-Y',    // pretty display incl. day
+              allowInput: false,       // block manual typing
               clickOpens: true,
-
-              onReady: (selected, str, inst) => {
-                // make the visible field (alt input) read-only
-                if (inst.altInput) {
-                  inst.altInput.readOnly = true;
-                  inst.altInput.setAttribute('aria-readonly', 'true');
-                }
-                // hydrate from saved ISO value
-                const iso = values[f.id];
-                if (iso) {
-                  const d = inst.parseDate(String(iso), 'Y-m-d');
-                  if (d) inst.setDate(d, false);
-                }
+              defaultDate: values[f.id] || null,
+              onReady: (_sel, _str, inst) => {
+                if (inst.altInput) inst.altInput.readOnly = true; // make visible input non-editable
               },
-
-              onChange: (selected, _str, inst) => {
-                const d = selected?.[0] || null;
-                values[f.id] = d ? inst.formatDate(d, 'Y-m-d') : '';
+              onChange: () => {
+                values[f.id] = input.value;   // persist ISO (Y-m-d)
                 scheduleSaveState();
-                recomputeDatediffs();     // ← live update diffs
+                recomputeDatediffs();         // update any datediff that uses this date
               },
-
-              onValueUpdate: (selected, _str, inst) => {
-                const d = selected?.[0] || null;
-                values[f.id] = d ? inst.formatDate(d, 'Y-m-d') : '';
+              onValueUpdate: () => {
+                values[f.id] = input.value;
                 scheduleSaveState();
                 recomputeDatediffs();
               }
             });
+            // defense in depth
+            fp.set('allowInput', false);
+            if (fp.altInput) fp.altInput.readOnly = true;
 
             inputRefs[f.id] = input;
 
@@ -936,15 +918,12 @@ def apply_visibility(u8, idx_to_action_json):
 
       mount.appendChild(form);
 
-      // ---- after form mounts: do first pass compute for datediff
+      // ---- after form mounts: compute helpers for datediff
       function getDateForField(fid) {
         const el = inputRefs[fid];
-        // Prefer flatpickr's parsed Date
+        if (!el) return null;
         const fp = el?._flatpickr;
-        if (fp && fp.selectedDates && fp.selectedDates[0] instanceof Date) {
-          return fp.selectedDates[0];
-        }
-        // Fallback to stored ISO (Y-m-d)
+        if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
         const iso = values[fid];
         if (iso) {
           const d = (window.flatpickr && window.flatpickr.parseDate)
@@ -954,7 +933,6 @@ def apply_visibility(u8, idx_to_action_json):
         }
         return null;
       }
-
 
       function recomputeDatediffs() {
         datediffRefs.forEach(({ field, outEl, fromId, toId }) => {
@@ -968,17 +946,92 @@ def apply_visibility(u8, idx_to_action_json):
           const days   = diffInDays(a, b);
           const months = diffInMonths(a, b);
           const years  = diffInYears(a, b);
-          const display = `${days}Days ${months}Months ${years}Years (${days}Days total)`; // D-M-Y (days)
-
+          const display = `${days}Days ${months}Months ${years}Years (${days}Days total)`;
           outEl.value = display;
           values[field.id] = { days, months, years, formatted: display };
         });
         scheduleSaveState();
       }
-
-      // expose so date inputs can call it
       window.recomputeDatediffs = recomputeDatediffs;
+
+      // Prevent negative ranges and keep inputs read-only
+      // Prevent negative ranges with FROM precedence
+      // Prevent non-positive ranges with FROM precedence (TO must be strictly after FROM)
+      // Strictly positive ranges with FROM precedence (TO must always be > FROM)
+      // Auto-advance TO to the next available date and show that month when FROM changes.
+      (function wireDateGuards() {
+        function nextDay(d) {
+          if (!d) return null;
+          const n = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+          n.setDate(n.getDate() + 1);
+          return n;
+        }
+
+        datediffRefs.forEach(({ fromId, toId }) => {
+          const fromEl = inputRefs[fromId];
+          const toEl   = inputRefs[toId];
+          const fpFrom = fromEl?._flatpickr;
+          const fpTo   = toEl?._flatpickr;
+          if (!fpFrom || !fpTo) return;
+
+          // click-only (defense in depth)
+          fpFrom.set('allowInput', false);
+          fpTo.set('allowInput', false);
+          if (fpFrom.altInput) fpFrom.altInput.readOnly = true;
+          if (fpTo.altInput)   fpTo.altInput.readOnly   = true;
+
+          // Core rule: TO must be strictly after FROM
+          const syncToWithFrom = (opts = { snap: true, jump: true }) => {
+            const from = fpFrom.selectedDates?.[0] || null;
+            const minForTo = nextDay(from);
+
+            // Grey out everything up to and including FROM in TO
+            fpTo.set('minDate', minForTo || null);
+
+            const toSel = fpTo.selectedDates?.[0] || null;
+
+            // If there's no TO yet but FROM exists → prefill TO with the next valid day
+            if (!toSel && minForTo) {
+              if (opts.snap) fpTo.setDate(minForTo, true); // triggers recompute
+            }
+
+            // If TO is now invalid (<= FROM) → snap forward to the next valid day
+            if (from && toSel && toSel <= from) {
+              if (opts.snap) fpTo.setDate(minForTo, true);
+            }
+
+            // Make sure TO opens focused on the first allowed date (not an old month)
+            if (minForTo && opts.jump) {
+              try { fpTo.jumpToDate(minForTo); } catch {}
+            }
+
+            if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs();
+          };
+
+          // Initial hydration (covers preloaded values)
+          syncToWithFrom({ snap: true, jump: false });
+
+          // FROM changes → enforce rule, snap TO forward, and move calendar view
+          fpFrom.config.onChange.push(() => syncToWithFrom({ snap: true, jump: true }));
+          fpFrom.config.onValueUpdate.push(() => syncToWithFrom({ snap: true, jump: true }));
+
+          // Ensure TO’s minDate/view is fresh when opening its calendar
+          fpTo.config.onOpen.push(() => syncToWithFrom({ snap: false, jump: true }));
+
+          // Recompute whenever TO changes
+          const recompute = () => {
+            if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs();
+          };
+          fpTo.config.onChange.push(recompute);
+          fpTo.config.onValueUpdate.push(recompute);
+
+          // NOTE: we do NOT constrain FROM by TO; FROM always has precedence.
+        });
+      })();
+
+
       recomputeDatediffs();
+
     }
 
 
