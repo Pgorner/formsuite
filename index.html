@@ -764,38 +764,49 @@ def apply_visibility(u8, idx_to_action_json):
     // - Month dropdown, week numbers, nicer arrows, better mobile behavior.
     // - Will add a CSS class on the first allowed day so it pops visually.
     function createPrettyDatepicker(input, extraOpts = {}) {
+      // Make sure the calendar can render above the card
+      if (!document.getElementById('fp-zindex-fix')) {
+        const st = document.createElement('style');
+        st.id = 'fp-zindex-fix';
+        st.textContent = `
+          .flatpickr-calendar { z-index: 50; } /* above .mc-item content */
+          .flatpickr-wrapper { position: relative; } /* for static positioning */
+        `;
+        document.head.appendChild(st);
+      }
+
       const baseOpts = {
-        dateFormat: 'Y-m-d',        // stored value
+        dateFormat: 'Y-m-d',
         altInput: true,
-        altFormat: 'D, j M Y',      // human display
-        allowInput: false,          // click-only
-        disableMobile: true,        // consistent look everywhere
-        static: true,               // keep the calendar anchored by input
+        altFormat: 'D, j M Y',
+        allowInput: false,
+        clickOpens: true,        // make explicit
+        disableMobile: true,
+        static: true,            // embed under the input (works with our grid)
+        wrap: false,             // we manage our own wrappers
         monthSelectorType: 'dropdown',
         weekNumbers: true,
         prevArrow: '‹',
         nextArrow: '›',
-        onReady: (sel, str, inst) => {
+        onReady: (_sel, _str, inst) => {
+          // alt input should be clickable and focusable
           if (inst.altInput) {
             inst.altInput.readOnly = true;
-            // wrap altInput to attach icon styling
+            inst.altInput.tabIndex = 0;
+            inst.altInput.style.pointerEvents = 'auto';
+            // ensure there is a positioned wrapper for static calendar
             const wrap = inst.altInput.parentElement;
-            if (wrap && !wrap.classList.contains('flatpickr-has-icon')) {
-              wrap.classList.add('flatpickr-has-icon');
+            if (wrap && !wrap.classList.contains('flatpickr-wrapper')) {
+              wrap.classList.add('flatpickr-wrapper');
+              // do not interfere with height measurements
+              if (getComputedStyle(wrap).position === 'static') {
+                wrap.style.position = 'relative';
+              }
             }
-          }
-        },
-        // Highlight the first available day (e.g., minDate) for quick visual guidance
-        onDayCreate: (dObj, dStr, fp, dayElem) => {
-          const min = fp.config.minDate ? fp.parseDate(fp.config.minDate, 'Y-m-d') : null;
-          if (!min) return;
-          // If the rendered day equals minDate, decorate it
-          const thisDate = dayElem.dateObj;
-          if (min && thisDate && thisDate.toDateString() === min.toDateString()) {
-            dayElem.classList.add('is-first-allowed');
           }
         }
       };
+
       return flatpickr(input, { ...baseOpts, ...extraOpts });
     }
 
@@ -814,612 +825,711 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     // ---------- Render whole form ----------
-function renderForm() {
-  // local fallbacks
-  const __slugifyMc = (window.slugifyMc) ? window.slugifyMc : function (s) {
-    return String(s || '')
-      .normalize('NFKD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-zA-Z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .toLowerCase();
-  };
-  const __mcExtraKey = (window.mcExtraKey) ? window.mcExtraKey : function (fieldId, optionValue, extraId) {
-    return `${fieldId}__${__slugifyMc(optionValue)}__${__slugifyMc(extraId)}`;
-  };
-
-  const mount = els.formMount;
-  mount.innerHTML = '';
-  if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
-    mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-    if (btnExportMain) btnExportMain.disabled = true;
-    return;
-  }
-
-  // hydrate defaults for tables
-  (schema.fields || []).forEach(f => {
-    if (f.type === 'table') {
-      if (!Array.isArray(values[f.id])) {
-        const min = Math.max(0, parseInt(f.minRows || 0, 10));
-        values[f.id] = Array.from({ length: min }, () => emptyRow(f));
-      } else {
-        values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
-      }
-    }
-  });
-
-  // form shell
-  const form = document.createElement('form');
-  form.classList.add('form-grid');
-
-  if (schema.title) {
-    const h = document.createElement('h4');
-    h.textContent = schema.title;
-    h.style.gridColumn = '1 / -1';
-    form.appendChild(h);
-  }
-
-  // refs
-  const inputRefs  = {};
-  const mcDateRefs = {};
-  const datediffRefs = []; // [{storeKey, outEl, resolve}]
-  const guardPairs = [];   // [{fromId, toId}]
-
-  // fields
-  (schema.fields || []).forEach(f => {
-    const wrap = document.createElement('div');
-    wrap.className = 'field';
-    if (f.type === 'address' || f.type === 'datediff') wrap.classList.add('span-2');
-    if (f.type === 'table') wrap.classList.add('full', 'field--table');
-    if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice');
-    if (f.wide === true) wrap.classList.add('span-2');
-    if (f.full === true) wrap.classList.add('full');
-
-    // label (address renders own)
-    if (f.type !== 'address') {
-      const label = document.createElement('label');
-      label.htmlFor = f.id;
-      label.textContent = f.label || f.id;
-      if (f.required) {
-        const star = document.createElement('span');
-        star.textContent = ' *';
-        star.style.color = '#ef4444';
-        label.appendChild(star);
-      }
-      wrap.appendChild(label);
-    }
-
-    // TEXT
-    if (f.type === 'text') {
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.id = f.id; input.name = f.id; input.style.width = '100%';
-      if (f.required) input.required = true;
-      if (values[f.id] != null) input.value = values[f.id];
-      input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
-      wrap.appendChild(input);
-      inputRefs[f.id] = input;
-
-    // NUMBER
-    } else if (f.type === 'number') {
-      const input = document.createElement('input');
-      input.type = 'number';
-      input.id = f.id; input.name = f.id; input.style.width = '100%';
-      if (f.required) input.required = true;
-      if (values[f.id] != null) input.value = values[f.id];
-      input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); });
-      wrap.appendChild(input);
-      inputRefs[f.id] = input;
-
-    // SELECT
-    } else if (f.type === 'select') {
-      const input = document.createElement('select');
-      input.id = f.id; input.name = f.id; input.style.width = '100%';
-      (f.options || []).forEach(v => {
-        const o = document.createElement('option');
-        o.value = String(v); o.textContent = String(v);
-        input.appendChild(o);
-      });
-      if (f.required) input.required = true;
-      if (values[f.id] != null) input.value = values[f.id];
-      input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
-      wrap.appendChild(input);
-      inputRefs[f.id] = input;
-
-    // MULTICHOICE
-    } else if (f.type === 'multichoice') {
-      const host = document.createElement('div');
-      host.className = 'mc-group';
-      host.style.display = 'grid';
-      host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
-      host.style.gap = '8px 16px';
-      host.style.alignItems = 'start'; // keep each card's natural height
-      if (Number.isFinite(+f.columns) && +f.columns > 0) {
-        host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
-      }
-
-      // normalize items
-      const items = [];
-      if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
-        f.mc.groups.forEach(g => (g.items || []).forEach(it =>
-          items.push({
-            value: String(it.value ?? it.label ?? ''),
-            alwaysSelected: !!it.alwaysSelected,
-            preselected: !!it.preselected,
-            fields: Array.isArray(it.fields) ? it.fields : []
-          })
-        ));
-      } else if (Array.isArray(f.options)) {
-        f.options.forEach(v => {
-          if (v && typeof v === 'object') {
-            items.push({
-              value: String(v.value ?? v.label ?? ''),
-              alwaysSelected: !!v.alwaysSelected,
-              preselected: !!v.preselected,
-              fields: Array.isArray(v.fields) ? v.fields : []
-            });
-          } else {
-            items.push({ value: String(v), alwaysSelected: false, preselected: false, fields: [] });
+    function renderForm() {
+      // --- one-time CSS for caret + collapse animation ---
+      (function injectMcStyles(){
+        const ID = 'mc-caret-styles';
+        if (document.getElementById(ID)) return;
+        const s = document.createElement('style');
+        s.id = ID;
+        s.textContent = `
+          .mc-item { position: relative; }
+          .mc-toggle {
+            all: unset;
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+            margin: 0;
+            pointer-events: auto;
           }
-        });
-      }
-
-      // default selections
-      if (!Array.isArray(values[f.id])) {
-        const initial = items.filter(it => it.alwaysSelected || it.preselected).map(it => it.value);
-        if (initial.length) values[f.id] = initial.slice();
-      }
-      const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
-
-      function persistMainSelection() {
-        const boxes = host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
-        values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
-        scheduleSaveState();
-      }
-
-      function drawOption(item) {
-        const optVal = item.value;
-        const optId  = `${f.id}__${__slugifyMc(optVal)}`;
-        const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
-
-        // CARD — stack children vertically so extras are BELOW header
-        const card = document.createElement('div');
-        card.className = 'mc-item';
-        card.style.display = 'flex';
-        card.style.flexDirection = 'column';
-        card.style.alignItems = 'stretch';
-        card.style.background = 'var(--card)';
-        card.style.border = '1px solid var(--border-strong)';
-        card.style.borderRadius = '8px';
-        card.style.padding = '10px 10px';
-
-        // HEADER ROW (checkbox + text only)
-        const row1 = document.createElement('div');
-        row1.className = 'row';
-        row1.style.alignItems = 'center';
-        row1.style.justifyContent = 'flex-start'; // don't reserve space on the right
-        row1.style.gap = '8px';
-        row1.style.width = '100%';
-
-        const left = document.createElement('label');
-        left.className = 'row';
-        left.style.alignItems = 'center';
-        left.style.gap = '8px';
-        left.style.cursor = 'pointer';
-        left.setAttribute('for', optId);
-
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.dataset.mc = '1';
-        cb.name = f.id;
-        cb.id = optId;
-        cb.value = optVal;
-
-        const locked = !!item.alwaysSelected;
-        const isPreselected = !!item.preselected;
-        cb.checked = locked || selected.has(optVal) || (!selected.size && isPreselected);
-        if (locked) cb.disabled = true;
-
-        const txt = document.createElement('span');
-        txt.textContent = optVal;
-
-        left.appendChild(cb);
-        left.appendChild(txt);
-        row1.appendChild(left);
-
-        // EXTRAS (always below header)
-        let extrasWrap = null;
-        if (hasExtras) {
-          extrasWrap = document.createElement('div');
-          extrasWrap.style.display = (cb.checked || locked) ? 'grid' : 'none';
-          extrasWrap.style.gridTemplateColumns = '1fr';
-          extrasWrap.style.rowGap = '8px';
-          extrasWrap.style.marginTop = (cb.checked || locked) ? '8px' : '0';
-          extrasWrap.style.paddingBottom = '2px';
-          extrasWrap.style.width = '100%';
-
-          function mountExtraFields() {
-            extrasWrap.innerHTML = '';
-            if (!item.fields.length) return;
-
-            item.fields.forEach(ex => {
-              const exType = (ex?.type) ? String(ex.type) : 'text';
-              const exId   = String(ex?.id || '');
-              if (!exId) return;
-              const exKey  = __mcExtraKey(f.id, optVal, exId);
-
-              const line = document.createElement('div');
-              line.className = 'row';
-              line.style.gap = '8px';
-              line.style.alignItems = 'center';
-              line.style.marginTop = '2px';
-
-              const lab = document.createElement('label');
-              lab.textContent = String(ex?.label || exId);
-              lab.style.minWidth = '120px';
-              lab.style.color = 'var(--muted)';
-
-              if (exType === 'date') {
-                const input = document.createElement('input');
-                input.type = 'text';
-                input.dataset.type = 'date';
-                input.style.minWidth = '180px';
-
-                extrasWrap.appendChild(line);
-                line.appendChild(lab);
-                line.appendChild(input);
-
-                const fp = createPrettyDatepicker(input, {
-                  dateFormat: 'Y-m-d',
-                  altInput: true,
-                  altFormat: 'D, j M Y',
-                  defaultDate: values[exKey] || null,
-                  onChange: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
-                  onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
-                });
-                fp.set('allowInput', false);
-                if (fp.altInput) fp.altInput.readOnly = true;
-
-                mcDateRefs[exKey] = input;
-                return;
-              }
-
-              if (exType === 'datediff') {
-                const lineOut = document.createElement('span');
-                lineOut.className = 'kbd datediff-out';
-                lineOut.style.whiteSpace = 'nowrap';
-                lineOut.textContent = '—';
-
-                lab.textContent = ex.label || 'Dauer';
-
-                extrasWrap.appendChild(line);
-                line.appendChild(lab);
-                line.appendChild(lineOut);
-
-                function readLocalMcDate(extraId) {
-                  const key = __mcExtraKey(f.id, optVal, extraId);
-                  const el = mcDateRefs[key];
-                  if (el && el._flatpickr?.selectedDates?.[0] instanceof Date) return el._flatpickr.selectedDates[0];
-                  const iso = values[key];
-                  if (!iso) return null;
-                  const d = (window.flatpickr && window.flatpickr.parseDate)
-                    ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
-                    : new Date(String(iso));
-                  return (d && !isNaN(d)) ? d : null;
-                }
-
-                datediffRefs.push({
-                  storeKey: exKey,
-                  outEl: lineOut,
-                  resolve: () => {
-                    const a = readLocalMcDate(ex.fromId) ?? getDateForField(ex.fromId);
-                    const b = readLocalMcDate(ex.toId)   ?? getDateForField(ex.toId);
-                    return { a, b };
-                  }
-                });
-
-                const fromLocalKey = __mcExtraKey(f.id, optVal, ex.fromId);
-                const toLocalKey   = __mcExtraKey(f.id, optVal, ex.toId);
-                const fromEl = mcDateRefs[fromLocalKey];
-                const toEl   = mcDateRefs[toLocalKey];
-                if (fromEl?._flatpickr && toEl?._flatpickr) {
-                  const fpFrom = fromEl._flatpickr;
-                  const fpTo   = toEl._flatpickr;
-                  const nextDay = (d) => { if (!d) return null; const n = new Date(d.getFullYear(), d.getMonth(), d.getDate()); n.setDate(n.getDate()+1); return n; };
-
-                  const syncToWithFrom = () => {
-                    const from = fpFrom.selectedDates?.[0] || null;
-                    const minForTo = nextDay(from);
-                    fpTo.set('minDate', minForTo || null);
-                    const toSel = fpTo.selectedDates?.[0] || null;
-                    if (!toSel && minForTo) fpTo.setDate(minForTo, true);
-                    if (from && toSel && toSel <= from) fpTo.setDate(minForTo, true);
-                    if (window.recomputeDatediffs) window.recomputeDatediffs();
-                  };
-
-                  syncToWithFrom();
-                  fpFrom.config.onChange.push(syncToWithFrom);
-                  fpFrom.config.onValueUpdate.push(syncToWithFrom);
-                  const bump = () => window.recomputeDatediffs && window.recomputeDatediffs();
-                  fpTo.config.onChange.push(bump);
-                  fpTo.config.onValueUpdate.push(bump);
-                }
-                return;
-              }
-
-              if (exType === 'number') {
-                const input = document.createElement('input');
-                input.type = 'number';
-                input.value = values[exKey] ?? '';
-                input.addEventListener('change', () => {
-                  values[exKey] = Number(input.value);
-                  scheduleSaveState();
-                });
-                extrasWrap.appendChild(line);
-                line.appendChild(lab);
-                line.appendChild(input);
-                return;
-              }
-
-              if (exType === 'duration') {
-                const unit = ['days','months','years','hours'].includes(ex?.unit) ? ex.unit : 'days';
-                const current = values[exKey];
-                const initial = (current && typeof current === 'object' && current.value != null)
-                  ? current.value
-                  : (ex.default != null ? ex.default : '');
-
-                const num = document.createElement('input');
-                num.type = 'number';
-                num.min = '0';
-                num.style.minWidth = '120px';
-                num.value = initial;
-
-                const unitBadge = document.createElement('span');
-                unitBadge.className = 'kbd';
-                unitBadge.textContent = unit;
-
-                num.addEventListener('change', () => {
-                  const v = num.value.trim();
-                  if (v === '') {
-                    delete values[exKey];
-                  } else {
-                    const n = Number(v);
-                    if (Number.isFinite(n)) values[exKey] = { value: n, unit };
-                  }
-                  scheduleSaveState();
-                });
-
-                extrasWrap.appendChild(line);
-                line.appendChild(lab);
-                line.appendChild(num);
-                line.appendChild(unitBadge);
-                return;
-              }
-
-              // default text
-              const input = document.createElement('input');
-              input.type = 'text';
-              input.value = values[exKey] ?? '';
-              input.addEventListener('change', () => {
-                values[exKey] = input.value;
-                scheduleSaveState();
-              });
-
-              extrasWrap.appendChild(line);
-              line.appendChild(lab);
-              line.appendChild(input);
-            });
+          .mc-toggle:focus-visible {
+            outline: 2px solid var(--focus, #2563eb);
+            outline-offset: 2px;
+            border-radius: 4px;
           }
+          .mc-caret {
+            width: 14px;
+            height: 14px;
+            transition: transform .18s ease, opacity .18s ease;
+            opacity: .85;
+            transform: rotate(0deg);
+            display: block;
+          }
+          .mc-caret.open { transform: rotate(90deg); }
 
-          mountExtraFields();
+          /* Keep this simple; JS controls height/display during animation */
+          .mc-extras {
+            display: none;     /* collapsed = removed from flow */
+            height: 0;         /* safety for measure/animate */
+            grid-template-columns: 1fr;
+            row-gap: 8px;
+            padding-bottom: 2px;
+            width: 100%;
+          }
+          .mc-extras.open { }
+        `;
+        document.head.appendChild(s);
+      })();
 
-          cb.addEventListener('change', () => {
-            if (locked) { cb.checked = true; return; }
-            persistMainSelection();
-            const show = cb.checked || locked;
-            extrasWrap.style.display = show ? 'grid' : 'none';
-            extrasWrap.style.marginTop = (show && (item.fields || []).length) ? '8px' : '0';
-          });
-        } else {
-          cb.addEventListener('change', () => {
-            if (locked) { cb.checked = true; return; }
-            persistMainSelection();
-          });
-        }
-
-        card.appendChild(row1);
-        if (extrasWrap) card.appendChild(extrasWrap);
-        host.appendChild(card);
-      }
-
-      items.forEach(drawOption);
-      values[f.id] = Array.from(host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
-        .filter(b => b.checked)
-        .map(b => b.value);
-      scheduleSaveState();
-
-      wrap.appendChild(host);
-
-    // DATE
-    } else if (f.type === 'date') {
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.dataset.type = 'date';
-      input.id = f.id; input.name = f.id; input.style.width = '100%';
-      if (f.required) input.required = true;
-      wrap.appendChild(input);
-
-      const fp = createPrettyDatepicker(input, {
-        dateFormat: 'Y-m-d',
-        altInput: true,
-        altFormat: 'D-d-M-Y',
-        allowInput: false,
-        clickOpens: true,
-        defaultDate: values[f.id] || null,
-        onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
-        onChange: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
-        onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
-      });
-      fp.set('allowInput', false);
-      if (fp.altInput) fp.altInput.readOnly = true;
-      inputRefs[f.id] = input;
-
-    // ADDRESS
-    } else if (f.type === 'address') {
-      const host = document.createElement('div');
-      host.className = 'addr-host';
-      wrap.appendChild(host);
-
-      const initial =
-        typeof values[f.id] === 'string'
-          ? { formatted: values[f.id] }
-          : (values[f.id] || null);
-
-      AddressAuto.mount(host, {
-        id: f.id,
-        label: f.label || 'Address',
-        required: !!f.required,
-        value: initial || null,
-        onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
-      });
-
-    // TABLE
-    } else if (f.type === 'table') {
-      renderTableField(wrap, f);
-
-    // DATEDIFF (top-level)
-    } else if (f.type === 'datediff') {
-      const fromId = f.fromId || f.from || '';
-      const toId   = f.toId   || f.to   || '';
-
-      const out = document.createElement('div');
-      out.id = f.id;
-      out.className = 'datediff-out kbd';
-      out.setAttribute('role', 'status');
-      out.setAttribute('aria-live', 'polite');
-      out.textContent = '—';
-      wrap.appendChild(out);
-
-      datediffRefs.push({
-        storeKey: f.id,
-        outEl: out,
-        resolve: () => ({ a: getDateForField(fromId), b: getDateForField(toId) })
-      });
-
-      guardPairs.push({ fromId, toId });
-
-    // DEFAULT
-    } else {
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.id = f.id; input.name = f.id; input.style.width = '100%';
-      if (values[f.id] != null) input.value = values[f.id];
-      input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
-      wrap.appendChild(input);
-      inputRefs[f.id] = input;
-    }
-
-    form.appendChild(wrap);
-  });
-
-  // bottom bar
-  const bar = document.createElement('div');
-  bar.className = 'bar';
-  bar.style.gridColumn = '1 / -1';
-  btnExportMain = document.createElement('button');
-  btnExportMain.type = 'button';
-  btnExportMain.className = 'secondary';
-  btnExportMain.textContent = 'Export…';
-  btnExportMain.disabled = !currentDoc;
-  btnExportMain.addEventListener('click', onExportFromOpenForm);
-  bar.appendChild(btnExportMain);
-  form.appendChild(bar);
-  mount.appendChild(form);
-
-  // date helpers
-  function getDateForField(fid) {
-    const el = inputRefs[fid];
-    if (!el) return null;
-    const fp = el?._flatpickr;
-    if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
-    const iso = values[fid];
-    if (iso) {
-      const d = (window.flatpickr && window.flatpickr.parseDate)
-        ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
-        : new Date(String(iso));
-      return (d && !isNaN(d)) ? d : null;
-    }
-    return null;
-  }
-
-  // labeled datediff
-  function recomputeDatediffs() {
-    datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
-      const { a, b } = resolve();
-      if (!a || !b) {
-        outEl.textContent = '—';
-        values[storeKey] = null;
-        return;
-      }
-      const days   = diffInDays(a, b);
-      const months = diffInMonths(a, b);
-      const years  = diffInYears(a, b);
-      const display = `${days}D  ${months}M  -  ${years}Y  (${days} Days total)`;
-      outEl.textContent = display;
-      values[storeKey] = { days, months, years, formatted: display };
-    });
-    scheduleSaveState();
-  }
-  window.recomputeDatediffs = recomputeDatediffs;
-
-  // guards for top-level pairs
-  (function wireTopLevelDateGuards() {
-    function nextDay(d) {
-      if (!d) return null;
-      const n = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      n.setDate(n.getDate() + 1);
-      return n;
-    }
-    guardPairs.forEach(({ fromId, toId }) => {
-      const fromEl = inputRefs[fromId];
-      const toEl   = inputRefs[toId];
-      const fpFrom = fromEl?._flatpickr;
-      const fpTo   = toEl?._flatpickr;
-      if (!fpFrom || !fpTo) return;
-
-      fpFrom.set('allowInput', false);
-      fpTo.set('allowInput', false);
-      if (fpFrom.altInput) fpFrom.altInput.readOnly = true;
-      if (fpTo.altInput)   fpTo.altInput.readOnly   = true;
-
-      const syncToWithFrom = (opts = { snap: true, jump: true }) => {
-        const from = fpFrom.selectedDates?.[0] || null;
-        const minForTo = nextDay(from);
-        fpTo.set('minDate', minForTo || null);
-
-        const toSel = fpTo.selectedDates?.[0] || null;
-        if (!toSel && minForTo && opts.snap) fpTo.setDate(minForTo, true);
-        if (from && toSel && toSel <= from && opts.snap) fpTo.setDate(minForTo, true);
-        if (minForTo && opts.jump) { try { fpTo.jumpToDate(minForTo); } catch {} }
-
-        if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs();
+      // local fallbacks
+      const __slugifyMc = (window.slugifyMc) ? window.slugifyMc : function (s) {
+        return String(s || '')
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^a-zA-Z0-9]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .toLowerCase();
+      };
+      const __mcExtraKey = (window.mcExtraKey) ? window.mcExtraKey : function (fieldId, optionValue, extraId) {
+        return `${fieldId}__${__slugifyMc(optionValue)}__${__slugifyMc(extraId)}`;
       };
 
-      syncToWithFrom({ snap: true, jump: false });
-      fpFrom.config.onChange.push(() => syncToWithFrom({ snap: true, jump: true }));
-      fpFrom.config.onValueUpdate.push(() => syncToWithFrom({ snap: true, jump: true }));
-      fpTo.config.onOpen.push(() => syncToWithFrom({ snap: false, jump: true }));
+      const mount = els.formMount;
+      mount.innerHTML = '';
+      if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
+        mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
+        if (btnExportMain) btnExportMain.disabled = true;
+        return;
+      }
 
-      const recompute = () => { if (window.recomputeDatediffs) window.recomputeDatediffs(); };
-      fpTo.config.onChange.push(recompute);
-      fpTo.config.onValueUpdate.push(recompute);
-    });
-  })();
+      // hydrate defaults for tables
+      (schema.fields || []).forEach(f => {
+        if (f.type === 'table') {
+          if (!Array.isArray(values[f.id])) {
+            const min = Math.max(0, parseInt(f.minRows || 0, 10));
+            values[f.id] = Array.from({ length: min }, () => emptyRow(f));
+          } else {
+            values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
+          }
+        }
+      });
 
-  // initial compute
-  recomputeDatediffs();
-}
-    // ----- TABLE FIELD -----
+      // form shell
+      const form = document.createElement('form');
+      form.classList.add('form-grid');
+
+      if (schema.title) {
+        const h = document.createElement('h4');
+        h.textContent = schema.title;
+        h.style.gridColumn = '1 / -1';
+        form.appendChild(h);
+      }
+
+      // refs
+      const inputRefs  = {};
+      const mcDateRefs = {};
+      const datediffRefs = []; // [{storeKey, outEl, resolve}]
+      const guardPairs = [];   // [{fromId, toId}]
+
+      // ---------- helpers ----------
+      function scheduleSaveState() {
+        clearTimeout(scheduleSaveState._t);
+        scheduleSaveState._t = setTimeout(() => {
+          if (!currentDoc?.docId) return;
+          const cleanValues = sanitizeValues(schema, values);
+          window.formSuitePersist.saveState(currentDoc.docId, { schema, values: cleanValues });
+        }, 150);
+      }
+
+      // Animate extras open/close; collapsed = display:none so it takes no height.
+      function setExtrasOpen(extras, caretEl, open) {
+        if (!extras) return;
+        const DURATION = 220;
+
+        // cancel previous
+        if (extras._animTimer) { clearTimeout(extras._animTimer); extras._animTimer = null; }
+        if (extras._onTe) { extras.removeEventListener('transitionend', extras._onTe); extras._onTe = null; }
+
+        const onEnd = () => {
+          extras.style.transition = '';
+          extras.style.willChange = '';
+          extras.style.opacity = open ? '1' : '0';
+          extras.style.marginTop = open ? '8px' : '0px';
+          extras.style.height = open ? 'auto' : '0px';
+          extras.style.overflow = 'visible';     // keep it visible so calendars can overflow
+          if (!open) extras.style.display = 'none';
+          if (extras._onTe) {
+            extras.removeEventListener('transitionend', extras._onTe);
+            extras._onTe = null;
+          }
+        };
+        extras._onTe = onEnd;
+        extras.addEventListener('transitionend', onEnd);
+
+        if (caretEl) caretEl.classList.toggle('open', !!open);
+
+        if (open) {
+          extras.style.display = 'grid';
+          extras.style.overflow = 'visible';
+          extras.style.willChange = 'height, opacity, margin-top';
+          extras.style.opacity = '0';
+          extras.style.marginTop = '0px';
+          extras.style.height = '0px';
+
+          requestAnimationFrame(() => {
+            const h = extras.scrollHeight;
+            extras.classList.add('open');
+            extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
+            extras.style.height = h + 'px';
+            extras.style.opacity = '1';
+            extras.style.marginTop = '8px';
+            extras._animTimer = setTimeout(onEnd, DURATION + 40);
+          });
+        } else {
+          const current = extras.offsetHeight || extras.scrollHeight || 0;
+          extras.classList.remove('open');
+          extras.style.display = 'grid';
+          extras.style.overflow = 'hidden';
+          extras.style.willChange = 'height, opacity, margin-top';
+          extras.style.transition = '';
+          extras.style.height = current + 'px';
+          extras.style.opacity = '1';
+          extras.style.marginTop = '8px';
+
+          requestAnimationFrame(() => {
+            extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
+            extras.style.height = '0px';
+            extras.style.opacity = '0';
+            extras.style.marginTop = '0px';
+            extras._animTimer = setTimeout(onEnd, DURATION + 40);
+          });
+        }
+      }
+
+      // ---------- fields ----------
+      (schema.fields || []).forEach(f => {
+        const wrap = document.createElement('div');
+        wrap.className = 'field';
+        if (f.type === 'address' || f.type === 'datediff') wrap.classList.add('span-2');
+        if (f.type === 'table') wrap.classList.add('full', 'field--table');
+        if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice');
+        if (f.wide === true) wrap.classList.add('span-2');
+        if (f.full === true) wrap.classList.add('full');
+
+        // label (address renders own)
+        if (f.type !== 'address') {
+          const label = document.createElement('label');
+          label.htmlFor = f.id;
+          label.textContent = f.label || f.id;
+          if (f.required) {
+            const star = document.createElement('span');
+            star.textContent = ' *';
+            star.style.color = '#ef4444';
+            label.appendChild(star);
+          }
+          wrap.appendChild(label);
+        }
+
+        // TEXT
+        if (f.type === 'text') {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (f.required) input.required = true;
+          if (values[f.id] != null) input.value = values[f.id];
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+          wrap.appendChild(input);
+          inputRefs[f.id] = input;
+
+        // NUMBER
+        } else if (f.type === 'number') {
+          const input = document.createElement('input');
+          input.type = 'number';
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (f.required) input.required = true;
+          if (values[f.id] != null) input.value = values[f.id];
+          input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); });
+          wrap.appendChild(input);
+          inputRefs[f.id] = input;
+
+        // SELECT
+        } else if (f.type === 'select') {
+          const input = document.createElement('select');
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          (f.options || []).forEach(v => {
+            const o = document.createElement('option');
+            o.value = String(v); o.textContent = String(v);
+            input.appendChild(o);
+          });
+          if (f.required) input.required = true;
+          if (values[f.id] != null) input.value = values[f.id];
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+          wrap.appendChild(input);
+          inputRefs[f.id] = input;
+
+        // MULTICHOICE
+        } else if (f.type === 'multichoice') {
+          const host = document.createElement('div');
+          host.className = 'mc-group';
+          host.style.display = 'grid';
+          host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
+          host.style.gap = '8px 16px';
+          host.style.alignItems = 'start';
+          if (Number.isFinite(+f.columns) && +f.columns > 0) {
+            host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
+          }
+
+          // normalize items
+          const items = [];
+          if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
+            f.mc.groups.forEach(g => (g.items || []).forEach(it =>
+              items.push({
+                value: String(it.value ?? it.label ?? ''),
+                alwaysSelected: !!it.alwaysSelected,
+                preselected: !!it.preselected,
+                fields: Array.isArray(it.fields) ? it.fields : []
+              })
+            ));
+          } else if (Array.isArray(f.options)) {
+            f.options.forEach(v => {
+              if (v && typeof v === 'object') {
+                items.push({
+                  value: String(v.value ?? v.label ?? ''),
+                  alwaysSelected: !!v.alwaysSelected,
+                  preselected: !!v.preselected,
+                  fields: Array.isArray(v.fields) ? v.fields : []
+                });
+              } else {
+                items.push({ value: String(v), alwaysSelected: false, preselected: false, fields: [] });
+              }
+            });
+          }
+
+          // default selections
+          if (!Array.isArray(values[f.id])) {
+            const initial = items.filter(it => it.alwaysSelected || it.preselected).map(it => it.value);
+            if (initial.length) values[f.id] = initial.slice();
+          }
+          const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
+
+          function persistMainSelection() {
+            const boxes = host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
+            values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
+            scheduleSaveState();
+          }
+
+          function drawOption(item) {
+            const optVal = item.value;
+            const optId  = `${f.id}__${__slugifyMc(optVal)}`;
+            const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
+
+            // CARD
+            const card = document.createElement('div');
+            card.className = 'mc-item';
+            card.style.position = 'relative';
+            card.style.display = 'flex';
+            card.style.flexDirection = 'column';
+            card.style.alignItems = 'stretch';
+            card.style.background = 'var(--card)';
+            card.style.border = '1px solid var(--border-strong)';
+            card.style.borderRadius = '8px';
+            card.style.padding = '10px 10px';
+
+            // HEADER
+            const row1 = document.createElement('div');
+            row1.className = 'row';
+            row1.style.alignItems = 'center';
+            row1.style.gap = '8px';
+            row1.style.width = '100%';
+
+            const left = document.createElement('label');
+            left.className = 'row';
+            left.style.alignItems = 'center';
+            left.style.gap = '8px';
+            left.style.cursor = 'pointer';
+            left.setAttribute('for', optId);
+            left.style.flex = '1';
+
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.dataset.mc = '1';
+            cb.name = f.id;
+            cb.id = optId;
+            cb.value = optVal;
+
+            const locked = !!item.alwaysSelected;
+            const isPreselected = !!item.preselected;
+            cb.checked = locked || selected.has(optVal) || (!selected.size && isPreselected);
+            if (locked) cb.disabled = true;
+
+            const txt = document.createElement('span');
+            txt.textContent = optVal;
+
+            left.appendChild(cb);
+            left.appendChild(txt);
+            row1.appendChild(left);
+
+            // EXTRAS
+            let extrasWrap = null;
+            if (hasExtras) {
+              extrasWrap = document.createElement('div');
+              extrasWrap.className = 'mc-extras';
+              extrasWrap.style.display = 'none';
+              extrasWrap.style.height  = '0px';
+
+              const mountExtraFields = () => {
+                extrasWrap.innerHTML = '';
+                if (!item.fields.length) return;
+
+                // helper for extras: read a date for a given MC extra key
+                function getDateForExtraKey(key) {
+                  const el = mcDateRefs[key];
+                  const fp = el?._flatpickr;
+                  if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
+                  const iso = values[key];
+                  if (iso) {
+                    const d = (window.flatpickr && window.flatpickr.parseDate)
+                      ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
+                      : new Date(String(iso));
+                    return (d && !isNaN(d)) ? d : null;
+                  }
+                  return null;
+                }
+
+                item.fields.forEach(ex => {
+                  const exType = (ex?.type) ? String(ex.type) : 'text';
+                  const exId   = String(ex?.id || '');
+                  if (!exId) return;
+                  const exKey  = __mcExtraKey(f.id, optVal, exId);
+
+                  const line = document.createElement('div');
+                  line.className = 'row';
+                  line.style.gap = '8px';
+                  line.style.alignItems = 'center';
+                  line.style.marginTop = '2px';
+
+                  const lab = document.createElement('label');
+                  lab.textContent = String(ex?.label || exId);
+                  lab.style.minWidth = '120px';
+                  lab.style.color = 'var(--muted)';
+
+                  if (exType === 'date') {
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.dataset.type = 'date';
+                    input.style.minWidth = '180px';
+
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(input);
+
+                    const fp = createPrettyDatepicker(input, {
+                      dateFormat: 'Y-m-d',
+                      altInput: true,
+                      altFormat: 'D, j M Y',
+                      defaultDate: values[exKey] || null,
+                      onChange: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
+                      onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
+                    });
+                    fp.set('allowInput', false);
+                    if (fp.altInput) fp.altInput.readOnly = true;
+
+                    mcDateRefs[exKey] = input;
+                    return;
+                  }
+
+                  if (exType === 'number') {
+                    const input = document.createElement('input');
+                    input.type = 'number';
+                    input.value = values[exKey] ?? '';
+                    input.addEventListener('change', () => {
+                      values[exKey] = Number(input.value);
+                      scheduleSaveState();
+                    });
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(input);
+                    return;
+                  }
+
+                  // NEW: computed DATEDIFF inside MC (read-only, not editable)
+                  if (exType === 'datediff') {
+                    const fromId = ex.fromId || ex.from || '';
+                    const toId   = ex.toId   || ex.to   || '';
+                    const fromKey = __mcExtraKey(f.id, optVal, fromId);
+                    const toKey   = __mcExtraKey(f.id, optVal, toId);
+
+                    const out = document.createElement('div');
+                    out.className = 'datediff-out kbd';
+                    out.setAttribute('role', 'status');
+                    out.setAttribute('aria-live', 'polite');
+                    out.textContent = '—';
+
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(out);
+
+                    // register in global recompute list
+                    datediffRefs.push({
+                      storeKey: exKey,
+                      outEl: out,
+                      resolve: () => ({ a: getDateForExtraKey(fromKey), b: getDateForExtraKey(toKey) })
+                    });
+                    return;
+                  }
+
+                  // default text
+                  const input = document.createElement('input');
+                  input.type = 'text';
+                  input.value = values[exKey] ?? '';
+                  input.addEventListener('change', () => {
+                    values[exKey] = input.value;
+                    scheduleSaveState();
+                  });
+                  extrasWrap.appendChild(line);
+                  line.appendChild(lab);
+                  line.appendChild(input);
+                });
+              };
+              mountExtraFields();
+            }
+
+            // CARET
+            let caretBtn = null, caretIcon = null;
+            if (hasExtras) {
+              caretBtn = document.createElement('button');
+              caretBtn.type = 'button';
+              caretBtn.className = 'mc-toggle';
+              caretBtn.setAttribute('aria-expanded', 'false');
+              caretBtn.setAttribute('aria-label', 'Details ein-/ausklappen');
+
+              const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+              svg.setAttribute('viewBox', '0 0 24 24');
+              svg.setAttribute('width', '14');
+              svg.setAttribute('height', '14');
+              svg.classList.add('mc-caret');
+              const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+              path.setAttribute('d', 'M9 18l6-6-6-6');
+              path.setAttribute('fill', 'none');
+              path.setAttribute('stroke', 'currentColor');
+              path.setAttribute('stroke-width', '2');
+              path.setAttribute('stroke-linecap', 'round');
+              path.setAttribute('stroke-linejoin', 'round');
+              svg.appendChild(path);
+
+              caretIcon = svg;
+              caretBtn.appendChild(svg);
+              row1.appendChild(caretBtn);
+
+              // start collapsed
+              setExtrasOpen(extrasWrap, caretIcon, false);
+
+              caretBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                const willOpen = !extrasWrap.classList.contains('open');
+                caretBtn.setAttribute('aria-expanded', String(willOpen));
+                setExtrasOpen(extrasWrap, caretIcon, willOpen);
+              });
+            }
+
+            // checkbox persists selection; no auto-open
+            cb.addEventListener('change', () => {
+              if (locked) { cb.checked = true; return; }
+              persistMainSelection();
+            });
+
+            // assemble
+            card.appendChild(row1);
+            if (extrasWrap) card.appendChild(extrasWrap);
+            host.appendChild(card);
+          }
+
+          items.forEach(drawOption);
+          values[f.id] = Array.from(host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
+            .filter(b => b.checked)
+            .map(b => b.value);
+          scheduleSaveState();
+
+          wrap.appendChild(host);
+
+        // DATE
+        } else if (f.type === 'date') {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.dataset.type = 'date';
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (f.required) input.required = true;
+          wrap.appendChild(input);
+
+          const fp = createPrettyDatepicker(input, {
+            dateFormat: 'Y-m-d',
+            altInput: true,
+            altFormat: 'D-d-M-Y',
+            allowInput: false,
+            clickOpens: true,
+            defaultDate: values[f.id] || null,
+            onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
+            onChange: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
+            onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
+          });
+          fp.set('allowInput', false);
+          if (fp.altInput) fp.altInput.readOnly = true;
+          inputRefs[f.id] = input;
+
+        // ADDRESS
+        } else if (f.type === 'address') {
+          const host = document.createElement('div');
+          host.className = 'addr-host';
+          wrap.appendChild(host);
+
+          const initial =
+            typeof values[f.id] === 'string'
+              ? { formatted: values[f.id] }
+              : (values[f.id] || null);
+
+          AddressAuto.mount(host, {
+            id: f.id,
+            label: f.label || 'Address',
+            required: !!f.required,
+            value: initial || null,
+            onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
+          });
+
+        // TABLE
+        } else if (f.type === 'table') {
+          renderTableField(wrap, f);
+
+        // DATEDIFF (top-level)
+        } else if (f.type === 'datediff') {
+          const fromId = f.fromId || f.from || '';
+          const toId   = f.toId   || f.to   || '';
+
+          const out = document.createElement('div');
+          out.id = f.id;
+          out.className = 'datediff-out kbd';
+          out.setAttribute('role', 'status');
+          out.setAttribute('aria-live', 'polite');
+          out.textContent = '—';
+          wrap.appendChild(out);
+
+          datediffRefs.push({
+            storeKey: f.id,
+            outEl: out,
+            resolve: () => ({ a: getDateForField(fromId), b: getDateForField(toId) })
+          });
+
+          guardPairs.push({ fromId, toId });
+
+        // DEFAULT
+        } else {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          if (values[f.id] != null) input.value = values[f.id];
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+          wrap.appendChild(input);
+          inputRefs[f.id] = input;
+        }
+
+        form.appendChild(wrap);
+      });
+
+      // bottom bar
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.style.gridColumn = '1 / -1';
+      btnExportMain = document.createElement('button');
+      btnExportMain.type = 'button';
+      btnExportMain.className = 'secondary';
+      btnExportMain.textContent = 'Export…';
+      btnExportMain.disabled = !currentDoc;
+      btnExportMain.addEventListener('click', onExportFromOpenForm);
+      bar.appendChild(btnExportMain);
+      form.appendChild(bar);
+      mount.appendChild(form);
+
+      // date helpers
+      function getDateForField(fid) {
+        const el = inputRefs[fid];
+        if (!el) return null;
+        const fp = el?._flatpickr;
+        if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
+        const iso = values[fid];
+        if (iso) {
+          const d = (window.flatpickr && window.flatpickr.parseDate)
+            ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
+            : new Date(String(iso));
+          return (d && !isNaN(d)) ? d : null;
+        }
+        return null;
+      }
+
+      // labeled datediff (works for top-level AND MC extras we pushed)
+      function recomputeDatediffs() {
+        datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
+          const { a, b } = resolve();
+          if (!a || !b) {
+            outEl.textContent = '—';
+            values[storeKey] = null;
+            return;
+          }
+          const days   = diffInDays(a, b);
+          const months = diffInMonths(a, b);
+          const years  = diffInYears(a, b);
+          const display = `${days}D ${months}M ${years}Y (${days} Days total)`;
+          outEl.textContent = display;
+          values[storeKey] = { days, months, years, formatted: display };
+        });
+        scheduleSaveState();
+      }
+      window.recomputeDatediffs = recomputeDatediffs;
+
+      // guards for top-level pairs
+      (function wireTopLevelDateGuards() {
+        function nextDay(d) {
+          if (!d) return null;
+          const n = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+          n.setDate(n.getDate() + 1);
+          return n;
+        }
+        guardPairs.forEach(({ fromId, toId }) => {
+          const fromEl = inputRefs[fromId];
+          const toEl   = inputRefs[toId];
+          const fpFrom = fromEl?._flatpickr;
+          const fpTo   = toEl?._flatpickr;
+          if (!fpFrom || !fpTo) return;
+
+          fpFrom.set('allowInput', false);
+          fpTo.set('allowInput', false);
+          if (fpFrom.altInput) fpFrom.altInput.readOnly = true;
+          if (fpTo.altInput)   fpTo.altInput.readOnly   = true;
+
+          const syncToWithFrom = (opts = { snap: true, jump: true }) => {
+            const from = fpFrom.selectedDates?.[0] || null;
+            const minForTo = nextDay(from);
+            fpTo.set('minDate', minForTo || null);
+
+            const toSel = fpTo.selectedDates?.[0] || null;
+            if (!toSel && minForTo && opts.snap) fpTo.setDate(minForTo, true);
+            if (from && toSel && toSel <= from && opts.snap) fpTo.setDate(minForTo, true);
+            if (minForTo && opts.jump) { try { fpTo.jumpToDate(minForTo); } catch {} }
+
+            if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs();
+          };
+
+          syncToWithFrom({ snap: true, jump: false });
+          fpFrom.config.onChange.push(() => syncToWithFrom({ snap: true, jump: true }));
+          fpFrom.config.onValueUpdate.push(() => syncToWithFrom({ snap: true, jump: true }));
+          fpTo.config.onOpen.push(() => syncToWithFrom({ snap: false, jump: true }));
+
+          const recompute = () => { if (window.recomputeDatediffs) window.recomputeDatediffs(); };
+          fpTo.config.onChange.push(recompute);
+          fpTo.config.onValueUpdate.push(recompute);
+        });
+      })();
+
+      // initial compute
+      recomputeDatediffs();
+    }
+
+
+// ----- TABLE FIELD -----
     function renderTableField(container, field) {
       if (!Array.isArray(values[field.id])) values[field.id] = [];
       const data = values[field.id];
