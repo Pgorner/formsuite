@@ -795,6 +795,74 @@ button.btn-danger:disabled {
   }
 }
 
+/* ---------- Compact, responsive form grid ---------- */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px 16px;               /* row / column gap */
+  align-items: start;
+  grid-auto-flow: dense;        /* pack smaller items tightly */
+}
+
+/* each field is a card-like box */
+.form-grid .field {
+  margin: 0;                    /* kill extra vertical space */
+  padding: 0;                   /* label + control already have spacing */
+}
+
+/* make “wider” fields span extra columns */
+.form-grid .field.span-2 { grid-column: span 2; min-width: 540px; }
+.form-grid .field.full   { grid-column: 1 / -1; }
+
+/* address widget: ensure dropdown overlays without shifting layout */
+.field .addr-host { width: 100%; }
+
+/* multichoice group: compact look inside its box */
+.mc-group { display: grid; grid-template-columns: 1fr; gap: 6px; }
+@media (min-width: 800px) {
+  .mc-group { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* datediff “output chip” — subtle and compact */
+.field .datediff-out {
+  padding: 10px 12px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 10px;
+  background: #f9fafb;
+  font-size: 14px;
+  line-height: 22px;
+  min-height: 22px;
+}
+
+/* keep table + bottom bar full width */
+.form-grid .field--table,
+.form-grid .bar { grid-column: 1 / -1; }
+
+/* Ensure the form grid already exists (you likely have these) */
+.form-grid { display:grid; gap:12px 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.form-grid > .span-2 { grid-column: span 2; }
+.form-grid > .full   { grid-column: 1 / -1; }
+
+/* Multichoice: responsive grid */
+.field--multichoice .mc-group.mc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px 16px;
+  align-items: start;
+}
+
+/* Tighter, nicer checkbox rows */
+.field--multichoice .mc-item {
+  display: flex;
+  align-items: flex-start;   /* keep long labels aligned nicely */
+  gap: 8px;
+  line-height: 1.35;
+  margin: 0;                 /* no extra vertical spacing */
+}
+.field--multichoice .mc-item input[type="checkbox"] {
+  margin-top: 2px;           /* align box with first line of text */
+}
+
 
 /* -------------------------------------------------------------
    END
