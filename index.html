@@ -826,7 +826,7 @@ def apply_visibility(u8, idx_to_action_json):
 
     // ---------- Render whole form ----------
     function renderForm() {
-      // --- one-time CSS for caret + collapse animation ---
+      // --- one-time CSS for caret + collapse animation + MC label alignment ---
       (function injectMcStyles(){
         const ID = 'mc-caret-styles';
         if (document.getElementById(ID)) return;
@@ -873,6 +873,25 @@ def apply_visibility(u8, idx_to_action_json):
             width: 100%;
           }
           .mc-extras.open { }
+
+          /* ---------- New: checkbox + text alignment (Option 1) ---------- */
+          .mc-option-label{
+            display:grid;
+            grid-template-columns:auto 1fr;
+            column-gap:8px;
+            align-items:center;     /* center checkbox with first text line */
+            cursor:pointer;
+            line-height:1.25;
+          }
+          .mc-option-label > span{
+            white-space:normal;
+            word-break:break-word;
+          }
+          .mc-option-checkbox{
+            align-self:center;      /* no extra nudge */
+            margin-top:0;
+            transform:none;
+          }
         `;
         document.head.appendChild(s);
       })();
@@ -1139,10 +1158,7 @@ def apply_visibility(u8, idx_to_action_json):
             row1.style.width = '100%';
 
             const left = document.createElement('label');
-            left.className = 'row';
-            left.style.alignItems = 'center';
-            left.style.gap = '8px';
-            left.style.cursor = 'pointer';
+            left.className = 'mc-option-label';
             left.setAttribute('for', optId);
             left.style.flex = '1';
 
@@ -1152,6 +1168,7 @@ def apply_visibility(u8, idx_to_action_json):
             cb.name = f.id;
             cb.id = optId;
             cb.value = optVal;
+            cb.className = 'mc-option-checkbox';
 
             const locked = !!item.alwaysSelected;
             const isPreselected = !!item.preselected;
@@ -1527,6 +1544,8 @@ def apply_visibility(u8, idx_to_action_json):
       // initial compute
       recomputeDatediffs();
     }
+
+
 
 
 // ----- TABLE FIELD -----
