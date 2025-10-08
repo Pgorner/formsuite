@@ -506,9 +506,35 @@ def apply_visibility(u8, idx_to_action_json):
       for (const f of fields) {
         const id = f.id;
         let v = vals?.[id];
-        if (v == null) continue;
+        if (v == null) {
+          // special case: datediff left empty -> skip
+          if (f.type === 'datediff') continue;
+          continue;
+        }
 
-        // ✅ ADDRESS: keep a structured object (upgrade legacy string -> { formatted })
+        if (f.type === 'datediff') {
+          // Keep structured object so exports can use .formatted,
+          // and rules can read .days/.months/.years if needed.
+          if (v && typeof v === 'object') {
+            const outObj = {
+              days: Number(v.days ?? 0),
+              months: Number(v.months ?? 0),
+              years: Number(v.years ?? 0),
+              formatted: String(v.formatted ?? '')
+            };
+            // if nothing valid, skip
+            if (!outObj.formatted) continue;
+            out[id] = outObj;
+          } else if (Number.isFinite(Number(v))) {
+            // legacy: only days number
+            const d = Number(v);
+            out[id] = { days: d, months: 0, years: 0, formatted: `${d}-0-0 (${d})` };
+          }
+          continue;
+        }
+
+
+        // ADDRESS
         if (f.type === 'address') {
           if (typeof v === 'string') {
             const s = v.trim();
@@ -643,6 +669,49 @@ def apply_visibility(u8, idx_to_action_json):
       return null;
     }
 
+    // ---- DATEDIFF helpers ----
+    function parseDateByFormat(str, fmt) {
+      if (!str) return null;
+      try {
+        // use flatpickr's own parser so we honor custom formats
+        const d = (window.flatpickr && window.flatpickr.parseDate)
+          ? window.flatpickr.parseDate(String(str), fmt || 'Y-m-d')
+          : new Date(String(str));
+        return (d && !isNaN(d.getTime())) ? d : null;
+      } catch { return null; }
+    }
+
+    function diffInDays(a, b) {
+      // normalize to midnight to avoid TZ drift
+      const A = new Date(a.getFullYear(), a.getMonth(), a.getDate());
+      const B = new Date(b.getFullYear(), b.getMonth(), b.getDate());
+      const ms = B - A; // to - from
+      return Math.floor(ms / (24*60*60*1000));
+    }
+    function diffInMonths(a, b) {
+      // calendar months between a -> b (subtract 1 if day-of-month hasn't been reached)
+      let months = (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
+      if (b.getDate() < a.getDate()) months -= 1;
+      return months;
+    }
+    function diffInYears(a, b) {
+      // full calendar years between a -> b
+      let years = b.getFullYear() - a.getFullYear();
+      const bBeforeAnniversary = (b.getMonth() < a.getMonth()) || (b.getMonth() === a.getMonth() && b.getDate() < a.getDate());
+      if (bBeforeAnniversary) years -= 1;
+      return years;
+    }
+
+    // returns number or null
+    function computeDateDiff(fromDate, toDate, unit = 'days') {
+      if (!fromDate || !toDate) return null;
+      const u = String(unit || 'days').toLowerCase();
+      if (u === 'years')  return diffInYears(fromDate, toDate);
+      if (u === 'months') return diffInMonths(fromDate, toDate);
+      return diffInDays(fromDate, toDate); // default days
+    }
+
+
     // ---------- Render whole form ----------
     function renderForm() {
       const mount = els.formMount;
@@ -663,6 +732,9 @@ def apply_visibility(u8, idx_to_action_json):
         form.appendChild(h);
       }
 
+      // map for quick lookups
+      const fieldById = Object.fromEntries((schema.fields || []).map(f => [f.id, f]));
+
       // hydrate table defaults
       schema.fields.forEach(f => {
         if (f.type === 'table') {
@@ -676,12 +748,16 @@ def apply_visibility(u8, idx_to_action_json):
         }
       });
 
+      // keep references to inputs so datediff can read them directly
+      const inputRefs = {};               // id -> HTMLInputElement (for date/text/select)
+      const datediffRefs = [];            // { field, outEl, fromId, toId }
+
       // fields
       schema.fields.forEach(f => {
         const wrap = document.createElement('div');
         wrap.className = 'field';
 
-        // ✅ Only render our own label for non-address fields (AddressAuto renders its own label)
+        // Skip outer label for address (AddressAuto renders its own)
         if (f.type !== 'address') {
           const label = document.createElement('label');
           label.htmlFor = f.id;
@@ -702,6 +778,7 @@ def apply_visibility(u8, idx_to_action_json):
           if (values[f.id] != null) input.value = values[f.id];
           input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
+          inputRefs[f.id] = input;
 
         } else if (f.type === 'select') {
           const input = document.createElement('select');
@@ -711,6 +788,7 @@ def apply_visibility(u8, idx_to_action_json):
           if (values[f.id] != null) input.value = values[f.id];
           input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
+          inputRefs[f.id] = input;
 
         } else if (f.type === 'multichoice') {
           const group = document.createElement('div'); group.className = 'mc-group';
@@ -733,6 +811,7 @@ def apply_visibility(u8, idx_to_action_json):
               const boxes = group.querySelectorAll(`input[name="${CSS.escape(f.id)}"]`);
               values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
               scheduleSaveState();
+              recomputeDatediffs(); // if rules later depend on this, safe to trigger (cheap)
             });
 
             const txt = document.createElement('span'); txt.textContent = String(opt);
@@ -741,23 +820,65 @@ def apply_visibility(u8, idx_to_action_json):
           });
           wrap.appendChild(group);
 
-        } else if (f.type === 'date') {
-          const input = document.createElement('input');
-          input.type = 'text';
-          input.dataset.type = 'date';
-          input.dataset.format = f.dateFormat || 'Y-m-d';
-          input.id = f.id; input.name = f.id; input.style.width = '100%';
-          if (f.required) input.required = true;
-          if (values[f.id] != null) input.value = values[f.id];
-          wrap.appendChild(input);
-          const fmt = input.dataset.format || 'Y-m-d';
-          flatpickr(input, { dateFormat: fmt, allowInput: true, onChange: () => { values[f.id] = input.value; scheduleSaveState(); } });
+          } else if (f.type === 'date') {
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.dataset.type = 'date';
+            input.id = f.id; input.name = f.id; input.style.width = '100%';
+
+            // keep required semantics
+            if (f.required) input.required = true;
+
+            // we store ISO (Y-m-d); display uses altFormat (must include day number)
+            const displayFmt = (f.dateFormat && /[dj]/.test(f.dateFormat)) ? f.dateFormat : 'D-d-M-Y';
+
+            wrap.appendChild(input);
+
+            const fp = flatpickr(input, {
+              // value that we persist
+              dateFormat: 'Y-m-d',
+              // pretty, non-editable display
+              altInput: true,
+              altFormat: displayFmt,
+              allowInput: false,
+              clickOpens: true,
+
+              onReady: (selected, str, inst) => {
+                // make the visible field (alt input) read-only
+                if (inst.altInput) {
+                  inst.altInput.readOnly = true;
+                  inst.altInput.setAttribute('aria-readonly', 'true');
+                }
+                // hydrate from saved ISO value
+                const iso = values[f.id];
+                if (iso) {
+                  const d = inst.parseDate(String(iso), 'Y-m-d');
+                  if (d) inst.setDate(d, false);
+                }
+              },
+
+              onChange: (selected, _str, inst) => {
+                const d = selected?.[0] || null;
+                values[f.id] = d ? inst.formatDate(d, 'Y-m-d') : '';
+                scheduleSaveState();
+                recomputeDatediffs();     // ← live update diffs
+              },
+
+              onValueUpdate: (selected, _str, inst) => {
+                const d = selected?.[0] || null;
+                values[f.id] = d ? inst.formatDate(d, 'Y-m-d') : '';
+                scheduleSaveState();
+                recomputeDatediffs();
+              }
+            });
+
+            inputRefs[f.id] = input;
+
 
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
 
         } else if (f.type === 'address') {
-          // AddressAuto renders its own label, so we skipped the outer label above.
           const mountDiv = document.createElement('div');
           mountDiv.className = 'address-field';
           wrap.appendChild(mountDiv);
@@ -773,10 +894,26 @@ def apply_visibility(u8, idx_to_action_json):
             required: !!f.required,
             value: initial || null,
             onChange: (val) => {
-              values[f.id] = val; // structured object or null
+              values[f.id] = val;
               scheduleSaveState();
             }
           });
+
+        } else if (f.type === 'datediff') {
+          const fromId = f.fromId || f.from || '';
+          const toId   = f.toId   || f.to   || '';
+
+          const out = document.createElement('input');
+          out.type = 'text';
+          out.id = f.id;
+          out.name = f.id;
+          out.style.width = '100%';
+          out.readOnly = true;
+          out.placeholder = 'D-M-Y (days)';
+          wrap.appendChild(out);
+
+          datediffRefs.push({ field: f, outEl: out, fromId, toId });
+
 
         } else {
           const input = document.createElement('input');
@@ -784,6 +921,7 @@ def apply_visibility(u8, idx_to_action_json):
           if (values[f.id] != null) input.value = values[f.id];
           input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
           wrap.appendChild(input);
+          inputRefs[f.id] = input;
         }
 
         form.appendChild(wrap);
@@ -797,6 +935,50 @@ def apply_visibility(u8, idx_to_action_json):
       bar.appendChild(btnExportMain); form.appendChild(bar);
 
       mount.appendChild(form);
+
+      // ---- after form mounts: do first pass compute for datediff
+      function getDateForField(fid) {
+        const el = inputRefs[fid];
+        // Prefer flatpickr's parsed Date
+        const fp = el?._flatpickr;
+        if (fp && fp.selectedDates && fp.selectedDates[0] instanceof Date) {
+          return fp.selectedDates[0];
+        }
+        // Fallback to stored ISO (Y-m-d)
+        const iso = values[fid];
+        if (iso) {
+          const d = (window.flatpickr && window.flatpickr.parseDate)
+            ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
+            : new Date(String(iso));
+          return (d && !isNaN(d)) ? d : null;
+        }
+        return null;
+      }
+
+
+      function recomputeDatediffs() {
+        datediffRefs.forEach(({ field, outEl, fromId, toId }) => {
+          const a = getDateForField(fromId);
+          const b = getDateForField(toId);
+          if (!a || !b) {
+            outEl.value = '';
+            values[field.id] = null;
+            return;
+          }
+          const days   = diffInDays(a, b);
+          const months = diffInMonths(a, b);
+          const years  = diffInYears(a, b);
+          const display = `${days}Days ${months}Months ${years}Years (${days}Days total)`; // D-M-Y (days)
+
+          outEl.value = display;
+          values[field.id] = { days, months, years, formatted: display };
+        });
+        scheduleSaveState();
+      }
+
+      // expose so date inputs can call it
+      window.recomputeDatediffs = recomputeDatediffs;
+      recomputeDatediffs();
     }
 
 

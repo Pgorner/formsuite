@@ -55,6 +55,7 @@
               <option value="select">select</option>
               <option value="multichoice">multichoice</option>
               <option value="date">date</option>
+              <option value="datediff">datediff</option>
               <option value="address">address</option>
               <option value="table">table</option>
             </select>
@@ -467,14 +468,25 @@
         const cols = (f.columns||[]).map(c => `${c.label||c.id}${c.type?`:${c.type}${(c.type==='select'&&c.options?.length)?':'+c.options.join('/'):''}`:''}`);
         return `Table with ${f.columns?.length||0} column(s)${(f.minRows||f.maxRows)?` ${f.minRows||0}–${f.maxRows||'∞'}`:''} → [ ${cols.join(' | ')} ]`;
       }
+      if (f.type === 'datediff') {
+        return `Δ ${f.fromId || '—'} → ${f.toId || '—'} (D-M-Y)`;
+      }
       return '';
     }
+
 
     // ---------- Type-specific UI ----------
     function renderTypeSpecific() {
       const t = els.pType.value;
       const wrap = els.typeSpecific;
       wrap.innerHTML = '';
+
+      // Helper: list current date field ids
+      function listDateFieldIds() {
+        return (FORM_BUILDER.schema?.fields || [])
+          .filter(x => x?.type === 'date')
+          .map(x => x.id);
+      }
 
       if (t === 'select' || t === 'multichoice') {
         const div = document.createElement('div');
@@ -517,13 +529,10 @@
               <input id="pMaxRows" type="number" value="0" min="0" style="width:140px"/>
             </div>
           </div>
-
-          <!-- Compatibility: keep legacy string mirror hidden -->
           <input id="pCols" type="hidden" />
         `;
         wrap.appendChild(div);
 
-        // Table Designer initialize
         window.TableDesigner?.destroy?.();
         window.TableDesigner = createTableDesigner({
           listEl: wrap.querySelector('#tdzList'),
@@ -533,6 +542,46 @@
           minEl: wrap.querySelector('#pMinRows'),
           maxEl: wrap.querySelector('#pMaxRows'),
         });
+
+      } else if (t === 'datediff') {
+        const dateIds = listDateFieldIds();
+        const none = !dateIds.length;
+
+        const div = document.createElement('div');
+        div.innerHTML = `
+          <div class="row" style="gap:10px; flex-wrap:wrap;">
+            <div>
+              <label class="small">From (date field)</label><br/>
+              <select id="pFromId" ${none ? 'disabled' : ''}></select>
+            </div>
+            <div>
+              <label class="small">To (date field)</label><br/>
+              <select id="pToId" ${none ? 'disabled' : ''}></select>
+            </div>
+          </div>
+          ${none ? `<div class="note warn" style="margin-top:8px;">You need at least two <em>date</em> fields in the form to wire a datediff.</div>` : ''}
+          <div class="muted" style="margin-top:6px;">Output format: <code>D-M-Y (valueInDays)</code></div>
+        `;
+        wrap.appendChild(div);
+
+        // populate selects
+        const fromSel = div.querySelector('#pFromId');
+        const toSel   = div.querySelector('#pToId');
+        if (!none) {
+          dateIds.forEach(id => {
+            const o1 = document.createElement('option'); o1.value = id; o1.textContent = id; fromSel.appendChild(o1);
+            const o2 = document.createElement('option'); o2.value = id; o2.textContent = id; toSel.appendChild(o2);
+          });
+        }
+      }
+
+      // Hide/disable "required" for datediff (computed)
+      const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
+      if (t === 'datediff') {
+        els.pRequired.checked = false;
+        if (reqContainer) reqContainer.style.display = 'none';
+      } else {
+        if (reqContainer) reqContainer.style.display = '';
       }
     }
 
@@ -856,8 +905,27 @@
           window.TableDesigner.loadColumns(Array.isArray(f.columns) ? f.columns : []);
           window.TableDesigner.setMinMax(f.minRows || 0, f.maxRows || 0);
         }
-      }
+      } else if (f.type === 'datediff') {
+        // set from/to/unit if available (controls exist after renderTypeSpecific())
+        const fromSel = document.getElementById('pFromId');
+        const toSel   = document.getElementById('pToId');
+        const unitSel = document.getElementById('pUnit');
+        if (fromSel && f.fromId) fromSel.value = f.fromId;
+        if (toSel && f.toId) toSel.value = f.toId;
+        if (unitSel) unitSel.value = (f.unit || 'days');
+      } else if (f.type === 'datediff') {
+      const fromSel = document.getElementById('pFromId');
+      const toSel   = document.getElementById('pToId');
+      if (fromSel && f.fromId) fromSel.value = f.fromId;
+      if (toSel && f.toId) toSel.value = f.toId;
+
+      // make sure "required" stays off/hidden
+      els.pRequired.checked = false;
+      const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
+      if (reqContainer) reqContainer.style.display = 'none';
     }
+    }
+
 
     // ---------- Parse, Save, Delete, Cancel ----------
     function parseFieldFromInputs() {
@@ -892,9 +960,30 @@
         }
         if (mr>0) f.minRows = mr;
         if (xr>0) f.maxRows = xr;
-      }
+
+        } else if (t === 'datediff') {
+          const fromId = (document.getElementById('pFromId')?.value || '').trim();
+          const toId   = (document.getElementById('pToId')?.value || '').trim();
+
+          const dateIds = (FORM_BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
+          if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
+            alert('Please choose two existing date fields for the datediff.');
+            return null;
+          }
+          if (fromId === toId) {
+            alert('Please select two different date fields for the datediff.');
+            return null;
+          }
+          f.fromId = fromId;
+          f.toId   = toId;
+          f.required = false; // computed, never required
+        }
+
+
       return f;
     }
+
+
 
     async function upsertField() {
       const f = parseFieldFromInputs();
