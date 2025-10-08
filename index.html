@@ -6,7 +6,7 @@
   <link rel="icon" href="favicon.ico" type="image/gif" sizes="32x32">
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/material_blue.css">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -711,6 +711,46 @@ def apply_visibility(u8, idx_to_action_json):
       return diffInDays(fromDate, toDate); // default days
     }
 
+    // Modern, pretty flatpickr with sensible defaults for our app.
+    // - Non-editable (click-to-pick), ISO storage via value, nice alt display.
+    // - Month dropdown, week numbers, nicer arrows, better mobile behavior.
+    // - Will add a CSS class on the first allowed day so it pops visually.
+    function createPrettyDatepicker(input, extraOpts = {}) {
+      const baseOpts = {
+        dateFormat: 'Y-m-d',        // stored value
+        altInput: true,
+        altFormat: 'D, j M Y',      // human display
+        allowInput: false,          // click-only
+        disableMobile: true,        // consistent look everywhere
+        static: true,               // keep the calendar anchored by input
+        monthSelectorType: 'dropdown',
+        weekNumbers: true,
+        prevArrow: '‹',
+        nextArrow: '›',
+        onReady: (sel, str, inst) => {
+          if (inst.altInput) {
+            inst.altInput.readOnly = true;
+            // wrap altInput to attach icon styling
+            const wrap = inst.altInput.parentElement;
+            if (wrap && !wrap.classList.contains('flatpickr-has-icon')) {
+              wrap.classList.add('flatpickr-has-icon');
+            }
+          }
+        },
+        // Highlight the first available day (e.g., minDate) for quick visual guidance
+        onDayCreate: (dObj, dStr, fp, dayElem) => {
+          const min = fp.config.minDate ? fp.parseDate(fp.config.minDate, 'Y-m-d') : null;
+          if (!min) return;
+          // If the rendered day equals minDate, decorate it
+          const thisDate = dayElem.dateObj;
+          if (min && thisDate && thisDate.toDateString() === min.toDateString()) {
+            dayElem.classList.add('is-first-allowed');
+          }
+        }
+      };
+      return flatpickr(input, { ...baseOpts, ...extraOpts });
+    }
+
 
     // ---------- Render whole form ----------
     function renderForm() {
@@ -829,7 +869,7 @@ def apply_visibility(u8, idx_to_action_json):
             if (f.required) input.required = true;
             wrap.appendChild(input);
 
-            const fp = flatpickr(input, {
+            const fp = createPrettyDatepicker(input, {
               dateFormat: 'Y-m-d',     // stored value
               altInput: true,
               altFormat: 'D-d-M-Y',    // pretty display incl. day

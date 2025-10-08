@@ -658,6 +658,58 @@ button.btn-danger:disabled {
 /* Keep RULES page spacing helper */
 .btn-primary, .btn-secondary, .btn-danger { margin-right: 6px; }
 
+/* Make the altInput (the visible text field) look like a modern control */
+  .flatpickr-input[readonly] {
+    cursor: pointer;
+  }
+
+  .flatpickr-input[readonly],
+  .flatpickr-alt-input {
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 10px;
+    padding: 10px 38px 10px 12px;
+    font-size: 14px;
+    line-height: 22px;
+    width: 100%;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  .flatpickr-alt-input:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59,130,246,.15);
+  }
+
+  /* calendar icon on the right of the altInput */
+  .flatpickr-has-icon {
+    position: relative;
+  }
+  .flatpickr-has-icon .flatpickr-alt-input {
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="%23737a82" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>');
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 18px;
+  }
+
+  /* prettier month selector + arrows already come from material theme, we just tweak spacing */
+  .flatpickr-calendar .flatpickr-months {
+    padding: 4px 6px;
+  }
+
+  /* subtle highlight for the first available day (we’ll add a class via onDayCreate) */
+  .flatpickr-day.is-first-allowed {
+    box-shadow: inset 0 0 0 2px #3b82f6;
+    border-radius: 8px;
+  }
+
+  /* improve disabled/greyed days contrast */
+  .flatpickr-day.disabled,
+  .flatpickr-day.flatpickr-disabled {
+    color: #b7c0cc !important;
+    opacity: 1;
+  }
+
 /* -------------------------------------------------------------
    END
    ------------------------------------------------------------- */
