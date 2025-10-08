@@ -488,13 +488,35 @@
           .map(x => x.id);
       }
 
-      if (t === 'select' || t === 'multichoice') {
+      if (t === 'select') {
         const div = document.createElement('div');
         div.innerHTML = `
           <label class="small">Options (comma separated)</label><br/>
           <input id="pOptions" type="text" placeholder="e.g. Red, Green, Blue" />
         `;
         wrap.appendChild(div);
+
+      } else if (t === 'multichoice') {
+        // NEW — advanced, grouped designer with conditional extras
+        const div = document.createElement('div');
+        div.innerHTML = `
+          <div class="tdz-toolbar">
+            <div><strong>Multi-Choice (Gruppen & Extras)</strong></div>
+          </div>
+          <div id="mcDesigner"></div>
+          <input id="pMcJson" type="hidden" />
+        `;
+        wrap.appendChild(div);
+
+        // init designer
+        window.MultiChoiceDesigner?.destroy?.(); // no-op for now
+        window.MultiChoiceDesigner = createMultiChoiceDesigner({
+          hostEl: div.querySelector('#mcDesigner')
+        });
+
+        // If editing an existing field, load happens in loadFieldIntoEditor();
+        // Otherwise show an empty designer.
+        window.MultiChoiceDesigner.loadModel({ groups: [] });
 
       } else if (t === 'date') {
         const div = document.createElement('div');
@@ -888,6 +910,288 @@
       return api;
     }
 
+    // ---------- MultiChoice Designer (groups + conditional fields, one-row extras) ----------
+    function createMultiChoiceDesigner(cfg) {
+      // Persisted shape on the field:
+      // f.mc = { groups:[{ title, items:[{ value, checked, alwaysSelected, fields:[{type,id,label,content}] }]}] }
+      // Legacy still supported via f.options (flat list)
+      let model = { groups: [] };
+
+      const api = {
+        loadModel(mc, legacyOptionsArr) {
+          if (mc && Array.isArray(mc.groups)) {
+            model = {
+              groups: mc.groups.map(g => ({
+                title: String(g?.title || ''),
+                items: Array.isArray(g?.items) ? g.items.map(it => ({
+                  value: String(it?.value || ''),
+                  checked: !!it?.checked,
+                  alwaysSelected: !!it?.alwaysSelected,     // NEW
+                  fields: Array.isArray(it?.fields) ? it.fields.map(x => ({
+                    type: (x.type === 'date' || x.type === 'text' || x.type === 'number') ? x.type : 'date',
+                    id: String(x.id || ''),
+                    label: String(x.label || ''),
+                    content: String(x.content || '')
+                  })) : []
+                })) : []
+              }))
+            };
+          } else if (Array.isArray(legacyOptionsArr) && legacyOptionsArr.length) {
+            model = {
+              groups: [{
+                title: '',
+                items: legacyOptionsArr.map(v => ({ value: String(v), checked: false, alwaysSelected: false, fields: [] }))
+              }]
+            };
+          } else {
+            model = { groups: [] };
+          }
+          render();
+        },
+        getModel() { return JSON.parse(JSON.stringify(model)); },
+        getFlatOptions() {
+          const out = [];
+          model.groups.forEach(g => g.items.forEach(it => { if (it.value) out.push(it.value); }));
+          return out;
+        }
+      };
+
+      function uid(prefix='id'){ return prefix + '_' + Math.random().toString(36).slice(2,8); }
+
+      function render() {
+        if (!cfg.hostEl) return;
+        cfg.hostEl.innerHTML = `
+          <div class="tdz-toolbar">
+            <div>
+              <strong>Gruppierte Optionen</strong>
+              <span class="tdz-muted">· ${model.groups.reduce((n,g)=>n+g.items.length,0)} Optionen in ${model.groups.length} Gruppe(n)</span>
+            </div>
+            <div class="row" style="gap:6px;">
+              <button type="button" class="mc-add-group">+ Gruppe</button>
+            </div>
+          </div>
+          <div class="mc-list"></div>
+          <input type="hidden" class="mc-hidden-json" />
+        `;
+
+        const list = cfg.hostEl.querySelector('.mc-list');
+        const hidden = cfg.hostEl.querySelector('.mc-hidden-json');
+        hidden.value = JSON.stringify(model);
+
+        model.groups.forEach((grp, gIdx) => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.style.marginBottom = '10px';
+
+          card.innerHTML = `
+            <div class="row" style="justify-content:space-between; gap:8px; margin-bottom:8px;">
+              <div class="row" style="gap:8px;">
+                <input type="text" class="mc-group-title" placeholder="Gruppen-Titel (optional)" value="${(grp.title||'').replace(/"/g,'&quot;')}" style="min-width:220px"/>
+              </div>
+              <div class="row" style="gap:6px;">
+                <button type="button" class="mc-add-opt">+ Option</button>
+                <button type="button" class="danger mc-del-group">Gruppe löschen</button>
+              </div>
+            </div>
+            <div class="mc-items"></div>
+          `;
+
+          const itemsWrap = card.querySelector('.mc-items');
+
+          grp.items.forEach((it, iIdx) => {
+            // ensure new prop exists
+            if (typeof it.alwaysSelected !== 'boolean') it.alwaysSelected = false;
+
+            const row = document.createElement('div');
+            row.className = 'tdz-row';
+            row.style.gridTemplateColumns = '240px 1fr 260px'; // checks, value, actions
+
+            // FIRST COLUMN: two checkboxes, no label header
+            const first = document.createElement('div');
+            first.className = 'tdz-col';
+            first.style.gap = '6px';
+            first.innerHTML = `
+              <label class="row" style="gap:8px; align-items:center;">
+                <input type="checkbox" class="mc-opt-checked" />
+                <span>Vorausgewählt</span>
+              </label>
+              <label class="row" style="gap:8px; align-items:center;">
+                <input type="checkbox" class="mc-opt-always" />
+                <span>Immer ausgewählt</span>
+              </label>
+            `;
+
+            // SECOND COLUMN: value
+            const valueCol = document.createElement('div');
+            valueCol.className = 'tdz-col tdz-grow';
+            valueCol.innerHTML = `
+              <label class="small">Wert</label>
+              <input type="text" class="mc-opt-value" value="${(it.value||'').replace(/"/g,'&quot;')}" placeholder="z. B. Onboarding"/>
+            `;
+
+            // ACTIONS
+            const actions = document.createElement('div');
+            actions.className = 'tdz-actions';
+            actions.innerHTML = `
+              <button type="button" class="ghost mc-add-field">+ Feld</button>
+              <button type="button" class="danger mc-del-opt">Löschen</button>
+            `;
+
+            // CONDITIONAL FIELDS container (full width)
+            const fieldsCol = document.createElement('div');
+            fieldsCol.className = 'tdz-col mc-fields-col';
+            fieldsCol.style.gridColumn = '1 / -1';
+
+            row.appendChild(first);
+            row.appendChild(valueCol);
+            row.appendChild(actions);
+            row.appendChild(fieldsCol);
+
+            // wire checkboxes + value
+            const cbDefault = first.querySelector('.mc-opt-checked');
+            const cbAlways  = first.querySelector('.mc-opt-always');
+            const inVal     = valueCol.querySelector('.mc-opt-value');
+
+            // init
+            cbDefault.checked = !!it.checked || !!it.alwaysSelected;
+            cbAlways.checked  = !!it.alwaysSelected;
+            cbDefault.disabled = !!it.alwaysSelected;
+
+            cbDefault.addEventListener('change', () => {
+              it.checked = !!cbDefault.checked;
+              hidden.value = JSON.stringify(model);
+            });
+
+            cbAlways.addEventListener('change', () => {
+              it.alwaysSelected = !!cbAlways.checked;
+              if (it.alwaysSelected) {
+                it.checked = true;
+                cbDefault.checked = true;
+                cbDefault.disabled = true;
+              } else {
+                cbDefault.disabled = false;
+              }
+              hidden.value = JSON.stringify(model);
+            });
+
+            inVal.addEventListener('input', () => { it.value = inVal.value; hidden.value = JSON.stringify(model); });
+
+            // CONDITIONAL FIELDS (single-row each)
+            function drawFields() {
+              fieldsCol.innerHTML = '';
+              if (!Array.isArray(it.fields)) it.fields = [];
+              if (!it.fields.length) return;
+
+              it.fields.forEach((fld, fIdx) => {
+                const typeSelId = uid('type');
+                const idId      = uid('id');
+                const labelId   = uid('label');
+                const contentId = uid('content');
+
+                const line = document.createElement('div');
+                line.className = 'row';
+                line.style.gap = '8px';
+                line.style.margin = '6px 0';
+                line.style.alignItems = 'center';
+                line.style.flexWrap = 'nowrap';
+                line.style.padding = '6px 8px';
+                line.style.borderLeft = '2px solid var(--border)';
+                line.style.background = 'rgba(127,127,127,.04)';
+                line.style.borderRadius = '8px';
+
+                const sel = document.createElement('select');
+                sel.id = typeSelId;
+                sel.innerHTML = `<option value="text">text</option><option value="number">number</option><option value="date">date</option>`;
+                sel.className = 'select-compact';
+                sel.style.minWidth = '110px';
+
+                const inId = document.createElement('input');
+                inId.id = idId; inId.type = 'text'; inId.placeholder = 'id';
+                inId.style.minWidth = '140px'; inId.style.width = '140px';
+
+                const inLabel = document.createElement('input');
+                inLabel.id = labelId; inLabel.type = 'text'; inLabel.placeholder = 'Label';
+                inLabel.style.minWidth = '180px'; inLabel.style.width = '180px';
+
+                const inContent = document.createElement('input');
+                inContent.id = contentId; inContent.type = 'text'; inContent.placeholder = 'Inhalt (optional)';
+                inContent.style.minWidth = '220px'; inContent.style.flex = '1 1 auto';
+
+                const btnDel = document.createElement('button');
+                btnDel.type = 'button'; btnDel.className = 'ghost mc-field-del'; btnDel.textContent = 'Entfernen';
+
+                // values
+                if (!fld || typeof fld !== 'object') fld = {};
+                fld.type = fld.type || 'text';
+                sel.value = fld.type;
+                inId.value = fld.id || '';
+                inLabel.value = fld.label || '';
+                inContent.value = fld.content || '';
+
+                // wire
+                sel.addEventListener('change',   () => { fld.type = sel.value;           hidden.value = JSON.stringify(model); });
+                inId.addEventListener('input',   () => { fld.id = inId.value;            hidden.value = JSON.stringify(model); });
+                inLabel.addEventListener('input',() => { fld.label = inLabel.value;      hidden.value = JSON.stringify(model); });
+                inContent.addEventListener('input',() => { fld.content = inContent.value; hidden.value = JSON.stringify(model); });
+
+                btnDel.addEventListener('click', () => {
+                  it.fields.splice(fIdx,1);
+                  drawFields();
+                  hidden.value = JSON.stringify(model);
+                });
+
+                line.appendChild(sel);
+                line.appendChild(inId);
+                line.appendChild(inLabel);
+                line.appendChild(inContent);
+                line.appendChild(btnDel);
+                fieldsCol.appendChild(line);
+              });
+            }
+            drawFields();
+
+            actions.querySelector('.mc-add-field').addEventListener('click', () => {
+              it.fields = it.fields || [];
+              it.fields.push({ type:'text', id:'', label:'', content:'' });
+              drawFields();
+              hidden.value = JSON.stringify(model);
+            });
+
+            actions.querySelector('.mc-del-opt').addEventListener('click', () => {
+              grp.items.splice(iIdx,1);
+              render();
+            });
+
+            itemsWrap.appendChild(row);
+          });
+
+          // group controls
+          card.querySelector('.mc-group-title').addEventListener('input', (e) => {
+            grp.title = e.target.value; hidden.value = JSON.stringify(model);
+          });
+          card.querySelector('.mc-add-opt').addEventListener('click', () => {
+            grp.items.push({ value:'', checked:false, alwaysSelected:false, fields:[] });
+            render();
+          });
+          card.querySelector('.mc-del-group').addEventListener('click', () => {
+            model.groups.splice(gIdx,1);
+            render();
+          });
+
+          list.appendChild(card);
+        });
+
+        // add group
+        cfg.hostEl.querySelector('.mc-add-group').addEventListener('click', () => {
+          model.groups.push({ title:'', items:[] });
+          render();
+        });
+      }
+
+      return api;
+    }
+
+
     // ---------- Fields list rendering (with DnD) ----------
     function renderFields() {
       const tb = els.tbodyFields;
@@ -1034,10 +1338,21 @@
       els.pRequired.checked = !!f.required;
       renderTypeSpecific();
 
-      if (f.type === 'select' || f.type === 'multichoice') {
+      if (f.type === 'select') {
         document.getElementById('pOptions').value = (f.options||[]).join(', ');
+
+      } else if (f.type === 'multichoice') {
+        // NEW: load advanced groups/extras if present; else derive from options
+        const designer = window.MultiChoiceDesigner;
+        if (designer) {
+          const mc = f.mc && typeof f.mc === 'object' ? f.mc : null;
+          const legacy = Array.isArray(f.options) ? f.options : [];
+          designer.loadModel(mc, legacy);
+        }
+
       } else if (f.type === 'date') {
         document.getElementById('pDateFmt').value = f.dateFormat || 'Y-m-d';
+
       } else if (f.type === 'table') {
         const colsLegacy = (f.columns||[]).map(c => {
           const base = `${c.id}:${c.label}${c.type && c.type!=='text' ? `:${c.type}`:''}`;
@@ -1051,27 +1366,18 @@
           window.TableDesigner.loadColumns(Array.isArray(f.columns) ? f.columns : []);
           window.TableDesigner.setMinMax(f.minRows || 0, f.maxRows || 0);
         }
+
       } else if (f.type === 'datediff') {
-        // set from/to/unit if available (controls exist after renderTypeSpecific())
         const fromSel = document.getElementById('pFromId');
         const toSel   = document.getElementById('pToId');
-        const unitSel = document.getElementById('pUnit');
         if (fromSel && f.fromId) fromSel.value = f.fromId;
         if (toSel && f.toId) toSel.value = f.toId;
-        if (unitSel) unitSel.value = (f.unit || 'days');
-      } else if (f.type === 'datediff') {
-      const fromSel = document.getElementById('pFromId');
-      const toSel   = document.getElementById('pToId');
-      if (fromSel && f.fromId) fromSel.value = f.fromId;
-      if (toSel && f.toId) toSel.value = f.toId;
 
-      // make sure "required" stays off/hidden
-      els.pRequired.checked = false;
-      const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
-      if (reqContainer) reqContainer.style.display = 'none';
-    }
-    }
-
+        els.pRequired.checked = false;
+        const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
+        if (reqContainer) reqContainer.style.display = 'none';
+      }
+    } 
 
     // ---------- Parse, Save, Delete, Cancel ----------
     function parseFieldFromInputs() {
@@ -1080,9 +1386,24 @@
       if (!id) { alert('Please enter a field id'); return null; }
       const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
 
-      if (t === 'select' || t === 'multichoice') {
+      if (t === 'select') {
         const raw = (document.getElementById('pOptions')?.value || '').trim();
         f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+      } else if (t === 'multichoice') {
+        // NEW: persist advanced groups/extras while keeping legacy f.options for compatibility
+        const designer = window.MultiChoiceDesigner;
+        if (designer) {
+          const mc = designer.getModel();
+          const flat = designer.getFlatOptions();
+          f.mc = mc;                 // advanced config (groups + extras)
+          f.options = flat;          // compatibility (flat list of labels)
+          // Optional: columns hint – you can keep your existing column UI elsewhere if needed
+        } else {
+          // fallback (shouldn't happen)
+          f.options = [];
+          f.mc = { groups: [] };
+        }
 
       } else if (t === 'date') {
         f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
@@ -1107,28 +1428,26 @@
         if (mr>0) f.minRows = mr;
         if (xr>0) f.maxRows = xr;
 
-        } else if (t === 'datediff') {
-          const fromId = (document.getElementById('pFromId')?.value || '').trim();
-          const toId   = (document.getElementById('pToId')?.value || '').trim();
+      } else if (t === 'datediff') {
+        const fromId = (document.getElementById('pFromId')?.value || '').trim();
+        const toId   = (document.getElementById('pToId')?.value || '').trim();
 
-          const dateIds = (FORM_BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
-          if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
-            alert('Please choose two existing date fields for the datediff.');
-            return null;
-          }
-          if (fromId === toId) {
-            alert('Please select two different date fields for the datediff.');
-            return null;
-          }
-          f.fromId = fromId;
-          f.toId   = toId;
-          f.required = false; // computed, never required
+        const dateIds = (FORM_BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
+        if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
+          alert('Please choose two existing date fields for the datediff.');
+          return null;
         }
-
+        if (fromId === toId) {
+          alert('Please select two different date fields for the datediff.');
+          return null;
+        }
+        f.fromId = fromId;
+        f.toId   = toId;
+        f.required = false; // computed, never required
+      }
 
       return f;
     }
-
 
 
     async function upsertField() {

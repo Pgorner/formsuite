@@ -629,6 +629,8 @@ select, input { background:var(--card); border:1px solid var(--border-strong); b
   gap: 8px 16px;     /* row-gap, column-gap (space between columns) */
 }
 
+.mc-list .pill { border-color: var(--border-strong); color: var(--muted); }
+
 
 .field--multichoice .mc-item {
   display: flex;              /* perfect vertical centering */
