@@ -101,7 +101,7 @@
     container.innerHTML = '';
     const field = h('div', { class: 'addr-field' }); // positioning context
 
-    const label = h('label', { class: 'small', for: id }, labelText, required ? ' *' : '');
+    const label = h('label', { class: 'small fs-label', for: id }, labelText, required ? ' *' : '');
     const input = h('input', {
       id, type: 'text', placeholder: 'Start typing an address…',
       autocomplete: 'off', spellcheck: 'false', 'aria-haspopup': 'listbox', 'aria-expanded': 'false'
