@@ -910,14 +910,24 @@
       return api;
     }
 
-    // ---------- MultiChoice Designer (groups + conditional fields, one-row extras, DnD items w/ handle) ----------
+    // ---------- MultiChoice Designer (groups + conditional fields, DnD w/ handle, now with DURATION type) ----------
     function createMultiChoiceDesigner(cfg) {
-      // f.mc = { groups:[{ title, items:[{ value, checked, alwaysSelected, fields:[{type,id,label,content}] }]}] }
+      // f.mc = { groups:[{ title, items:[{ value, checked, alwaysSelected, fields:[{...}] }]}] }
       let model = { groups: [] };
+
+      function globalDateIds() {
+        try {
+          return (FORM_BUILDER.schema?.fields || [])
+            .filter(x => x?.type === 'date')
+            .map(x => String(x.id));
+        } catch { return []; }
+      }
+      const uniq = (arr) => Array.from(new Set(arr.filter(Boolean).map(String)));
 
       const api = {
         loadModel(mc, legacyOptionsArr) {
           if (mc && Array.isArray(mc.groups)) {
+            // deep copy + migrate any old "duration" → "datediff"
             model = {
               groups: mc.groups.map(g => ({
                 title: String(g?.title || ''),
@@ -925,12 +935,28 @@
                   value: String(it?.value || ''),
                   checked: !!it?.checked,
                   alwaysSelected: !!it?.alwaysSelected,
-                  fields: Array.isArray(it?.fields) ? it.fields.map(x => ({
-                    type: (x.type === 'date' || x.type === 'text' || x.type === 'number') ? x.type : 'text',
-                    id: String(x.id || ''),
-                    label: String(x.label || ''),
-                    content: String(x.content || '')
-                  })) : []
+                  fields: Array.isArray(it?.fields) ? it.fields.map(x => {
+                    const t = (x?.type === 'duration') ? 'datediff' : (x?.type || 'text');
+                    if (t === 'datediff') {
+                      const fromId = String(x?.fromId || '');
+                      const toId   = String(x?.toId || '');
+                      return {
+                        type: 'datediff',
+                        id: `datediff_${fromId}_${toId}` || `datediff_${Math.random().toString(36).slice(2,8)}`,
+                        label: 'Dauer',
+                        fromId, toId
+                      };
+                    }
+                    if (t === 'text' || t === 'number' || t === 'date') {
+                      return {
+                        type: t,
+                        id: String(x?.id || ''),
+                        label: String(x?.label || ''),
+                        content: String(x?.content || '')
+                      };
+                    }
+                    return { type:'text', id:'', label:'', content:'' };
+                  }) : []
                 })) : []
               }))
             };
@@ -971,22 +997,17 @@
         const hidden = cfg.hostEl.querySelector('.mc-hidden-json');
         hidden.value = JSON.stringify(model);
 
-        // scoped styles (drag handle + hints)
         const style = document.createElement('style');
         style.textContent = `
           .mc-item-row{ position:relative; }
-          .mc-drag {
-            width: 34px; min-width:34px; display:flex; align-items:center; justify-content:center;
-            user-select:none; cursor:grab; color:#6b7280; border-right:1px solid var(--border,#e5e7eb);
-          }
+          .mc-drag { width:34px; min-width:34px; display:flex; align-items:center; justify-content:center;
+                    user-select:none; cursor:grab; color:#6b7280; border-right:1px solid var(--border,#e5e7eb); }
           .mc-drag:active { cursor:grabbing; }
-          .mc-drag .grip {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-            font-size:16px; line-height:1; opacity:.9;
-          }
           .mc-item-row.dragging{ opacity:.6; }
           .mc-item-row.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
           .mc-item-row.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
+          .mc-dd-wrap { display:flex; gap:8px; align-items:center; }
+          .mc-dd-fixed { font-size:12px; color: var(--muted,#6b7280); user-select:none; }
         `;
         cfg.hostEl.appendChild(style);
 
@@ -1013,21 +1034,17 @@
           const itemsWrap = card.querySelector('.mc-items');
           const addOptBtn = card.querySelector('.mc-add-opt');
 
-          // ---- render a single item row ----
           function drawItemRow(it, iIdx) {
             const row = document.createElement('div');
             row.className = 'tdz-row mc-item-row';
-            // add a narrow column for the handle on the left
             row.style.gridTemplateColumns = '34px 240px 1fr 260px';
             row.dataset.index = String(iIdx);
 
-            // DRAG HANDLE (left-most)
             const handleCol = document.createElement('div');
             handleCol.className = 'mc-drag';
             handleCol.title = 'Ziehen zum Sortieren';
             handleCol.innerHTML = `<span class="grip">☰</span>`;
 
-            // FIRST COLUMN (checkboxes)
             const first = document.createElement('div');
             first.className = 'tdz-col';
             first.style.gap = '6px';
@@ -1042,7 +1059,6 @@
               </label>
             `;
 
-            // SECOND COLUMN (value)
             const valueCol = document.createElement('div');
             valueCol.className = 'tdz-col tdz-grow';
             valueCol.innerHTML = `
@@ -1050,7 +1066,6 @@
               <input type="text" class="mc-opt-value" value="${(it.value||'').replace(/"/g,'&quot;')}" placeholder="z. B. Onboarding"/>
             `;
 
-            // ACTIONS (right column)
             const actions = document.createElement('div');
             actions.className = 'tdz-actions';
             actions.innerHTML = `
@@ -1058,7 +1073,6 @@
               <button type="button" class="danger mc-del-opt">Löschen</button>
             `;
 
-            // CONDITIONAL FIELDS (full width)
             const fieldsCol = document.createElement('div');
             fieldsCol.className = 'tdz-col mc-fields-col';
             fieldsCol.style.gridColumn = '1 / -1';
@@ -1069,7 +1083,7 @@
             row.appendChild(actions);
             row.appendChild(fieldsCol);
 
-            // wire controls
+            // wire top-level
             const cbDefault = first.querySelector('.mc-opt-checked');
             const cbAlways  = first.querySelector('.mc-opt-always');
             const inVal     = valueCol.querySelector('.mc-opt-value');
@@ -1078,24 +1092,18 @@
             cbAlways.checked  = !!it.alwaysSelected;
             cbDefault.disabled = !!it.alwaysSelected;
 
-            cbDefault.addEventListener('change', () => {
-              it.checked = !!cbDefault.checked;
-              hidden.value = JSON.stringify(model);
-            });
+            cbDefault.addEventListener('change', () => { it.checked = !!cbDefault.checked; hidden.value = JSON.stringify(model); });
             cbAlways.addEventListener('change', () => {
               it.alwaysSelected = !!cbAlways.checked;
-              if (it.alwaysSelected) {
-                it.checked = true;
-                cbDefault.checked = true;
-                cbDefault.disabled = true;
-              } else {
-                cbDefault.disabled = false;
-              }
+              if (it.alwaysSelected) { it.checked = true; cbDefault.checked = true; cbDefault.disabled = true; }
+              else { cbDefault.disabled = false; }
               hidden.value = JSON.stringify(model);
             });
             inVal.addEventListener('input', () => { it.value = inVal.value; hidden.value = JSON.stringify(model); });
 
-            // CONDITIONAL FIELDS (single-row each)
+            // Re-render all extras when an earlier field changes type/id, so datediff dropdowns refresh
+            function triggerRefresh() { drawFields(); hidden.value = JSON.stringify(model); }
+
             function drawFields() {
               fieldsCol.innerHTML = '';
               if (!Array.isArray(it.fields)) it.fields = [];
@@ -1107,6 +1115,10 @@
                 const labelId   = uid('label');
                 const contentId = uid('content');
 
+                if (!fld || typeof fld !== 'object') fld = {};
+                if (!['text','number','date','datediff'].includes(fld.type)) fld.type = 'text';
+
+                // row container (flex)
                 const line = document.createElement('div');
                 line.className = 'row';
                 line.style.gap = '8px';
@@ -1118,12 +1130,19 @@
                 line.style.background = 'rgba(127,127,127,.04)';
                 line.style.borderRadius = '8px';
 
+                // type selector
                 const sel = document.createElement('select');
                 sel.id = typeSelId;
-                sel.innerHTML = `<option value="text">text</option><option value="number">number</option><option value="date">date</option>`;
+                sel.innerHTML = `
+                  <option value="text">text</option>
+                  <option value="number">number</option>
+                  <option value="date">date</option>
+                  <option value="datediff">datediff</option>
+                `;
                 sel.className = 'select-compact';
-                sel.style.minWidth = '110px';
+                sel.style.minWidth = '120px';
 
+                // generic inputs
                 const inId = document.createElement('input');
                 inId.id = idId; inId.type = 'text'; inId.placeholder = 'id';
                 inId.style.minWidth = '140px'; inId.style.width = '140px';
@@ -1136,20 +1155,122 @@
                 inContent.id = contentId; inContent.type = 'text'; inContent.placeholder = 'Inhalt (optional)';
                 inContent.style.minWidth = '220px'; inContent.style.flex = '1 1 auto';
 
-                const btnDel = document.createElement('button');
-                btnDel.type = 'button'; btnDel.className = 'ghost mc-field-del'; btnDel.textContent = 'Entfernen';
+                // datediff config
+                const ddWrap = document.createElement('div');
+                ddWrap.className = 'mc-dd-wrap';
+                ddWrap.style.display = 'none';
 
-                if (!fld || typeof fld !== 'object') fld = {};
-                fld.type = fld.type || 'text';
-                sel.value = fld.type;
+                const ddLabel = document.createElement('span');
+                ddLabel.className = 'mc-dd-fixed';
+                ddLabel.textContent = 'Dauer:';
+
+                const fromSel = document.createElement('select');
+                const toSel   = document.createElement('select');
+
+                // build source list: earlier local date extras + global date fields
+                function availableDateIds() {
+                  const localPrev = it.fields.slice(0, fIdx)
+                    .filter(ff => ff && ff.type === 'date' && ff.id)
+                    .map(ff => String(ff.id));
+                  return uniq([ ...localPrev, ...globalDateIds() ]);
+                }
+                function populateDateSelects() {
+                  const ids = availableDateIds();
+                  [fromSel, toSel].forEach(sel => { sel.innerHTML = ''; });
+                  if (!ids.length) {
+                    const o = document.createElement('option'); o.value = ''; o.textContent = '— keine Date-Felder —';
+                    fromSel.appendChild(o.cloneNode(true)); toSel.appendChild(o.cloneNode(true));
+                    fromSel.disabled = true; toSel.disabled = true;
+                    return;
+                  }
+                  fromSel.disabled = false; toSel.disabled = false;
+                  ids.forEach(id => {
+                    const o1 = document.createElement('option'); o1.value = id; o1.textContent = id; fromSel.appendChild(o1);
+                    const o2 = document.createElement('option'); o2.value = id; o2.textContent = id; toSel.appendChild(o2);
+                  });
+                }
+
+                ddWrap.appendChild(ddLabel);
+                ddWrap.appendChild(fromSel);
+                ddWrap.appendChild(toSel);
+
+                // delete button (always at far right)
+                const btnDel = document.createElement('button');
+                btnDel.type = 'button';
+                btnDel.className = 'ghost mc-field-del';
+                btnDel.textContent = 'Entfernen';
+                // push delete to the right edge
+                btnDel.style.marginLeft = 'auto';
+
+                // init values
+                sel.value = fld.type || 'text';
                 inId.value = fld.id || '';
                 inLabel.value = fld.label || '';
                 inContent.value = fld.content || '';
 
-                sel.addEventListener('change',   () => { fld.type = sel.value;           hidden.value = JSON.stringify(model); });
-                inId.addEventListener('input',   () => { fld.id = inId.value;            hidden.value = JSON.stringify(model); });
-                inLabel.addEventListener('input',() => { fld.label = inLabel.value;      hidden.value = JSON.stringify(model); });
-                inContent.addEventListener('input',() => { fld.content = inContent.value; hidden.value = JSON.stringify(model); });
+                // wire helpers
+                function ensureDatediffFixedBits() {
+                  // fixed label + generated id using from/to
+                  fld.label = 'Dauer';
+                  const fromId = fld.fromId || '';
+                  const toId   = fld.toId || '';
+                  fld.id = `datediff_${fromId}_${toId}`;
+                }
+
+                function toggleBits() {
+                  const isDD = sel.value === 'datediff';
+                  ddWrap.style.display   = isDD ? '' : 'none';
+                  inId.style.display     = isDD ? 'none' : '';
+                  inLabel.style.display  = isDD ? 'none' : '';
+                  inContent.style.display= isDD ? 'none' : '';
+                  if (isDD) {
+                    populateDateSelects();
+                    // restore previously selected values
+                    if (fld.fromId) fromSel.value = fld.fromId;
+                    if (fld.toId)   toSel.value   = fld.toId;
+                  }
+                }
+
+                toggleBits();
+
+                // events
+                sel.addEventListener('change', () => {
+                  fld.type = sel.value;
+                  if (fld.type === 'datediff') {
+                    // initialize if empty
+                    if (!fld.fromId || !fld.toId) {
+                      const ids = availableDateIds();
+                      fld.fromId = ids[0] || '';
+                      fld.toId   = ids[1] || ids[0] || '';
+                    }
+                    ensureDatediffFixedBits();
+                  } else {
+                    delete fld.fromId; delete fld.toId;
+                  }
+                  toggleBits();
+                  hidden.value = JSON.stringify(model);
+                });
+
+                // when non-datediff fields change → refresh so datediff lists include them
+                inId.addEventListener('input',   () => { if (fld.type !== 'datediff') { fld.id = inId.value; hidden.value = JSON.stringify(model); triggerRefresh(); } });
+                inLabel.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.label = inLabel.value; hidden.value = JSON.stringify(model); } });
+                inContent.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.content = inContent.value; hidden.value = JSON.stringify(model); } });
+
+                // switching a field to/from 'date' needs refresh for later datediff fields
+                sel.addEventListener('change', () => { triggerRefresh(); });
+
+                fromSel.addEventListener('change', () => {
+                  if (fld.type !== 'datediff') return;
+                  fld.fromId = fromSel.value;
+                  ensureDatediffFixedBits();
+                  hidden.value = JSON.stringify(model);
+                });
+                toSel.addEventListener('change', () => {
+                  if (fld.type !== 'datediff') return;
+                  fld.toId = toSel.value;
+                  ensureDatediffFixedBits();
+                  hidden.value = JSON.stringify(model);
+                });
 
                 btnDel.addEventListener('click', () => {
                   it.fields.splice(fIdx,1);
@@ -1157,10 +1278,12 @@
                   hidden.value = JSON.stringify(model);
                 });
 
+                // mount row
                 line.appendChild(sel);
                 line.appendChild(inId);
                 line.appendChild(inLabel);
                 line.appendChild(inContent);
+                line.appendChild(ddWrap);
                 line.appendChild(btnDel);
                 fieldsCol.appendChild(line);
               });
@@ -1169,7 +1292,7 @@
 
             actions.querySelector('.mc-add-field').addEventListener('click', () => {
               it.fields = it.fields || [];
-              it.fields.push({ type:'text', id:'', label:'', content:'' });
+              it.fields.push({ type:'text', id:'', label:'', content:'' }); // default new field
               drawFields();
               hidden.value = JSON.stringify(model);
             });
@@ -1180,11 +1303,9 @@
               hidden.value = JSON.stringify(model);
             });
 
-            // ---- DnD within group (via handle only) ----
+            // DnD via handle
             let dragFrom = null;
-
             handleCol.setAttribute('draggable', 'true');
-
             handleCol.addEventListener('dragstart', (e) => {
               dragFrom = iIdx;
               row.classList.add('dragging');
@@ -1196,8 +1317,6 @@
               Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
               dragFrom = null;
             });
-
-            // rows are drop targets
             row.addEventListener('dragover', (e) => {
               e.preventDefault();
               const rect = row.getBoundingClientRect();
@@ -1205,9 +1324,7 @@
               Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
               row.classList.add(before ? 'drop-before' : 'drop-after');
             });
-            row.addEventListener('dragleave', () => {
-              row.classList.remove('drop-before','drop-after');
-            });
+            row.addEventListener('dragleave', () => { row.classList.remove('drop-before','drop-after'); });
             row.addEventListener('drop', (e) => {
               e.preventDefault();
               const from = (dragFrom != null) ? dragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
@@ -1218,7 +1335,6 @@
               if (!Number.isFinite(from) || from < 0 || from >= grp.items.length) return;
               if (to < 0) to = 0;
               if (to > grp.items.length) to = grp.items.length;
-
               if (from === to || from + 1 === to) { row.classList.remove('drop-before','drop-after'); return; }
 
               const [moved] = grp.items.splice(from, 1);
@@ -1239,7 +1355,6 @@
           }
           redrawItems();
 
-          // “+ Option” aligned to the RIGHT
           addOptBtn.addEventListener('click', () => {
             grp.items.push({ value:'', checked:false, alwaysSelected:false, fields:[] });
             redrawItems();
@@ -1247,7 +1362,6 @@
             try { itemsWrap.lastElementChild?.scrollIntoView({ block: 'nearest' }); } catch {}
           });
 
-          // group controls
           card.querySelector('.mc-group-title').addEventListener('input', (e) => {
             grp.title = e.target.value; hidden.value = JSON.stringify(model);
           });
@@ -1259,7 +1373,6 @@
           list.appendChild(card);
         });
 
-        // add group (toolbar)
         cfg.hostEl.querySelector('.mc-add-group').addEventListener('click', () => {
           model.groups.push({ title:'', items:[] });
           render();

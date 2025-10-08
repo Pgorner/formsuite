@@ -500,6 +500,7 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     // ---------- Helpers: sanitize ----------
+    // ---------- Helpers: sanitize ----------
     function sanitizeValues(schema, vals) {
       const out = {};
       const fields = Array.isArray(schema?.fields) ? schema.fields : [];
@@ -508,6 +509,7 @@ def apply_visibility(u8, idx_to_action_json):
         const id = f.id;
         let v = vals?.[id];
 
+        // DATEDIFF — store the computed object
         if (f.type === 'datediff') {
           const d = vals?.[id];
           if (d && typeof d === 'object') {
@@ -522,7 +524,6 @@ def apply_visibility(u8, idx_to_action_json):
             const n = Number(d);
             out[id] = { days: n, months: 0, years: 0, formatted: `${n}-0-0 (${n})` };
           }
-          // continue loop
           continue;
         }
 
@@ -548,13 +549,12 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // MULTICHOICE (now: options + conditional fields)
+        // MULTICHOICE (options + conditional extras)
         if (f.type === 'multichoice') {
-          // 1) the main value remains an array of selected option values
+          // main value: array of selected options
           let arr = Array.isArray(v) ? v.slice() : (typeof v === 'string' ? v.split(',') : []);
           arr = arr.map(x => String(x).trim()).filter(Boolean);
 
-          // If classic f.options is present, filter against it; if grouped (f.mc) exists, allow any of those
           let allowed = null;
           if (Array.isArray(f.options) && f.options.length) {
             allowed = new Set(f.options.map(String));
@@ -567,30 +567,48 @@ def apply_visibility(u8, idx_to_action_json):
           if (arr.length) out[id] = arr;
           else if (f.required) out[id] = [];
 
-          // 2) Conditional extras: persist under synthesized ids
+          // conditional extras under synthesized keys
           if (f.mc && Array.isArray(f.mc.groups)) {
             for (const g of f.mc.groups) {
               for (const it of (g.items || [])) {
                 const optVal = String(it?.value || '');
                 const extras = Array.isArray(it?.fields) ? it.fields : [];
                 for (const ex of extras) {
-                  const exType = (ex?.type === 'date' || ex?.type === 'number' || ex?.type === 'text') ? ex.type : 'text';
-                  const exId   = String(ex?.id || '');
+                  const exId = String(ex?.id || '');
                   if (!exId) continue;
                   const k = mcExtraKey(f.id, optVal, exId);
                   const raw = vals?.[k];
 
-                  if (exType === 'date') {
+                  if (ex.type === 'date') {
                     const s = String(raw ?? '');
-                    if (s) out[k] = s; // ISO string (we already keep it as text)
-                  } else if (exType === 'number') {
+                    if (s) out[k] = s;
+                    continue;
+                  }
+
+                  if (ex.type === 'number') {
                     if (raw === '' || raw == null) continue;
                     const num = (typeof raw === 'number') ? raw : Number(String(raw).replace(',', '.'));
                     if (Number.isFinite(num)) out[k] = num;
-                  } else { // text
-                    const s = String(raw ?? '');
-                    if (s) out[k] = s;
+                    continue;
                   }
+
+                  // NEW: datediff inside MC — store same object shape as top-level
+                  if (ex.type === 'datediff') {
+                    if (raw && typeof raw === 'object' && typeof raw.days !== 'undefined') {
+                      const o = {
+                        days: Number(raw.days ?? 0),
+                        months: Number(raw.months ?? 0),
+                        years: Number(raw.years ?? 0),
+                        formatted: String(raw.formatted ?? '')
+                      };
+                      if (o.formatted) out[k] = o;
+                    }
+                    continue;
+                  }
+
+                  // default: text
+                  const s = String(raw ?? '');
+                  if (s) out[k] = s;
                 }
               }
             }
@@ -637,7 +655,7 @@ def apply_visibility(u8, idx_to_action_json):
           }).filter(r => Object.values(r).some(val => String(val).trim() !== ''));
           const min = Math.max(0, parseInt(f.minRows || 0, 10));
           while (cleaned.length < min) {
-            const empty = {}; colIds.forEach(cid => empty[cid] = ''); cleaned.push(empty);
+            const empty = {}; colIds.forEach(cid => empty[cid] = '', cleaned.push(empty));
           }
           if (cleaned.length) out[id] = cleaned;
           else if (f.required) out[id] = [];
@@ -796,7 +814,6 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     // ---------- Render whole form ----------
-
     function renderForm() {
       // local fallbacks in case helpers weren't injected elsewhere
       const __slugifyMc = (window.slugifyMc) ? window.slugifyMc : function (s) {
@@ -819,7 +836,7 @@ def apply_visibility(u8, idx_to_action_json):
         return;
       }
 
-      // ---------- hydrate defaults for tables ----------
+      // hydrate defaults for tables
       (schema.fields || []).forEach(f => {
         if (f.type === 'table') {
           if (!Array.isArray(values[f.id])) {
@@ -831,7 +848,7 @@ def apply_visibility(u8, idx_to_action_json):
         }
       });
 
-      // ---------- build form container (responsive grid) ----------
+      // build form container
       const form = document.createElement('form');
       form.classList.add('form-grid');
 
@@ -842,11 +859,15 @@ def apply_visibility(u8, idx_to_action_json):
         form.appendChild(h);
       }
 
-      // refs used by datediff + guards
-      const inputRefs = {};     // id -> input element (date/text/select)
-      const datediffRefs = [];  // { field, outEl, fromId, toId }
+      // refs used by dates/datediff
+      const inputRefs  = {};  // global date inputs by field id
+      const mcDateRefs = {};  // MC date extras by synthetic key
+      // generic datediff list: each entry exposes a resolver for a & b dates
+      const datediffRefs = []; // [{storeKey, outEl, resolve}]
+      // top-level guard pairs only (global date fields)
+      const guardPairs = [];   // [{fromId, toId}]
 
-      // ---------- render each field ----------
+      // render fields
       (schema.fields || []).forEach(f => {
         const wrap = document.createElement('div');
         wrap.className = 'field';
@@ -909,7 +930,7 @@ def apply_visibility(u8, idx_to_action_json):
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
-        // ---- MULTICHOICE (groups + conditional fields + preselect/locked) ----
+        // ---- MULTICHOICE (groups + conditional fields) ----
         } else if (f.type === 'multichoice') {
           const host = document.createElement('div');
           host.className = 'mc-group';
@@ -946,7 +967,7 @@ def apply_visibility(u8, idx_to_action_json):
             });
           }
 
-          // 1) PRESELECT on first load (only when there's no saved selection yet)
+          // PRESELECT on first load (no saved selection yet)
           if (!Array.isArray(values[f.id])) {
             const initial = items
               .filter(it => it.alwaysSelected || it.preselected)
@@ -969,7 +990,7 @@ def apply_visibility(u8, idx_to_action_json):
             const optId  = `${f.id}__${__slugifyMc(optVal)}`;
             const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
 
-            // wrapper card
+            // card
             const card = document.createElement('div');
             card.className = 'mc-item';
             card.style.display = 'block';
@@ -978,7 +999,7 @@ def apply_visibility(u8, idx_to_action_json):
             card.style.borderRadius = '8px';
             card.style.padding = '10px 10px';
 
-            // line 1: checkbox + label
+            // header row
             const row1 = document.createElement('div');
             row1.className = 'row';
             row1.style.alignItems = 'center';
@@ -999,7 +1020,6 @@ def apply_visibility(u8, idx_to_action_json):
             cb.id = optId;
             cb.value = optVal;
 
-            // 2) IMMER AUSGEWÄHLT (locked) + preselect logic
             const locked = !!item.alwaysSelected;
             const isPreselected = !!item.preselected;
             cb.checked = locked || selected.has(optVal) || (!selected.size && isPreselected);
@@ -1012,23 +1032,23 @@ def apply_visibility(u8, idx_to_action_json):
             left.appendChild(txt);
             row1.appendChild(left);
 
-            // line 2: conditional fields (only render if option defines extras)
+            // extras
             let extrasWrap = null;
             if (hasExtras) {
               extrasWrap = document.createElement('div');
-              // 4) no gap if no extras or when hidden
-              extrasWrap.style.marginTop = '0';
-              extrasWrap.style.display = (cb.checked || locked) ? '' : 'none';
+              // NEW: consistent spacing between each extra row
+              extrasWrap.style.display = 'grid';
+              extrasWrap.style.gridTemplateColumns = '1fr';
+              extrasWrap.style.rowGap = '8px';
+              extrasWrap.style.marginTop = (cb.checked || locked) ? '8px' : '0';
+              extrasWrap.style.paddingBottom = '2px';
 
               function mountExtraFields() {
                 extrasWrap.innerHTML = '';
                 if (!item.fields.length) return;
 
-                // only add vertical spacing when we actually place extras
-                extrasWrap.style.marginTop = (cb.checked || locked) ? '8px' : '0';
-
                 item.fields.forEach(ex => {
-                  const exType = (ex?.type === 'date' || ex?.type === 'number' || ex?.type === 'text') ? ex.type : 'text';
+                  const exType = (ex?.type) ? String(ex.type) : 'text';
                   const exId   = String(ex?.id || '');
                   if (!exId) return;
                   const exKey  = __mcExtraKey(f.id, optVal, exId);
@@ -1037,12 +1057,15 @@ def apply_visibility(u8, idx_to_action_json):
                   line.className = 'row';
                   line.style.gap = '8px';
                   line.style.alignItems = 'center';
+                  // NEW: add slight vertical spacing so this extra doesn't stick to the previous one
+                  line.style.marginTop = '2px';
 
                   const lab = document.createElement('label');
                   lab.textContent = String(ex?.label || exId);
                   lab.style.minWidth = '120px';
                   lab.style.color = 'var(--muted)';
 
+                  // MC DATE
                   if (exType === 'date') {
                     const input = document.createElement('input');
                     input.type = 'text';
@@ -1058,30 +1081,143 @@ def apply_visibility(u8, idx_to_action_json):
                       altInput: true,
                       altFormat: 'D, j M Y',
                       defaultDate: values[exKey] || null,
-                      onChange: () => { values[exKey] = input.value; scheduleSaveState(); },
-                      onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); }
+                      onChange: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
+                      onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
                     });
                     fp.set('allowInput', false);
                     if (fp.altInput) fp.altInput.readOnly = true;
+
+                    // keep handle so MC datediff can reference/guard
+                    mcDateRefs[exKey] = input;
                     return;
                   }
 
-                  const input = document.createElement('input');
+                  // MC DATEDIFF (display-only, same output as top-level)
+                  if (exType === 'datediff') {
+                    const lineOut = document.createElement('span');
+                    // NEW: make it look like a read-only pill and space it nicely
+                    lineOut.className = 'kbd datediff-out';
+                    lineOut.style.whiteSpace = 'nowrap';
+                    lineOut.textContent = '—';
+
+                    lab.textContent = ex.label || 'Dauer';
+
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(lineOut);
+
+                    // resolver: prefers local MC date extras, else global fields
+                    function readLocalMcDate(extraId) {
+                      const key = __mcExtraKey(f.id, optVal, extraId);
+                      const el = mcDateRefs[key];
+                      if (el && el._flatpickr?.selectedDates?.[0] instanceof Date) return el._flatpickr.selectedDates[0];
+                      const iso = values[key];
+                      if (!iso) return null;
+                      const d = (window.flatpickr && window.flatpickr.parseDate)
+                        ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
+                        : new Date(String(iso));
+                      return (d && !isNaN(d)) ? d : null;
+                    }
+
+                    datediffRefs.push({
+                      storeKey: exKey,
+                      outEl: lineOut,
+                      resolve: () => {
+                        const a = readLocalMcDate(ex.fromId) ?? getDateForField(ex.fromId);
+                        const b = readLocalMcDate(ex.toId)   ?? getDateForField(ex.toId);
+                        return { a, b };
+                      }
+                    });
+
+                    // If both sides are local MC dates, enforce "to >= from + 1 day"
+                    const fromLocalKey = __mcExtraKey(f.id, optVal, ex.fromId);
+                    const toLocalKey   = __mcExtraKey(f.id, optVal, ex.toId);
+                    const fromEl = mcDateRefs[fromLocalKey];
+                    const toEl   = mcDateRefs[toLocalKey];
+                    if (fromEl?._flatpickr && toEl?._flatpickr) {
+                      const fpFrom = fromEl._flatpickr;
+                      const fpTo   = toEl._flatpickr;
+                      const nextDay = (d) => { if (!d) return null; const n = new Date(d.getFullYear(), d.getMonth(), d.getDate()); n.setDate(n.getDate()+1); return n; };
+
+                      const syncToWithFrom = () => {
+                        const from = fpFrom.selectedDates?.[0] || null;
+                        const minForTo = nextDay(from);
+                        fpTo.set('minDate', minForTo || null);
+                        const toSel = fpTo.selectedDates?.[0] || null;
+                        if (!toSel && minForTo) fpTo.setDate(minForTo, true);
+                        if (from && toSel && toSel <= from) fpTo.setDate(minForTo, true);
+                        if (window.recomputeDatediffs) window.recomputeDatediffs();
+                      };
+
+                      syncToWithFrom();
+                      fpFrom.config.onChange.push(syncToWithFrom);
+                      fpFrom.config.onValueUpdate.push(syncToWithFrom);
+                      const bump = () => window.recomputeDatediffs && window.recomputeDatediffs();
+                      fpTo.config.onChange.push(bump);
+                      fpTo.config.onValueUpdate.push(bump);
+                    }
+                    return;
+                  }
+
+                  // number
                   if (exType === 'number') {
+                    const input = document.createElement('input');
                     input.type = 'number';
                     input.value = values[exKey] ?? '';
                     input.addEventListener('change', () => {
                       values[exKey] = Number(input.value);
                       scheduleSaveState();
                     });
-                  } else {
-                    input.type = 'text';
-                    input.value = values[exKey] ?? '';
-                    input.addEventListener('change', () => {
-                      values[exKey] = input.value;
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(input);
+                    return;
+                  }
+
+                  // LEGACY: duration gadget (kept if you still use it)
+                  if (exType === 'duration') {
+                    const unit = ['days','months','years','hours'].includes(ex?.unit) ? ex.unit : 'days';
+                    const current = values[exKey];
+                    const initial = (current && typeof current === 'object' && current.value != null)
+                      ? current.value
+                      : (ex.default != null ? ex.default : '');
+
+                    const num = document.createElement('input');
+                    num.type = 'number';
+                    num.min = '0';
+                    num.style.minWidth = '120px';
+                    num.value = initial;
+
+                    const unitBadge = document.createElement('span');
+                    unitBadge.className = 'kbd';
+                    unitBadge.textContent = unit;
+
+                    num.addEventListener('change', () => {
+                      const v = num.value.trim();
+                      if (v === '') {
+                        delete values[exKey];
+                      } else {
+                        const n = Number(v);
+                        if (Number.isFinite(n)) values[exKey] = { value: n, unit };
+                      }
                       scheduleSaveState();
                     });
+
+                    extrasWrap.appendChild(line);
+                    line.appendChild(lab);
+                    line.appendChild(num);
+                    line.appendChild(unitBadge);
+                    return;
                   }
+
+                  // default: text
+                  const input = document.createElement('input');
+                  input.type = 'text';
+                  input.value = values[exKey] ?? '';
+                  input.addEventListener('change', () => {
+                    values[exKey] = input.value;
+                    scheduleSaveState();
+                  });
 
                   extrasWrap.appendChild(line);
                   line.appendChild(lab);
@@ -1091,16 +1227,16 @@ def apply_visibility(u8, idx_to_action_json):
 
               mountExtraFields();
 
-              // 3) toggle extras visibility with selection
+              // toggle extras visibility with selection
               cb.addEventListener('change', () => {
                 if (locked) { cb.checked = true; return; }
                 persistMainSelection();
                 const show = cb.checked || locked;
-                extrasWrap.style.display = show ? '' : 'none';
-                extrasWrap.style.marginTop = (show && item.fields.length) ? '8px' : '0';
+                extrasWrap.style.display = show ? 'grid' : 'none';
+                extrasWrap.style.marginTop = (show && (item.fields || []).length) ? '8px' : '0';
               });
             } else {
-              // no extras: still persist selection changes; ensure no gap
+              // no extras: still persist selection changes
               cb.addEventListener('change', () => {
                 if (locked) { cb.checked = true; return; }
                 persistMainSelection();
@@ -1113,7 +1249,7 @@ def apply_visibility(u8, idx_to_action_json):
           }
 
           items.forEach(drawOption);
-          // keep persisted array updated after initial draw (covers preselect defaults)
+          // persist array after initial draw (covers preselect defaults)
           values[f.id] = Array.from(host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
             .filter(b => b.checked)
             .map(b => b.value);
@@ -1168,20 +1304,31 @@ def apply_visibility(u8, idx_to_action_json):
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
 
-        // ---- DATEDIFF ----
+        // ---- DATEDIFF (top-level) ----
         } else if (f.type === 'datediff') {
           const fromId = f.fromId || f.from || '';
           const toId   = f.toId   || f.to   || '';
 
           const out = document.createElement('div');
           out.id = f.id;
-          out.className = 'datediff-out';
+          out.className = 'datediff-out kbd';
           out.setAttribute('role', 'status');
           out.setAttribute('aria-live', 'polite');
           out.textContent = '—';
           wrap.appendChild(out);
 
-          datediffRefs.push({ field: f, outEl: out, fromId, toId });
+          // unify computation via resolver
+          datediffRefs.push({
+            storeKey: f.id,
+            outEl: out,
+            resolve: () => ({
+              a: getDateForField(fromId),
+              b: getDateForField(toId)
+            })
+          });
+
+          // remember for top-level guard wiring
+          guardPairs.push({ fromId, toId });
 
         // ---- DEFAULT ----
         } else {
@@ -1197,7 +1344,7 @@ def apply_visibility(u8, idx_to_action_json):
         form.appendChild(wrap);
       });
 
-      // ---------- bottom bar ----------
+      // bottom bar
       const bar = document.createElement('div');
       bar.className = 'bar';
       bar.style.gridColumn = '1 / -1';
@@ -1212,7 +1359,7 @@ def apply_visibility(u8, idx_to_action_json):
 
       mount.appendChild(form);
 
-      // ---------- datediff helpers ----------
+      // ---- datediff helpers ----
       function getDateForField(fid) {
         const el = inputRefs[fid];
         if (!el) return null;
@@ -1228,36 +1375,36 @@ def apply_visibility(u8, idx_to_action_json):
         return null;
       }
 
+      // Unified recompute for top-level + MC datediff.
+      // NEW: labeled format "XDays - XMonths - XYears (XDays total)"
       function recomputeDatediffs() {
-        datediffRefs.forEach(({ field, outEl, fromId, toId }) => {
-          const a = getDateForField(fromId);
-          const b = getDateForField(toId);
+        datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
+          const { a, b } = resolve();
           if (!a || !b) {
             outEl.textContent = '—';
-            values[field.id] = null;
+            values[storeKey] = null;
             return;
           }
           const days   = diffInDays(a, b);
           const months = diffInMonths(a, b);
           const years  = diffInYears(a, b);
-          const display = `${days} Days · ${months} Months · ${years} Years (${days} total)`;
+          const display = `${days}D ${months}M - ${years}Y (${days} Days total)`;
           outEl.textContent = display;
-          values[field.id] = { days, months, years, formatted: display };
+          values[storeKey] = { days, months, years, formatted: display };
         });
         scheduleSaveState();
       }
       window.recomputeDatediffs = recomputeDatediffs;
 
-      // ---------- date guards (FROM precedence; TO strictly after FROM) ----------
-      (function wireDateGuards() {
+      // Guards for top-level pairs only (MC local guards are wired inline)
+      (function wireTopLevelDateGuards() {
         function nextDay(d) {
           if (!d) return null;
           const n = new Date(d.getFullYear(), d.getMonth(), d.getDate());
           n.setDate(n.getDate() + 1);
           return n;
         }
-
-        datediffRefs.forEach(({ fromId, toId }) => {
+        guardPairs.forEach(({ fromId, toId }) => {
           const fromEl = inputRefs[fromId];
           const toEl   = inputRefs[toId];
           const fpFrom = fromEl?._flatpickr;
@@ -1297,6 +1444,7 @@ def apply_visibility(u8, idx_to_action_json):
       // initial compute
       recomputeDatediffs();
     }
+
 
 
     // ----- TABLE FIELD -----
