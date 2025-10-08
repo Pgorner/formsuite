@@ -35,18 +35,20 @@
   }
 
   function toDisplayLine(feat) {
-    // Build a nice human-readable string
     const p = feat.properties || {};
     const parts = [
       p.name,
-      [p.housenumber, p.street].filter(Boolean).join(' '), // prefer street + number together
+      [p.housenumber, p.street].filter(Boolean).join(' '),
       p.postcode,
       p.city || p.town || p.village,
       p.country
     ].filter(Boolean);
-    // De-duplicate small artifacts
-    const line = parts.join(', ').replace(/\s+,/g, ',').replace(/,+/g, ',').replace(/,\s*,/g, ', ').replace(/\s{2,}/g, ' ').trim();
-    return line || p.label || p.name || '—';
+    return parts.join(', ')
+      .replace(/\s+,/g, ',')
+      .replace(/,+/g, ',')
+      .replace(/,\s*,/g, ', ')
+      .replace(/\s{2,}/g, ' ')
+      .trim() || p.label || p.name || '—';
   }
 
   function normalizeValue(feat) {
@@ -72,7 +74,10 @@
     params.set('limit', String(MAX_RESULTS));
     if (lang) params.set('lang', lang);
     if (bbox && Array.isArray(bbox) && bbox.length === 4) params.set('bbox', bbox.join(','));
-    if (biasLonLat && Array.isArray(biasLonLat) && biasLonLat.length === 2) params.set('lon', biasLonLat[0]), params.set('lat', biasLonLat[1]);
+    if (biasLonLat && Array.isArray(biasLonLat) && biasLonLat.length === 2) {
+      params.set('lon', biasLonLat[0]);
+      params.set('lat', biasLonLat[1]);
+    }
 
     const url = `${PHOTON_URL}?${params.toString()}`;
     const res = await fetch(url, { method: 'GET' });
@@ -89,102 +94,126 @@
     const required = !!opts?.required;
     let currentValue = opts?.value || null;
     let highlightIndex = -1;
+    let featsCache = [];
 
-    container.classList.add('addr-wrap');
+    // host + structure
+    container.classList.add('addr-host');
+    container.innerHTML = '';
+    const field = h('div', { class: 'addr-field' }); // positioning context
 
     const label = h('label', { class: 'small', for: id }, labelText, required ? ' *' : '');
-    const input = h('input', { id, type: 'text', placeholder: 'Start typing an address…', autocomplete: 'off', spellcheck: 'false' });
+    const input = h('input', {
+      id, type: 'text', placeholder: 'Start typing an address…',
+      autocomplete: 'off', spellcheck: 'false', 'aria-haspopup': 'listbox', 'aria-expanded': 'false'
+    });
+
+    // overlay dropdown (absolute)
     const list = h('div', { class: 'addr-list', role: 'listbox', id: id + '_list' });
 
-    // When we already have a value (edit mode), show it
+    // screen-reader only live region (no visual preview / no extra space)
+    const sr = h('div', { class: 'sr-only', 'aria-live': 'polite' });
+
     if (currentValue?.formatted) input.value = currentValue.formatted;
 
-    const status = h('div', { class: 'addr-status muted small' });
+    field.appendChild(label);
+    field.appendChild(input);
+    field.appendChild(list);
+    field.appendChild(sr);
+    container.appendChild(field);
 
-    container.appendChild(label);
-    container.appendChild(input);
-    container.appendChild(list);
-    container.appendChild(status);
-
-    function renderList(feats) {
+    function renderList(items) {
       list.innerHTML = '';
       highlightIndex = -1;
-      feats.forEach((f, idx) => {
+      featsCache = items;
+      items.forEach((f, idx) => {
         const line = toDisplayLine(f);
         const item = h('div', { class: 'addr-item', role: 'option', 'data-idx': String(idx) }, line);
-        item.addEventListener('mousedown', (e) => {
-          e.preventDefault(); // keep focus
-          pick(idx, feats);
+        item.addEventListener('pointerdown', (e) => {
+          e.preventDefault(); // retain input focus
+          pick(idx);
         });
         list.appendChild(item);
       });
-      list.style.display = feats.length ? 'block' : 'none';
+      const open = items.length > 0;
+      list.style.display = open ? 'block' : 'none';
+      input.setAttribute('aria-expanded', open ? 'true' : 'false');
+      sr.textContent = open ? `${items.length} Treffer` : '';
     }
 
-    function highlight(delta, feats) {
+    function ensureVisible(activeEl) {
+      if (!activeEl) return;
+      const { top, bottom } = activeEl.getBoundingClientRect();
+      const lp = list.getBoundingClientRect();
+      if (top < lp.top) activeEl.scrollIntoView({ block: 'nearest' });
+      if (bottom > lp.bottom) activeEl.scrollIntoView({ block: 'nearest' });
+    }
+
+    function highlight(delta) {
       if (!list.children.length) return;
       highlightIndex = (highlightIndex + delta + list.children.length) % list.children.length;
-      Array.from(list.children).forEach((el, i) => el.classList.toggle('active', i === highlightIndex));
-      if (feats && feats[highlightIndex]) {
-        status.textContent = toDisplayLine(feats[highlightIndex]);
-      }
+      Array.from(list.children).forEach((el, i) => {
+        el.classList.toggle('active', i === highlightIndex);
+        if (i === highlightIndex) ensureVisible(el);
+      });
     }
 
-    function pick(idx, feats) {
-      const f = feats[idx];
+    function pick(idx) {
+      const f = featsCache[idx];
       if (!f) return;
       const val = normalizeValue(f);
       currentValue = val;
       input.value = val.formatted || '';
       list.style.display = 'none';
-      status.textContent = val.formatted || '';
+      input.setAttribute('aria-expanded', 'false');
+      // NO visible preview; just fire change
       try { opts?.onChange && opts.onChange(val); } catch {}
     }
 
     const doQuery = debounce(async () => {
       const q = input.value.trim();
-      if (q.length < MIN_LEN) { list.style.display = 'none'; status.textContent = ''; return; }
-      status.textContent = 'Searching…';
+      if (q.length < MIN_LEN) { renderList([]); return; }
+      sr.textContent = 'Suche läuft…';
       try {
         const feats = await fetchPhoton(q, { lang: navigator.language?.slice(0,2) || 'en' });
         renderList(feats.slice(0, MAX_RESULTS));
-        status.textContent = feats.length ? '' : 'No matches.';
-      } catch (e) {
-        status.textContent = 'Lookup failed. Try again.';
-        list.style.display = 'none';
+      } catch {
+        renderList([]);
+        sr.textContent = 'Abfrage fehlgeschlagen.';
       }
     }, DEBOUNCE_MS);
 
     input.addEventListener('input', () => {
       currentValue = null;
-      opts?.onChange && opts.onChange(null);
+      try { opts?.onChange && opts.onChange(null); } catch {}
       doQuery();
     });
 
-    input.addEventListener('keydown', async (e) => {
-      const visible = list.style.display !== 'none';
-      if (e.key === 'ArrowDown' && visible) { e.preventDefault(); highlight(+1); return; }
-      if (e.key === 'ArrowUp'   && visible) { e.preventDefault(); highlight(-1); return; }
-      if (e.key === 'Enter' && visible) {
+    input.addEventListener('keydown', (e) => {
+      const open = list.style.display !== 'none';
+      if (e.key === 'ArrowDown' && open) { e.preventDefault(); highlight(+1); return; }
+      if (e.key === 'ArrowUp'   && open) { e.preventDefault(); highlight(-1); return; }
+      if (e.key === 'Enter' && open) {
         e.preventDefault();
-        const items = Array.from(list.children);
         const idx = (highlightIndex >= 0 ? highlightIndex : 0);
-        if (items[idx]) items[idx].dispatchEvent(new MouseEvent('mousedown'));
+        pick(idx);
       }
-      if (e.key === 'Escape' && visible) { list.style.display = 'none'; }
+      if (e.key === 'Escape' && open) { list.style.display = 'none'; input.setAttribute('aria-expanded','false'); }
     });
 
     document.addEventListener('click', (e) => {
-      if (!container.contains(e.target)) list.style.display = 'none';
+      if (!container.contains(e.target)) {
+        list.style.display = 'none';
+        input.setAttribute('aria-expanded','false');
+      }
     });
 
-    // API exposed to caller (optional)
+    // public API
     return {
       get value() { return currentValue; },
       set value(v) {
         currentValue = v;
         input.value = v?.formatted || '';
-        status.textContent = v?.formatted || '';
+        // no preview update
       },
       focus: () => input.focus()
     };
@@ -194,16 +223,59 @@
   (function injectStyles() {
     if (document.getElementById('addr-autocomplete-styles')) return;
     const css = `
-.addr-wrap { position: relative; }
-.addr-wrap .addr-list {
-  position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px);
-  background: var(--card, #fff); border: 1px solid var(--border, #e5e7eb);
-  border-radius: var(--radius, 10px); box-shadow: 0 6px 16px rgba(0,0,0,.08);
-  max-height: 260px; overflow: auto; display:none;
+.addr-host { position: relative; }
+.addr-field { position: relative; display: grid; gap: 6px; }
+.addr-field > input[type="text"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1.5px solid var(--border-strong, #d1d5db);
+  border-radius: var(--radius-sm, 8px);
+  font-size: 14px;
+  background: var(--card, #fff);
+  color: var(--ink, #0f172a);
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(0,0,0,.02);
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
-.addr-wrap .addr-item { padding: 8px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.addr-wrap .addr-item:hover, .addr-wrap .addr-item.active { background: var(--ghost-bg, #eef2f7); }
-.addr-wrap .addr-status { margin-top: 6px; min-height: 1em; }
+.addr-field > input[type="text"]:focus {
+  border-color: var(--focus-border, #86a7ff);
+  box-shadow: 0 0 0 3px var(--focus-ring, rgba(134,167,255,.28));
+}
+
+/* Overlayed dropdown */
+.addr-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0; right: 0;
+  z-index: 40;
+  display: none;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 10px);
+  background: var(--card, #fff);
+  box-shadow: var(--shadow-lg, 0 12px 24px rgba(0,0,0,.12));
+  max-height: 260px;
+  overflow: auto;
+  padding: 4px 0;
+}
+.addr-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.addr-item:hover,
+.addr-item.active {
+  background: rgba(48,136,255,.08);
+}
+
+/* screen-reader-only helper (no layout space) */
+.sr-only {
+  position: absolute !important;
+  width: 1px; height: 1px; padding: 0; margin: 0;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap; border: 0;
+}
 `;
     const el = document.createElement('style');
     el.id = 'addr-autocomplete-styles';

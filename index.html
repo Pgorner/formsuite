@@ -910,16 +910,39 @@ def apply_visibility(u8, idx_to_action_json):
               ? { formatted: values[f.id] }
               : (values[f.id] || null);
 
-          AddressAuto.mount(mountDiv, {
-            id: f.id,
-            label: f.label || 'Address',
-            required: !!f.required,
-            value: initial || null,
-            onChange: (val) => {
-              values[f.id] = val;
-              scheduleSaveState();
-            }
-          });
+        AddressAuto.mount(mountDiv, {
+          id: f.id,
+          label: f.label || 'Address',
+          required: !!f.required,
+          value: initial || null,
+          // if your component supports it, these make it cleaner:
+          showSelectedPreview: false,
+          renderDropdownAsOverlay: true,
+          onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
+        });
+
+        /* Post-mount tidy: keep dropdown inside the .address-field and overlayed */
+        (() => {
+          const host = mountDiv.closest('.address-field') || mountDiv;
+
+          // Find a dropdown candidate by common class names
+          const dropdown =
+            host.querySelector('.aa-dropdown, .address-dropdown, .suggestions, .autocomplete-list') ||
+            document.querySelector('.aa-dropdown, .address-dropdown, .suggestions, .autocomplete-list');
+
+          if (dropdown && dropdown.parentElement !== host) {
+            host.appendChild(dropdown);        // move it under the input wrapper
+          }
+
+          // Ensure the input doesn’t trigger native autocomplete overlays
+          const input = host.querySelector('input[type="text"], .aa-input, .address-input');
+          if (input) {
+            input.setAttribute('autocomplete', 'off');
+            input.setAttribute('autocapitalize', 'off');
+            input.setAttribute('spellcheck', 'false');
+          }
+        })();
+
 
         } else if (f.type === 'datediff') {
           const fromId = f.fromId || f.from || '';

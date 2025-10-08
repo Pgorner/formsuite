@@ -710,6 +710,92 @@ button.btn-danger:disabled {
     opacity: 1;
   }
 
+/* === Address picker: overlay dropdown, no layout shift === */
+.address-field { position: relative; }
+
+/* input look matches other fields, kills extra bottom space */
+.address-field input[type="text"],
+.address-field .aa-input,
+.address-field .address-input {
+  width: 100%;
+  margin-bottom: 0;               /* remove stray gap under input */
+}
+
+/* common dropdown container class names we might see */
+.address-field .aa-dropdown,
+.address-field .address-dropdown,
+.address-field .suggestions,
+.address-field .autocomplete-list {
+  position: absolute;             /* keep it from pushing layout */
+  top: calc(100% + 4px);          /* a small gap under the input */
+  left: 0; right: 0;
+  z-index: 50;
+
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+
+  max-height: 260px;              /* scroll if long */
+  overflow: auto;
+  padding: 6px;
+}
+
+/* suggestion items (again, cover common class names) */
+.address-field .aa-item,
+.address-field .suggestion,
+.address-field .autocomplete-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  line-height: 1.25;
+}
+
+/* hover/active styles */
+.address-field .aa-item:hover,
+.address-field .suggestion:hover,
+.address-field .autocomplete-item:hover,
+.address-field .aa-item[aria-selected="true"],
+.address-field .autocomplete-item[aria-selected="true"] {
+  background: #eef2ff;
+}
+
+/* divider between groups (if any) */
+.address-field .aa-sep,
+.address-field .suggestion-sep {
+  height: 1px;
+  margin: 6px 4px;
+  background: var(--border);
+}
+
+/* Hide any below-input “selected summary/preview” block */
+.address-field .aa-selected,
+.address-field .selected-preview,
+.address-field .address-preview,
+.address-field .chosen,
+.address-field .result-preview {
+  display: none !important;
+}
+
+/* make sure the dropdown never wraps outside */
+.address-field .aa-dropdown,
+.address-field .address-dropdown,
+.address-field .suggestions,
+.address-field .autocomplete-list {
+  inset-inline: 0;
+}
+
+/* Mobile tweak: dropdown sits above other content */
+@media (max-width: 640px) {
+  .address-field .aa-dropdown,
+  .address-field .address-dropdown,
+  .address-field .suggestions,
+  .address-field .autocomplete-list {
+    max-height: 50vh;
+  }
+}
+
+
 /* -------------------------------------------------------------
    END
    ------------------------------------------------------------- */
