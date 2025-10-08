@@ -1083,7 +1083,7 @@ def apply_visibility(u8, idx_to_action_json):
       const editorInputs = {};
       let editorState = emptyRow(field);
 
-      // small helper to size inputs decently without extra CSS
+      // helpers for sizing
       const measurer = document.createElement('canvas').getContext('2d');
       function textPx(str) {
         try { measurer.font = getComputedStyle(document.body).font; } catch {}
@@ -1141,7 +1141,7 @@ def apply_visibility(u8, idx_to_action_json):
         editorWrap.appendChild(pair);
       });
 
-      // --- Toolbar (inline, same look/feel as other form bits) ---
+      // --- Toolbar ---
       const toolbar = document.createElement('div');
       toolbar.className = 'row';
       toolbar.style.gap = '8px';
@@ -1160,15 +1160,21 @@ def apply_visibility(u8, idx_to_action_json):
       btnDelete.className = 'ghost';
       btnDelete.textContent = 'Zeile löschen';
 
+      const btnCancel = document.createElement('button');
+      btnCancel.type = 'button';
+      btnCancel.className = 'ghost';
+      btnCancel.textContent = 'Abbrechen';
+
       toolbar.appendChild(btnAdd);
       toolbar.appendChild(btnSave);
       toolbar.appendChild(btnDelete);
+      toolbar.appendChild(btnCancel);
 
       const status = document.createElement('div');
       status.className = 'muted';
       status.style.minHeight = '1.2em';
 
-      // --- Live table preview (now actually appended) ---
+      // --- Table preview ---
       const tableWrap = document.createElement('div');
       tableWrap.style.overflow = 'auto';
       const table = document.createElement('table');
@@ -1193,12 +1199,25 @@ def apply_visibility(u8, idx_to_action_json):
         tbody.innerHTML = '';
         data.forEach((row, idx) => {
           const tr = document.createElement('tr');
-          tr.dataset.sel = (idx === selectedIndex) ? '1' : '';
+          const isSel = idx === selectedIndex;
+
+          // persistent "selected" styling (stronger than hover)
+          if (isSel) {
+            tr.style.background = '#DBEAFE';           // strong light blue
+            tr.style.outline = '2px solid #93C5FD';    // visible border
+            tr.style.outlineOffset = '-2px';
+          } else {
+            tr.style.background = '';
+            tr.style.outline = '';
+            tr.style.outlineOffset = '';
+          }
+
           tr.addEventListener('click', () => {
-            selectedIndex = (selectedIndex === idx ? -1 : idx);
+            selectedIndex = idx;        // do NOT toggle off on second click
             drawTable();
-            if (selectedIndex >= 0) loadIntoEditor(idx);
+            loadIntoEditor(idx);
           });
+
           (field.columns || []).forEach(col => {
             const td = document.createElement('td');
             td.textContent = row[col.id] || '';
@@ -1213,9 +1232,19 @@ def apply_visibility(u8, idx_to_action_json):
       function updateToolbar() {
         const min = Math.max(0, parseInt(field.minRows || 0, 10));
         const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+
+        // Add is always visible
         btnAdd.disabled = (max && data.length >= max);
-        btnSave.disabled = (selectedIndex < 0);
-        btnDelete.disabled = (selectedIndex < 0) || (min && data.length <= min);
+
+        // Only show these when a row is selected
+        const showEdit = selectedIndex >= 0;
+        btnSave.style.display   = showEdit ? '' : 'none';
+        btnDelete.style.display = showEdit ? '' : 'none';
+        btnCancel.style.display = showEdit ? '' : 'none';
+
+        btnSave.disabled   = !showEdit;
+        btnDelete.disabled = !showEdit || (min && data.length <= min);
+        btnCancel.disabled = !showEdit;
       }
 
       function loadIntoEditor(i) {
@@ -1243,16 +1272,14 @@ def apply_visibility(u8, idx_to_action_json):
         const min = Math.max(0, parseInt(field.minRows || 0, 10));
         for (let i = 0; i < min; i++) data.push(emptyRow(field));
       }
-      drawTable();
-      if (data.length) { selectedIndex = 0; loadIntoEditor(0); }
+      drawTable(); // no auto-selection by default
 
       // actions
       btnAdd.addEventListener('click', () => {
         const max = Math.max(0, parseInt(field.maxRows || 0, 10));
         if (max && data.length >= max) return;
+        // Always create a NEW row with current editor content
         data.push({ ...editorState });
-        resetEditor();
-        clearSelection();
         drawTable();
         scheduleSaveState();
         status.textContent = 'Zeile hinzugefügt.';
@@ -1272,12 +1299,269 @@ def apply_visibility(u8, idx_to_action_json):
         if (min && data.length <= min) return;
         data.splice(selectedIndex, 1);
         clearSelection();
+        resetEditor();
         drawTable();
         scheduleSaveState();
         status.textContent = 'Zeile gelöscht.';
       });
 
-      // append in this exact order so preview appears BELOW the buttons
+      btnCancel.addEventListener('click', () => {
+        clearSelection();
+        resetEditor();
+        drawTable();
+        status.textContent = 'Auswahl aufgehoben.';
+      });
+
+      // append so preview appears BELOW the buttons
+      container.appendChild(editorWrap);
+      container.appendChild(toolbar);
+      container.appendChild(status);
+      container.appendChild(tableWrap);
+    }
+
+    function renderTableField(container, field) {
+      if (!Array.isArray(values[field.id])) values[field.id] = [];
+      const data = values[field.id];
+
+      // --- Inline editor (no special card/container) ---
+      const editorWrap = document.createElement('div');
+      editorWrap.style.display = 'flex';
+      editorWrap.style.flexWrap = 'wrap';
+      editorWrap.style.gap = '10px';
+
+      const editorInputs = {};
+      let editorState = emptyRow(field);
+
+      // helpers for sizing
+      const measurer = document.createElement('canvas').getContext('2d');
+      function textPx(str) {
+        try { measurer.font = getComputedStyle(document.body).font; } catch {}
+        return Math.ceil(measurer.measureText(String(str || '')).width);
+      }
+      function longest(arr) {
+        return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
+      }
+
+      (field.columns || []).forEach(col => {
+        const pair = document.createElement('label');
+        pair.style.display = 'flex';
+        pair.style.alignItems = 'center';
+        pair.style.gap = '8px';
+
+        const lbl = document.createElement('span');
+        lbl.textContent = col.label || col.id;
+
+        let el;
+        if (col.type === 'select') {
+          el = document.createElement('select');
+          const opts = (col.options || []);
+          const empty = document.createElement('option'); empty.value = ''; empty.textContent = '— wählen —';
+          el.appendChild(empty);
+          opts.forEach(opt => {
+            const o = document.createElement('option');
+            o.value = String(opt); o.textContent = String(opt);
+            el.appendChild(o);
+          });
+          el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
+          el.addEventListener('change', () => { editorState[col.id] = el.value; });
+        } else if (col.type === 'date') {
+          el = document.createElement('input');
+          el.type = 'text';
+          el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
+          setTimeout(() => {
+            flatpickr(el, { allowInput: true, dateFormat: 'Y-m-d', onChange: () => { editorState[col.id] = el.value; } });
+          }, 0);
+          el.addEventListener('change', () => { editorState[col.id] = el.value; });
+        } else if (col.type === 'number') {
+          el = document.createElement('input');
+          el.type = 'number';
+          el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
+          el.addEventListener('change', () => { editorState[col.id] = el.value; });
+        } else {
+          el = document.createElement('input');
+          el.type = 'text';
+          el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
+          el.addEventListener('change', () => { editorState[col.id] = el.value; });
+        }
+
+        editorInputs[col.id] = el;
+        pair.appendChild(lbl);
+        pair.appendChild(el);
+        editorWrap.appendChild(pair);
+      });
+
+      // --- Toolbar ---
+      const toolbar = document.createElement('div');
+      toolbar.className = 'row';
+      toolbar.style.gap = '8px';
+
+      const btnAdd = document.createElement('button');
+      btnAdd.type = 'button';
+      btnAdd.textContent = 'Zeile hinzufügen';
+
+      const btnSave = document.createElement('button');
+      btnSave.type = 'button';
+      btnSave.className = 'secondary';
+      btnSave.textContent = 'Änderungen speichern';
+
+      const btnDelete = document.createElement('button');
+      btnDelete.type = 'button';
+      btnDelete.className = 'ghost';
+      btnDelete.textContent = 'Zeile löschen';
+
+      const btnCancel = document.createElement('button');
+      btnCancel.type = 'button';
+      btnCancel.className = 'ghost';
+      btnCancel.textContent = 'Abbrechen';
+
+      toolbar.appendChild(btnAdd);
+      toolbar.appendChild(btnSave);
+      toolbar.appendChild(btnDelete);
+      toolbar.appendChild(btnCancel);
+
+      const status = document.createElement('div');
+      status.className = 'muted';
+      status.style.minHeight = '1.2em';
+
+      // --- Table preview ---
+      const tableWrap = document.createElement('div');
+      tableWrap.style.overflow = 'auto';
+      const table = document.createElement('table');
+      table.style.width = '100%';
+      const thead = document.createElement('thead');
+      const trh = document.createElement('tr');
+      thead.appendChild(trh);
+      const tbody = document.createElement('tbody');
+      table.appendChild(thead);
+      table.appendChild(tbody);
+      tableWrap.appendChild(table);
+
+      (field.columns || []).forEach(col => {
+        const th = document.createElement('th');
+        th.textContent = col.label || col.id;
+        trh.appendChild(th);
+      });
+
+      let selectedIndex = -1;
+
+      function drawTable() {
+        tbody.innerHTML = '';
+        data.forEach((row, idx) => {
+          const tr = document.createElement('tr');
+          const isSel = idx === selectedIndex;
+
+          // persistent "selected" styling (stronger than hover)
+          if (isSel) {
+            tr.style.background = '#DBEAFE';           // strong light blue
+            tr.style.outline = '2px solid #93C5FD';    // visible border
+            tr.style.outlineOffset = '-2px';
+          } else {
+            tr.style.background = '';
+            tr.style.outline = '';
+            tr.style.outlineOffset = '';
+          }
+
+          tr.addEventListener('click', () => {
+            selectedIndex = idx;        // do NOT toggle off on second click
+            drawTable();
+            loadIntoEditor(idx);
+          });
+
+          (field.columns || []).forEach(col => {
+            const td = document.createElement('td');
+            td.textContent = row[col.id] || '';
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        updateToolbar();
+      }
+
+      function clearSelection() { selectedIndex = -1; updateToolbar(); }
+      function updateToolbar() {
+        const min = Math.max(0, parseInt(field.minRows || 0, 10));
+        const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+
+        // Add is always visible
+        btnAdd.disabled = (max && data.length >= max);
+
+        // Only show these when a row is selected
+        const showEdit = selectedIndex >= 0;
+        btnSave.style.display   = showEdit ? '' : 'none';
+        btnDelete.style.display = showEdit ? '' : 'none';
+        btnCancel.style.display = showEdit ? '' : 'none';
+
+        btnSave.disabled   = !showEdit;
+        btnDelete.disabled = !showEdit || (min && data.length <= min);
+        btnCancel.disabled = !showEdit;
+      }
+
+      function loadIntoEditor(i) {
+        const rec = data[i] || emptyRow(field);
+        for (const c of (field.columns || [])) {
+          const el = editorInputs[c.id];
+          if (!el) continue;
+          el.value = rec[c.id] || '';
+        }
+        editorState = { ...rec };
+        updateToolbar();
+      }
+
+      function resetEditor() {
+        editorState = emptyRow(field);
+        for (const c of (field.columns || [])) {
+          const el = editorInputs[c.id];
+          if (!el) continue;
+          el.value = '';
+        }
+      }
+
+      // initial rows (respect minRows) + first draw
+      if (!data.length) {
+        const min = Math.max(0, parseInt(field.minRows || 0, 10));
+        for (let i = 0; i < min; i++) data.push(emptyRow(field));
+      }
+      drawTable(); // no auto-selection by default
+
+      // actions
+      btnAdd.addEventListener('click', () => {
+        const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+        if (max && data.length >= max) return;
+        // Always create a NEW row with current editor content
+        data.push({ ...editorState });
+        drawTable();
+        scheduleSaveState();
+        status.textContent = 'Zeile hinzugefügt.';
+      });
+
+      btnSave.addEventListener('click', () => {
+        if (selectedIndex < 0 || selectedIndex >= data.length) return;
+        data[selectedIndex] = { ...editorState };
+        drawTable();
+        scheduleSaveState();
+        status.textContent = 'Änderungen gespeichert.';
+      });
+
+      btnDelete.addEventListener('click', () => {
+        const min = Math.max(0, parseInt(field.minRows || 0, 10));
+        if (selectedIndex < 0) return;
+        if (min && data.length <= min) return;
+        data.splice(selectedIndex, 1);
+        clearSelection();
+        resetEditor();
+        drawTable();
+        scheduleSaveState();
+        status.textContent = 'Zeile gelöscht.';
+      });
+
+      btnCancel.addEventListener('click', () => {
+        clearSelection();
+        resetEditor();
+        drawTable();
+        status.textContent = 'Auswahl aufgehoben.';
+      });
+
+      // append so preview appears BELOW the buttons
       container.appendChild(editorWrap);
       container.appendChild(toolbar);
       container.appendChild(status);
