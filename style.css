@@ -597,7 +597,7 @@ select, input { background:var(--card); border:1px solid var(--border-strong); b
   align-items: start;
   display: grid;
   gap: 22px 16px;
-  grid-auto-flow: dense;
+  grid-auto-flow: row;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 }
 .form-grid .field { margin: 0; padding: 0; gap: 4px }
