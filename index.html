@@ -925,17 +925,23 @@ def apply_visibility(u8, idx_to_action_json):
           const fromId = f.fromId || f.from || '';
           const toId   = f.toId   || f.to   || '';
 
-          const out = document.createElement('input');
-          out.type = 'text';
+          // Static text display (no input, not focusable)
+          const out = document.createElement('div');
           out.id = f.id;
-          out.name = f.id;
-          out.style.width = '100%';
-          out.readOnly = true;
-          out.placeholder = 'D-M-Y (days)';
+          out.setAttribute('role', 'status');
+          out.setAttribute('aria-live', 'polite');
+          out.style.padding = '10px 12px';
+          out.style.border = '1px solid #e5e7eb';
+          out.style.borderRadius = '10px';
+          out.style.background = '#f9fafb';
+          out.style.fontSize = '14px';
+          out.style.lineHeight = '22px';
+          out.style.userSelect = 'text';
+          out.style.minHeight = '22px';          // keep height stable when empty
+          out.textContent = '—';                 // placeholder dash
           wrap.appendChild(out);
 
           datediffRefs.push({ field: f, outEl: out, fromId, toId });
-
 
         } else {
           const input = document.createElement('input');
@@ -979,19 +985,20 @@ def apply_visibility(u8, idx_to_action_json):
           const a = getDateForField(fromId);
           const b = getDateForField(toId);
           if (!a || !b) {
-            outEl.value = '';
+            outEl.textContent = '—';
             values[field.id] = null;
             return;
           }
           const days   = diffInDays(a, b);
           const months = diffInMonths(a, b);
           const years  = diffInYears(a, b);
-          const display = `${days}Days ${months}Months ${years}Years (${days}Days total)`;
-          outEl.value = display;
+          const display = `${days} Days · ${months} Months · ${years} Years (${days} total)`;
+          outEl.textContent = display;
           values[field.id] = { days, months, years, formatted: display };
         });
         scheduleSaveState();
       }
+
       window.recomputeDatediffs = recomputeDatediffs;
 
       // Prevent negative ranges and keep inputs read-only
