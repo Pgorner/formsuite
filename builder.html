@@ -910,11 +910,9 @@
       return api;
     }
 
-    // ---------- MultiChoice Designer (groups + conditional fields, one-row extras) ----------
+    // ---------- MultiChoice Designer (groups + conditional fields, one-row extras, DnD items w/ handle) ----------
     function createMultiChoiceDesigner(cfg) {
-      // Persisted shape on the field:
       // f.mc = { groups:[{ title, items:[{ value, checked, alwaysSelected, fields:[{type,id,label,content}] }]}] }
-      // Legacy still supported via f.options (flat list)
       let model = { groups: [] };
 
       const api = {
@@ -926,9 +924,9 @@
                 items: Array.isArray(g?.items) ? g.items.map(it => ({
                   value: String(it?.value || ''),
                   checked: !!it?.checked,
-                  alwaysSelected: !!it?.alwaysSelected,     // NEW
+                  alwaysSelected: !!it?.alwaysSelected,
                   fields: Array.isArray(it?.fields) ? it.fields.map(x => ({
-                    type: (x.type === 'date' || x.type === 'text' || x.type === 'number') ? x.type : 'date',
+                    type: (x.type === 'date' || x.type === 'text' || x.type === 'number') ? x.type : 'text',
                     id: String(x.id || ''),
                     label: String(x.label || ''),
                     content: String(x.content || '')
@@ -937,12 +935,7 @@
               }))
             };
           } else if (Array.isArray(legacyOptionsArr) && legacyOptionsArr.length) {
-            model = {
-              groups: [{
-                title: '',
-                items: legacyOptionsArr.map(v => ({ value: String(v), checked: false, alwaysSelected: false, fields: [] }))
-              }]
-            };
+            model = { groups: [{ title: '', items: legacyOptionsArr.map(v => ({ value:String(v), checked:false, alwaysSelected:false, fields:[] })) }] };
           } else {
             model = { groups: [] };
           }
@@ -978,6 +971,25 @@
         const hidden = cfg.hostEl.querySelector('.mc-hidden-json');
         hidden.value = JSON.stringify(model);
 
+        // scoped styles (drag handle + hints)
+        const style = document.createElement('style');
+        style.textContent = `
+          .mc-item-row{ position:relative; }
+          .mc-drag {
+            width: 34px; min-width:34px; display:flex; align-items:center; justify-content:center;
+            user-select:none; cursor:grab; color:#6b7280; border-right:1px solid var(--border,#e5e7eb);
+          }
+          .mc-drag:active { cursor:grabbing; }
+          .mc-drag .grip {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size:16px; line-height:1; opacity:.9;
+          }
+          .mc-item-row.dragging{ opacity:.6; }
+          .mc-item-row.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
+          .mc-item-row.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
+        `;
+        cfg.hostEl.appendChild(style);
+
         model.groups.forEach((grp, gIdx) => {
           const card = document.createElement('div');
           card.className = 'card';
@@ -989,24 +1001,33 @@
                 <input type="text" class="mc-group-title" placeholder="Gruppen-Titel (optional)" value="${(grp.title||'').replace(/"/g,'&quot;')}" style="min-width:220px"/>
               </div>
               <div class="row" style="gap:6px;">
-                <button type="button" class="mc-add-opt">+ Option</button>
                 <button type="button" class="danger mc-del-group">Gruppe löschen</button>
               </div>
             </div>
-            <div class="mc-items"></div>
+            <div class="mc-items" aria-live="polite"></div>
+            <div class="row" style="margin-top:8px; justify-content:flex-end;">
+              <button type="button" class="mc-add-opt">+ Option</button>
+            </div>
           `;
 
           const itemsWrap = card.querySelector('.mc-items');
+          const addOptBtn = card.querySelector('.mc-add-opt');
 
-          grp.items.forEach((it, iIdx) => {
-            // ensure new prop exists
-            if (typeof it.alwaysSelected !== 'boolean') it.alwaysSelected = false;
-
+          // ---- render a single item row ----
+          function drawItemRow(it, iIdx) {
             const row = document.createElement('div');
-            row.className = 'tdz-row';
-            row.style.gridTemplateColumns = '240px 1fr 260px'; // checks, value, actions
+            row.className = 'tdz-row mc-item-row';
+            // add a narrow column for the handle on the left
+            row.style.gridTemplateColumns = '34px 240px 1fr 260px';
+            row.dataset.index = String(iIdx);
 
-            // FIRST COLUMN: two checkboxes, no label header
+            // DRAG HANDLE (left-most)
+            const handleCol = document.createElement('div');
+            handleCol.className = 'mc-drag';
+            handleCol.title = 'Ziehen zum Sortieren';
+            handleCol.innerHTML = `<span class="grip">☰</span>`;
+
+            // FIRST COLUMN (checkboxes)
             const first = document.createElement('div');
             first.className = 'tdz-col';
             first.style.gap = '6px';
@@ -1021,7 +1042,7 @@
               </label>
             `;
 
-            // SECOND COLUMN: value
+            // SECOND COLUMN (value)
             const valueCol = document.createElement('div');
             valueCol.className = 'tdz-col tdz-grow';
             valueCol.innerHTML = `
@@ -1029,7 +1050,7 @@
               <input type="text" class="mc-opt-value" value="${(it.value||'').replace(/"/g,'&quot;')}" placeholder="z. B. Onboarding"/>
             `;
 
-            // ACTIONS
+            // ACTIONS (right column)
             const actions = document.createElement('div');
             actions.className = 'tdz-actions';
             actions.innerHTML = `
@@ -1037,22 +1058,22 @@
               <button type="button" class="danger mc-del-opt">Löschen</button>
             `;
 
-            // CONDITIONAL FIELDS container (full width)
+            // CONDITIONAL FIELDS (full width)
             const fieldsCol = document.createElement('div');
             fieldsCol.className = 'tdz-col mc-fields-col';
             fieldsCol.style.gridColumn = '1 / -1';
 
+            row.appendChild(handleCol);
             row.appendChild(first);
             row.appendChild(valueCol);
             row.appendChild(actions);
             row.appendChild(fieldsCol);
 
-            // wire checkboxes + value
+            // wire controls
             const cbDefault = first.querySelector('.mc-opt-checked');
             const cbAlways  = first.querySelector('.mc-opt-always');
             const inVal     = valueCol.querySelector('.mc-opt-value');
 
-            // init
             cbDefault.checked = !!it.checked || !!it.alwaysSelected;
             cbAlways.checked  = !!it.alwaysSelected;
             cbDefault.disabled = !!it.alwaysSelected;
@@ -1061,7 +1082,6 @@
               it.checked = !!cbDefault.checked;
               hidden.value = JSON.stringify(model);
             });
-
             cbAlways.addEventListener('change', () => {
               it.alwaysSelected = !!cbAlways.checked;
               if (it.alwaysSelected) {
@@ -1073,7 +1093,6 @@
               }
               hidden.value = JSON.stringify(model);
             });
-
             inVal.addEventListener('input', () => { it.value = inVal.value; hidden.value = JSON.stringify(model); });
 
             // CONDITIONAL FIELDS (single-row each)
@@ -1120,7 +1139,6 @@
                 const btnDel = document.createElement('button');
                 btnDel.type = 'button'; btnDel.className = 'ghost mc-field-del'; btnDel.textContent = 'Entfernen';
 
-                // values
                 if (!fld || typeof fld !== 'object') fld = {};
                 fld.type = fld.type || 'text';
                 sel.value = fld.type;
@@ -1128,7 +1146,6 @@
                 inLabel.value = fld.label || '';
                 inContent.value = fld.content || '';
 
-                // wire
                 sel.addEventListener('change',   () => { fld.type = sel.value;           hidden.value = JSON.stringify(model); });
                 inId.addEventListener('input',   () => { fld.id = inId.value;            hidden.value = JSON.stringify(model); });
                 inLabel.addEventListener('input',() => { fld.label = inLabel.value;      hidden.value = JSON.stringify(model); });
@@ -1159,19 +1176,80 @@
 
             actions.querySelector('.mc-del-opt').addEventListener('click', () => {
               grp.items.splice(iIdx,1);
-              render();
+              redrawItems();
+              hidden.value = JSON.stringify(model);
             });
 
-            itemsWrap.appendChild(row);
+            // ---- DnD within group (via handle only) ----
+            let dragFrom = null;
+
+            handleCol.setAttribute('draggable', 'true');
+
+            handleCol.addEventListener('dragstart', (e) => {
+              dragFrom = iIdx;
+              row.classList.add('dragging');
+              try { e.dataTransfer.setData('text/plain', String(iIdx)); } catch {}
+              e.dataTransfer.effectAllowed = 'move';
+            });
+            handleCol.addEventListener('dragend', () => {
+              row.classList.remove('dragging');
+              Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
+              dragFrom = null;
+            });
+
+            // rows are drop targets
+            row.addEventListener('dragover', (e) => {
+              e.preventDefault();
+              const rect = row.getBoundingClientRect();
+              const before = (e.clientY - rect.top) < rect.height / 2;
+              Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
+              row.classList.add(before ? 'drop-before' : 'drop-after');
+            });
+            row.addEventListener('dragleave', () => {
+              row.classList.remove('drop-before','drop-after');
+            });
+            row.addEventListener('drop', (e) => {
+              e.preventDefault();
+              const from = (dragFrom != null) ? dragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
+              const rect = row.getBoundingClientRect();
+              const before = (e.clientY - rect.top) < rect.height / 2;
+              let to = iIdx + (before ? 0 : 1);
+
+              if (!Number.isFinite(from) || from < 0 || from >= grp.items.length) return;
+              if (to < 0) to = 0;
+              if (to > grp.items.length) to = grp.items.length;
+
+              if (from === to || from + 1 === to) { row.classList.remove('drop-before','drop-after'); return; }
+
+              const [moved] = grp.items.splice(from, 1);
+              if (to > from) to -= 1;
+              grp.items.splice(to, 0, moved);
+
+              row.classList.remove('drop-before','drop-after');
+              redrawItems();
+              hidden.value = JSON.stringify(model);
+            });
+
+            return row;
+          }
+
+          function redrawItems() {
+            itemsWrap.innerHTML = '';
+            grp.items.forEach((it, iIdx) => itemsWrap.appendChild(drawItemRow(it, iIdx)));
+          }
+          redrawItems();
+
+          // “+ Option” aligned to the RIGHT
+          addOptBtn.addEventListener('click', () => {
+            grp.items.push({ value:'', checked:false, alwaysSelected:false, fields:[] });
+            redrawItems();
+            hidden.value = JSON.stringify(model);
+            try { itemsWrap.lastElementChild?.scrollIntoView({ block: 'nearest' }); } catch {}
           });
 
           // group controls
           card.querySelector('.mc-group-title').addEventListener('input', (e) => {
             grp.title = e.target.value; hidden.value = JSON.stringify(model);
-          });
-          card.querySelector('.mc-add-opt').addEventListener('click', () => {
-            grp.items.push({ value:'', checked:false, alwaysSelected:false, fields:[] });
-            render();
           });
           card.querySelector('.mc-del-group').addEventListener('click', () => {
             model.groups.splice(gIdx,1);
@@ -1181,7 +1259,7 @@
           list.appendChild(card);
         });
 
-        // add group
+        // add group (toolbar)
         cfg.hostEl.querySelector('.mc-add-group').addEventListener('click', () => {
           model.groups.push({ title:'', items:[] });
           render();
@@ -1190,6 +1268,7 @@
 
       return api;
     }
+
 
 
     // ---------- Fields list rendering (with DnD) ----------
