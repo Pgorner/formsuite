@@ -413,11 +413,11 @@
  * Active Document Guard (global)
  * - Auto-mounts on every page that includes persistence.js
  * - Detects lost DOCX (no bytes/handle/permission) and blocks UI with a modal
- * - Offers: Open DOCX…, Try again, or Clear workspace
+ * - Offers: Open/Upload DOCX…, Try again, or Clear workspace
  * -------------------------------------------------------------------------- */
 (function () {
   const ACTIVE_LS_KEY = 'FS_ACTIVE_DOC_META';
-  const supportsFS = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
+  const hasFSAccess = typeof window.showOpenFilePicker === 'function'; // feature detection
   const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
   const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
 
@@ -430,7 +430,7 @@
     catch { return null; }
   };
 
-  // Broadcast active meta to all tabs/pages
+  // Broadcast helpers
   function broadcastActive(meta) {
     try { localStorage.setItem(ACTIVE_LS_KEY, JSON.stringify({ docId: meta?.docId || null, name: meta?.name || null })); } catch {}
     try { bcCanon?.postMessage({ type: 'active:set', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
@@ -495,26 +495,62 @@
 
     const status = el('div', { id: 'fsdgStatus', style: { color: 'var(--muted,#6b7280)', fontSize: '.9rem' } }, '');
 
-    const btnOpen = el('button', { class: 'fs-docguard-btn primary', id: 'fsdgOpen' }, 'Open DOCX…');
-    const btnRetry = el('button', { class: 'fs-docguard-btn ghost', id: 'fsdgRetry' }, 'Try again');
-    const btnClear = el('button', { class: 'fs-docguard-btn danger', id: 'fsdgClear' }, 'Clear workspace');
+    const btnOpenLabel = hasFSAccess ? 'Open DOCX…' : 'Upload DOCX…';
+    const btnOpen  = el('button', { class: 'fs-docguard-btn primary', id: 'fsdgOpen' }, btnOpenLabel);
+    const btnRetry = el('button', { class: 'fs-docguard-btn ghost',   id: 'fsdgRetry' }, 'Try again');
+    const btnClear = el('button', { class: 'fs-docguard-btn danger',  id: 'fsdgClear' }, 'Clear workspace');
 
     const actions = el('div', { class: 'fs-docguard-actions' }, [btnClear, btnRetry, btnOpen]);
     const card = el('div', { class: 'fs-docguard-card' }, [title, body, status, actions]);
     overlay = el('div', { class: 'fs-docguard-overlay', style: { display: 'none' } }, [style, card]);
     document.documentElement.appendChild(overlay);
 
+    // ---- cross-browser DOCX picker ----
+    async function pickDocxFile() {
+      // Preferred: File System Access API
+      if (hasFSAccess) {
+        const [handle] = await window.showOpenFilePicker({
+          multiple: false,
+          excludeAcceptAllOption: true,
+          types: [{
+            description: 'Word document',
+            accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm'] }
+          }]
+        });
+        const f = await handle.getFile();
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        return { file: f, bytes, handle };
+      }
+
+      // Fallback: classic file input (works on Safari/Firefox/iOS)
+      return new Promise((resolve, reject) => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.docx,.docm,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        input.style.position = 'fixed';
+        input.style.inset = '-9999px';
+        document.body.appendChild(input);
+        input.addEventListener('change', async () => {
+          const f = input.files && input.files[0];
+          input.remove();
+          if (!f) { reject(new DOMException('Abort', 'AbortError')); return; }
+          try {
+            const bytes = new Uint8Array(await f.arrayBuffer());
+            resolve({ file: f, bytes, handle: null });
+          } catch (e) { reject(e); }
+        }, { once: true });
+        // Kick off picker; if user cancels, no 'change' — input is auto-removed after 60s.
+        setTimeout(() => { try { input.click(); } catch {} }, 0);
+        setTimeout(() => { if (document.body.contains(input)) input.remove(); }, 60000);
+      });
+    }
+
     // Wire actions
     btnOpen.addEventListener('click', async () => {
       setStatus('Opening picker…');
       try {
-        const [handle] = await window.showOpenFilePicker({
-          multiple: false,
-          types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm'] } }]
-        });
-        const f = await handle.getFile();
-        const bytes = new Uint8Array(await f.arrayBuffer());
-        const nameNoExt = f.name?.replace(/\.docx$/i, '') || 'document';
+        const { file, bytes, handle } = await pickDocxFile();
+        const nameNoExt = (file?.name || 'document').replace(/\.docx$/i, '');
 
         // Persist into our storage layer
         let meta;
@@ -526,19 +562,16 @@
           meta = { docId: 'inline-' + Date.now(), name: nameNoExt + '.docx' };
         }
 
-        // Broadcast new active doc so every page rehydrates
-        broadcastActive(meta);
+        // Seed bytes and broadcast so all tabs rehydrate
         try { await window.formSuitePersist?.putBytes?.(meta.docId, bytes); } catch {}
-
-        // Small “updated” ping
+        broadcastActive(meta);
         broadcastUpdated(meta);
 
-        // Unblock UI
         hide();
-        console.log(...tag('opened + broadcasted'));
       } catch (e) {
-        setStatus('Open canceled or failed.');
-        console.warn(...tag('open failed'), e);
+        const msg = (e && (e.name === 'AbortError' || e.code === e.ABORT_ERR)) ? 'Open canceled.' : 'Open failed.';
+        setStatus(msg);
+        console.warn('[DocGuard] open failed', e);
       }
     });
 
@@ -548,14 +581,14 @@
         const ok = await checkAccess(true);
         setStatus(ok ? 'Reconnected.' : 'Still not available.');
         if (ok) hide();
-      } catch (e) {
+      } catch {
         setStatus('Retry failed.');
       }
     });
 
     btnClear.addEventListener('click', async () => {
       try {
-        // Attempt to clear persisted state safely (best-effort; pages will handle UI reset)
+        // Best-effort clear; pages will reset themselves
         const meta = jget(ACTIVE_LS_KEY);
         if (meta?.docId) {
           try { await window.formSuitePersist?.saveState?.(meta.docId, {}); } catch {}
@@ -582,8 +615,7 @@
     ov._setDocName(name || jget(ACTIVE_LS_KEY)?.name || '(no name)');
     ov.style.display = 'block';
     visible = true;
-    // Prevent page interaction behind
-    document.documentElement.style.overflow = 'hidden';
+    document.documentElement.style.overflow = 'hidden'; // lock scroll behind
   }
   function hide() {
     if (!overlay) return;
@@ -612,7 +644,6 @@
       if (tryHandleFallback) {
         const h = await window.formSuitePersist?.getHandle?.(docId);
         if (h?.getFile) {
-          // Try read permission
           try {
             const p = await h.queryPermission?.({ mode: 'read' });
             if (p !== 'granted') await h.requestPermission?.({ mode: 'read' });
@@ -620,9 +651,7 @@
           const f = await h.getFile();
           const ab = await f.arrayBuffer();
           if (ab?.byteLength) {
-            // Re-seed bytes into persistence for other tabs
-            const u8 = new Uint8Array(ab);
-            try { await window.formSuitePersist?.putBytes?.(docId, u8); } catch {}
+            try { await window.formSuitePersist?.putBytes?.(docId, new Uint8Array(ab)); } catch {}
             return true;
           }
         }
@@ -633,11 +662,7 @@
     return false;
   }
 
-  // Detection strategy:
-  //  - on focus / visibilitychange: re-check
-  //  - on broadcast "active:clear" or legacy "doc-cleared": show
-  //  - on storage change removing ACTIVE_LS_KEY: show
-  //  - periodic light heartbeat while visible=false (rare)
+  // Detection strategy
   async function evaluateAndMaybeShow(source) {
     const meta = jget(ACTIVE_LS_KEY);
     const hasDoc = !!meta?.docId;
@@ -661,22 +686,15 @@
   bcCanon?.addEventListener('message', (ev) => {
     const m = ev?.data || {};
     if (m.type === 'active:clear') {
-      show('(cleared)');
-      setStatus('Workspace cleared.');
+      show('(cleared)'); setStatus('Workspace cleared.');
     }
-    if (m.type === 'active:set') {
-      // New doc set elsewhere → hide if we can access it
-      evaluateAndMaybeShow('bcCanon active:set');
-    }
-    if (m.type === 'active:updated') {
-      evaluateAndMaybeShow('bcCanon active:updated');
-    }
+    if (m.type === 'active:set')      evaluateAndMaybeShow('bcCanon active:set');
+    if (m.type === 'active:updated')  evaluateAndMaybeShow('bcCanon active:updated');
   });
   bcLegacy?.addEventListener('message', (ev) => {
     const m = ev?.data || {};
     if (m.type === 'doc-cleared') {
-      show('(cleared)');
-      setStatus('Workspace cleared.');
+      show('(cleared)'); setStatus('Workspace cleared.');
     }
     if (m.type === 'doc-switched' || m.type === 'doc-updated') {
       evaluateAndMaybeShow('bcLegacy ' + m.type);
@@ -685,9 +703,7 @@
 
   // Storage listener (cross-tab)
   window.addEventListener('storage', (e) => {
-    if (e.key === ACTIVE_LS_KEY) {
-      evaluateAndMaybeShow('storage');
-    }
+    if (e.key === ACTIVE_LS_KEY) evaluateAndMaybeShow('storage');
   });
 
   // Foreground triggers
@@ -696,15 +712,13 @@
   });
   window.addEventListener('focus', () => evaluateAndMaybeShow('focus'));
 
-  // Light heartbeat: check every ~25s (only if not already visible)
+  // Light heartbeat (only if not visible)
   setInterval(() => { if (!visible) evaluateAndMaybeShow('heartbeat'); }, 25000);
 
   // Initial mount
-  window.addEventListener('DOMContentLoaded', () => {
-    evaluateAndMaybeShow('DOMContentLoaded');
-  });
+  window.addEventListener('DOMContentLoaded', () => { evaluateAndMaybeShow('DOMContentLoaded'); });
 
-  // Expose (optional) API if you need to force it
+  // Expose (optional) API
   window.fsDocGuard = {
     show, hide,
     ping: () => evaluateAndMaybeShow('manual'),
