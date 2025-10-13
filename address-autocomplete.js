@@ -5,10 +5,30 @@
 (function (global) {
   const PHOTON_URL = 'https://photon.komoot.io/api/';
   const MIN_LEN = 3;
-  const DEBOUNCE_MS = 250;
+  const DEBOUNCE_MS = 180;
   const MAX_RESULTS = 8;
 
+  // DE-first defaults
+  const DEFAULT_LANG = 'de';
+  // Approx Germany bbox [minLon, minLat, maxLon, maxLat]
+  const DE_BBOX = [5.9, 47.2, 15.1, 55.2];
+  const BIAS_LS_KEY = 'FS_ADDR_BIAS'; // [lon,lat]
+
   const cache = new Map(); // key -> results
+  const negativeCache = new Map(); // normalized query -> ts
+
+  // Preconnect to speed up first request
+  (function preconnectOnce(){
+    try {
+      if (document.getElementById('preconnect-photon')) return;
+      const l = document.createElement('link');
+      l.id = 'preconnect-photon';
+      l.rel = 'preconnect';
+      l.href = 'https://photon.komoot.io';
+      l.crossOrigin = '';
+      document.head.appendChild(l);
+    } catch {}
+  })();
 
   function debounce(fn, ms) {
     let t = null;
@@ -32,6 +52,85 @@
       else el.appendChild(c);
     }
     return el;
+  }
+
+  // ---------- DE-first normalization, variants, scoring ----------
+  function stripDiacritics(s){
+    return String(s||'').normalize('NFKD').replace(/[\u0300-\u036f]/g,'');
+  }
+  function normalizeUmlauts(s){
+    return s
+      .replace(/ß/g,'ss')
+      .replace(/Ä/g,'Ae').replace(/Ö/g,'Oe').replace(/Ü/g,'Ue')
+      .replace(/ä/g,'ae').replace(/ö/g,'oe').replace(/ü/g,'ue');
+  }
+  function normalizeQuery(q){
+    let s = normalizeUmlauts(stripDiacritics(String(q||'').trim()))
+      .replace(/[.,;]+/g,' ')
+      .replace(/\s+/g,' ')
+      .toLowerCase();
+    // soften abbreviations
+    s = s
+      .replace(/\bstr\.?\b/g,' strasse')
+      .replace(/\bplz\b/g,'')
+      .replace(/\bnr\.?\b/g,'')
+      .replace(/\bhausnr\.?\b/g,'')
+      .replace(/\bdeutschland\b/g,'');
+    return s.trim().replace(/\s+/g,' ');
+  }
+  const RX_PLZ = /\b\d{5}\b/;
+  const RX_HNO = /^(\d+[a-z]?(?:-\d+)?)([a-z]?)$/i;
+  function parseTokens(qn){
+    const tokens = qn.split(' ').filter(Boolean);
+    let postcode=null,houseno=null;
+    for(let i=tokens.length-1;i>=0;i--){
+      const t=tokens[i];
+      if(!postcode && RX_PLZ.test(t)){ postcode=t; continue; }
+      if(!houseno && RX_HNO.test(t)){ houseno=t; continue; }
+    }
+    return { tokens, postcode, houseno };
+  }
+  function buildVariantsDE(qn){
+    const { tokens, houseno, postcode } = parseTokens(qn);
+    if(!tokens.length) return [];
+    const last=tokens[tokens.length-1];
+    const city = /\d/.test(last) ? null : last;
+    const street = (city ? tokens.slice(0,-1) : tokens).join(' ');
+    const v = new Set();
+    const push = s=>{ s=String(s||'').trim().replace(/\s+/g,' '); if(s) v.add(s); };
+    push(qn);
+    if(city && houseno) push(`${street} ${houseno} ${city}`);
+    if(city) push(`${street} ${city}`);
+    if(houseno) push(`${street} ${houseno}`);
+    if(city && houseno) push(`${city} ${street} ${houseno}`);
+    if(city) push(`${city} ${street}`);
+    if(postcode) push(qn.replace(postcode,'').replace(/\s+/g,' '));
+    return Array.from(v).slice(0,4);
+  }
+  function scoreFeature(feat, qn){
+    const p=feat.properties||{};
+    const hay = normalizeQuery([p.name,[p.housenumber,p.street].filter(Boolean).join(' '),p.postcode,p.city||p.town||p.village,p.country].filter(Boolean).join(' '));
+    const toks = qn.split(' ').filter(Boolean);
+    let s=0;
+    toks.forEach(t=>{
+      if(hay.startsWith(t+' ')||hay.includes(' '+t+' ')) s+=3;
+      else if(hay.includes(t)) s+=1;
+    });
+    const hno = toks.find(t=>RX_HNO.test(t));
+    if(hno && String(p.housenumber||'').toLowerCase()===hno.toLowerCase()) s+=5;
+    const plz = toks.find(t=>RX_PLZ.test(t));
+    if(plz && String(p.postcode||'')===plz) s+=3;
+    return s;
+  }
+  function highlightMatch(text, qn){
+    const toks = qn.split(' ').filter(t=>t.length>=3);
+    if(!toks.length) return text;
+    let html = text;
+    toks.forEach(t=>{
+      const rx = new RegExp('('+t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','ig');
+      html = html.replace(rx,'<mark>$1</mark>');
+    });
+    return html;
   }
 
   function toDisplayLine(feat) {
@@ -65,27 +164,52 @@
     };
   }
 
-  async function fetchPhoton(query, { lang = 'de', bbox = null, biasLonLat = null } = {}) {
-    const key = JSON.stringify({ query, lang, bbox, biasLonLat });
-    if (cache.has(key)) return cache.get(key);
+  async function fetchPhoton(query, { lang = DEFAULT_LANG, bbox = DE_BBOX, biasLonLat = null, signal = undefined } = {}) {
+    const qn = normalizeQuery(query);
+    if (!qn || qn.length < MIN_LEN) return [];
+    const neg = negativeCache.get(qn);
+    if (neg && Date.now() - neg < 30_000) return [];
 
-    const params = new URLSearchParams();
-    params.set('q', query);
-    params.set('limit', String(MAX_RESULTS));
-    if (lang) params.set('lang', lang);
-    if (bbox && Array.isArray(bbox) && bbox.length === 4) params.set('bbox', bbox.join(','));
-    if (biasLonLat && Array.isArray(biasLonLat) && biasLonLat.length === 2) {
-      params.set('lon', biasLonLat[0]);
-      params.set('lat', biasLonLat[1]);
+    const variants = buildVariantsDE(qn);
+    const featsAll = [];
+    const bias = (Array.isArray(biasLonLat) && biasLonLat.length===2) ? biasLonLat : (function(){ try{const v=JSON.parse(localStorage.getItem(BIAS_LS_KEY)||'null'); return (Array.isArray(v)&&v.length===2)?v:null;}catch{return null;} })();
+
+    async function runOne(q){
+      const key = JSON.stringify({ q, lang, bbox, bias });
+      if (cache.has(key)) return cache.get(key);
+      const params = new URLSearchParams();
+      params.set('q', q);
+      params.set('limit', String(MAX_RESULTS));
+      if (lang) params.set('lang', lang);
+      if (bbox && Array.isArray(bbox) && bbox.length===4) params.set('bbox', bbox.join(','));
+      if (bias) { params.set('lon', bias[0]); params.set('lat', bias[1]); }
+      const url = `${PHOTON_URL}?${params.toString()}`;
+      const res = await fetch(url, { method: 'GET', signal });
+      if (!res.ok) return [];
+      const json = await res.json();
+      const feats = Array.isArray(json.features) ? json.features : [];
+      cache.set(key, feats);
+      return feats;
     }
 
-    const url = `${PHOTON_URL}?${params.toString()}`;
-    const res = await fetch(url, { method: 'GET' });
-    if (!res.ok) throw new Error('Photon request failed: ' + res.status);
-    const json = await res.json();
-    const feats = Array.isArray(json.features) ? json.features : [];
-    cache.set(key, feats);
-    return feats;
+    // Run up to 3 variants in parallel for speed
+    const toRun = variants.slice(0, 3);
+    const results = await Promise.allSettled(toRun.map(v => runOne(v)));
+    for (const r of results) {
+      if (r.status === 'fulfilled' && Array.isArray(r.value)) featsAll.push(...r.value);
+    }
+    if (!featsAll.length) negativeCache.set(qn, Date.now());
+
+    const uniq = new Map();
+    featsAll.forEach(f => {
+      const id = JSON.stringify([f?.properties?.osm_id, f?.properties?.osm_type, f?.geometry?.coordinates||[]]);
+      if (!uniq.has(id)) uniq.set(id, f);
+    });
+    return Array.from(uniq.values())
+      .map(f => ({ f, s: scoreFeature(f, qn) }))
+      .sort((a,b) => b.s - a.s)
+      .map(x => x.f)
+      .slice(0, MAX_RESULTS);
   }
 
   function mount(container, opts) {
@@ -127,7 +251,8 @@
       featsCache = items;
       items.forEach((f, idx) => {
         const line = toDisplayLine(f);
-        const item = h('div', { class: 'addr-item', role: 'option', 'data-idx': String(idx) }, line);
+        const item = h('div', { class: 'addr-item', role: 'option', 'data-idx': String(idx) });
+        item.innerHTML = highlightMatch(line, normalizeQuery(input.value));
         item.addEventListener('pointerdown', (e) => {
           e.preventDefault(); // retain input focus
           pick(idx);
@@ -137,7 +262,7 @@
       const open = items.length > 0;
       list.style.display = open ? 'block' : 'none';
       input.setAttribute('aria-expanded', open ? 'true' : 'false');
-      sr.textContent = open ? `${items.length} Treffer` : '';
+      sr.textContent = open ? `${items.length} Treffer` : 'Keine Treffer – z. B. "Straße 12, Stadt" oder PLZ hinzufügen';
     }
 
     function ensureVisible(activeEl) {
@@ -167,16 +292,30 @@
       input.setAttribute('aria-expanded', 'false');
       // NO visible preview; just fire change
       try { opts?.onChange && opts.onChange(val); } catch {}
+      // Persist bias for follow-up queries
+      try {
+        const lon = f?.geometry?.coordinates?.[0];
+        const lat = f?.geometry?.coordinates?.[1];
+        if (Number.isFinite(lon) && Number.isFinite(lat)) {
+          localStorage.setItem(BIAS_LS_KEY, JSON.stringify([lon, lat]));
+        }
+      } catch {}
     }
 
+    let inFlightAbort = null;
     const doQuery = debounce(async () => {
       const q = input.value.trim();
       if (q.length < MIN_LEN) { renderList([]); return; }
       sr.textContent = 'Suche läuft…';
+      if (inFlightAbort) { try { inFlightAbort.abort(); } catch {} }
+      const controller = new AbortController();
+      inFlightAbort = controller;
       try {
-        const feats = await fetchPhoton(q, { lang: navigator.language?.slice(0,2) || 'en' });
+        const feats = await fetchPhoton(q, { lang: DEFAULT_LANG, bbox: DE_BBOX, signal: controller.signal });
+        if (inFlightAbort !== controller) return; // outdated
         renderList(feats.slice(0, MAX_RESULTS));
       } catch {
+        if (inFlightAbort !== controller) return;
         renderList([]);
         sr.textContent = 'Abfrage fehlgeschlagen.';
       }
@@ -192,10 +331,18 @@
       const open = list.style.display !== 'none';
       if (e.key === 'ArrowDown' && open) { e.preventDefault(); highlight(+1); return; }
       if (e.key === 'ArrowUp'   && open) { e.preventDefault(); highlight(-1); return; }
-      if (e.key === 'Enter' && open) {
-        e.preventDefault();
-        const idx = (highlightIndex >= 0 ? highlightIndex : 0);
-        pick(idx);
+      if (e.key === 'Enter') {
+        if (open) {
+          e.preventDefault();
+          const idx = (highlightIndex >= 0 ? highlightIndex : 0);
+          pick(idx);
+        } else {
+          const s = input.value.trim();
+          if (s) {
+            currentValue = { formatted: s };
+            try { opts?.onChange && opts.onChange(currentValue); } catch {}
+          }
+        }
       }
       if (e.key === 'Escape' && open) { list.style.display = 'none'; input.setAttribute('aria-expanded','false'); }
     });
@@ -204,6 +351,15 @@
       if (!container.contains(e.target)) {
         list.style.display = 'none';
         input.setAttribute('aria-expanded','false');
+      }
+    });
+
+    input.addEventListener('blur', () => {
+      const s = input.value.trim();
+      if (!s) return;
+      if (!currentValue || currentValue.formatted !== s) {
+        currentValue = { formatted: s };
+        try { opts?.onChange && opts.onChange(currentValue); } catch {}
       }
     });
 
