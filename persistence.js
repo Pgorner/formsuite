@@ -382,6 +382,43 @@
 
         if (f.type === 'date') { out[id] = String(v ?? ''); continue; }
 
+        if (f.type === 'datediff') {
+          const d = v;
+          if (d && typeof d === 'object') {
+            const outObj = {
+              days: Number(d.days ?? 0),
+              months: Number(d.months ?? 0),
+              years: Number(d.years ?? 0),
+              formatted: String(d.formatted ?? '')
+            };
+            if (outObj.formatted) out[id] = outObj;
+          } else if (Number.isFinite(Number(d))) {
+            const n = Number(d);
+            out[id] = { days: n, months: 0, years: 0, formatted: `${n}-0-0 (${n})` };
+          }
+          continue;
+        }
+
+        if (f.type === 'address') {
+          if (typeof v === 'string') {
+            const s = v.trim();
+            if (s || f.required) out[id] = s ? { formatted: s } : { formatted: '' };
+          } else if (v && typeof v === 'object') {
+            const o = {
+              formatted: String(v.formatted || ''),
+              street: String(v.street || ''),
+              houseNumber: String(v.houseNumber || ''),
+              postcode: String(v.postcode || ''),
+              city: String(v.city || ''),
+              country: String(v.country || ''),
+              lat: (v.lat ?? null),
+              lon: (v.lon ?? null)
+            };
+            if (o.formatted || f.required) out[id] = o;
+          }
+          continue;
+        }
+
         if (f.type === 'table') {
           const cols = Array.isArray(f.columns) ? f.columns : [];
           const colIds = cols.map(c => c.id);
