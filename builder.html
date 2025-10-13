@@ -854,7 +854,7 @@
                 const before = (e.clientX - rect.left) < rect.width / 2;
                 let to = toIdx + (before ? 0 : 1);
 
-                if (from === to || from + 1 === to) { chip.classList.remove('drop-before','drop-after'); return; }
+                if (from === to) { chip.classList.remove('drop-before','drop-after'); return; }
                 const arr = col.options;
                 const [moved] = arr.splice(from, 1);
                 if (to > from) to -= 1;
@@ -913,6 +913,7 @@
     function createMultiChoiceDesigner(cfg) {
       // f.mc = { groups:[{ title, items:[{ value, checked, alwaysSelected, fields:[{...}] }]}] }
       let model = { groups: [] };
+      let mcGroupDragFrom = null; // shared drag-from index across group cards
 
       function globalDateIds() {
         try {
@@ -1010,10 +1011,31 @@
         `;
         cfg.hostEl.appendChild(style);
 
+        // Extra styles for group drop hints
+        const gStyle = document.createElement('style');
+        gStyle.textContent = `
+          .mc-group-card { position: relative; }
+          .mc-group-card.dragging { opacity: .6; }
+          .mc-group-card.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
+          .mc-group-card.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
+        `;
+        cfg.hostEl.appendChild(gStyle);
+
+        // Helper: collapse/expand all groups' contents during DnD for easier reordering
+        function setGroupsCollapsed(collapsed) {
+          Array.from(list.querySelectorAll('.mc-group-card')).forEach(gc => {
+            const items = gc.querySelector('.mc-items');
+            const actionsRow = gc.querySelector('.mc-add-opt')?.closest('.row');
+            if (items) items.style.display = collapsed ? 'none' : '';
+            if (actionsRow) actionsRow.style.display = collapsed ? 'none' : '';
+          });
+        }
+
         model.groups.forEach((grp, gIdx) => {
           const card = document.createElement('div');
-          card.className = 'card';
+          card.className = 'card mc-group-card';
           card.style.marginBottom = '10px';
+          card.dataset.index = String(gIdx);
 
           card.innerHTML = `
             <div class="row" style="justify-content:space-between; gap:8px; margin-bottom:8px;">
@@ -1032,6 +1054,61 @@
 
           const itemsWrap = card.querySelector('.mc-items');
           const addOptBtn = card.querySelector('.mc-add-opt');
+          // Inject group drag handle before the title input
+          const titleInput = card.querySelector('.mc-group-title');
+          if (titleInput && titleInput.parentElement) {
+            const gHandle = document.createElement('div');
+            gHandle.className = 'mc-drag mc-g-drag';
+            gHandle.title = 'Ziehen zum Sortieren';
+            gHandle.setAttribute('draggable','true');
+            gHandle.innerHTML = '<span class="grip">☰</span>';
+            titleInput.parentElement.insertBefore(gHandle, titleInput);
+
+            // DnD for groups
+            function clearGroupDropHints(){
+              Array.from(list.querySelectorAll('.mc-group-card')).forEach(el => el.classList.remove('drop-before','drop-after'));
+            }
+            gHandle.addEventListener('dragstart', (e) => {
+              mcGroupDragFrom = gIdx;
+              card.classList.add('dragging');
+              try { e.dataTransfer.setData('text/plain', String(gIdx)); } catch {}
+              e.dataTransfer.effectAllowed = 'move';
+              // Collapse all groups for easier reordering
+              setGroupsCollapsed(true);
+            });
+            gHandle.addEventListener('dragend', () => {
+              mcGroupDragFrom = null;
+              card.classList.remove('dragging');
+              clearGroupDropHints();
+              setGroupsCollapsed(false);
+            });
+            card.addEventListener('dragenter', (e) => { e.preventDefault(); });
+            card.addEventListener('dragover', (e) => {
+              e.preventDefault();
+              const rect = card.getBoundingClientRect();
+              const before = (e.clientY - rect.top) < rect.height / 2;
+              clearGroupDropHints();
+              card.classList.add(before ? 'drop-before' : 'drop-after');
+            });
+            card.addEventListener('dragleave', () => { card.classList.remove('drop-before','drop-after'); });
+            card.addEventListener('drop', (e) => {
+              e.preventDefault();
+              const fromRaw = (mcGroupDragFrom != null) ? mcGroupDragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
+              const rect = card.getBoundingClientRect();
+              const before = (e.clientY - rect.top) < rect.height / 2;
+              let to = gIdx + (before ? 0 : 1);
+              if (!Number.isFinite(fromRaw) || fromRaw < 0 || fromRaw >= model.groups.length) { clearGroupDropHints(); return; }
+              if (to < 0) to = 0;
+              if (to > model.groups.length) to = model.groups.length;
+              if (fromRaw === to) { clearGroupDropHints(); return; }
+              const [moved] = model.groups.splice(fromRaw, 1);
+              if (to > fromRaw) to -= 1;
+              model.groups.splice(to, 0, moved);
+              clearGroupDropHints();
+              setGroupsCollapsed(false);
+              render();
+            });
+          }
 
           function drawItemRow(it, iIdx) {
             const row = document.createElement('div');
@@ -1334,7 +1411,7 @@
               if (!Number.isFinite(from) || from < 0 || from >= grp.items.length) return;
               if (to < 0) to = 0;
               if (to > grp.items.length) to = grp.items.length;
-              if (from === to || from + 1 === to) { row.classList.remove('drop-before','drop-after'); return; }
+              if (from === to) { row.classList.remove('drop-before','drop-after'); return; }
 
               const [moved] = grp.items.splice(from, 1);
               if (to > from) to -= 1;
@@ -1491,7 +1568,7 @@
     function reorderFields(from, to) {
       const list = FORM_BUILDER.schema.fields;
       const target = Math.max(0, Math.min(to, list.length));
-      if (from === target || from+1 === target) return;
+      if (from === target) return;
 
       const [moved] = list.splice(from, 1);
       const insertAt = (target > from) ? target - 1 : target;
