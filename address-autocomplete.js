@@ -236,11 +236,17 @@
 
     // screen-reader only live region (no visual preview / no extra space)
     const sr = h('div', { class: 'sr-only', 'aria-live': 'polite' });
+    // input + spinner wrapper (for vertical centering)
+    const inputWrap = h('div', { class: 'addr-input-wrap' });
+    // right-side loading indicator (spins via ::before)
+    const indicator = h('div', { class: 'addr-indicator', 'aria-hidden': 'true' });
 
     if (currentValue?.formatted) input.value = currentValue.formatted;
 
     field.appendChild(label);
-    field.appendChild(input);
+    inputWrap.appendChild(input);
+    inputWrap.appendChild(indicator);
+    field.appendChild(inputWrap);
     field.appendChild(list);
     field.appendChild(sr);
     container.appendChild(field);
@@ -300,24 +306,28 @@
           localStorage.setItem(BIAS_LS_KEY, JSON.stringify([lon, lat]));
         }
       } catch {}
+      field.classList.remove('loading');
     }
 
     let inFlightAbort = null;
     const doQuery = debounce(async () => {
       const q = input.value.trim();
-      if (q.length < MIN_LEN) { renderList([]); return; }
+      if (q.length < MIN_LEN) { field.classList.remove('loading'); renderList([]); return; }
       sr.textContent = 'Suche läuft…';
       if (inFlightAbort) { try { inFlightAbort.abort(); } catch {} }
       const controller = new AbortController();
       inFlightAbort = controller;
+      field.classList.add('loading');
       try {
         const feats = await fetchPhoton(q, { lang: DEFAULT_LANG, bbox: DE_BBOX, signal: controller.signal });
         if (inFlightAbort !== controller) return; // outdated
         renderList(feats.slice(0, MAX_RESULTS));
+        if (inFlightAbort === controller) field.classList.remove('loading');
       } catch {
         if (inFlightAbort !== controller) return;
         renderList([]);
         sr.textContent = 'Abfrage fehlgeschlagen.';
+        field.classList.remove('loading');
       }
     }, DEBOUNCE_MS);
 
@@ -381,9 +391,11 @@
     const css = `
 .addr-host { position: relative; }
 .addr-field { position: relative; display: grid; gap: 6px; }
+.addr-input-wrap { position: relative; }
 .addr-field > input[type="text"] {
   width: 100%;
   padding: 10px 12px;
+  padding-right: 34px; /* room for spinner */
   border: 1.5px solid var(--border-strong, #d1d5db);
   border-radius: var(--radius-sm, 8px);
   font-size: 14px;
@@ -397,6 +409,27 @@
   border-color: var(--focus-border, #86a7ff);
   box-shadow: 0 0 0 3px var(--focus-ring, rgba(134,167,255,.28));
 }
+
+/* Loading indicator */
+.addr-indicator {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px; height: 16px;
+  display: none;
+}
+.addr-indicator::before {
+  content: '';
+  display: block;
+  width: 100%; height: 100%;
+  border: 2px solid rgba(0,0,0,0.18);
+  border-top-color: var(--accent,#2563eb);
+  border-radius: 50%;
+  animation: addrSpin .8s linear infinite;
+}
+.addr-field.loading .addr-indicator { display: block; }
+@keyframes addrSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
 /* Overlayed dropdown */
 .addr-list {
