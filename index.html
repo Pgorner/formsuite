@@ -1084,15 +1084,10 @@ def apply_visibility(u8, idx_to_action_json):
 
         // MULTICHOICE
         } else if (f.type === 'multichoice') {
-          const host = document.createElement('div');
-          host.className = 'mc-group';
-          host.style.display = 'grid';
-          host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
-          host.style.gap = '8px 16px';
-          host.style.alignItems = 'start';
-          if (Number.isFinite(+f.columns) && +f.columns > 0) {
-            host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
-          }
+          // Container for all groups
+          const mcContainer = document.createElement('div');
+          mcContainer.className = 'mc-container';
+          mcContainer.style.display = 'block';
 
           // normalize items
           const items = [];
@@ -1128,12 +1123,12 @@ def apply_visibility(u8, idx_to_action_json):
           const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
 
           function persistMainSelection() {
-            const boxes = host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
+            const boxes = mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
             values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
             scheduleSaveState();
           }
 
-          function drawOption(item) {
+          function drawOption(item, parentHost) {
             const optVal = item.value;
             const optId  = `${f.id}__${__slugifyMc(optVal)}`;
             const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
@@ -1354,16 +1349,67 @@ def apply_visibility(u8, idx_to_action_json):
             // assemble
             card.appendChild(row1);
             if (extrasWrap) card.appendChild(extrasWrap);
-            host.appendChild(card);
+            parentHost.appendChild(card);
           }
 
-          items.forEach(drawOption);
-          values[f.id] = Array.from(host.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
+          // Render grouped when mc.groups exist; otherwise single grid
+          if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
+            f.mc.groups.forEach(g => {
+              const section = document.createElement('div');
+              section.className = 'mc-group-section';
+              section.style.marginBottom = '10px';
+
+              if (g.title) {
+                const h = document.createElement('div');
+                h.className = 'mc-group-title';
+                h.textContent = String(g.title);
+                h.style.color = 'var(--muted)';
+                h.style.fontWeight = '600';
+                h.style.fontSize = '.95rem';
+                h.style.margin = '4px 0 6px';
+                section.appendChild(h);
+              }
+
+              const host = document.createElement('div');
+              host.className = 'mc-group';
+              host.style.display = 'grid';
+              host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
+              host.style.gap = '8px 16px';
+              host.style.alignItems = 'start';
+              if (Number.isFinite(+f.columns) && +f.columns > 0) {
+                host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
+              }
+
+              (g.items || []).forEach(it => drawOption({
+                value: String(it.value ?? it.label ?? ''),
+                alwaysSelected: !!it.alwaysSelected,
+                preselected: !!it.preselected,
+                fields: Array.isArray(it.fields) ? it.fields : []
+              }, host));
+
+              section.appendChild(host);
+              mcContainer.appendChild(section);
+            });
+          } else {
+            const host = document.createElement('div');
+            host.className = 'mc-group';
+            host.style.display = 'grid';
+            host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
+            host.style.gap = '8px 16px';
+            host.style.alignItems = 'start';
+            if (Number.isFinite(+f.columns) && +f.columns > 0) {
+              host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
+            }
+            items.forEach(it => drawOption(it, host));
+            mcContainer.appendChild(host);
+          }
+
+          values[f.id] = Array.from(mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
             .filter(b => b.checked)
             .map(b => b.value);
           scheduleSaveState();
 
-          wrap.appendChild(host);
+          wrap.appendChild(mcContainer);
 
         // DATE
         } else if (f.type === 'date') {

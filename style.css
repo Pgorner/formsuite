@@ -478,6 +478,10 @@ tr.dragging { opacity: 0.5 }
 .tdz-opts { align-items:center; display:flex; gap:8px }
 .tdz-muted { color:var(--muted); font-size:12px }
 
+/* Multi-Choice group headings */
+.mc-group-title { color: var(--muted); font-weight: 600; font-size: .95rem; margin: 4px 0 6px }
+.mc-group-section { margin-bottom: 10px }
+
 /* ============ HELPERS / MISC ============ */
 .hr { background: var(--border); height: 1px; margin: 10px 0 }
 .drag { background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 6px; cursor: grab; font-size: 12px; padding: 2px 6px; user-select: none }
