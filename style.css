@@ -682,6 +682,17 @@ label.fs-label {
 @keyframes fs-shimmer { 0%{ background-position:-200% 0 } 100%{ background-position:200% 0 } }
 .skeleton { animation: fs-shimmer 1.2s infinite linear; background: linear-gradient(90deg, rgba(127,127,127,.10) 25%, rgba(127,127,127,.18) 37%, rgba(127,127,127,.10) 63%); background-size: 400% 100%; border-radius: var(--radius-sm); min-height: 1.2rem; position: relative }
 
+/* Subtle muted input variant (for less prominent fields like id) */
+.muted-input { opacity: .85 }
+
+/* Muted field wrapper: greys out the label and input */
+.muted-field > label.small { color: var(--muted) }
+.muted-field > input {
+  background: #f3f4f6;
+  border-color: var(--border);
+  color: var(--muted);
+}
+
 /* ============ REDUCED MOTION ============ */
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important }

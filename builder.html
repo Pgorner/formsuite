@@ -61,15 +61,12 @@
             </select>
           </div>
           <div class="grow">
-            <label for="pId" class="small">id</label><br/>
-            <input id="pId" type="text" placeholder="e.g. firstName" />
-          </div>
-        </div>
-
-        <div class="row" style="gap:10px; margin-top:8px;">
-          <div class="grow">
             <label for="pLabel" class="small">label</label><br/>
             <input id="pLabel" type="text" placeholder="What should be shown to the user" />
+          </div>
+          <div class="muted-field" style="min-width:220px;">
+            <label for="pId" class="small">id</label><br/>
+            <input id="pId" type="text" class="muted-input" placeholder="e.g. firstName" />
           </div>
           <div style="display:flex; align-items:flex-end;">
             <label class="switch">
@@ -83,10 +80,10 @@
         <div id="typeSpecific" style="margin-top:10px;"></div>
 
         <div class="row" style="margin-top:10px; gap:8px; flex-wrap: wrap;">
+          <span class="muted" id="builderStatus" style="margin-right:auto;"></span>
           <button id="btnAdd">Add / Update field</button>
           <button id="btnCancel" class="ghost" disabled>Cancel</button>
           <button id="btnDelete" class="danger" disabled>Delete</button>
-          <span class="muted" id="builderStatus" style="margin-left:auto;"></span>
         </div>
       </aside>
 
