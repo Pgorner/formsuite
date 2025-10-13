@@ -159,6 +159,13 @@
 
   let _active = null; // { docId, name }
 
+  // Small debug helper
+  function dbg(where, data) {
+    try {
+      console.log('%c[Persist]', 'color:#2563eb;font-weight:600', where, data || '');
+    } catch {}
+  }
+
   function readActiveFromStorage() {
     for (const k of ACTIVE_KEYS_READ_ORDER) {
       const v = readJSON(k);
@@ -286,6 +293,8 @@
     if (!await loadState(docId)) await saveState(docId, { schema: null, values: {} });
 
     await setActiveDoc(meta); // BC + LS (both canonical + legacy)
+    // Opportunistic hydrate after switching/setting current
+    try { coalesce('hydrate:'+docId, () => hydrateFromDocxIfEmpty(docId)); } catch {}
     return meta;
   }
 
@@ -330,6 +339,8 @@
     // Concurrency helpers
     withDocLock,
     coalesce,
+    // Restore
+    hydrateFromDocxIfEmpty,
   };
 
   // Utils bundle (optional)
@@ -403,6 +414,105 @@
     function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
     return { sanitizeValues, sanitizeTagMap, emptyRow };
   })();
+
+  // ===== Payload hydration (centralized) =====
+  async function ensureJSZip(){
+    if (window.JSZip) return;
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+      s.onload = res; s.onerror = rej; document.head.appendChild(s);
+    });
+  }
+
+  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+
+  async function readPayloadFromDocx(bytes){
+    try {
+      await ensureJSZip();
+      const zip = await window.JSZip.loadAsync(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      const settings = zip.file('word/settings.xml');
+      if (settings) {
+        const xmlText = await settings.async('string');
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlText, 'application/xml');
+        const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
+        if (docVars) {
+          const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
+          for (let i = 0; i < vars.length; i++) {
+            const dv = vars[i];
+            const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
+            if (name === PAYLOAD_KEY) {
+              const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
+              return val || null;
+            }
+          }
+        }
+      }
+      const custom = zip.file('docProps/custom.xml');
+      if (custom) {
+        const xmlText = await custom.async('string');
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlText, 'application/xml');
+        const props = xml.getElementsByTagName('property');
+        for (let i = 0; i < props.length; i++) {
+          const p = props[i];
+          const nm = p.getAttribute('name');
+          if (nm === PAYLOAD_KEY) {
+            const child = p.firstElementChild;
+            return child && child.textContent ? child.textContent : null;
+          }
+        }
+      }
+    } catch (e) { dbg('readPayloadFromDocx error', e); }
+    return null;
+  }
+
+  let __hydrating = false;
+  async function hydrateFromDocxIfEmpty(docId) {
+    if (!docId || __hydrating) return false;
+    try {
+      const st = await loadState(docId);
+      const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
+      if (hasSchema) return false;
+      dbg('hydrate:begin', { docId });
+      let bytes = await getBytes(docId);
+      if (!bytes) bytes = await getCurrentDocBytes();
+      if (!bytes) { dbg('hydrate:no-bytes', { docId }); return false; }
+      const raw = await readPayloadFromDocx(bytes);
+      if (!raw) { dbg('hydrate:no-payload', { docId }); return false; }
+      let payload = null;
+      try { payload = JSON.parse(raw); } catch { payload = null; }
+      if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) { dbg('hydrate:invalid', { docId }); return false; }
+      const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
+      const cleanValues = (window.formSuiteUtils?.sanitizeValues ? window.formSuiteUtils.sanitizeValues(nextSchema, payload.values || {}) : (payload.values || {}));
+      const tagMap = payload.tagMap || {};
+      const rules  = Array.isArray(payload.rules) ? payload.rules : [];
+      await saveState(docId, { schema: nextSchema, values: cleanValues, tagMap, rules, schemaUpdatedAt: new Date().toISOString() });
+      // Notify other tabs/pages
+      try { bcCanon?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
+      try { bcLegacy?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
+      try { const meta = getActiveDocMeta(); broadcastDocUpdated(docId, meta?.name); } catch {}
+      dbg('hydrate:done', { docId, fields: nextSchema.fields.length });
+      return true;
+    } catch (e) { dbg('hydrate:error', e); return false; }
+  }
+
+  // Trigger hydration on key events across tabs
+  try {
+    bcCanon?.addEventListener('message', (ev) => {
+      const m = ev?.data || {};
+      if ((m.type === 'active:set' || m.type === 'active:updated') && m.docId) {
+        coalesce('hydrate:'+m.docId, () => hydrateFromDocxIfEmpty(m.docId));
+      }
+    });
+  } catch {}
+
+  window.addEventListener('focus', () => {
+    const meta = getActiveDocMeta();
+    if (meta?.docId) coalesce('hydrate:'+meta.docId, () => hydrateFromDocxIfEmpty(meta.docId));
+  });
 
   // Expose
   window.formSuitePersist = api;

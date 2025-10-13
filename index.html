@@ -130,6 +130,10 @@
         const m = ev?.data || {};
         if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
         if (m.type === 'active:clear') emit(null);
+        if (m.type === 'active:updated') {
+          const meta = readActiveDocSync();
+          if (meta?.docId) emit(meta);
+        }
       });
 
       window.addEventListener('storage', (e) => {
@@ -153,6 +157,10 @@
       const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
       schema = st?.schema || null;
       values = st?.values || {};
+      if (!schema) {
+        // Attempt one-time hydration from DOCX payload so Form loads without visiting Extractor
+        await hydrateWorkspaceFromDocxIfEmpty();
+      }
       setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
       renderForm();
       await updateWriteAccessBanner();
@@ -169,12 +177,12 @@
         currentDoc = readActiveDocSync() || currentDoc;
         if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
 
-        const bytes = await fetchWorkingDocBytes();
-        if (!bytes) { await hardResetOpenForm('lost access'); return; }
-
         const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
         schema = st?.schema || null;
         values = st?.values || {};
+        if (!schema) {
+          await hydrateWorkspaceFromDocxIfEmpty();
+        }
         setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
         renderForm();
         await updateWriteAccessBanner();
@@ -212,7 +220,10 @@
       }
     }
     els.btnRegrant?.addEventListener('click', async () => {
-      await updateWriteAccessBanner({ tryPrompt: true });
+      const p = await updateWriteAccessBanner({ tryPrompt: true });
+      if (p === 'granted') {
+        await ensureActiveDocOrReset();
+      }
     });
 
     // ---------- Pyodide (robust) ----------
@@ -265,6 +276,54 @@ def write_docvar(u8, var_name, value):
             zfout.writestr(n, zfin.read(n))
         zfout.writestr("word/settings.xml", settings_bytes)
     return outbuf.getvalue()
+
+def read_docvar_settings(u8, var_name):
+    data = bytes(u8)
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        try:
+            xml = zf.read("word/settings.xml")
+        except KeyError:
+            return None
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return None
+        W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        def _q(local):
+            return "{%s}%s" % (W_NS, local)
+        doc_vars = root.find(_q("docVars"))
+        if doc_vars is None:
+            return None
+        for dv in doc_vars.findall(_q("docVar")):
+            if dv.get(_q("name")) == var_name:
+                return dv.get(_q("val"))
+    return None
+
+def read_docvar_custom(u8, var_name):
+    # Try docProps/custom.xml docVars fallback
+    data = bytes(u8)
+    name = str(var_name or "")
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        try:
+            xml = zf.read("docProps/custom.xml")
+        except KeyError:
+            return None
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return None
+        # Namespaces for custom properties
+        ns = {
+            'cp': 'http://schemas.openxmlformats.org/officeDocument/2006/custom-properties',
+            'vt': 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
+        }
+        for prop in root.findall('cp:property', ns):
+            if prop.get('name') == name:
+                # value could be vt:lpwstr or other types
+                for child in list(prop):
+                    if child.text is not None:
+                        return child.text
+    return None
 
 def _set_sdt_text(content_el, value):
     texts = content_el.findall(".//w:t", {"w": _W_NS})
@@ -461,9 +520,138 @@ def apply_visibility(u8, idx_to_action_json):
             zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
     return outbuf.getvalue()
-        `);
+`);
 
         pyLoaded = true;
+      }
+    }
+
+    // Minimal readers for CRONOS_PAYLOAD using pyodide helpers
+    async function readDocVarSettings(arrayBufferOrBytes, name) {
+      await ensurePy();
+      const u8in = arrayBufferOrBytes instanceof Uint8Array ? arrayBufferOrBytes : new Uint8Array(arrayBufferOrBytes);
+      const fn = py.globals.get('read_docvar_settings');
+      const pyBytes = py.toPy(u8in);
+      let pyOut;
+      try { pyOut = fn(pyBytes, name); }
+      finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} }
+      let txt = null;
+      if (pyOut && typeof pyOut.toJs === 'function') txt = pyOut.toJs({ create_proxies:false });
+      else txt = pyOut ?? null;
+      try { pyOut?.destroy?.(); } catch {}
+      return txt;
+    }
+
+    async function readDocVarCustom(arrayBufferOrBytes, name) {
+      await ensurePy();
+      const u8in = arrayBufferOrBytes instanceof Uint8Array ? arrayBufferOrBytes : new Uint8Array(arrayBufferOrBytes);
+      const fn = py.globals.get('read_docvar_custom');
+      const pyBytes = py.toPy(u8in);
+      let pyOut;
+      try { pyOut = fn(pyBytes, name); }
+      finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} }
+      let txt = null;
+      if (pyOut && typeof pyOut.toJs === 'function') txt = pyOut.toJs({ create_proxies:false });
+      else txt = pyOut ?? null;
+      try { pyOut?.destroy?.(); } catch {}
+      return txt;
+    }
+
+    // PAYLOAD_KEY is defined earlier in this script
+    // Lightweight JSZip-based payload reader (no Pyodide dependency on index)
+    async function ensureJSZip(){
+      if (window.JSZip) return;
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+        s.onload = res; s.onerror = rej; document.head.appendChild(s);
+      });
+    }
+
+    async function readPayloadFromDocx(bytes){
+      try {
+        await ensureJSZip();
+        const zip = await window.JSZip.loadAsync(bytes);
+        // Try settings.xml → w:docVars/w:docVar
+        const settings = zip.file('word/settings.xml');
+        if (settings) {
+          const xmlText = await settings.async('string');
+          const parser = new DOMParser();
+          const xml = parser.parseFromString(xmlText, 'application/xml');
+          const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+          const docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
+          if (docVars) {
+            const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
+            for (let i = 0; i < vars.length; i++) {
+              const dv = vars[i];
+              const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
+              if (name === PAYLOAD_KEY) {
+                const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
+                return val || null;
+              }
+            }
+          }
+        }
+        // Fallback: docProps/custom.xml → cp:property[name=PAYLOAD_KEY]
+        const custom = zip.file('docProps/custom.xml');
+        if (custom) {
+          const xmlText = await custom.async('string');
+          const parser = new DOMParser();
+          const xml = parser.parseFromString(xmlText, 'application/xml');
+          const props = xml.getElementsByTagName('property');
+          for (let i = 0; i < props.length; i++) {
+            const p = props[i];
+            const nm = p.getAttribute('name');
+            if (nm === PAYLOAD_KEY) {
+              const child = p.firstElementChild;
+              return child && child.textContent ? child.textContent : null;
+            }
+          }
+        }
+      } catch (e) { console.warn('readPayloadFromDocx failed', e); }
+      return null;
+    }
+
+    let __hydrating = false;
+    async function hydrateWorkspaceFromDocxIfEmpty() {
+      try {
+        if (__hydrating) return false;
+        if (!currentDoc?.docId) return false;
+        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+        const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
+        if (hasSchema) return false; // nothing to do
+        setStatus('Restoring from document…');
+        const bytes = await fetchWorkingDocBytes();
+        if (!bytes) return false;
+        __hydrating = true;
+        let payloadRaw = await readPayloadFromDocx(bytes);
+        if (!payloadRaw) return false;
+        let payload = null;
+        try { payload = JSON.parse(payloadRaw); } catch { payload = null; }
+        if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) return false;
+
+        const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
+        const cleanValues = sanitizeValues(nextSchema, payload.values || {});
+        const tagMap = payload.tagMap || {};
+        const rules  = Array.isArray(payload.rules) ? payload.rules : [];
+        await window.formSuitePersist.saveState(currentDoc.docId, {
+          schema: nextSchema,
+          values: cleanValues,
+          tagMap,
+          rules,
+          schemaUpdatedAt: new Date().toISOString()
+        });
+        // refresh local variables + UI
+        schema = nextSchema;
+        values = cleanValues;
+        renderForm();
+        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>`);
+        return true;
+      } catch (e) {
+        console.warn('hydrateWorkspaceFromDocxIfEmpty failed:', e);
+        return false;
+      } finally {
+        __hydrating = false;
       }
     }
 
