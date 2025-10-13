@@ -534,12 +534,13 @@
               <strong>Tabellen-Spalten</strong>
               <span class="tdz-muted" id="tdzCount"></span>
             </div>
-            <div class="row" style="gap:6px;">
-              <button type="button" id="tdzAdd">+ Spalte hinzufügen</button>
-            </div>
           </div>
 
           <div id="tdzList" aria-live="polite"></div>
+
+          <div class="row" style="margin-top:8px; justify-content:flex-end;">
+            <button type="button" id="tdzAddBottom">+ Spalte hinzufügen</button>
+          </div>
 
           <div class="row" style="gap:12px; margin-top:10px;">
             <div class="tdz-col">
@@ -559,7 +560,7 @@
         window.TableDesigner = createTableDesigner({
           listEl: wrap.querySelector('#tdzList'),
           countEl: wrap.querySelector('#tdzCount'),
-          addBtn:  wrap.querySelector('#tdzAdd'),
+          addBtn:  wrap.querySelector('#tdzAddBottom'),
           hiddenColsEl: wrap.querySelector('#pCols'),
           minEl: wrap.querySelector('#pMinRows'),
           maxEl: wrap.querySelector('#pMaxRows'),
@@ -907,6 +908,7 @@
 
 
       cfg.addBtn?.addEventListener('click', () => api.addEmpty());
+      cfg.addBtn2?.addEventListener('click', () => api.addEmpty());
       return api;
     }
 
