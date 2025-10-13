@@ -1222,6 +1222,7 @@
                 const inId = document.createElement('input');
                 inId.id = idId; inId.type = 'text'; inId.placeholder = 'id';
                 inId.style.minWidth = '140px'; inId.style.width = '140px';
+                inId.classList.add('muted-input');
 
                 const inLabel = document.createElement('input');
                 inLabel.id = labelId; inLabel.type = 'text'; inLabel.placeholder = 'Label';
@@ -1328,7 +1329,9 @@
                 });
 
                 // when non-datediff fields change → refresh so datediff lists include them
-                inId.addEventListener('input',   () => { if (fld.type !== 'datediff') { fld.id = inId.value; hidden.value = JSON.stringify(model); triggerRefresh(); } });
+                inId.addEventListener('input',   () => { if (fld.type !== 'datediff') { fld.id = inId.value; hidden.value = JSON.stringify(model); /* no re-render on each keystroke */ } });
+                // On blur, if this field is a date, refresh so later datediff dropdowns include updated id
+                inId.addEventListener('blur',    () => { if (fld.type === 'date') { triggerRefresh(); } });
                 inLabel.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.label = inLabel.value; hidden.value = JSON.stringify(model); } });
                 inContent.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.content = inContent.value; hidden.value = JSON.stringify(model); } });
 
@@ -1354,10 +1357,10 @@
                   hidden.value = JSON.stringify(model);
                 });
 
-                // mount row
+                // mount row (Type, Label, Id, Content)
                 line.appendChild(sel);
-                line.appendChild(inId);
                 line.appendChild(inLabel);
+                line.appendChild(inId);
                 line.appendChild(inContent);
                 line.appendChild(ddWrap);
                 line.appendChild(btnDel);
