@@ -191,13 +191,51 @@
       const fieldsArr = Array.isArray(schemaObj?.fields) ? schemaObj.fields
                         : Array.isArray(state?.schema) ? state.schema : [];
       const title = schemaObj?.title || state?.schemaTitle || state?.title || 'Schema';
-      const fields = fieldsArr
-        .map(f => {
-          if (!f) return null;
-          const key = (f.id != null) ? String(f.id) : (f.key != null) ? String(f.key) : null;
-          return key ? { key, type: f.type || 'text' } : null;
-        })
-        .filter(Boolean);
+
+      // local helpers (mirror index.html)
+      const slugifyMc = (s) => String(s || '')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+      const mcExtraKey = (fieldId, optionValue, extraId) => `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
+
+      const uniq = new Map(); // key -> { type, label }
+      const addField = (k, t, label) => {
+        const key = String(k || '');
+        if (!key) return;
+        if (!uniq.has(key)) uniq.set(key, { type: t || 'text', label: String(label || key) });
+      };
+
+      for (const f of fieldsArr) {
+        if (!f) continue;
+        const key = (f.id != null) ? String(f.id) : (f.key != null) ? String(f.key) : null;
+        if (key) addField(key, f.type || 'text', key);
+
+        // Flatten MultiChoice extras as mappable fields as well
+        if (f.type === 'multichoice' && f.mc && Array.isArray(f.mc.groups)) {
+          for (const g of f.mc.groups) {
+            for (const it of (g.items || [])) {
+              const optVal = String(it?.value ?? it?.label ?? '');
+              const extras = Array.isArray(it?.fields) ? it.fields : [];
+              for (const ex of extras) {
+                let exId = String(ex?.id || '').trim();
+                if (!exId && String(ex?.type) === 'datediff') {
+                  const fromId = String(ex?.fromId || '').trim();
+                  const toId   = String(ex?.toId   || '').trim();
+                  if (fromId || toId) exId = `datediff_${fromId}_${toId}`.replace(/__+/g,'_').replace(/^_|_$/g,'');
+                }
+                if (!exId) continue;
+                const k = mcExtraKey(f.id, optVal, exId);
+                // Show just the subfield id as the label
+                addField(k, ex?.type || 'text', exId);
+              }
+            }
+          }
+        }
+      }
+      const fields = Array.from(uniq.entries()).map(([key, v]) => ({ key, type: v.type, label: v.label }));
       return { title, fields, count: fields.length };
     }
 
@@ -211,7 +249,7 @@
 
     function buildFieldOptions(fields) {
       const frag = document.createDocumentFragment();
-      const sorted = fields.slice().sort((a,b)=> a.key.localeCompare(b.key));
+      const sorted = fields.slice().sort((a,b)=> (a.label||a.key).localeCompare(b.label||b.key));
       const optNone = document.createElement('option');
       optNone.value = '';
       optNone.textContent = '— not mapped —';
@@ -219,7 +257,7 @@
       for (const f of sorted) {
         const opt = document.createElement('option');
         opt.value = f.key;
-        opt.textContent = f.key;
+        opt.textContent = f.label || f.key;
         frag.appendChild(opt);
       }
       return frag;
