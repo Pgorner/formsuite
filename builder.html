@@ -985,11 +985,11 @@
               <strong>Gruppierte Optionen</strong>
               <span class="tdz-muted">· ${model.groups.reduce((n,g)=>n+g.items.length,0)} Optionen in ${model.groups.length} Gruppe(n)</span>
             </div>
-            <div class="row" style="gap:6px;">
-              <button type="button" class="mc-add-group">+ Gruppe</button>
-            </div>
           </div>
           <div class="mc-list"></div>
+          <div class="row" style="margin-top:8px; justify-content:flex-end;">
+            <button type="button" class="mc-add-group">+ Gruppe</button>
+          </div>
           <input type="hidden" class="mc-hidden-json" />
         `;
 
