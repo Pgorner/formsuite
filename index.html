@@ -57,7 +57,7 @@
       btnRegrant:document.getElementById('btnRegrant'),
     };
 
-    let currentDoc = null, schema = null, values = {};
+    let currentDoc = null, schema = null, values = {}, fieldRules = [];
     let btnExportMain = null;
 
     // ---------- Status + Hard Reset ----------
@@ -157,6 +157,7 @@
       const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
       schema = st?.schema || null;
       values = st?.values || {};
+      fieldRules = Array.isArray(st?.fieldRules) ? st.fieldRules : [];
       if (!schema) {
         // Attempt one-time hydration from DOCX payload so Form loads without visiting Extractor
         await hydrateWorkspaceFromDocxIfEmpty();
@@ -180,6 +181,7 @@
         const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
         schema = st?.schema || null;
         values = st?.values || {};
+        fieldRules = Array.isArray(st?.fieldRules) ? st.fieldRules : [];
         if (!schema) {
           await hydrateWorkspaceFromDocxIfEmpty();
         }
@@ -745,10 +747,15 @@ def apply_visibility(u8, idx_to_action_json):
 
           let allowed = null;
           if (Array.isArray(f.options) && f.options.length) {
-            allowed = new Set(f.options.map(String));
+            allowed = new Set(
+              f.options.map(o => (o && typeof o === 'object')
+                ? String(o.value ?? o.label ?? '')
+                : String(o)
+              )
+            );
           } else if (f.mc && Array.isArray(f.mc.groups)) {
             allowed = new Set(
-              f.mc.groups.flatMap(g => (g.items || []).map(it => String(it.value || '')))
+              f.mc.groups.flatMap(g => (g.items || []).map(it => String((it?.value ?? it?.label ?? ''))))
             );
           }
           if (allowed) arr = arr.filter(x => allowed.has(String(x)));
@@ -1213,6 +1220,7 @@ def apply_visibility(u8, idx_to_action_json):
       (schema.fields || []).forEach(f => {
         const wrap = document.createElement('div');
         wrap.className = 'field';
+        try { wrap.dataset.fieldId = String(f.id || ''); } catch {}
         if (f.type === 'address' || f.type === 'datediff') wrap.classList.add('span-2');
         if (f.type === 'table') wrap.classList.add('full', 'field--table');
         if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice');
@@ -1240,7 +1248,7 @@ def apply_visibility(u8, idx_to_action_json):
           input.id = f.id; input.name = f.id; input.style.width = '100%';
           if (f.required) input.required = true;
           if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); try{ applyFieldVisibility(); }catch{} });
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
@@ -1251,7 +1259,7 @@ def apply_visibility(u8, idx_to_action_json):
           input.id = f.id; input.name = f.id; input.style.width = '100%';
           if (f.required) input.required = true;
           if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); });
+          input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); try{ applyFieldVisibility(); }catch{} });
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
@@ -1266,7 +1274,7 @@ def apply_visibility(u8, idx_to_action_json):
           });
           if (f.required) input.required = true;
           if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); try{ applyFieldVisibility(); }catch{} });
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
@@ -1321,10 +1329,11 @@ def apply_visibility(u8, idx_to_action_json):
             const optId  = `${f.id}__${__slugifyMc(optVal)}`;
             const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
 
-            // CARD
-            const card = document.createElement('div');
-            card.className = 'mc-item';
-            card.style.position = 'relative';
+          // CARD
+          const card = document.createElement('div');
+          card.className = 'mc-item';
+          try { card.dataset.optId = `${f.id}__opt__${__slugifyMc(optVal)}`; } catch {}
+          card.style.position = 'relative';
             card.style.display = 'flex';
             card.style.flexDirection = 'column';
             card.style.alignItems = 'stretch';
@@ -1532,6 +1541,7 @@ def apply_visibility(u8, idx_to_action_json):
             cb.addEventListener('change', () => {
               if (locked) { cb.checked = true; return; }
               persistMainSelection();
+              try { applyFieldVisibility(); } catch {}
             });
 
             // assemble
@@ -1616,8 +1626,8 @@ def apply_visibility(u8, idx_to_action_json):
             clickOpens: true,
             defaultDate: values[f.id] || null,
             onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
-            onChange: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
-            onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
+            onChange: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); try{ applyFieldVisibility(); }catch{} },
+            onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); try{ applyFieldVisibility(); }catch{} }
           });
           fp.set('allowInput', false);
           if (fp.altInput) fp.altInput.readOnly = true;
@@ -1693,7 +1703,12 @@ def apply_visibility(u8, idx_to_action_json):
       btnExportMain.addEventListener('click', onExportFromOpenForm);
       bar.appendChild(btnExportMain);
       form.appendChild(bar);
+      // reactively apply field visibility on any change within the form
+      form.addEventListener('change', () => { try { applyFieldVisibility(); } catch {} });
       mount.appendChild(form);
+
+      // initial apply based on current values
+      try { applyFieldVisibility(); } catch {}
 
       // date helpers
       function getDateForField(fid) {
@@ -2208,12 +2223,51 @@ def apply_visibility(u8, idx_to_action_json):
 
         const fieldId = r.fieldId || r.field || r.whenField;
         const op      = r.op || r.operator || 'equals';
-        theExp = r.values ?? r.value ?? r.expected;
-        const exp = theExp;
+        const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
 
-        const actual  = getVal(fieldId);
-        if (!ruleMatchesValue(op, exp, actual)) continue;
+        // New matching supporting boolean pseudo options and date ops
+        let match = false;
+        if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
+          const [baseId, slug] = fieldId.split('__opt__');
+          const raw = getVal(baseId);
+          const arr = Array.isArray(raw) ? raw.map(String) : [];
+          const toSlug = (s) => String(s||'')
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-zA-Z0-9]+/g, '_')
+            .replace(/^_+|_+$/g, '')
+            .toLowerCase();
+          const selected = arr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
+          const expect = Array.isArray(exp) ? exp[0] : exp;
+          const expectBool = (String(expect) === 'true');
+          if (op === 'equals') match = (selected === expectBool);
+        } else {
+          const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
+          const t = String(fld?.type||'').toLowerCase();
+          const actual = getVal(fieldId);
+          if (t === 'date') {
+            const expStr = Array.isArray(exp) ? String(exp[0]||'') : String(exp||'');
+            const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
+            const a = toDay(actual);
+            const b = toDay(expStr);
+            if (!Number.isNaN(a) && !Number.isNaN(b)) {
+              if (op === 'before') match = a < b;
+              else if (op === 'after') match = a > b;
+              else if (op === 'equals') match = a === b;
+            }
+          } else if (t === 'text' || t === 'number' || t === 'select') {
+            const expVal = Array.isArray(exp) ? exp[0] : exp;
+            if (op === 'equals') match = String(actual) === String(expVal);
+            else if (op === 'notEquals') match = String(actual) !== String(expVal);
+            else if (t === 'text' && op === 'contains') match = String(actual ?? '').toLowerCase().includes(String(expVal ?? '').toLowerCase());
+          } else if (t === 'multichoice') {
+            match = ruleMatchesValue(op, exp, actual);
+          } else {
+            match = ruleMatchesValue(op, exp, actual);
+          }
+        }
+        if (!match) continue;
 
         for (const t of targets) {
           const key = t?.key ?? t?.idx ?? t?.id;
@@ -2227,6 +2281,126 @@ def apply_visibility(u8, idx_to_action_json):
       }
       return out;
     }
+
+    // ---------- Field Rules (UI visibility) ----------
+    function loadFieldRulesForDoc(state) {
+      return (
+        state?.fieldRules ||
+        state?.payload?.fieldRules ||
+        state?.CRONOS_FIELD_RULES ||
+        state?.cronos_field_rules ||
+        []
+      );
+    }
+
+    function evaluateFieldRulesToVisibility(schema, values, rules) {
+      const out = Object.create(null); // fieldId -> 'SHOW'|'HIDE'
+      if (!Array.isArray(rules) || !rules.length) return out;
+
+      const cleanVals = sanitizeValues(schema, values || {});
+      const getVal = (fid) => cleanVals[fid];
+
+      for (const r of rules) {
+        if (!r) continue;
+        const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
+                    : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
+                    : null;
+        if (!action) continue;
+
+        const fieldId = r.fieldId || r.field || r.whenField;
+        const op      = r.op || r.operator || 'equals';
+        const exp     = r.values ?? r.value ?? r.expected;
+        const targets = Array.isArray(r.targets) ? r.targets : [];
+
+        // Support boolean pseudo-field for multichoice option: <fieldId>__opt__<slug>
+        let match = false;
+        if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
+          const [baseId, slug] = fieldId.split('__opt__');
+          const base = baseId;
+          const raw = getVal(base);
+          const arr = Array.isArray(raw) ? raw.map(String) : [];
+          // slugify comparable
+          const toSlug = (s) => String(s||'')
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-zA-Z0-9]+/g, '_')
+            .replace(/^_+|_+$/g, '')
+            .toLowerCase();
+          const selected = arr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
+          const expect = Array.isArray(exp) ? exp[0] : exp;
+          const expectBool = (String(expect) === 'true');
+          if (op === 'equals') match = (selected === expectBool);
+        } else {
+          // Resolve field type
+          const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
+          const t = String(fld?.type||'').toLowerCase();
+          const actual = getVal(fieldId);
+          if (t === 'date') {
+            const expStr = Array.isArray(exp) ? String(exp[0]||'') : String(exp||'');
+            const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
+            const a = toDay(actual);
+            const b = toDay(expStr);
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false;
+            else if (op === 'before') match = a < b;
+            else if (op === 'after') match = a > b;
+            else if (op === 'equals') match = a === b;
+          } else if (t === 'text' || t === 'number') {
+            const expVal = Array.isArray(exp) ? exp[0] : exp;
+            if (op === 'equals') match = String(actual) === String(expVal);
+            else if (op === 'notEquals') match = String(actual) !== String(expVal);
+          } else if (t === 'select') {
+            const expVal = Array.isArray(exp) ? exp[0] : exp;
+            if (op === 'equals') match = String(actual) === String(expVal);
+            else if (op === 'notEquals') match = String(actual) !== String(expVal);
+          } else if (t === 'multichoice') {
+            // legacy compatibility: anyOf/allOf/equals
+            match = ruleMatchesValue(op, exp, actual);
+          } else {
+            // fallback to generic
+            match = ruleMatchesValue(op, exp, actual);
+          }
+        }
+        if (!match) continue;
+
+        for (const t of targets) {
+          const id = String(t?.id ?? t?.fieldId ?? '');
+          if (!id) continue;
+          const prev = out[id];
+          if (action === 'SHOW') out[id] = 'SHOW';
+          else if (action === 'HIDE' && prev !== 'SHOW') out[id] = 'HIDE';
+        }
+      }
+      return out;
+    }
+
+    function applyFieldVisibility() {
+      try {
+        if (!schema || !Array.isArray(schema.fields)) return;
+        const visMap = evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
+        // First reset shown state
+        document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; });
+        document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; });
+        // Apply per mapping key
+        const esc = (window.CSS && CSS.escape) ? CSS.escape : (s => String(s)
+          .replace(/\\/g,'\\\\')
+          .replace(/"/g,'\\"')
+          .replace(/\]/g,'\\]')
+          .replace(/\[/g,'\\[')
+        );
+        Object.keys(visMap || {}).forEach(id => {
+          const dir = visMap[id];
+          if (dir !== 'HIDE') return; // only hide explicitly; show is default
+          if (typeof id === 'string' && id.includes('__opt__')) {
+            document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => { el.style.display = 'none'; });
+          } else {
+            document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => { el.style.display = 'none'; });
+          }
+        });
+      } catch (e) { /* no-op */ }
+    }
+
+    // Expose for cross-callbacks
+    try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
 
     // ---------- Bridge to Python: apply visibility using fsHidden ----------
     async function applyVisibilityByRules(bytesU8, visibilityMap) {
