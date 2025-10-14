@@ -2294,7 +2294,7 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     function evaluateFieldRulesToVisibility(schema, values, rules) {
-      const out = Object.create(null); // fieldId -> 'SHOW'|'HIDE'
+      const out = Object.create(null); // fieldId -> 'SHOW'|'HIDE'|'DISABLE'
       if (!Array.isArray(rules) || !rules.length) return out;
 
       const cleanVals = sanitizeValues(schema, values || {});
@@ -2311,6 +2311,7 @@ def apply_visibility(u8, idx_to_action_json):
         const op      = r.op || r.operator || 'equals';
         const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
+        const effect = (String(r.hideMode||'hide').toLowerCase() === 'disable') ? 'DISABLE' : 'HIDE';
 
         // Support boolean pseudo-field for multichoice option: <fieldId>__opt__<slug>
         let match = false;
@@ -2367,7 +2368,10 @@ def apply_visibility(u8, idx_to_action_json):
           if (!id) continue;
           const prev = out[id];
           if (action === 'SHOW') out[id] = 'SHOW';
-          else if (action === 'HIDE' && prev !== 'SHOW') out[id] = 'HIDE';
+          else if (action === 'HIDE' && prev !== 'SHOW') {
+            if (prev === 'HIDE') out[id] = 'HIDE';
+            else out[id] = effect; // DISABLE or HIDE
+          }
         }
       }
       return out;
@@ -2377,9 +2381,15 @@ def apply_visibility(u8, idx_to_action_json):
       try {
         if (!schema || !Array.isArray(schema.fields)) return;
         const visMap = evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
-        // First reset shown state
-        document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; });
-        document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; });
+        // First reset shown/enabled state
+        const clearDisabled = (el) => {
+          el.style.opacity = '';
+          el.style.pointerEvents = '';
+          el.removeAttribute('aria-disabled');
+          el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = false; } catch {} });
+        };
+        document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
+        document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
         // Apply per mapping key
         const esc = (window.CSS && CSS.escape) ? CSS.escape : (s => String(s)
           .replace(/\\/g,'\\\\')
@@ -2389,11 +2399,16 @@ def apply_visibility(u8, idx_to_action_json):
         );
         Object.keys(visMap || {}).forEach(id => {
           const dir = visMap[id];
-          if (dir !== 'HIDE') return; // only hide explicitly; show is default
           if (typeof id === 'string' && id.includes('__opt__')) {
-            document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => { el.style.display = 'none'; });
+            document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => {
+              if (dir === 'HIDE') el.style.display = 'none';
+              else { el.style.display=''; el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; el.setAttribute('aria-disabled','true'); el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} }); }
+            });
           } else {
-            document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => { el.style.display = 'none'; });
+            document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => {
+              if (dir === 'HIDE') el.style.display = 'none';
+              else { el.style.display=''; el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; el.setAttribute('aria-disabled','true'); el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} }); }
+            });
           }
         });
       } catch (e) { /* no-op */ }

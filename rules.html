@@ -341,7 +341,17 @@
         card._updateSave?.();
       });
       pAction.appendChild(lblA); pAction.appendChild(selA);
+
+      // Effect selector when HIDE on Fields tab
+      const pEffect = document.createElement('div'); pEffect.className = 'pair';
+      const lblE = document.createElement('label'); lblE.textContent = 'Effect';
+      const selE = document.createElement('select');
+      const addOpt = (v,t) => { const o=document.createElement('option'); o.value=v; o.textContent=t; if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o); };
+      addOpt('hide','hide (remove)'); addOpt('disable','disable (greyed)');
+      selE.addEventListener('change', ()=>{ rule.hideMode = selE.value || 'hide'; if(!isDraft){ persistRules(); renderList(); } });
+
       row1.appendChild(pAction);
+      if (gMode==='fields') { pEffect.appendChild(lblE); pEffect.appendChild(selE); row1.appendChild(pEffect); }
 
       // When source
       const pField = document.createElement("div"); pField.className="pair";
