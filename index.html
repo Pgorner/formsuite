@@ -2397,15 +2397,58 @@ def apply_visibility(u8, idx_to_action_json):
           .replace(/\]/g,'\\]')
           .replace(/\[/g,'\\[')
         );
+        // helpers to clear selections when hiding/greying
+        const deselectMcItem = (mcEl) => {
+          const cb = mcEl.querySelector('input[type="checkbox"][data-mc="1"]');
+          if (!cb) return;
+          const fid = cb.name;
+          const optVal = cb.value;
+          if (cb.checked) cb.checked = false;
+          const arr = Array.isArray(values[fid]) ? values[fid].map(String) : [];
+          const next = arr.filter(v => v !== String(optVal));
+          values[fid] = next;
+          scheduleSaveState();
+        };
+                const deselectFieldWrapper = (wrapEl) => {
+          const fid = wrapEl?.dataset?.fieldId || '';
+          if (!fid) return;
+          const fld = (schema?.fields || []).find(f => String(f.id) === String(fid));
+          const t = String(fld?.type || '').toLowerCase();
+          if (t === 'multichoice') {
+            wrapEl.querySelectorAll('input[type="checkbox"][data-mc="1"]').forEach(cb => { cb.checked = false; });
+            values[fid] = [];
+            scheduleSaveState();
+          } else if (t === 'select') {
+            const sel = wrapEl.querySelector('select');
+            if (sel) { sel.value = ''; values[fid] = ''; scheduleSaveState(); }
+          } else if (t === 'text') {
+            const inp = wrapEl.querySelector('input[type="text"]:not([data-type="date"])');
+            if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
+          } else if (t === 'number') {
+            const inp = wrapEl.querySelector('input[type="number"]');
+            if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
+          } else if (t === 'date') {
+            const inp = wrapEl.querySelector('input[data-type="date"]');
+            if (inp) {
+              try { if (inp._flatpickr) inp._flatpickr.clear(); } catch {}
+              inp.value = '';
+              values[fid] = '';
+              scheduleSaveState();
+            }
+          }
+        };
+
         Object.keys(visMap || {}).forEach(id => {
           const dir = visMap[id];
           if (typeof id === 'string' && id.includes('__opt__')) {
             document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => {
+              deselectMcItem(el);
               if (dir === 'HIDE') el.style.display = 'none';
               else { el.style.display=''; el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; el.setAttribute('aria-disabled','true'); el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} }); }
             });
           } else {
             document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => {
+              deselectFieldWrapper(el);
               if (dir === 'HIDE') el.style.display = 'none';
               else { el.style.display=''; el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; el.setAttribute('aria-disabled','true'); el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} }); }
             });
@@ -2470,3 +2513,4 @@ def apply_visibility(u8, idx_to_action_json):
   </script>
 </body>
 </html>
+
