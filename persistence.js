@@ -282,19 +282,47 @@
   // Keep the SAME docId if one already exists; otherwise mint a new one.
   async function setCurrentDoc({ bytes, handle, name }) {
     const prev = readActiveFromStorage();
-    const docId = prev?.docId || uuid();
+
+    // Compute fingerprint if we have bytes
+    let newFp = null;
+    try {
+      if (bytes && (bytes.byteLength || (bytes.length|0) > 0)) {
+        const ab = (bytes instanceof ArrayBuffer) ? bytes
+                 : (bytes && bytes.buffer instanceof ArrayBuffer) ? bytes.buffer
+                 : new Uint8Array(bytes || []).buffer;
+        const d = await crypto.subtle.digest('SHA-256', ab);
+        newFp = Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2,'0')).join('');
+      }
+    } catch {}
+
+    // Decide whether to reuse previous docId
+    let reusePrev = false;
+    if (prev?.docId) {
+      try {
+        const prevState = await loadState(prev.docId);
+        const prevFp = prevState?.fingerprint || null;
+        if (prevFp && newFp && prevFp === newFp) reusePrev = true;
+      } catch {}
+    }
+
+    const docId = (reusePrev && prev?.docId) ? prev.docId : uuid();
     const meta = { docId, name: (name || prev?.name || 'document').replace(/\.docx$/i,'') };
 
     // Persist handle & bytes (best-effort)
     if (handle) await idbPutHandle(docId, handle);
     if (bytes)  await opfsPut(docId, bytes);
 
-    // Ensure there is at least an empty state container
-    if (!await loadState(docId)) await saveState(docId, { schema: null, values: {} });
+    // Ensure there is at least an empty state container and store fingerprint
+    const existing = await loadState(docId);
+    if (!existing) {
+      await saveState(docId, { schema: null, values: {}, fingerprint: newFp || null });
+    } else if (newFp && existing.fingerprint !== newFp) {
+      await saveState(docId, { fingerprint: newFp });
+    }
 
     await setActiveDoc(meta); // BC + LS (both canonical + legacy)
-    // Opportunistic hydrate after switching/setting current
-    try { coalesce('hydrate:'+docId, () => hydrateFromDocxIfEmpty(docId)); } catch {}
+    // Hydrate immediately (no debounce) so pages update fast
+    try { await hydrateFromDocxIfEmpty(docId); } catch {}
     return meta;
   }
 
