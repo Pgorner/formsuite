@@ -74,20 +74,32 @@
     } catch { return null; }
   }
   async function idbEachHandle(cb) {
+    let rows = [];
     try {
       const db = await openDB();
-      await new Promise((res, rej) => {
+      rows = await new Promise((res, rej) => {
+        const items = [];
         const tx = db.transaction(DB_STORE_HANDLES, 'readonly');
         const store = tx.objectStore(DB_STORE_HANDLES);
         const req = store.openCursor();
-        req.onsuccess = async () => {
+        req.onsuccess = () => {
           const cursor = req.result;
-          if (cursor) { try { await cb(cursor.value.docId, cursor.value.handle); } catch {} cursor.continue(); }
-          else res();
+          if (cursor) {
+            items.push(cursor.value);
+            cursor.continue();
+          }
         };
         req.onerror = () => rej(req.error);
+        tx.oncomplete = () => res(items);
+        tx.onerror = () => rej(tx.error);
       });
-    } catch {}
+    } catch {
+      rows = [];
+    }
+    for (const { docId, handle } of rows) {
+      try { await cb(docId, handle); }
+      catch {}
+    }
   }
 
   // ===== OPFS working copy =====
