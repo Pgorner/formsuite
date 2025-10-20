@@ -548,52 +548,52 @@ def apply_visibility(u8, idx_to_action_json):
                 _clear_table_hidden_markers(tbl)
             parts_roots[n] = root
 
-        # PASS 2: apply current HIDE ranges
-        global_idx = 0
-        for n in names:
-            if not is_doc_part(n): continue
-            root = parts_roots.get(n)
-            if root is None: continue
+    # PASS 2: apply current HIDE ranges
+    global_idx = 0
+    for n in names:
+        if not is_doc_part(n): continue
+        root = parts_roots.get(n)
+        if root is None: continue
 
-            body = root.find(_q("body"))
-            if body is None:
-                zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
+        body = root.find(_q("body"))
+        if body is None:
+            zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
 
-            elems = _collect_body_blocks(body)
+        elems = _collect_body_blocks(body)
 
-            heading_positions = []
-            for i, blk in enumerate(elems):
-                if blk.get("type") == "p" and blk.get("level") is not None:
-                    global_idx += 1
-                    heading_positions.append((i, blk.get("level"), global_idx))
+        heading_positions = []
+        for i, blk in enumerate(elems):
+            if blk.get("type") == "p" and blk.get("level") is not None:
+                global_idx += 1
+                heading_positions.append((i, blk.get("level"), global_idx))
 
-            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
-                if idx_to_action.get(idx) != "HIDE":
+        for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+            if idx_to_action.get(idx) != "HIDE":
+                continue
+            if h_i + 1 < len(heading_positions):
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+            else:
+                end = len(elems)
+
+            seen = set()
+            for j in range(pos, end):
+                blk = elems[j]
+                top = blk.get("top")
+                if top is None:
                     continue
-                if h_i + 1 < len(heading_positions):
-                    end = len(elems)
-                    for j in range(h_i + 1, len(heading_positions)):
-                        np, nl, _ = heading_positions[j]
-                        if nl <= lvl:
-                            end = np
-                            break
-                else:
-                    end = len(elems)
+                key = id(top)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if top.tag in {_q("p"), _q("tbl"), _q("sdt")}:
+                    _mark_block_hidden(top)
 
-                seen = set()
-                for j in range(pos, end):
-                    blk = elems[j]
-                    top = blk.get("top")
-                    if top is None:
-                        continue
-                    key = id(top)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    if top.tag in {_q("p"), _q("tbl"), _q("sdt")}:
-                        _mark_block_hidden(top)
-
-            zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+        zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
     return outbuf.getvalue()
 `);
