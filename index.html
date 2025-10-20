@@ -384,7 +384,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
     return outbuf.getvalue()
 
 # ---------------------- NEW: visibility tooling ----------------------
-def _ensure_fsHidden_style(zfin, zfout, names):
+def _ensure_fsHidden_style(zfin, names):
     if "word/styles.xml" in names:
         try: root = ET.fromstring(zfin.read("word/styles.xml"))
         except ET.ParseError: root = ET.Element(_q("styles"))
@@ -400,7 +400,7 @@ def _ensure_fsHidden_style(zfin, zfout, names):
         rpr = ET.SubElement(st, _q("rPr"))
         ET.SubElement(rpr, _q("vanish"))
         root.append(st)
-    zfout.writestr("word/styles.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 def _heading_level(p_el):
     ppr = p_el.find(_q("pPr"))
@@ -428,6 +428,79 @@ def _apply_rStyle_hidden_to_runs(el):
                 has = True; break
         if not has:
             ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
+
+def _clear_table_hidden_markers(tbl_el):
+    tbl_pr = tbl_el.find(_q("tblPr"))
+    if tbl_pr is not None:
+        for node in list(tbl_pr.findall(_q("hidden"))):
+            tbl_pr.remove(node)
+    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
+        tr_pr = tr.find(_q("trPr"))
+        if tr_pr is None:
+            continue
+        for node in list(tr_pr.findall(_q("hidden"))):
+            tr_pr.remove(node)
+
+def _mark_table_hidden(tbl_el):
+    tbl_pr = tbl_el.find(_q("tblPr"))
+    if tbl_pr is None:
+        tbl_pr = ET.SubElement(tbl_el, _q("tblPr"))
+    hidden = tbl_pr.find(_q("hidden"))
+    if hidden is None:
+        ET.SubElement(tbl_pr, _q("hidden"), {_q("val"): "true"})
+    else:
+        hidden.set(_q("val"), "true")
+    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
+        tr_pr = tr.find(_q("trPr"))
+        if tr_pr is None:
+            tr_pr = ET.SubElement(tr, _q("trPr"))
+        hidden = tr_pr.find(_q("hidden"))
+        if hidden is None:
+            ET.SubElement(tr_pr, _q("hidden"), {_q("val"): "true"})
+        else:
+            hidden.set(_q("val"), "true")
+
+def _iter_blocks_within(container, top_level):
+    for node in list(container):
+        if node.tag == _q("sdt"):
+            inner = node.find(_q("sdtContent"))
+            if inner is not None:
+                yield from _iter_blocks_within(inner, top_level)
+            else:
+                yield {"element": node, "type": "other", "level": None, "top": top_level}
+        elif node.tag == _q("p"):
+            yield {"element": node, "type": "p", "level": _heading_level(node), "top": top_level}
+        elif node.tag == _q("tbl"):
+            yield {"element": node, "type": "tbl", "level": None, "top": top_level}
+        else:
+            yield {"element": node, "type": "other", "level": None, "top": top_level}
+
+def _collect_body_blocks(body_el):
+    blocks = []
+    for child in list(body_el):
+        if child.tag == _q("sdt"):
+            content = child.find(_q("sdtContent"))
+            if content is not None:
+                blocks.extend(_iter_blocks_within(content, child))
+            else:
+                blocks.append({"element": child, "type": "other", "level": None, "top": child})
+        elif child.tag == _q("p"):
+            blocks.append({"element": child, "type": "p", "level": _heading_level(child), "top": child})
+        elif child.tag == _q("tbl"):
+            blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
+        else:
+            blocks.append({"element": child, "type": "other", "level": None, "top": child})
+    return blocks
+
+def _mark_block_hidden(el):
+    if el is None:
+        return
+    _apply_rStyle_hidden_to_runs(el)
+    if el.tag == _q("tbl"):
+        _mark_table_hidden(el)
+    for tbl in el.findall(".//w:tbl", {"w": _W_NS}):
+        _apply_rStyle_hidden_to_runs(tbl)
+        _mark_table_hidden(tbl)
 
 def _clear_table_hidden_markers(tbl_el):
     tbl_pr = tbl_el.find(_q("tblPr"))
