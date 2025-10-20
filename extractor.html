@@ -1100,93 +1100,77 @@
             _apply_rStyle_hidden_to_runs(tbl)
             _mark_table_hidden(tbl)
 
-      def apply_visibility(u8, idx_to_action_json):
-          try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
-          except Exception: idx_to_action = {}
-          data = bytes(u8)
-          outbuf = io.BytesIO()
-          with zipfile.ZipFile(io.BytesIO(data), "r") as zfin:
-              names = list(zfin.namelist())
-              styles_xml = _ensure_fsHidden_style(zfin, set(names))
-              raw_entries = {n: zfin.read(n) for n in names if n != "word/styles.xml"}
-
-              def is_doc_part(n):
-                  if not (n.startswith("word/") and n.endswith(".xml")): return False
-                  skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
-                  return n not in skip and not n.startswith("word/_rels/")
-
-              parts_roots = {}
-              for n in names:
-                  if not is_doc_part(n): continue
-                  payload = raw_entries.get(n)
-                  if payload is None:
-                      parts_roots[n] = None
-                      continue
-                  try:
-                      root = ET.fromstring(payload)
-                  except ET.ParseError:
-                      parts_roots[n] = None
-                      continue
-                  for r in root.findall(".//w:r", {"w": _W_NS}):
-                      rpr = r.find(_q("rPr"))
-                      if rpr is None: continue
-                      for rs in list(rpr.findall(_q("rStyle"))):
-                          if rs.get(_q("val")) == "fsHidden":
-                              rpr.remove(rs)
-                  for tbl in root.findall(".//w:tbl", {"w": _W_NS}):
-                      _clear_table_hidden_markers(tbl)
-                  parts_roots[n] = root
-
-              global_idx = 0
-              for n in names:
-                  if not is_doc_part(n): continue
-                  root = parts_roots.get(n)
-                  if root is None:
-                      continue
-                  body = root.find(_q("body"))
-                  if body is None:
-                      raw_entries[n] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-                      continue
-                  elems = _collect_body_blocks(body)
-                  heading_positions = []
-                  for i, blk in enumerate(elems):
-                      if blk.get("type") == "p" and blk.get("level") is not None:
-                          global_idx += 1
-                          heading_positions.append((i, blk.get("level"), global_idx))
-                  for h_i, (pos, lvl, idx) in enumerate(heading_positions):
-                      if idx_to_action.get(idx) != "HIDE":
-                          continue
-                      if h_i + 1 < len(heading_positions):
-                          end = len(elems)
-                          for j in range(h_i+1, len(heading_positions)):
-                              np, nl, _ = heading_positions[j]
-                              if nl <= lvl:
-                                  end = np
-                                  break
-                      else:
-                          end = len(elems)
-                      seen = set()
-                      for j in range(pos, end):
-                          blk = elems[j]
-                          top = blk.get("top")
-                          if top is None:
-                              continue
-                          key = id(top)
-                          if key in seen:
-                              continue
-                          seen.add(key)
-                          if top.tag in {_q("p"), _q("tbl"), _q("sdt")}:
-                              _mark_block_hidden(top)
-                  raw_entries[n] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-
-          with zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
-              for n in names:
-                  if n == "word/styles.xml":
-                      continue
-                  zfout.writestr(n, raw_entries.get(n, b""))
-              zfout.writestr("word/styles.xml", styles_xml)
-
-          return outbuf.getvalue()
+    def apply_visibility(u8, idx_to_action_json):
+        try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
+        except Exception: idx_to_action = {}
+        data = bytes(u8)
+        outbuf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+            names = zfin.namelist()
+            for n in names:
+                if n == "word/styles.xml": continue
+                zfout.writestr(n, zfin.read(n))
+            _ensure_fsHidden_style(zfin, zfout, set(names))
+            def is_doc_part(n):
+                if not (n.startswith("word/") and n.endswith(".xml")): return False
+                skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
+                return n not in skip and not n.startswith("word/_rels/")
+            parts_roots = {}
+            for n in names:
+                if not is_doc_part(n): continue
+                try: root = ET.fromstring(zfin.read(n))
+                except ET.ParseError:
+                    parts_roots[n] = None
+                    continue
+                for r in root.findall(".//w:r", {"w": _W_NS}):
+                    rpr = r.find(_q("rPr"))
+                    if rpr is None: continue
+                    for rs in list(rpr.findall(_q("rStyle"))):
+                        if rs.get(_q("val")) == "fsHidden":
+                            rpr.remove(rs)
+                for tbl in root.findall(".//w:tbl", {"w": _W_NS}):
+                    _clear_table_hidden_markers(tbl)
+                parts_roots[n] = root
+            global_idx = 0
+            for n in names:
+                if not is_doc_part(n): continue
+                root = parts_roots.get(n)
+                if root is None: continue
+                body = root.find(_q("body"))
+                if body is None:
+                    zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
+                elems = _collect_body_blocks(body)
+                heading_positions = []
+                for i, blk in enumerate(elems):
+                    if blk.get("type") == "p" and blk.get("level") is not None:
+                        global_idx += 1
+                        heading_positions.append((i, blk.get("level"), global_idx))
+                for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                    if idx_to_action.get(idx) != "HIDE":
+                        continue
+                    if h_i + 1 < len(heading_positions):
+                        end = len(elems)
+                        for j in range(h_i+1, len(heading_positions)):
+                            np, nl, _ = heading_positions[j]
+                            if nl <= lvl:
+                                end = np
+                                break
+                    else:
+                        end = len(elems)
+                    seen = set()
+                    for j in range(pos, end):
+                        blk = elems[j]
+                        top = blk.get("top")
+                        if top is None:
+                            continue
+                        key = id(top)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        if top.tag in {_q("p"), _q("tbl"), _q("sdt")}:
+                            _mark_block_hidden(top)
+                zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+        return outbuf.getvalue()
         `);
         tr.end('pyodide ready');
         return py;
