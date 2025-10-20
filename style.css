@@ -503,7 +503,18 @@ details[open] summary::before { transform: rotate(90deg) }
 /* Rules (RULES.html) */
 .pills { display:flex; flex-wrap:wrap; gap:6px }
 .pill { align-items:center; background:var(--card); border:1px solid var(--border-strong); border-radius:999px; display:inline-flex; gap:6px; padding:4px 8px }
-.pill > button { background:transparent; border:none; cursor:pointer; font-weight:600; padding:0 2px }
+.pill > button {
+  background:transparent;
+  border:none;
+  color:var(--btn-danger-bg);
+  cursor:pointer;
+  font-weight:600;
+  padding:0 2px;
+}
+.pill > button:hover,
+.pill > button:focus {
+  color:var(--btn-danger-bg-hover);
+}
 .rule-card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); display:grid; gap:12px; padding:12px }
 .rule-row { align-items:center; display:flex; flex-wrap:wrap; gap:10px }
 .pair { align-items:center; display:flex; gap:6px }
