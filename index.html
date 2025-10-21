@@ -517,14 +517,51 @@ def _prune_dead_tables(root):
                         break
                 if removed: break
 
-def _ensure_backup_embedded(zfin, zfout, names, backup_path="customXml/originalDocument.xml"):
+def _ensure_backup_embedded(zfin, zfout, names, backup_path="customXml/originalDocument.xml", override_bytes=None):
     if backup_path in names:
+        # Already present → keep existing backup to preserve the untouched original
+        return
+    if override_bytes is not None:
+        try:
+            zfout.writestr(backup_path, override_bytes)
+        except Exception:
+            pass
         return
     try:
         orig = zfin.read("word/document.xml")
         zfout.writestr(backup_path, orig)
     except KeyError:
         pass
+
+def _ensure_update_fields(zfin, zfout):
+    try:
+        raw = zfin.read("word/settings.xml")
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            root = ET.Element(_q("settings"))
+    except KeyError:
+        root = ET.Element(_q("settings"))
+
+    upd = root.find(_q("updateFields"))
+    if upd is None:
+        upd = ET.SubElement(root, _q("updateFields"))
+    upd.set(_q("val"), "true")
+
+    zfout.writestr("word/settings.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+def _extract_part_from_bytes(data_like, part_name):
+    if data_like is None:
+        return None
+    try:
+        data = bytes(data_like)
+    except Exception:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+            return zf.read(part_name)
+    except Exception:
+        return None
 
 # ----- TOC minimal rebuild -----
 def _next_in_doc_order(node, root):
@@ -617,7 +654,7 @@ def _rebuild_toc(root):
         for ch in new_children: parent.append(ch)
 
 # ---------- CORE: remove ranges & embed backup ----------
-def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/originalDocument.xml"):
+def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/originalDocument.xml", original_bytes=None):
     """
     idx_to_action_json: {"12":"HIDE","13":"SHOW", ...}
       - For headings where action == "HIDE": remove [heading .. next heading with <= level)
@@ -631,6 +668,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         idx_to_action = {}
 
     data = bytes(u8)
+    override_backup = _extract_part_from_bytes(original_bytes, "word/document.xml")
     outbuf = io.BytesIO()
 
     with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, \
@@ -641,8 +679,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         for n in names:
             zfout.writestr(n, zfin.read(n))
 
-        # Ensure embedded backup exists
-        _ensure_backup_embedded(zfin, zfout, names, backup_path=backup_path)
+        # Ensure embedded backup exists (using untouched original if provided)
+        _ensure_backup_embedded(zfin, zfout, names, backup_path=backup_path, override_bytes=override_backup)
 
         # Process primary document (you can extend to headers/footers if needed)
         doc_parts = [n for n in names if n == "word/document.xml"]
@@ -706,6 +744,9 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
             _rebuild_toc(root)
 
             zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+        # Align settings with Word expectations (updateFields must be true)
+        _ensure_update_fields(zfin, zfout)
 
     return outbuf.getvalue()
 `);
@@ -2183,6 +2224,10 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const docBytes = await fetchWorkingDocBytes();
         if (!docBytes) return;
 
+        const originalBytes = (docBytes instanceof Uint8Array)
+          ? docBytes
+          : new Uint8Array(docBytes);
+
         const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
         const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
                     || (state?.cronos_payload?.tagMap)
@@ -2192,12 +2237,16 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const validIds   = new Set((schema?.fields || []).map(f => f.id));
         const safeValues = sanitizeValues(schema, values || {});
         const cleanTagMap = sanitizeTagMap(tagMap, validIds);
+        const rules = loadRulesForDoc(state);
+        const fieldRulesForDoc = loadFieldRulesForDoc(state);
 
         const payload = JSON.stringify({
           title: schema?.title || 'Form',
           fields: schema?.fields || [],
           values: safeValues,
-          tagMap: cleanTagMap
+          tagMap: cleanTagMap,
+          rules,
+          fieldRules: fieldRulesForDoc
         });
 
         // 1) write CRONOS_PAYLOAD → settings.xml
@@ -2216,21 +2265,18 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         let updated2 = await writeSDTs(updated, sdtMap);
 
         // 3) evaluate rules → visibility map (SHOW overrides HIDE)
-        const rules = loadRulesForDoc(state);
         const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules);
 
-        // 4) REMOVE sections and embed backup (only mode)
-        if (Object.keys(visibilityMap).length) {
-          updated2 = await applyRemovalWithBackup(updated2, visibilityMap);
-        }
+        // 4) REMOVE sections (if requested) + embed untouched original backup
+        const updated3 = await applyRemovalWithBackup(updated2, visibilityMap, originalBytes);
 
-        await window.formSuitePersist.putBytes?.(currentDoc.docId, updated2);
+        await window.formSuitePersist.putBytes?.(currentDoc.docId, updated3);
 
         let saved = false;
         if (fileHandle) {
           try {
             const stream = await fileHandle.createWritable();
-            await stream.write(updated2);
+            await stream.write(updated3);
             await stream.close();
             saved = true;
           } catch (e) {
@@ -2244,7 +2290,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
           if (skipPickerReason) {
             console.info(`Falling back to download due to: ${skipPickerReason}`);
           }
-          const blob = new Blob([updated2], {
+          const blob = new Blob([updated3], {
             type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
           });
           const a = document.createElement('a');
@@ -2551,14 +2597,33 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     }
 
     // ---------- JS bridge to Python removal-with-backup ----------
-    async function applyRemovalWithBackup(bytesU8, visibilityMap) {
+    async function applyRemovalWithBackup(bytesU8, visibilityMap, originalBytes) {
       await ensurePy();
       const fn = py.globals.get('apply_removal_with_backup');
-      const pyBytes = py.toPy(bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8));
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8);
+      const pyBytes = py.toPy(buf);
       const pyMap   = py.toPy(JSON.stringify(visibilityMap || {}));
+      const pyPath  = py.toPy('customXml/originalDocument.xml');
+      const origBuf = (originalBytes instanceof Uint8Array)
+        ? originalBytes
+        : (originalBytes ? new Uint8Array(originalBytes) : null);
       let pyOut;
-      try { pyOut = fn(pyBytes, pyMap); }
-      finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
+      let pyOrig = null;
+      try {
+        if (origBuf) {
+          pyOrig = py.toPy(origBuf);
+          pyOut = fn(pyBytes, pyMap, pyPath, pyOrig);
+        } else {
+          pyOut = fn(pyBytes, pyMap, pyPath);
+        }
+      }
+      finally {
+        try{fn.destroy();}catch{}
+        try{pyBytes.destroy();}catch{}
+        try{pyMap.destroy();}catch{}
+        try{pyPath.destroy();}catch{}
+        try{pyOrig?.destroy();}catch{}
+      }
       let u8;
       if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
       else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
