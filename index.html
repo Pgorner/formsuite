@@ -2321,6 +2321,14 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
     function resolveTargetToIdxFactory(byIdx, byKey){
       return function resolveTargetToIdx(t){
+        if (t && typeof t === 'object'){
+          const stableRaw = t.stableKey ?? t.normKey ?? t.normalizedKey ?? t.headingKey;
+          if (stableRaw != null){
+            const stableStr = String(stableRaw);
+            const hitStable = byKey.get(stableStr);
+            if (hitStable) return hitStable.idx;
+          }
+        }
         const raw = t?.key ?? t?.idx ?? t?.id;
         if(raw == null) return null;
 

@@ -131,6 +131,29 @@
       .toLowerCase();
   }
 
+  function normalizeHeadingText(s){
+    return String(s ?? '')
+      .replace(/\u00A0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function stripLeadingHeadingNumber(s){
+    return String(s || '')
+      .replace(/^[\s\t\u00A0]*\d+(?:[.\u00A0 \t]+\d+)*[.\u00A0 \t]*/, '')
+      .trim();
+  }
+
+  function buildStableHeadingKey(level, text){
+    const lvl = Math.max(1, Number(level) || 1);
+    const normalized = stripLeadingHeadingNumber(
+      normalizeHeadingText(text)
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+    ).toLowerCase();
+    return `${lvl}::${normalized}`;
+  }
+
   // Build condition sources: includes normal fields and boolean pseudo-fields for each multichoice option
   // Returns items: { id, label, type, options? }
   function buildConditionSources(schema){
@@ -199,12 +222,51 @@
         counters[depth]++;
         const number = counters.slice(0, depth+1).join(".");
         const label = (n.label?.trim?.() ? n.label : n.text) || "";
-        out.push({ key:String(n.idx ?? (number+"|"+label)), label:number+" "+label, level:n.level || (depth+1) });
+        const textForStable = (n.text?.trim?.() ? n.text : label) || label;
+        const level = n.level || (depth+1);
+        const stableKey = buildStableHeadingKey(level, textForStable);
+        const idx = (n.idx != null) ? n.idx : null;
+        out.push({
+          key: String(n.idx ?? (number+"|"+label)),
+          label: number+" "+label,
+          level,
+          stableKey,
+          idx
+        });
         if (n.children?.length) walk(n.children, depth+1);
       }
     }
     walk(tree||[],0);
     return out;
+  }
+
+  function ensureStableHeadingTargets(rules, headingsFlat){
+    if (!Array.isArray(rules) || !Array.isArray(headingsFlat) || !headingsFlat.length) return false;
+    const byKey = new Map(headingsFlat.map(h => [String(h.key), h]));
+    const byStable = new Map(headingsFlat.map(h => [String(h.stableKey), h]));
+    const byLabel = new Map();
+    for (const h of headingsFlat){
+      if (h.label && !byLabel.has(String(h.label))) byLabel.set(String(h.label), h);
+    }
+    let changed = false;
+    for (const rule of rules){
+      if (!rule || !Array.isArray(rule.targets)) continue;
+      for (const tgt of rule.targets){
+        if (!tgt || typeof tgt !== 'object') continue;
+        const keyStr = tgt.key != null ? String(tgt.key) : null;
+        const stableStr = tgt.stableKey != null ? String(tgt.stableKey) : null;
+        const labelStr = tgt.label != null ? String(tgt.label) : null;
+        let heading = null;
+        if (stableStr && byStable.has(stableStr)) heading = byStable.get(stableStr);
+        if (!heading && keyStr && byKey.has(keyStr)) heading = byKey.get(keyStr);
+        if (!heading && labelStr && byLabel.has(labelStr)) heading = byLabel.get(labelStr);
+        if (!heading) continue;
+        if (heading.stableKey && stableStr !== heading.stableKey){ tgt.stableKey = heading.stableKey; changed = true; }
+        if (heading.level != null && tgt.level !== heading.level){ tgt.level = heading.level; changed = true; }
+        if (heading.idx != null && tgt.idx !== heading.idx){ tgt.idx = heading.idx; changed = true; }
+      }
+    }
+    return changed;
   }
 
   function isRuleValid(rule, schema=gSchema, headingsTree=gHeadingsTree){
@@ -462,7 +524,11 @@
             const h = flattenWithNumbers(gHeadingsTree).find(x=>x.key===key);
             if (!h) return;
             rule.targets = rule.targets || [];
-            rule.targets.push({ key:h.key, label:h.label });
+            const tgt = { key:h.key, label:h.label };
+            if (h.stableKey) tgt.stableKey = h.stableKey;
+            if (h.level != null) tgt.level = h.level;
+            if (h.idx != null) tgt.idx = h.idx;
+            rule.targets.push(tgt);
             if (!isDraft){ persistRules(); renderEditor(); renderList(); }
             else { renderEditor(); }
           });
@@ -598,8 +664,22 @@
       if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
       if (Array.isArray(st.rules)) gRulesHeadings = st.rules;
       if (Array.isArray(st.fieldRules)) gRulesFields = st.fieldRules;
+      const flatHeadings = flattenWithNumbers(gHeadingsTree);
+      const upgraded = ensureStableHeadingTargets(gRulesHeadings, flatHeadings);
+      if (upgraded){
+        try { await window.formSuitePersist?.saveState?.(gDocId, { rules: gRulesHeadings, fieldRules: gRulesFields }); }
+        catch (e) { tr.warn('failed to persist upgraded heading targets', e); }
+      }
       gRules = (gMode==='headings') ? (gRulesHeadings.slice()) : (gRulesFields.slice());
       sanitizeRules();
+      if (gMode==='headings'){
+        const upgradedView = ensureStableHeadingTargets(gRules, flatHeadings);
+        if (upgradedView){
+          gRulesHeadings = gRules.slice();
+          try { await window.formSuitePersist?.saveState?.(gDocId, { rules: gRulesHeadings, fieldRules: gRulesFields }); }
+          catch (e) { tr.warn('failed to persist upgraded heading targets (view)', e); }
+        }
+      }
       if (!gRules.find(r=>r.id===gEditingId)) gEditingId = null;
       if (gDraft && !isRuleValid(gDraft)) gDraft = gDraft;
       setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
