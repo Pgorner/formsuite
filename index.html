@@ -2188,6 +2188,183 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       try { if (currentDoc?.docId) saveState(); else if (schema) saveLS(schema); } catch {}
     });
 
+    // ============================================================
+    // ==== LIVE HEADING INDEX & RULE MATERIALIZATION (NEW) =======
+    // ============================================================
+    function _normalizeTextJs(s){
+      return String(s ?? '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+    function _stripLeadingNumberJs(s){
+      return String(s||'').replace(/^[\s\t\u00A0]*\d+(?:[.\u00A0 \t]+\d+)*[.\u00A0 \t]*/,'').trim();
+    }
+    function _normKeyJs(level, text){
+      const t = _stripLeadingNumberJs(
+        _normalizeTextJs(text)
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g,'')
+      ).toLowerCase();
+      return `${level}::${t}`;
+    }
+
+    async function buildLiveHeadingIndexFromBytes(bytes){
+      await ensureJSZip();
+      const zip = await window.JSZip.loadAsync(bytes);
+      const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+      // styles → paragraph style → inferred level
+      async function buildStyleMap(){
+        const f = zip.file('word/styles.xml');
+        if(!f) return {};
+        const xml = new DOMParser().parseFromString(await f.async('string'), "application/xml");
+        const byId = {};
+        const styles = xml.getElementsByTagNameNS(W_NS, 'style');
+
+        function levelFromStyleHint(str){
+          if(!str) return 0; const s=String(str).trim().toLowerCase();
+          const ps=[/heading\s*([1-9])/,/überschrift\s*([1-9])/,/titre\s*([1-9])/,/t[ií]tulo\s*([1-9])/,/encabezado\s*([1-9])/,/rubrik\s*([1-9])/,/zagolovok\s*([1-9])/,/заголовок\s*([1-9])/];
+          for(const re of ps){ const m=s.match(re); if(m) return +m[1]; }
+          const m2=s.match(/^heading([1-9])$/i); return m2?+m2[1]:0;
+        }
+
+        for(let i=0;i<styles.length;i++){
+          const st = styles[i];
+          const type = st.getAttributeNS(W_NS,'type') || st.getAttribute('w:type');
+          if(type !== 'paragraph') continue;
+
+          const id = st.getAttributeNS(W_NS,'styleId') || st.getAttribute('w:styleId') || '';
+          if(!id) continue;
+
+          const nameEl = st.getElementsByTagNameNS(W_NS,'name')[0];
+          const name = nameEl ? (nameEl.getAttributeNS(W_NS,'val') || nameEl.getAttribute('w:val') || '') : '';
+
+          const basedEl = st.getElementsByTagNameNS(W_NS,'basedOn')[0];
+          const basedOn = basedEl ? ((basedEl.getAttributeNS && basedEl.getAttributeNS(W_NS,'val')) || (basedEl.getAttribute && basedEl.getAttribute('w:val')) || '') : '';
+
+          let lvl = 0;
+          const pPr = st.getElementsByTagNameNS(W_NS,'pPr')[0];
+          if(pPr){
+            const ol = pPr.getElementsByTagNameNS(W_NS,'outlineLvl')[0];
+            if(ol){
+              const v = ol.getAttributeNS(W_NS,'val') || ol.getAttribute('w:val');
+              if(v != null && v !== ''){
+                const n = +v;
+                if(Number.isFinite(n)) lvl = Math.max(1, Math.min(9, n+1));
+              }
+            }
+          }
+          if(!lvl) lvl = levelFromStyleHint(id) || levelFromStyleHint(name) || 0;
+          byId[id] = { basedOn, rawLevel:lvl };
+        }
+        const resolved = {};
+        const resolve = (id, depth=0)=>{
+          if(!id || !byId[id] || depth>12) return 0;
+          if(resolved[id] != null) return resolved[id];
+          const info = byId[id];
+          if(info.rawLevel){ resolved[id] = info.rawLevel; return resolved[id]; }
+          return (resolved[id] = resolve(info.basedOn, depth+1) || 0);
+        };
+        Object.keys(byId).forEach(id => resolve(id));
+        return resolved;
+      }
+
+      const styleMap = await buildStyleMap();
+
+      const doc = zip.file('word/document.xml');
+      if(!doc) return { list:[], byIdx:new Map(), byKey:new Map() };
+      const xml = new DOMParser().parseFromString(await doc.async('string'), 'application/xml');
+      const body = xml.getElementsByTagNameNS(W_NS, 'body')[0] || xml.documentElement;
+      const paras = Array.from(body.getElementsByTagNameNS(W_NS,'p'));
+
+      function detectHeadingLevel(p){
+        const pPr = p.getElementsByTagNameNS(W_NS,'pPr')[0];
+        if(pPr){
+          const ol = pPr.getElementsByTagNameNS(W_NS,'outlineLvl')[0];
+          if(ol){
+            const v = ol.getAttributeNS(W_NS,'val') || ol.getAttribute('w:val');
+            if(v != null && v !== ''){
+              const n = +v;
+              if(Number.isFinite(n)) return Math.max(1, Math.min(9, n+1));
+            }
+          }
+          const pStyle = pPr.getElementsByTagNameNS(W_NS,'pStyle')[0];
+          if(pStyle){
+            const id = pStyle.getAttributeNS(W_NS,'val') || pStyle.getAttribute('w:val') || '';
+            const lvl = styleMap?.[id];
+            if(lvl) return lvl;
+          }
+        }
+        return 0;
+      }
+      function textOfPara(p){
+        const ts = p.getElementsByTagNameNS(W_NS,'t'); let s='';
+        for(let i=0;i<ts.length;i++){ s += ts[i].textContent; }
+        return _normalizeTextJs(s);
+      }
+
+      const list = [];
+      let idx = 0;
+      for(const p of paras){
+        const lvl = detectHeadingLevel(p);
+        if(!lvl) continue;
+        const txt = textOfPara(p);
+        if(!txt) continue;
+        idx += 1;
+        list.push({ idx, level:lvl, text:txt, key:_normKeyJs(lvl, txt) });
+      }
+      const byIdx = new Map(list.map(h => [h.idx, h]));
+      const byKey = new Map(list.map(h => [String(h.key), h]));
+      return { list, byIdx, byKey };
+    }
+
+    function resolveTargetToIdxFactory(byIdx, byKey){
+      return function resolveTargetToIdx(t){
+        const raw = t?.key ?? t?.idx ?? t?.id;
+        if(raw == null) return null;
+
+        // 1) numeric already?
+        const n = Number(raw);
+        if(Number.isFinite(n) && byIdx.has(n)) return n;
+
+        // 2) legacy "1.2|Some Title"
+        if(typeof raw === 'string' && raw.includes('|')){
+          const [numbering, ...rest] = raw.split('|');
+          const level = Math.max(1, (numbering.match(/\d+/g) || []).length);
+          const title = rest.join('|').trim();
+          const hit = byKey.get(_normKeyJs(level, title));
+          if(hit) return hit.idx;
+        }
+
+        // 3) last resort: treat as text (assume level 1)
+        if(typeof raw === 'string'){
+          const hit = byKey.get(_normKeyJs(1, raw));
+          if(hit) return hit.idx;
+        }
+
+        return null;
+      };
+    }
+
+    function materializeRuleTargets(rules, resolveTargetToIdx){
+      if(!Array.isArray(rules)) return [];
+      return rules.map(r => {
+        const targets = (r?.targets || [])
+          .map(t => resolveTargetToIdx(t))
+          .filter(v => Number.isFinite(v))
+          .map(idx => ({ idx }));
+        return { ...r, targets };
+      });
+    }
+
+    async function materializeRulesNow(docBytes, rules){
+      const { byIdx, byKey } = await buildLiveHeadingIndexFromBytes(docBytes);
+      const resolve = resolveTargetToIdxFactory(byIdx, byKey);
+      return materializeRuleTargets(rules, resolve);
+    }
+    // ============================================================
+
     // ---------- Export (Open Form) ----------
     async function onExportFromOpenForm() {
       if (!currentDoc?.docId) {
@@ -2242,7 +2419,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const validIds   = new Set((schema?.fields || []).map(f => f.id));
         const safeValues = sanitizeValues(schema, values || {});
         const cleanTagMap = sanitizeTagMap(tagMap, validIds);
-        const rules = loadRulesForDoc(state);
+        const rules = loadRulesForDoc(state);               // heading rules (raw)
         const fieldRulesForDoc = loadFieldRulesForDoc(state);
 
         const payload = JSON.stringify({
@@ -2269,8 +2446,9 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         }
         let updated2 = await writeSDTs(updated, sdtMap);
 
-        // 3) evaluate rules → visibility map (SHOW overrides HIDE)
-        const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules);
+        // (3) rules → visibility (using LIVE indices)  <<<<< NEW
+        const rulesLive = await materializeRulesNow(updated2, rules);
+        const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
 
         // 4) REMOVE sections (if requested) + embed untouched original backup
         const updated3 = await applyRemovalWithBackup(updated2, visibilityMap, originalBytes);
@@ -2421,9 +2599,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         if (!match) continue;
 
         for (const t of targets) {
-          const key = t?.key ?? t?.idx ?? t?.id;
-          if (key == null) continue;
-          const idx = Number(key);
+          // After materialization, targets are { idx }
+          const idx = Number(t?.idx ?? t?.key ?? t?.id);
           if (!Number.isFinite(idx)) continue;
           const prev = out[idx];
           if (action === 'SHOW') out[idx] = 'SHOW';
