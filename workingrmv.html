@@ -2,13 +2,20 @@
 <html lang="de">
 <head>
 <meta charset="utf-8" />
-<title>DOCX Baseline Rebuilder – Laden, Erkennen & Wiederherstellen</title>
+<title>DOCX Baseline Rebuilder – Live-Vorschau + Diff</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <style>
-  :root{--ink:#0f172a;--muted:#6b7280;--card:#fff;--bg:#f8fafc;--border:#e5e7eb;--accent:#3b82f6}
-  *{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,Arial}
+  :root{
+    --ink:#0f172a;--muted:#6b7280;--card:#fff;--bg:#f8fafc;--border:#e5e7eb;--accent:#3b82f6;
+    --l1:#2563eb; --l2:#16a34a; --l3:#f59e0b; --l4:#ef4444; --l5:#7c3aed; --l6:#0ea5e9;
+    --removed-bg: rgba(239, 68, 68, .12);
+    --ok:#16a34a; --warn:#b45309
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,Arial}
   header{padding:16px 20px;border-bottom:1px solid var(--border);background:#fff;position:sticky;top:0;z-index:1}
-  h1{font-size:18px;margin:0} main{max-width:1040px;margin:20px auto;padding:0 16px 56px}
+  h1{font-size:18px;margin:0}
+  main{max-width:1280px;margin:20px auto;padding:0 16px 64px}
   .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.spacer{flex:1}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;box-shadow:0 1px 0 rgba(0,0,0,.03);padding:16px;margin:16px 0}
   input[type="file"]{padding:8px;border:1px dashed var(--border);border-radius:8px;background:#fff}
@@ -17,12 +24,25 @@
   .muted{color:var(--muted)} #status{white-space:pre-wrap;font:12px ui-monospace,Consolas,Menlo}
   .tree{max-height:560px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:6px 8px;background:#fff}
   .tree ul{margin:0;padding-left:18px}
-  .node{display:flex;align-items:center;gap:8px;padding:4px 2px;border-radius:6px}
+  .node{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;border-left:3px solid transparent}
   .node:hover{background:#f1f5f9}
   .num{font-variant-numeric:tabular-nums;opacity:.9;min-width:3.5ch;text-align:right}
-  .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70ch}
+  .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:62ch}
   .lvl-1 .title{font-weight:700}.lvl-2 .title{font-weight:600}.lvl-3 .title{font-weight:500}
-  .badge{margin-left:auto;font-size:11px;color:#334155;background:#e2e8f0;border-radius:999px;padding:2px 6px}
+  .badge{margin-left:auto;font-size:11px;color:#334155;background:#e2e8f0;border-radius:999px;padding:2px 6px;border:1px solid var(--border)}
+  .grid{display:grid;grid-template-columns:360px 1fr;gap:16px}
+  .pane{border:1px solid var(--border);border-radius:10px;background:#fff;overflow:hidden;display:flex;flex-direction:column;min-height:420px}
+  .pane header{position:initial;border-bottom:1px solid var(--border);padding:10px 12px;background:#f9fafb}
+  .pane .content{padding:14px;overflow:auto;flex:1}
+  .preview-wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .preview{border:1px solid var(--border);border-radius:10px;min-height:420px;background:#fff;overflow:auto}
+  .preview header{padding:10px 12px;border-bottom:1px solid var(--border);background:#f9fafb}
+  .doc{max-width:70ch;margin:0 auto;padding:16px}
+  .doc h1,.doc h2,.doc h3,.doc h4,.doc h5,.doc h6{line-height:1.2;margin:1em 0 .4em;padding-left:.6rem;border-left:4px solid transparent}
+  .doc p{margin:.5em 0}
+  .legend{font-size:12px;color:var(--muted)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:#fff}
+  .pill.ok{border-color:#bbf7d0;background:#f0fdf4;color:var(--ok)}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
@@ -30,8 +50,7 @@
 <header>
   <h1>DOCX Baseline Rebuilder</h1>
   <div class="muted">
-    Lädt auch <b>veränderte</b> Dateien, hakt bereits <b>entfernte</b> Abschnitte an und kann sie per Haken wieder <b>herstellen</b>.
-    Arbeitet immer aus einer <b>Baseline</b> (Original-XML) in <code>customXml/originalDocument.xml</code>.
+    Live-Vorschau: <b>Baseline</b> links &nbsp;|&nbsp; <b>Ergebnis (Sektionen entfernt)</b> rechts. Vollständiges Backup im DOCX eingebettet.
   </div>
 </header>
 
@@ -41,43 +60,82 @@
       <input id="fileInput" type="file" accept=".docx" />
       <button id="btnLoad" class="primary">Laden</button>
       <div class="spacer"></div>
-      <label title="Aus dem Baseline-Dokument neu erzeugen und Felder von Word aktualisieren lassen">
+
+      <label title="TOCs als Feld neu einsetzen, damit Word die Inhalte neu berechnet">
         <input id="chkRebuildToc" type="checkbox" checked/> TOC neu setzen
       </label>
-      <label><input type="radio" name="mode" value="hide" checked/> Verstecken</label>
-      <label><input type="radio" name="mode" value="delete"/> Löschen</label>
+
       <button id="btnSelectAll">Alle wählen</button>
       <button id="btnClearAll">Alle abwählen</button>
       <button id="btnExport" class="primary" disabled>Export</button>
+      <button id="btnRestore" title="Setzt word/document.xml aus dem eingebetteten Original zurück" disabled>Original wiederherstellen</button>
     </div>
     <div id="status" class="muted" style="margin-top:8px"></div>
   </div>
 
-  <div class="card">
-    <strong>Überschriften (Baseline; Haken = im Export ausblenden/löschen)</strong>
-    <div id="tree" class="tree"></div>
+  <div class="grid">
+    <!-- LEFT: Tree -->
+    <div class="pane">
+      <header class="toolbar">
+        <strong>Überschriften (Baseline)</strong>
+        <span class="spacer"></span>
+        <span class="legend">Haken = Abschnitt im Export <em>entfernen</em></span>
+      </header>
+      <div id="tree" class="content tree"></div>
+    </div>
+
+    <!-- RIGHT: Side-by-side preview -->
+    <div class="pane">
+      <header class="toolbar">
+        <strong>Vorschau</strong>
+        <span class="spacer"></span>
+        <span class="pill ok">Modus: Entfernen + eingebettetes Backup</span>
+      </header>
+      <div class="content">
+        <div class="preview-wrap">
+          <div class="preview" id="prevBase">
+            <header><strong>Baseline</strong> <span class="legend">Rot = wird entfernt</span></header>
+            <div class="doc" id="docBase"><em class="muted">Noch keine Datei geladen.</em></div>
+          </div>
+          <div class="preview" id="prevTrans">
+            <header>
+              <strong>Ergebnis</strong>
+              <span class="legend">Keine Platzhalter, keine Tabellenskelette</span>
+            </header>
+            <div class="doc" id="docTrans"><em class="muted">Noch keine Datei geladen.</em></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </main>
 
 <script>
-/* ===== Namespaces & State ===== */
+/* ===== Namespaces & Paths ===== */
 const W_NS="http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const XML_NS="http://www.w3.org/XML/1998/namespace";
-const BASE_PATH='customXml/originalDocument.xml';
+const BASE_PATH='customXml/originalDocument.xml';         // embedded full original
 const INDEX_PATH='customXml/sections.json';
-const SEL_PATH='customXml/selection.json';
+const SEL_PATH='customXml/selection.json';                // last selection
+const META_PATH='customXml/rebuilder_meta.json';          // small meta (version, timestamps)
 
 let zip=null, fileNameBase='document';
 let styleMap={};
-let activeDoc=null;        // aktuell im DOCX vorhandenes document.xml (zum Erkennen)
-let baseDoc=null;          // eingefrorene Baseline (Quelle für Export)
+let activeDoc=null;  // current word/document.xml
+let baseDoc=null;    // embedded original (baseline)
 let settingsDoc=null;
 
 let allParasBase=[], headingsFlat=[], treeRoot=[];
 const statusEl=document.getElementById('status'), treeEl=document.getElementById('tree');
 const setStatus=s=>statusEl.textContent=s;
 
-/* ===== Style map ===== */
+const docBaseEl = document.getElementById('docBase');
+const docTransEl = document.getElementById('docTrans');
+
+function debounce(fn, ms=100){ let t=0; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+function normalizeText(s){ return String(s||'').replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim(); }
+
+/* ===== Style map detection ===== */
 function levelFromStyleHint(str){
   if(!str) return 0; const s=String(str).trim().toLowerCase();
   const ps=[/heading\s*([1-9])/,/überschrift\s*([1-9])/,/titre\s*([1-9])/,/t[ií]tulo\s*([1-9])/,/encabezado\s*([1-9])/,/rubrik\s*([1-9])/,/zagolovok\s*([1-9])/,/заголовок\s*([1-9])/];
@@ -94,10 +152,10 @@ async function buildStyleMap(zip){
     const nameEl=st.getElementsByTagNameNS(W_NS,'name')[0];
     const name=nameEl?(nameEl.getAttributeNS(W_NS,'val')||nameEl.getAttribute('w:val')||''):'';
     const basedEl=st.getElementsByTagNameNS(W_NS,'basedOn')[0];
-    const basedOn=basedEl?((basedEl.getAttributeNS && basedEl.getAttributeNS(W_NS,'val'))||(basedEl.getAttribute && basedEl.getAttribute('w:val'))||''):'';
+    const basedOn=basedEl?((basedEl.getAttributeNS && (basedEl.getAttributeNS(W_NS,'val')))||(basedEl.getAttribute && (basedEl.getAttribute('w:val')))||''):'';
     let lvl=0; const pPr=st.getElementsByTagNameNS(W_NS,'pPr')[0];
     if(pPr){ const ol=pPr.getElementsByTagNameNS(W_NS,'outlineLvl')[0];
-      if(ol){ const v=ol.getAttributeNS(W_NS,'val')||ol.getAttribute('w:val'); if(v!=null && v!==''){ const n=+v; if(Number.isFinite(n)) lvl=Math.max(1,Math.min(9,n+1));}}}
+      if(ol){ const v=ol.getAttributeNS(W_NS,'val')||ol.getAttribute('w:val'); if(v!=null&&v!==''){ const n=+v; if(Number.isFinite(n)) lvl=Math.max(1,Math.min(9,n+1));}}}
     if(!lvl) lvl=levelFromStyleHint(id)||levelFromStyleHint(name)||0;
     byId[id]={basedOn, rawLevel:lvl};
   }
@@ -111,7 +169,7 @@ async function buildStyleMap(zip){
 /* ===== Paragraph utils ===== */
 function textOfPara(p){
   const ts=p.getElementsByTagNameNS(W_NS,'t'); let s=''; for(let i=0;i<ts.length;i++) s+=ts[i].textContent;
-  return s.replace(/\s+/g,' ').trim();
+  return normalizeText(s);
 }
 function detectHeadingLevel(p){
   const pPr=p.getElementsByTagNameNS(W_NS,'pPr')[0];
@@ -123,6 +181,7 @@ function detectHeadingLevel(p){
   }
   return 0;
 }
+function isHeadingParagraph(p){ return detectHeadingLevel(p)>0; }
 function stripLeadingNumber(s){
   return String(s||'').replace(/^[\s\t\u00A0]*\d+(?:[.\u00A0 \t]+\d+)*[.\u00A0 \t]*/,'').trim();
 }
@@ -164,13 +223,16 @@ function renumberTree(root){
 function renderTree(){
   renumberTree(treeRoot);
   treeEl.innerHTML=''; const top=document.createElement('ul');
+
+  const onAnyChange = ()=> updatePreview();
+
   function mk(list){
     const ul=document.createElement('ul');
     for(const n of list){
       const li=document.createElement('li');
-      const row=document.createElement('div'); row.className=`node lvl-${n.level}`;
+      const row=document.createElement('div'); row.className=`node lvl-${Math.min(n.level,6)}`;
       const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=n.selected;
-      cb.addEventListener('change',()=>{ n.selected=cb.checked; if(n.children) markChildren(n.children, cb.checked); });
+      cb.addEventListener('change',()=>{ n.selected=cb.checked; if(n.children) markChildren(n.children, cb.checked); onAnyChange(); });
       const num=document.createElement('span'); num.className='num'; num.textContent=n.num;
       const title=document.createElement('span'); title.className='title'; title.textContent=n.title;
       const badge=document.createElement('span'); badge.className='badge'; badge.textContent=`H${n.level}`;
@@ -183,23 +245,12 @@ function renderTree(){
   top.appendChild(mk(treeRoot)); treeEl.appendChild(top);
 }
 
-/* ===== Selection persistence & detection ===== */
+/* ===== Selection & detection ===== */
 function getSelectionFromTree(){
   const ids=[];
-  (function walk(list){
-    for(const n of list){ if(n.selected) ids.push(n.id); if(n.children) walk(n.children); }
-  })(treeRoot);
+  (function walk(list){ for(const n of list){ if(n.selected) ids.push(n.id); if(n.children) walk(n.children); } })(treeRoot);
   return ids;
 }
-function applySelectionToTree(idsSet){
-  (function walk(list){
-    for(const n of list){ n.selected = idsSet.has(n.id); if(n.children) applySelectionToTree(n.children); }
-  })(treeRoot);
-}
-
-/* Heuristik: Welche Baseline-Headings sind aktuell im DOC sichtbar?
-   -> wir sammeln alle sichtbaren (Heading-)Absätze aus activeDoc, normalisieren ihren Text (Nummer vorn weg)
-   -> ist ein Baseline-Heading *nicht* dabei => gilt als "entfernt" => im Tree vorangekreuzt */
 function detectRemovedHeadingsAgainstActive(){
   if(!activeDoc){ return new Set(); }
   const vis = new Set();
@@ -217,11 +268,13 @@ function detectRemovedHeadingsAgainstActive(){
   return removed;
 }
 
-/* ===== Baseline/Index/Selection management ===== */
+/* ===== Baseline/Index ===== */
 async function ensureBaselineAndIndex(){
+  // Always embed original as our backup once
   if(!zip.file(BASE_PATH)){
     const docText = await zip.file('word/document.xml').async('string');
     zip.file(BASE_PATH, docText);
+    zip.file(META_PATH, JSON.stringify({ version:1, baselineCreated: new Date().toISOString() }, null, 2));
   }
   if(!zip.file(INDEX_PATH)){
     const baseText = await zip.file(BASE_PATH).async('string');
@@ -237,184 +290,135 @@ async function loadBaselineAndIndex(){
   collectAllParagraphsBase(); computeSectionsFromBase();
 }
 
-/* ===== Hide/Delete sicher (inkl. Tabellen/SDT/Textbox) ===== */
-function applyVanishRunDeep(node){
-  if(node.namespaceURI===W_NS && node.localName==='p'){
-    let pPr=node.getElementsByTagNameNS(W_NS,'pPr')[0];
-    if(!pPr){ pPr=node.ownerDocument.createElementNS(W_NS,'w:pPr'); node.insertBefore(pPr,node.firstChild); }
-    let rPr=pPr.getElementsByTagNameNS(W_NS,'rPr')[0];
-    if(!rPr){ rPr=node.ownerDocument.createElementNS(W_NS,'w:rPr'); pPr.insertBefore(rPr,pPr.firstChild); }
-    if(!rPr.getElementsByTagNameNS(W_NS,'vanish')[0]) rPr.appendChild(node.ownerDocument.createElementNS(W_NS,'w:vanish'));
+/* ===== Whitespace & container pruning ===== */
+function hasAnyText(node){
+  const ts = node.getElementsByTagNameNS(W_NS,'t');
+  for(let i=0;i<ts.length;i++){ if((normalizeText(ts[i].textContent)||'')!=='') return true; }
+  return false;
+}
+function hasPageBreakRun(node){
+  const brs = node.getElementsByTagNameNS(W_NS,'br');
+  for(let i=0;i<brs.length;i++){
+    const t = brs[i].getAttributeNS(W_NS,'type') || brs[i].getAttribute('w:type');
+    if((t||'').toLowerCase()==='page') return true;
   }
-  if(node.namespaceURI===W_NS && node.localName==='r'){
-    let rPr=node.getElementsByTagNameNS(W_NS,'rPr')[0];
-    if(!rPr){ rPr=node.ownerDocument.createElementNS(W_NS,'w:rPr'); node.insertBefore(rPr,node.firstChild); }
-    if(!rPr.getElementsByTagNameNS(W_NS,'vanish')[0]) rPr.appendChild(node.ownerDocument.createElementNS(W_NS,'w:vanish'));
+  return false;
+}
+function hasPageBreakBefore(node){
+  const pPr = node.getElementsByTagNameNS(W_NS,'pPr')[0];
+  if(!pPr) return false;
+  return !!pPr.getElementsByTagNameNS(W_NS,'pageBreakBefore')[0];
+}
+function paragraphHasNontrivialContent(p){
+  if(p.getElementsByTagNameNS(W_NS,'fldSimple').length) return true;
+  if(p.getElementsByTagNameNS(W_NS,'drawing').length) return true;
+  if(p.getElementsByTagNameNS(W_NS,'object').length) return true;
+  if(p.getElementsByTagNameNS(W_NS,'pict').length) return true;
+  return hasAnyText(p);
+}
+function isEmptyParagraph(p){
+  if(p.namespaceURI!==W_NS || p.localName!=='p') return false;
+  if (paragraphHasNontrivialContent(p)) return false;
+  return true; // bookmark-only etc. counts as empty and can be removed
+}
+function pruneEmptySDTs(doc){
+  const sdts = Array.from(doc.getElementsByTagNameNS(W_NS,'sdt'));
+  for(const sdt of sdts){
+    // If it contains any table, keep; otherwise check for any meaningful content
+    if(sdt.getElementsByTagNameNS(W_NS,'tbl').length>0) continue;
+    const ps = sdt.getElementsByTagNameNS(W_NS,'p');
+    let hasMeaning=false;
+    for(let i=0;i<ps.length;i++){
+      if(paragraphHasNontrivialContent(ps[i])){ hasMeaning=true; break; }
+    }
+    if(!hasMeaning && sdt.parentNode) sdt.parentNode.removeChild(sdt);
   }
-  for(let c=node.firstChild;c;c=c.nextSibling) applyVanishRunDeep(c);
 }
-function canReplaceWithParagraph(parent){
-  if(!parent || parent.namespaceURI!==W_NS) return false;
-  const ok=new Set(['body','sdtContent','tc','hdr','ftr','footnote','endnote','comment','docPartBody']);
-  return ok.has(parent.localName);
+function pruneDeadTables(doc){
+  // Defensive: if some broken/partial table structure remained, drop it
+  const tbls = Array.from(doc.getElementsByTagNameNS(W_NS,'tbl'));
+  for(const t of tbls){
+    // If it has zero rows or zero cells, drop it
+    const trs = t.getElementsByTagNameNS(W_NS,'tr');
+    let hasCell=false;
+    for(let i=0;i<trs.length;i++){
+      if(trs[i].getElementsByTagNameNS(W_NS,'tc').length>0){ hasCell=true; break; }
+    }
+    if(!hasCell && t.parentNode) t.parentNode.removeChild(t);
+  }
 }
-function makeHiddenPlaceholderParagraph(doc, marker=''){
-  const p=doc.createElementNS(W_NS,'w:p');
-  const pPr=doc.createElementNS(W_NS,'w:pPr');
-  const rPr=doc.createElementNS(W_NS,'w:rPr'); rPr.appendChild(doc.createElementNS(W_NS,'w:vanish'));
-  pPr.appendChild(rPr); p.appendChild(pPr);
-  const r=doc.createElementNS(W_NS,'w:r'); const t=doc.createElementNS(W_NS,'w:t'); t.setAttributeNS(XML_NS,'xml:space','preserve'); t.textContent=marker;
-  r.appendChild(t); p.appendChild(r); return p;
+function compactWhitespace(doc){
+  const body = doc.getElementsByTagNameNS(W_NS,'body')[0] || doc.documentElement;
+
+  // Remove empty paragraphs unless they carry a page break
+  let n = body.firstChild;
+  while(n){
+    const next = n.nextSibling;
+    if(n.namespaceURI===W_NS && n.localName==='p'){
+      const keepForPage = hasPageBreakRun(n) || hasPageBreakBefore(n);
+      if(!keepForPage && isEmptyParagraph(n)){ body.removeChild(n); }
+    }
+    n = next;
+  }
+
+  // Collapse duplicate page-break-only paragraphs
+  function isPurePageBreakPara(p){ return p.namespaceURI===W_NS && p.localName==='p' && hasPageBreakRun(p) && !paragraphHasNontrivialContent(p); }
+  n = body.firstChild;
+  let prevWasPB = false;
+  while(n){
+    const next = n.nextSibling;
+    if(isPurePageBreakPara(n)){
+      if(prevWasPB){ body.removeChild(n); } else { prevWasPB = true; }
+    } else { prevWasPB = false; }
+    n = next;
+  }
 }
+
+/* ===== Transform – REMOVE (only mode) ===== */
+function transformRemoveFromBase(selectedIdsSet){
+  // start from BASELINE to ensure indices and structure match
+  const d = new DOMParser().parseFromString(new XMLSerializer().serializeToString(baseDoc), "application/xml");
+  const body = d.getElementsByTagNameNS(W_NS,'body')[0] || d.documentElement;
+
+  function paragraphList(doc){ return Array.from(doc.getElementsByTagNameNS(W_NS,'p')); }
+  let paras = paragraphList(d);
+
+  const work = headingsFlat
+    .filter(h => selectedIdsSet.has(h.id))
+    .map(h => ({ start:h.start, end:h.end }))
+    .sort((a,b) => b.start - a.start);
+
+  for(const { start, end } of work){
+    paras = paragraphList(d);
+    if(start<0 || start>=paras.length) continue;
+
+    let cur = paras[start]; // heading paragraph at baseline index
+    const endAnchor = end < paras.length ? paras[end] : null;
+
+    // Remove EVERYTHING from heading to (but not including) the next same/higher heading
+    while(cur && cur !== endAnchor){
+      const next = cur.nextSibling;
+      if(cur.parentNode) cur.parentNode.removeChild(cur);
+      cur = next;
+    }
+  }
+
+  // Deep cleanup: no leftover empty SDTs or dead tables; then tidy whitespace
+  pruneEmptySDTs(d);
+  pruneDeadTables(d);
+  compactWhitespace(d);
+
+  return d;
+}
+
+/* ===== TOC ===== */
+function findAncestor(node, names){ const set=new Set(names); let n=node; while(n){ if(n.namespaceURI===W_NS && set.has(n.localName)) return n; n=n.parentNode; } return null; }
 function nextNodeInDocOrder(node, root){
   if(!node) return null;
   if(node.firstChild) return node.firstChild;
   while(node && node!==root){ if(node.nextSibling) return node.nextSibling; node=node.parentNode; }
   return null;
 }
-function transformFromBase(mode, selectedIdsSet){
-  // Clone the frozen baseline
-  const d = new DOMParser().parseFromString(new XMLSerializer().serializeToString(baseDoc), "application/xml");
-  const body = d.getElementsByTagNameNS(W_NS, 'body')[0] || d.documentElement;
-  const hide = (mode === 'hide');
-
-  // NOTE: all start/end are based on baseline indices and still valid on the clone
-  const paras = Array.from(d.getElementsByTagNameNS(W_NS, 'p'));
-
-  // Build work ranges from selected headings, processed descending to avoid index drift
-  const ranges = headingsFlat
-    .filter(h => selectedIdsSet.has(h.id))
-    .map(h => ({ start: h.start, end: h.end }))
-    .sort((a, b) => b.start - a.start);
-
-  // Helper: create a unique, invisible boundary paragraph
-  function makeBoundary(doc){
-    const p = doc.createElementNS(W_NS, 'w:p');
-    const pPr = doc.createElementNS(W_NS, 'w:pPr');
-    const rPr = doc.createElementNS(W_NS, 'w:rPr');
-    rPr.appendChild(doc.createElementNS(W_NS, 'w:vanish'));
-    pPr.appendChild(rPr);
-    p.appendChild(pPr);
-
-    // also add a tiny text node so some Word parsers don't drop empty p
-    const r = doc.createElementNS(W_NS, 'w:r');
-    const t = doc.createElementNS(W_NS, 'w:t');
-    t.setAttributeNS(XML_NS,'xml:space','preserve');
-    t.textContent = ''; // empty text
-    r.appendChild(t);
-    p.appendChild(r);
-    // tag it so we can recognize it even if structure shifts
-    p.setAttribute('data-boundary', 'true');
-    return p;
-  }
-
-  // Doc-order iterator limited to the body subtree (robust even while mutating)
-  function nextInBody(node){
-    if(!node) return null;
-    if(node.firstChild) return node.firstChild;
-    while(node && node !== body){
-      if(node.nextSibling) return node.nextSibling;
-      node = node.parentNode;
-    }
-    return null;
-  }
-
-  for(const { start, end } of ranges){
-    const startP = paras[start];
-    const endP   = end < paras.length ? paras[end] : null;
-
-    if(!startP || !startP.parentNode){
-      continue; // defensive
-    }
-
-    // Insert a hidden clone of the heading (with style removed so it drops from TOC),
-    // then remove the original heading paragraph.
-    const clone = startP.cloneNode(true);
-    let pPr = clone.getElementsByTagNameNS(W_NS,'pPr')[0];
-    if(!pPr){
-      pPr = clone.ownerDocument.createElementNS(W_NS,'w:pPr');
-      clone.insertBefore(pPr, clone.firstChild);
-    }
-    const pStyle = pPr.getElementsByTagNameNS(W_NS,'pStyle')[0];
-    if(pStyle) pPr.removeChild(pStyle);
-    applyVanishRunDeep(clone);
-
-    startP.parentNode.insertBefore(clone, startP);
-    startP.parentNode.removeChild(startP);
-
-    // Create and insert a hard stop boundary right before endP (or at end of body)
-    let boundary = null;
-    if(endP && endP.parentNode){
-      boundary = makeBoundary(d);
-      endP.parentNode.insertBefore(boundary, endP);
-    } else {
-      // no next heading -> place boundary at end of body so we don't overrun
-      boundary = makeBoundary(d);
-      body.appendChild(boundary);
-    }
-
-    // Now safely walk forward from just after our clone until we hit the boundary.
-    let cur = nextInBody(clone);
-    while(cur && cur !== boundary){
-      const next = nextInBody(cur);
-
-      if(cur.namespaceURI === W_NS){
-        const parent = cur.parentNode;
-
-        if(cur.localName === 'p'){
-          // Paragraphs: hide text or remove
-          if(hide){
-            applyVanishRunDeep(cur);
-          } else if(parent){
-            parent.removeChild(cur);
-          }
-        }
-        else if(cur.localName === 'tbl' || cur.localName === 'sdt' || cur.localName === 'customXml'){
-          if(hide){
-            // Replace heavy containers by a vanished placeholder paragraph when legal
-            if(parent && canReplaceWithParagraph(parent)){
-              parent.insertBefore(makeHiddenPlaceholderParagraph(d, ''), cur);
-              parent.removeChild(cur);
-            } else {
-              // Deep-vanish all inner paragraphs (incl. nested tables)
-              const ps = cur.getElementsByTagNameNS(W_NS,'p');
-              for(let i=0;i<ps.length;i++) applyVanishRunDeep(ps[i]);
-            }
-          } else if(parent){
-            parent.removeChild(cur);
-          }
-        }
-        else if(cur.localName === 'txbxContent'){
-          // Textbox content: vanish paragraphs
-          const ps = cur.getElementsByTagNameNS(W_NS,'p');
-          for(let i=0;i<ps.length;i++) if(hide) applyVanishRunDeep(ps[i]);
-        }
-        else if(cur.localName !== 'sectPr'){
-          // Generic fallback: vanish inner paragraphs on hide; remove on delete
-          if(hide){
-            const ps = cur.getElementsByTagNameNS(W_NS,'p');
-            for(let i=0;i<ps.length;i++) applyVanishRunDeep(ps[i]);
-          } else if(parent){
-            parent.removeChild(cur);
-          }
-        }
-      }
-
-      cur = next;
-    }
-
-    // Remove the temporary boundary
-    if(boundary && boundary.parentNode){
-      boundary.parentNode.removeChild(boundary);
-    }
-  }
-
-  return d;
-}
-
-
-/* ===== TOC ===== */
-function findAncestor(node, names){ const set=new Set(names); let n=node; while(n){ if(n.namespaceURI===W_NS && set.has(n.localName)) return n; n=n.parentNode; } return null; }
 function nextAfter(node, root){ if(!node) return null; if(node.nextSibling) return node.nextSibling; let p=node.parentNode; while(p && p!==root){ if(p.nextSibling) return p.nextSibling; p=p.parentNode; } return null; }
 function findAllTOCRanges(docx){
   const ranges=[]; const body=docx.getElementsByTagNameNS(W_NS,'body')[0]||docx.documentElement;
@@ -423,7 +427,7 @@ function findAllTOCRanges(docx){
     if(begin.getAttributeNS(W_NS,'val')!=='begin') continue;
     let cur=begin, instr='', hasTOC=false, separate=null, end=null;
     while(cur){ cur=nextNodeInDocOrder(cur,body); if(!cur) break;
-      if(cur.namespaceURI===W_NS && cur.localName==='instrText'){ instr+=cur.textContent||''; const u=instr.toUpperCase(); if(u.includes(' TOC ')||u.startsWith('TOC ')||u.includes('TOC\\')||u.includes('TOC "')) hasTOC=true; }
+      if(cur.namespaceURI===W_NS && cur.localName==='instrText'){ instr+=cur.textContent||''; const u=normalizeText(instr).toUpperCase(); if(u.includes(' TOC ')||u.startsWith('TOC ')||u.includes('TOC\\')||u.includes('TOC "')) hasTOC=true; }
       if(cur.namespaceURI===W_NS && cur.localName==='fldChar'){ const t=cur.getAttributeNS(W_NS,'val'); if(t==='separate') separate=cur; if(t==='end'){ end=cur; break; } }
     }
     if(hasTOC && separate && end) ranges.push({begin,separate,end,instr});
@@ -448,15 +452,14 @@ function rebuildTOCs(docx){
 }
 
 /* ===== Export helper ===== */
-async function exportFromDoc(newDoc, suffix){
-  // 1) Settings bereitstellen (oder minimal erzeugen)
+async function exportFromDoc(newDoc){
+  // Ensure settings and set updateFields=true
   if(!settingsDoc){
     const s = zip.file('word/settings.xml');
     settingsDoc = s
       ? new DOMParser().parseFromString(await s.async('string'), "application/xml")
       : new DOMParser().parseFromString(`<w:settings xmlns:w="${W_NS}"/>`, "application/xml");
   }
-  // UpdateFields einschalten
   {
     const root = settingsDoc.documentElement;
     let upd = root.getElementsByTagNameNS(W_NS,'updateFields')[0];
@@ -464,40 +467,140 @@ async function exportFromDoc(newDoc, suffix){
     upd.setAttributeNS(W_NS,'w:val','true');
   }
 
-  // 2) Auswahl serialisieren (fürs Wiederherstellen später)
+  // Persist selection & meta
   const selectedIds = getSelectionFromTree();
-  const selectionJson = JSON.stringify({version:1, hiddenIds:selectedIds}, null, 2);
+  const selectionJson = JSON.stringify({version:1, removedIds:selectedIds}, null, 2);
+  const meta = zip.file(META_PATH) ? JSON.parse(await zip.file(META_PATH).async('string')) : {version:1};
+  meta.lastExport = new Date().toISOString();
+  zip.file(META_PATH, JSON.stringify(meta, null, 2));
 
-  // 3) Neues ZIP aufbauen – nur echte Dateien kopieren, keine Ordner;
-  //    außerdem die Teile ersetzen, die wir neu schreiben.
-  const out = new JSZip();
-  for (const [name, entry] of Object.entries(zip.files)) {
-    if (entry.dir) continue; // << wichtig: Ordner überspringen
-    if (name === 'word/document.xml' ||
-        name === 'word/settings.xml' ||
-        name === SEL_PATH) {
-      continue; // wir schreiben diese Teile unten neu
-    }
-    out.file(name, await zip.file(name).async('arraybuffer'));
+  // Always keep BASE_PATH (embedded original) for restore
+  if(!zip.file(BASE_PATH)){
+    const original = await zip.file('word/document.xml').async('string');
+    zip.file(BASE_PATH, original);
   }
 
-  // 4) Unsere neuen/aktualisierten Teile hinzufügen
+  // Rebuild TOCs + compact
+  if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+  pruneEmptySDTs(newDoc);
+  pruneDeadTables(newDoc);
+  compactWhitespace(newDoc);
+
+  // New zip for download
+  const out = new JSZip();
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    if (name === 'word/document.xml' || name === 'word/settings.xml' || name === SEL_PATH) continue;
+    out.file(name, await zip.file(name).async('arraybuffer'));
+  }
   out.file('word/document.xml', new XMLSerializer().serializeToString(newDoc));
   out.file('word/settings.xml', new XMLSerializer().serializeToString(settingsDoc));
   out.file(SEL_PATH, selectionJson);
 
-  // 5) Download
   const blob = await out.generateAsync({ type:'blob' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${fileNameBase}-${suffix}.docx`;
+  a.download = `${fileNameBase}-removed.docx`;
   document.body.appendChild(a);
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
 }
 
+/* ===== Restore helper (from embedded BASE_PATH) ===== */
+async function exportRestoredOriginal(){
+  if(!zip.file(BASE_PATH)){ alert('Kein eingebettetes Backup gefunden (customXml/originalDocument.xml).'); return; }
+  const originalXml = await zip.file(BASE_PATH).async('string');
+
+  const out = new JSZip();
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    if (name === 'word/document.xml') continue; // replace
+    out.file(name, await zip.file(name).async('arraybuffer'));
+  }
+  out.file('word/document.xml', originalXml);
+
+  const blob = await out.generateAsync({ type:'blob' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${fileNameBase}-restored.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ===== Minimal DOCX -> HTML preview (no placeholders) ===== */
+function esc(s){ return s.replace(/[&<>]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+function renderDocxToHtml(doc, options={}){
+  const { annotateMask=null } = options;
+  const body = doc.getElementsByTagNameNS(W_NS,'body')[0] || doc.documentElement;
+  let html = '';
+  let pIndex = -1;
+
+  function paragraphOpenClasses(){
+    let cl = '';
+    if(annotateMask && annotateMask.has(pIndex)){ cl = ' removed'; }
+    return cl;
+  }
+  function textOf(node){
+    const ts = node.getElementsByTagNameNS(W_NS,'t');
+    let t=''; for(let i=0;i<ts.length;i++) t+=ts[i].textContent;
+    return normalizeText(t);
+  }
+  function walk(node){
+    for(let n=node.firstChild;n;n=n.nextSibling){
+      if(n.namespaceURI===W_NS){
+        if(n.localName==='p'){
+          pIndex++;
+          const lvl = detectHeadingLevel(n);
+          let t = textOf(n);
+          if(!t) continue; // skip empties
+          const cls = paragraphOpenClasses();
+          const h = Math.min(Math.max(lvl||0,0),6);
+          if(lvl && h>=1){ html += `<h${h} class="${cls.trim()}">${esc(t||'')}</h${h}>`; }
+          else { html += `<p class="${cls.trim()}">${esc(t||'')}</p>`; }
+        } else if(n.localName==='tbl' || n.localName==='sdt' || n.localName==='customXml'){
+          // no placeholders in preview (keeps it gap-free)
+        }
+      }
+    }
+  }
+  walk(body);
+  return html || `<p class="muted">Keine darstellbaren Inhalte gefunden.</p>`;
+}
+
+/* ===== Build baseline highlight mask ===== */
+function buildAnnotationMask(selectedIdsSet){
+  const mask = new Map();
+  for(const h of headingsFlat){
+    if(!selectedIdsSet.has(h.id)) continue;
+    for(let i=h.start;i<h.end;i++) mask.set(i, 'remove');
+  }
+  return mask;
+}
+
+/* ===== Live preview ===== */
+const updatePreview = debounce(()=>{
+  if(!baseDoc) return;
+  const selectedIds = new Set(getSelectionFromTree());
+
+  // Left: Baseline with annotations
+  const mask = buildAnnotationMask(selectedIds);
+  docBaseEl.innerHTML = renderDocxToHtml(baseDoc, { annotateMask: mask });
+
+  // Right: transformed (remove mode)
+  let newDoc = transformRemoveFromBase(selectedIds);
+  if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+  pruneEmptySDTs(newDoc);
+  pruneDeadTables(newDoc);
+  compactWhitespace(newDoc);
+
+  const resultHtml = renderDocxToHtml(newDoc, { });
+  docTransEl.innerHTML = resultHtml;
+}, 60);
 
 /* ===== UI wiring ===== */
 document.getElementById('btnLoad').addEventListener('click', async ()=>{
@@ -507,59 +610,68 @@ document.getElementById('btnLoad').addEventListener('click', async ()=>{
   zip=await JSZip.loadAsync(f);
   styleMap=await buildStyleMap(zip);
 
-  // aktives document.xml (zum Abgleich)
   activeDoc=new DOMParser().parseFromString(await zip.file('word/document.xml').async('string'),"application/xml");
   const s=zip.file('word/settings.xml');
   settingsDoc=s?new DOMParser().parseFromString(await s.async('string'),"application/xml"):null;
 
-  // Baseline + Index sicherstellen/laden
   await ensureBaselineAndIndex();
   await loadBaselineAndIndex();
 
-  // Tree aufbauen
   buildTree();
 
-  // 1) Auswahl aus selection.json (falls vorhanden)
   let appliedFrom = 'Heuristik';
   if(zip.file(SEL_PATH)){
     try{
       const sel = JSON.parse(await zip.file(SEL_PATH).async('string'));
-      if(sel && Array.isArray(sel.hiddenIds)){
-        const ids = new Set(sel.hiddenIds);
-        (function apply(list){ for(const n of list){ n.selected = ids.has(n.id); if(n.children) apply(n.children);} })(treeRoot);
+      if(sel && Array.isArray(sel.removedIds)){
+        const ids = new Set(sel.removedIds);
+        (function apply(list){
+          for(const n of list){ n.selected = ids.has(n.id); if(n.children) apply(n.children); }
+        })(treeRoot);
         appliedFrom = 'selection.json';
       }
     }catch{}
   } else {
-    // 2) Heuristik: gegen aktives Dokument abgleichen
-    const removedIds = detectRemovedHeadingsAgainstActive(); // was fehlt -> Haken AN
-    (function apply(list){ for(const n of list){ n.selected = removedIds.has(n.id); if(n.children) apply(n.children);} })(treeRoot);
+    const removedIds = detectRemovedHeadingsAgainstActive();
+    (function apply2(list){
+      for(const n of list){ n.selected = removedIds.has(n.id); if(n.children) apply2(n.children); }
+    })(treeRoot);
   }
 
   renderTree();
   document.getElementById('btnExport').disabled = headingsFlat.length===0;
+  document.getElementById('btnRestore').disabled = !zip.file(BASE_PATH);
   setStatus(`Baseline ✓  • Überschriften: ${headingsFlat.length} • Vorauswahl: ${appliedFrom}`);
+
+  updatePreview();
 });
 
 document.getElementById('btnSelectAll').addEventListener('click', ()=>{
   (function mark(list){ for(const n of list){ n.selected=true; if(n.children) mark(n.children);} })(treeRoot);
-  renderTree();
+  renderTree(); updatePreview();
 });
 document.getElementById('btnClearAll').addEventListener('click', ()=>{
   (function mark(list){ for(const n of list){ n.selected=false; if(n.children) mark(n.children);} })(treeRoot);
-  renderTree();
+  renderTree(); updatePreview();
 });
+
+document.getElementById('chkRebuildToc').addEventListener('change', ()=> updatePreview());
 
 document.getElementById('btnExport').addEventListener('click', async ()=>{
   if(!baseDoc){ alert('Bitte zuerst laden.'); return; }
   const idsSet = new Set(getSelectionFromTree());
-  const mode = document.querySelector('input[name="mode"]:checked').value;
-
-  let newDoc = transformFromBase(mode, idsSet);
+  let newDoc = transformRemoveFromBase(idsSet);
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+  pruneEmptySDTs(newDoc);
+  pruneDeadTables(newDoc);
+  compactWhitespace(newDoc);
+  await exportFromDoc(newDoc);
+  setStatus('Entfernen exportiert. Auswahl gespeichert (customXml/selection.json).');
+});
 
-  await exportFromDoc(newDoc, mode==='hide'?'hidden':'deleted');
-  setStatus('Export fertig. Auswahl gespeichert (customXml/selection.json).');
+document.getElementById('btnRestore').addEventListener('click', async ()=>{
+  await exportRestoredOriginal();
+  setStatus('Wiederhergestellt: Original aus eingebettetem Backup exportiert.');
 });
 </script>
 </body>

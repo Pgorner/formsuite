@@ -250,7 +250,7 @@ import xml.etree.ElementTree as ET
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 def _q(local): return "{%s}%s" % (_W_NS, local)
 
-# ---------------------- existing functions ----------------------
+# ---------------------- existing helpers ----------------------
 def write_docvar(u8, var_name, value):
     data = bytes(u8); outbuf = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
@@ -302,7 +302,6 @@ def read_docvar_settings(u8, var_name):
     return None
 
 def read_docvar_custom(u8, var_name):
-    # Try docProps/custom.xml docVars fallback
     data = bytes(u8)
     name = str(var_name or "")
     with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
@@ -314,14 +313,12 @@ def read_docvar_custom(u8, var_name):
             root = ET.fromstring(xml)
         except ET.ParseError:
             return None
-        # Namespaces for custom properties
         ns = {
             'cp': 'http://schemas.openxmlformats.org/officeDocument/2006/custom-properties',
             'vt': 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
         }
         for prop in root.findall('cp:property', ns):
             if prop.get('name') == name:
-                # value could be vt:lpwstr or other types
                 for child in list(prop):
                     if child.text is not None:
                         return child.text
@@ -383,25 +380,7 @@ def write_sdts_by_tag(u8, tag_to_text_json):
             zfout.writestr(n, out_xml)
     return outbuf.getvalue()
 
-# ---------------------- NEW: visibility tooling ----------------------
-def _ensure_fsHidden_style(zfin, names):
-    if "word/styles.xml" in names:
-        try: root = ET.fromstring(zfin.read("word/styles.xml"))
-        except ET.ParseError: root = ET.Element(_q("styles"))
-    else:
-        root = ET.Element(_q("styles"))
-    have = False
-    for st in root.findall(_q("style")):
-        if st.get(_q("type")) == "character" and st.get(_q("styleId")) == "fsHidden":
-            have = True; break
-    if not have:
-        st = ET.Element(_q("style"), {_q("type"): "character", _q("styleId"): "fsHidden"})
-        ET.SubElement(st, _q("name"), {_q("val"): "fsHidden"})
-        rpr = ET.SubElement(st, _q("rPr"))
-        ET.SubElement(rpr, _q("vanish"))
-        root.append(st)
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
-
+# ---------- heading + block collectors ----------
 def _heading_level(p_el):
     ppr = p_el.find(_q("pPr"))
     if ppr is not None:
@@ -417,49 +396,6 @@ def _heading_level(p_el):
                 except: return None
     return None
 
-def _apply_rStyle_hidden_to_runs(el):
-    for r in el.findall(".//w:r", {"w": _W_NS}):
-        rpr = r.find(_q("rPr"))
-        if rpr is None:
-            rpr = ET.SubElement(r, _q("rPr"))
-        has = False
-        for rs in rpr.findall(_q("rStyle")):
-            if rs.get(_q("val")) == "fsHidden":
-                has = True; break
-        if not has:
-            ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
-
-def _clear_table_hidden_markers(tbl_el):
-    tbl_pr = tbl_el.find(_q("tblPr"))
-    if tbl_pr is not None:
-        for node in list(tbl_pr.findall(_q("hidden"))):
-            tbl_pr.remove(node)
-    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-        tr_pr = tr.find(_q("trPr"))
-        if tr_pr is None:
-            continue
-        for node in list(tr_pr.findall(_q("hidden"))):
-            tr_pr.remove(node)
-
-def _mark_table_hidden(tbl_el):
-    tbl_pr = tbl_el.find(_q("tblPr"))
-    if tbl_pr is None:
-        tbl_pr = ET.SubElement(tbl_el, _q("tblPr"))
-    hidden = tbl_pr.find(_q("hidden"))
-    if hidden is None:
-        ET.SubElement(tbl_pr, _q("hidden"), {_q("val"): "true"})
-    else:
-        hidden.set(_q("val"), "true")
-    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-        tr_pr = tr.find(_q("trPr"))
-        if tr_pr is None:
-            tr_pr = ET.SubElement(tr, _q("trPr"))
-        hidden = tr_pr.find(_q("hidden"))
-        if hidden is None:
-            ET.SubElement(tr_pr, _q("hidden"), {_q("val"): "true"})
-        else:
-            hidden.set(_q("val"), "true")
-
 def _iter_blocks_within(container, top_level):
     for node in list(container):
         if node.tag == _q("sdt"):
@@ -492,254 +428,284 @@ def _collect_body_blocks(body_el):
             blocks.append({"element": child, "type": "other", "level": None, "top": child})
     return blocks
 
-def _mark_block_hidden(el):
-    if el is None:
-        return
-    _apply_rStyle_hidden_to_runs(el)
-    if el.tag == _q("tbl"):
-        _mark_table_hidden(el)
-    for tbl in el.findall(".//w:tbl", {"w": _W_NS}):
-        _apply_rStyle_hidden_to_runs(tbl)
-        _mark_table_hidden(tbl)
+# ---------- removal/backup/cleanup helpers ----------
+def _is_empty_para(p):
+    if p.findall(".//w:fldSimple", {"w": _W_NS}): return False
+    if p.findall(".//w:drawing", {"w": _W_NS}): return False
+    if p.findall(".//w:object",  {"w": _W_NS}): return False
+    if p.findall(".//w:pict",    {"w": _W_NS}): return False
+    ts = p.findall(".//w:t", {"w": _W_NS})
+    return all(((t.text or "").strip() == "") for t in ts)
 
-def _clear_table_hidden_markers(tbl_el):
-    tbl_pr = tbl_el.find(_q("tblPr"))
-    if tbl_pr is not None:
-        for node in list(tbl_pr.findall(_q("hidden"))):
-            tbl_pr.remove(node)
-    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-        tr_pr = tr.find(_q("trPr"))
-        if tr_pr is None:
+def _has_page_break_run(p):
+    for br in p.findall(".//w:br", {"w": _W_NS}):
+        t = br.get(_q("type"))
+        if (t or "").lower() == "page":
+            return True
+    return False
+
+def _has_page_break_before(p):
+    pPr = p.find(_q("pPr"))
+    if pPr is None: return False
+    return pPr.find(_q("pageBreakBefore")) is not None
+
+def _compact_whitespace(root):
+    body = root.find(_q("body")) or root
+    # remove empty paragraphs unless they carry a page break
+    for node in list(body):
+        if node.tag == _q("p"):
+            keep_for_page = _has_page_break_run(node) or _has_page_break_before(node)
+            if (not keep_for_page) and _is_empty_para(node):
+                try: body.remove(node)
+                except: pass
+    # collapse duplicate page-break-only paras
+    def _is_pure_pb(p):
+        if p.tag != _q("p"): return False
+        if not _has_page_break_run(p): return False
+        ts = p.findall(".//w:t", {"w": _W_NS})
+        return all(((t.text or "").strip() == "") for t in ts)
+    prev_pb = False
+    for node in list(body):
+        if _is_pure_pb(node):
+            if prev_pb:
+                try: body.remove(node)
+                except: pass
+            else:
+                prev_pb = True
+        else:
+            prev_pb = False
+
+def _prune_empty_sdts(root):
+    # best-effort: remove SDTs whose content has only empty paragraphs (no tables)
+    for sdt in list(root.findall(".//w:sdt", {"w": _W_NS})):
+        content = sdt.find(_q("sdtContent"))
+        if content is None:
             continue
-        for node in list(tr_pr.findall(_q("hidden"))):
-            tr_pr.remove(node)
-
-def _mark_table_hidden(tbl_el):
-    tbl_pr = tbl_el.find(_q("tblPr"))
-    if tbl_pr is None:
-        tbl_pr = ET.SubElement(tbl_el, _q("tblPr"))
-    hidden = tbl_pr.find(_q("hidden"))
-    if hidden is None:
-        ET.SubElement(tbl_pr, _q("hidden"), {_q("val"): "true"})
-    else:
-        hidden.set(_q("val"), "true")
-    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-        tr_pr = tr.find(_q("trPr"))
-        if tr_pr is None:
-            tr_pr = ET.SubElement(tr, _q("trPr"))
-        hidden = tr_pr.find(_q("hidden"))
-        if hidden is None:
-            ET.SubElement(tr_pr, _q("hidden"), {_q("val"): "true"})
-        else:
-            hidden.set(_q("val"), "true")
-
-def _iter_blocks_within(container, top_level):
-    for node in list(container):
-        if node.tag == _q("sdt"):
-            inner = node.find(_q("sdtContent"))
-            if inner is not None:
-                yield from _iter_blocks_within(inner, top_level)
-            else:
-                yield {"element": node, "type": "other", "level": None, "top": top_level}
-        elif node.tag == _q("p"):
-            yield {"element": node, "type": "p", "level": _heading_level(node), "top": top_level}
-        elif node.tag == _q("tbl"):
-            yield {"element": node, "type": "tbl", "level": None, "top": top_level}
-        else:
-            yield {"element": node, "type": "other", "level": None, "top": top_level}
-
-def _collect_body_blocks(body_el):
-    blocks = []
-    for child in list(body_el):
-        if child.tag == _q("sdt"):
-            content = child.find(_q("sdtContent"))
-            if content is not None:
-                blocks.extend(_iter_blocks_within(content, child))
-            else:
-                blocks.append({"element": child, "type": "other", "level": None, "top": child})
-        elif child.tag == _q("p"):
-            blocks.append({"element": child, "type": "p", "level": _heading_level(child), "top": child})
-        elif child.tag == _q("tbl"):
-            blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
-        else:
-            blocks.append({"element": child, "type": "other", "level": None, "top": child})
-    return blocks
-
-def _mark_block_hidden(el):
-    if el is None:
-        return
-    _apply_rStyle_hidden_to_runs(el)
-    if el.tag == _q("tbl"):
-        _mark_table_hidden(el)
-    for tbl in el.findall(".//w:tbl", {"w": _W_NS}):
-        _apply_rStyle_hidden_to_runs(tbl)
-        _mark_table_hidden(tbl)
-
-def _clear_table_hidden_markers(tbl_el):
-    tbl_pr = tbl_el.find(_q("tblPr"))
-    if tbl_pr is not None:
-        for node in list(tbl_pr.findall(_q("hidden"))):
-            tbl_pr.remove(node)
-    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-        tr_pr = tr.find(_q("trPr"))
-        if tr_pr is None:
+        if content.find(".//w:tbl", {"w": _W_NS}) is not None:
             continue
-        for node in list(tr_pr.findall(_q("hidden"))):
-            tr_pr.remove(node)
+        keep = False
+        for p in content.findall(".//w:p", {"w": _W_NS}):
+            if not _is_empty_para(p):
+                keep = True
+                break
+        if not keep:
+            # remove sdt by scanning parent
+            removed = False
+            for cand in root.iter():
+                for ch in list(cand):
+                    if ch is sdt:
+                        try: cand.remove(ch); removed = True
+                        except: pass
+                        break
+                if removed: break
 
-def _mark_table_hidden(tbl_el):
-    tbl_pr = tbl_el.find(_q("tblPr"))
-    if tbl_pr is None:
-        tbl_pr = ET.SubElement(tbl_el, _q("tblPr"))
-    hidden = tbl_pr.find(_q("hidden"))
-    if hidden is None:
-        ET.SubElement(tbl_pr, _q("hidden"), {_q("val"): "true"})
-    else:
-        hidden.set(_q("val"), "true")
-    for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-        tr_pr = tr.find(_q("trPr"))
-        if tr_pr is None:
-            tr_pr = ET.SubElement(tr, _q("trPr"))
-        hidden = tr_pr.find(_q("hidden"))
-        if hidden is None:
-            ET.SubElement(tr_pr, _q("hidden"), {_q("val"): "true"})
-        else:
-            hidden.set(_q("val"), "true")
+def _prune_dead_tables(root):
+    for tbl in list(root.findall(".//w:tbl", {"w": _W_NS})):
+        trs = tbl.findall(".//w:tr", {"w": _W_NS})
+        has_cell = False
+        for tr in trs:
+            if tr.find(".//w:tc", {"w": _W_NS}) is not None:
+                has_cell = True; break
+        if not has_cell:
+            # remove this <w:tbl>
+            removed = False
+            for cand in root.iter():
+                for ch in list(cand):
+                    if ch is tbl:
+                        try: cand.remove(ch); removed = True
+                        except: pass
+                        break
+                if removed: break
 
-def _iter_blocks_within(container, top_level):
-    for node in list(container):
-        if node.tag == _q("sdt"):
-            inner = node.find(_q("sdtContent"))
-            if inner is not None:
-                yield from _iter_blocks_within(inner, top_level)
-            else:
-                yield {"element": node, "type": "other", "level": None, "top": top_level}
-        elif node.tag == _q("p"):
-            yield {"element": node, "type": "p", "level": _heading_level(node), "top": top_level}
-        elif node.tag == _q("tbl"):
-            yield {"element": node, "type": "tbl", "level": None, "top": top_level}
-        else:
-            yield {"element": node, "type": "other", "level": None, "top": top_level}
-
-def _collect_body_blocks(body_el):
-    blocks = []
-    for child in list(body_el):
-        if child.tag == _q("sdt"):
-            content = child.find(_q("sdtContent"))
-            if content is not None:
-                blocks.extend(_iter_blocks_within(content, child))
-            else:
-                blocks.append({"element": child, "type": "other", "level": None, "top": child})
-        elif child.tag == _q("p"):
-            blocks.append({"element": child, "type": "p", "level": _heading_level(child), "top": child})
-        elif child.tag == _q("tbl"):
-            blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
-        else:
-            blocks.append({"element": child, "type": "other", "level": None, "top": child})
-    return blocks
-
-def _mark_block_hidden(el):
-    if el is None:
+def _ensure_backup_embedded(zfin, zfout, names, backup_path="customXml/originalDocument.xml"):
+    if backup_path in names:
         return
-    _apply_rStyle_hidden_to_runs(el)
-    if el.tag == _q("tbl"):
-        _mark_table_hidden(el)
-    for tbl in el.findall(".//w:tbl", {"w": _W_NS}):
-        _apply_rStyle_hidden_to_runs(tbl)
-        _mark_table_hidden(tbl)
+    try:
+        orig = zfin.read("word/document.xml")
+        zfout.writestr(backup_path, orig)
+    except KeyError:
+        pass
 
-def apply_visibility(u8, idx_to_action_json):
+# ----- TOC minimal rebuild -----
+def _next_in_doc_order(node, root):
+    if node is None: return None
+    found = False
+    for el in root.iter():
+        if found: return el
+        if el is node: found = True
+    return None
+
+def _find_toc_ranges(root):
+    ranges = []
+    body = root.find(_q("body")) or root
+    fldChars = root.findall(".//w:fldChar", {"w": _W_NS})
+    for begin in fldChars:
+        if begin.get(_q("val")) != "begin":
+            continue
+        cur = begin
+        instr = ""
+        separate = None
+        end = None
+        while True:
+            cur = _next_in_doc_order(cur, body)
+            if cur is None: break
+            if cur.tag == _q("instrText"): instr += (cur.text or "")
+            if cur.tag == _q("fldChar"):
+                v = cur.get(_q("val"))
+                if v == "separate": separate = cur
+                if v == "end":
+                    end = cur
+                    break
+        u = (instr or "").strip().upper()
+        if u.startswith("TOC"):
+            if separate is not None and end is not None:
+                ranges.append((begin, separate, end, instr))
+    return ranges
+
+def _rebuild_toc(root): 
+    # Replace existing complex range with a minimal fldSimple paragraph
+    for (begin, separate, end, instr) in _find_toc_ranges(root):
+        switches = (instr.strip() if instr else r'TOC \\o "1-3" \\h \\z \\u')
+        # locate host paragraph of 'begin'
+        host_p = None
+        for par in root.findall(".//w:p", {"w": _W_NS}):
+            for el in par.iter():
+                if el is begin:
+                    host_p = par; break
+            if host_p is not None: break
+        if host_p is None: continue
+        # parent of host_p
+        parent = None
+        for cand in root.iter():
+            for ch in list(cand):
+                if ch is host_p:
+                    parent = cand; break
+            if parent is not None: break
+        if parent is None: continue
+
+        # new paragraph with simple TOC field
+        p = ET.Element(_q("p"))
+        fld = ET.SubElement(p, _q("fldSimple"), {_q("instr"): switches})
+        r = ET.SubElement(fld, _q("r")); ET.SubElement(r, _q("t")).text = ""
+
+        idx = list(parent).index(host_p)
+        parent.insert(idx, p)
+
+        # remove host_p and following siblings up to node that contains 'end'
+        # Simplest: rebuild parent's children excluding nodes that belong to the TOC range
+        new_children = []
+        skipping = False
+        end_reached = False
+        for ch in list(parent):
+            if not skipping and ch is host_p:
+                skipping = True
+                continue
+            if skipping:
+                hit_end = False
+                for el in ch.iter():
+                    if el is end:
+                        hit_end = True; break
+                if hit_end:
+                    skipping = False
+                    end_reached = True
+                    continue
+                else:
+                    continue
+            new_children.append(ch)
+        # replace
+        for ch in list(parent): parent.remove(ch)
+        for ch in new_children: parent.append(ch)
+
+# ---------- CORE: remove ranges & embed backup ----------
+def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/originalDocument.xml"):
     """
     idx_to_action_json: {"12":"HIDE","13":"SHOW", ...}
-    Semantics:
-      - First, remove ALL occurrences of our own rStyle=fsHidden (global reset).
-      - Then, apply HIDE to current target ranges.
-      - SHOW is accepted but redundant post-reset.
+      - For headings where action == "HIDE": remove [heading .. next heading with <= level)
+      - Embed original as customXml/originalDocument.xml (if not already present)
+      - Cleanup empty SDTs, dead tables, whitespace
+      - Rebuild TOC (minimal fldSimple form)
     """
-    try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
-    except Exception: idx_to_action = {}
+    try:
+        idx_to_action = {int(k): v for (k, v) in json.loads(idx_to_action_json).items()}
+    except Exception:
+        idx_to_action = {}
+
     data = bytes(u8)
     outbuf = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
-        names = zfin.namelist()
 
-        # Copy everything except styles.xml (we rewrite after ensuring fsHidden)
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, \
+         zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+
+        names = zfin.namelist()
+        # Copy everything first
         for n in names:
-            if n == "word/styles.xml": continue
             zfout.writestr(n, zfin.read(n))
 
-        _ensure_fsHidden_style(zfin, zfout, set(names))
+        # Ensure embedded backup exists
+        _ensure_backup_embedded(zfin, zfout, names, backup_path=backup_path)
 
-        def is_doc_part(n):
-            if not (n.startswith("word/") and n.endswith(".xml")): return False
-            skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
-            return n not in skip and not n.startswith("word/_rels/")
+        # Process primary document (you can extend to headers/footers if needed)
+        doc_parts = [n for n in names if n == "word/document.xml"]
 
-        # PASS 1: global reset (remove fsHidden rStyle everywhere)
-        parts_roots = {}
-        for n in names:
-            if not is_doc_part(n): continue
+        global_idx = 0
+        for part in doc_parts:
             try:
-                root = ET.fromstring(zfin.read(n))
+                root = ET.fromstring(zfin.read(part))
             except ET.ParseError:
-                parts_roots[n] = None
                 continue
-            for r in root.findall(".//w:r", {"w": _W_NS}):
-                rpr = r.find(_q("rPr"))
-                if rpr is None: continue
-                for rs in list(rpr.findall(_q("rStyle"))):
-                    if rs.get(_q("val")) == "fsHidden":
-                        rpr.remove(rs)
-            for tbl in root.findall(".//w:tbl", {"w": _W_NS}):
-                _clear_table_hidden_markers(tbl)
-            parts_roots[n] = root
 
-    # PASS 2: apply current HIDE ranges
-    global_idx = 0
-    for n in names:
-        if not is_doc_part(n): continue
-        root = parts_roots.get(n)
-        if root is None: continue
-
-        body = root.find(_q("body"))
-        if body is None:
-            zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
-
-        elems = _collect_body_blocks(body)
-
-        heading_positions = []
-        for i, blk in enumerate(elems):
-            if blk.get("type") == "p" and blk.get("level") is not None:
-                global_idx += 1
-                heading_positions.append((i, blk.get("level"), global_idx))
-
-        for h_i, (pos, lvl, idx) in enumerate(heading_positions):
-            if idx_to_action.get(idx) != "HIDE":
+            body = root.find(_q("body"))
+            if body is None:
+                zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
                 continue
-            if h_i + 1 < len(heading_positions):
-                end = len(elems)
-                for j in range(h_i + 1, len(heading_positions)):
-                    np, nl, _ = heading_positions[j]
-                    if nl <= lvl:
-                        end = np
-                        break
-            else:
-                end = len(elems)
 
-            seen = set()
-            for j in range(pos, end):
-                blk = elems[j]
-                top = blk.get("top")
-                if top is None:
-                    continue
-                key = id(top)
-                if key in seen:
-                    continue
-                seen.add(key)
-                if top.tag in {_q("p"), _q("tbl"), _q("sdt")}:
-                    _mark_block_hidden(top)
+            elems = _collect_body_blocks(body)
 
-        zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+            heading_positions = []
+            for i, blk in enumerate(elems):
+                if blk.get("type") == "p" and blk.get("level") is not None:
+                    global_idx += 1
+                    heading_positions.append((i, blk.get("level"), global_idx))
+
+            to_remove_top_nodes = set()
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if idx_to_action.get(idx) != "HIDE":
+                    continue
+                # compute end boundary
+                if h_i + 1 < len(heading_positions):
+                    end = len(elems)
+                    for j in range(h_i + 1, len(heading_positions)):
+                        np, nl, _ = heading_positions[j]
+                        if nl <= lvl:
+                            end = np
+                            break
+                else:
+                    end = len(elems)
+                # gather distinct top nodes to remove (no duplicates)
+                seen = set()
+                for j in range(pos, end):
+                    top = elems[j].get("top")
+                    if top is None: continue
+                    k = id(top)
+                    if k in seen: continue
+                    seen.add(k)
+                    to_remove_top_nodes.add(top)
+
+            # Remove nodes by scanning parents (xml.etree has no getparent)
+            if to_remove_top_nodes:
+                for cand in root.iter():
+                    for ch in list(cand):
+                        if ch in to_remove_top_nodes:
+                            try: cand.remove(ch)
+                            except: pass
+
+            # Cleanup & TOC rebuild
+            _prune_empty_sdts(root)
+            _prune_dead_tables(root)
+            _compact_whitespace(root)
+            _rebuild_toc(root)
+
+            zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
     return outbuf.getvalue()
 `);
@@ -910,7 +876,6 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     // ---------- Helpers: sanitize ----------
-    // ---------- Helpers: sanitize ----------
     function sanitizeValues(schema, vals) {
       const out = {};
       const fields = Array.isArray(schema?.fields) ? schema.fields : [];
@@ -919,7 +884,6 @@ def apply_visibility(u8, idx_to_action_json):
         const id = f.id;
         let v = vals?.[id];
 
-        // DATEDIFF — store the computed object
         if (f.type === 'datediff') {
           const d = vals?.[id];
           if (d && typeof d === 'object') {
@@ -937,7 +901,6 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // ADDRESS
         if (f.type === 'address') {
           const vv = vals?.[id];
           if (typeof vv === 'string') {
@@ -959,9 +922,7 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // MULTICHOICE (options + conditional extras)
         if (f.type === 'multichoice') {
-          // main value: array of selected options
           let arr = Array.isArray(v) ? v.slice() : (typeof v === 'string' ? v.split(',') : []);
           arr = arr.map(x => String(x).trim()).filter(Boolean);
 
@@ -982,7 +943,6 @@ def apply_visibility(u8, idx_to_action_json):
           if (arr.length) out[id] = arr;
           else if (f.required) out[id] = [];
 
-          // conditional extras under synthesized keys
           if (f.mc && Array.isArray(f.mc.groups)) {
             for (const g of f.mc.groups) {
               for (const it of (g.items || [])) {
@@ -1007,7 +967,6 @@ def apply_visibility(u8, idx_to_action_json):
                     continue;
                   }
 
-                  // NEW: datediff inside MC — store same object shape as top-level
                   if (ex.type === 'datediff') {
                     if (raw && typeof raw === 'object' && typeof raw.days !== 'undefined') {
                       const o = {
@@ -1021,7 +980,6 @@ def apply_visibility(u8, idx_to_action_json):
                     continue;
                   }
 
-                  // default: text
                   const s = String(raw ?? '');
                   if (s) out[k] = s;
                 }
@@ -1031,7 +989,6 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // SELECT
         if (f.type === 'select') {
           let s = Array.isArray(v) ? String(v[0] ?? '') : String(v ?? '');
           if (Array.isArray(f.options) && f.options.length) {
@@ -1043,7 +1000,6 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // NUMBER
         if (f.type === 'number') {
           if (v === '' || v == null) continue;
           const num = (typeof v === 'number') ? v : Number(String(v).replace(',', '.'));
@@ -1051,10 +1007,8 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // DATE
         if (f.type === 'date') { out[id] = String(v ?? ''); continue; }
 
-        // TABLE
         if (f.type === 'table') {
           const cols = Array.isArray(f.columns) ? f.columns : [];
           const colIds = cols.map(c => c.id);
@@ -1077,7 +1031,6 @@ def apply_visibility(u8, idx_to_action_json):
           continue;
         }
 
-        // TEXT-ish default
         const s = String(v ?? '');
         if (s || f.required) out[id] = s;
       }
@@ -1136,7 +1089,6 @@ def apply_visibility(u8, idx_to_action_json):
     function parseDateByFormat(str, fmt) {
       if (!str) return null;
       try {
-        // use flatpickr's own parser so we honor custom formats
         const d = (window.flatpickr && window.flatpickr.parseDate)
           ? window.flatpickr.parseDate(String(str), fmt || 'Y-m-d')
           : new Date(String(str));
@@ -1145,47 +1097,38 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     function diffInDays(a, b) {
-      // normalize to midnight to avoid TZ drift
       const A = new Date(a.getFullYear(), a.getMonth(), a.getDate());
       const B = new Date(b.getFullYear(), b.getMonth(), b.getDate());
-      const ms = B - A; // to - from
+      const ms = B - A;
       return Math.floor(ms / (24*60*60*1000));
     }
     function diffInMonths(a, b) {
-      // calendar months between a -> b (subtract 1 if day-of-month hasn't been reached)
       let months = (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
       if (b.getDate() < a.getDate()) months -= 1;
       return months;
     }
     function diffInYears(a, b) {
-      // full calendar years between a -> b
       let years = b.getFullYear() - a.getFullYear();
       const bBeforeAnniversary = (b.getMonth() < a.getMonth()) || (b.getMonth() === a.getMonth() && b.getDate() < a.getDate());
       if (bBeforeAnniversary) years -= 1;
       return years;
     }
 
-    // returns number or null
     function computeDateDiff(fromDate, toDate, unit = 'days') {
       if (!fromDate || !toDate) return null;
       const u = String(unit || 'days').toLowerCase();
       if (u === 'years')  return diffInYears(fromDate, toDate);
       if (u === 'months') return diffInMonths(fromDate, toDate);
-      return diffInDays(fromDate, toDate); // default days
+      return diffInDays(fromDate, toDate);
     }
 
-    // Modern, pretty flatpickr with sensible defaults for our app.
-    // - Non-editable (click-to-pick), ISO storage via value, nice alt display.
-    // - Month dropdown, week numbers, nicer arrows, better mobile behavior.
-    // - Will add a CSS class on the first allowed day so it pops visually.
     function createPrettyDatepicker(input, extraOpts = {}) {
-      // Make sure the calendar can render above the card
       if (!document.getElementById('fp-zindex-fix')) {
         const st = document.createElement('style');
         st.id = 'fp-zindex-fix';
         st.textContent = `
-          .flatpickr-calendar { z-index: 50; } /* above .mc-item content */
-          .flatpickr-wrapper { position: relative; } /* for static positioning */
+          .flatpickr-calendar { z-index: 50; }
+          .flatpickr-wrapper { position: relative; }
         `;
         document.head.appendChild(st);
       }
@@ -1195,25 +1138,22 @@ def apply_visibility(u8, idx_to_action_json):
         altInput: true,
         altFormat: 'D, j M Y',
         allowInput: false,
-        clickOpens: true,        // make explicit
+        clickOpens: true,
         disableMobile: true,
-        static: true,            // embed under the input (works with our grid)
-        wrap: false,             // we manage our own wrappers
+        static: true,
+        wrap: false,
         monthSelectorType: 'dropdown',
         weekNumbers: true,
         prevArrow: '‹',
         nextArrow: '›',
         onReady: (_sel, _str, inst) => {
-          // alt input should be clickable and focusable
           if (inst.altInput) {
             inst.altInput.readOnly = true;
             inst.altInput.tabIndex = 0;
             inst.altInput.style.pointerEvents = 'auto';
-            // ensure there is a positioned wrapper for static calendar
             const wrap = inst.altInput.parentElement;
             if (wrap && !wrap.classList.contains('flatpickr-wrapper')) {
               wrap.classList.add('flatpickr-wrapper');
-              // do not interfere with height measurements
               if (getComputedStyle(wrap).position === 'static') {
                 wrap.style.position = 'relative';
               }
@@ -1226,7 +1166,6 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
 
-    // --- MC helpers: stable key for a conditional sub-field of a multichoice option
     function slugifyMc(s) {
       return String(s || '')
         .normalize('NFKD')
@@ -1241,7 +1180,6 @@ def apply_visibility(u8, idx_to_action_json):
 
     // ---------- Render whole form ----------
     function renderForm() {
-      // --- one-time CSS for caret + collapse animation + MC label alignment ---
       (function injectMcStyles(){
         const ID = 'mc-caret-styles';
         if (document.getElementById(ID)) return;
@@ -1249,69 +1187,18 @@ def apply_visibility(u8, idx_to_action_json):
         s.id = ID;
         s.textContent = `
           .mc-item { position: relative; }
-          .mc-toggle {
-            all: unset;
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            line-height: 1;
-            padding: 0;
-            margin: 0;
-            pointer-events: auto;
-          }
-          .mc-toggle:focus-visible {
-            outline: 2px solid var(--focus, #2563eb);
-            outline-offset: 2px;
-            border-radius: 4px;
-          }
-          .mc-caret {
-            width: 14px;
-            height: 14px;
-            transition: transform .18s ease, opacity .18s ease;
-            opacity: .85;
-            transform: rotate(0deg);
-            display: block;
-          }
+          .mc-toggle { all: unset; position: absolute; top: 10px; right: 10px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; line-height: 1; padding: 0; margin: 0; pointer-events: auto; }
+          .mc-toggle:focus-visible { outline: 2px solid var(--focus, #2563eb); outline-offset: 2px; border-radius: 4px; }
+          .mc-caret { width: 14px; height: 14px; transition: transform .18s ease, opacity .18s ease; opacity: .85; transform: rotate(0deg); display: block; }
           .mc-caret.open { transform: rotate(90deg); }
-
-          /* Keep this simple; JS controls height/display during animation */
-          .mc-extras {
-            display: none;     /* collapsed = removed from flow */
-            height: 0;         /* safety for measure/animate */
-            grid-template-columns: 1fr;
-            row-gap: 8px;
-            padding-bottom: 2px;
-            width: 100%;
-          }
-          .mc-extras.open { }
-
-          /* ---------- New: checkbox + text alignment (Option 1) ---------- */
-          .mc-option-label{
-            display:grid;
-            grid-template-columns:auto 1fr;
-            column-gap:8px;
-            align-items:center;     /* center checkbox with first text line */
-            cursor:pointer;
-            line-height:1.25;
-          }
-          .mc-option-label > span{
-            white-space:normal;
-            word-break:break-word;
-          }
-          .mc-option-checkbox{
-            align-self:center;      /* no extra nudge */
-            margin-top:0;
-            transform:none;
-          }
+          .mc-extras { display: none; height: 0; grid-template-columns: 1fr; row-gap: 8px; padding-bottom: 2px; width: 100%; }
+          .mc-option-label{ display:grid; grid-template-columns:auto 1fr; column-gap:8px; align-items:center; cursor:pointer; line-height:1.25; }
+          .mc-option-label > span{ white-space:normal; word-break:break-word; }
+          .mc-option-checkbox{ align-self:center; margin-top:0; transform:none; }
         `;
         document.head.appendChild(s);
       })();
 
-      // local fallbacks
       const __slugifyMc = (window.slugifyMc) ? window.slugifyMc : function (s) {
         return String(s || '')
           .normalize('NFKD')
@@ -1332,7 +1219,6 @@ def apply_visibility(u8, idx_to_action_json):
         return;
       }
 
-      // hydrate defaults for tables
       (schema.fields || []).forEach(f => {
         if (f.type === 'table') {
           if (!Array.isArray(values[f.id])) {
@@ -1344,7 +1230,6 @@ def apply_visibility(u8, idx_to_action_json):
         }
       });
 
-      // form shell
       const form = document.createElement('form');
       form.classList.add('form-grid');
 
@@ -1355,13 +1240,11 @@ def apply_visibility(u8, idx_to_action_json):
         form.appendChild(h);
       }
 
-      // refs
       const inputRefs  = {};
       const mcDateRefs = {};
-      const datediffRefs = []; // [{storeKey, outEl, resolve}]
-      const guardPairs = [];   // [{fromId, toId}]
+      const datediffRefs = [];
+      const guardPairs = [];
 
-      // ---------- helpers ----------
       function scheduleSaveState() {
         clearTimeout(scheduleSaveState._t);
         scheduleSaveState._t = setTimeout(() => {
@@ -1371,12 +1254,10 @@ def apply_visibility(u8, idx_to_action_json):
         }, 150);
       }
 
-      // Animate extras open/close; collapsed = display:none so it takes no height.
       function setExtrasOpen(extras, caretEl, open) {
         if (!extras) return;
         const DURATION = 220;
 
-        // cancel previous
         if (extras._animTimer) { clearTimeout(extras._animTimer); extras._animTimer = null; }
         if (extras._onTe) { extras.removeEventListener('transitionend', extras._onTe); extras._onTe = null; }
 
@@ -1386,7 +1267,7 @@ def apply_visibility(u8, idx_to_action_json):
           extras.style.opacity = open ? '1' : '0';
           extras.style.marginTop = open ? '8px' : '0px';
           extras.style.height = open ? 'auto' : '0px';
-          extras.style.overflow = 'visible';     // keep it visible so calendars can overflow
+          extras.style.overflow = 'visible';
           if (!open) extras.style.display = 'none';
           if (extras._onTe) {
             extras.removeEventListener('transitionend', extras._onTe);
@@ -1436,7 +1317,6 @@ def apply_visibility(u8, idx_to_action_json):
         }
       }
 
-      // ---------- fields ----------
       (schema.fields || []).forEach(f => {
         const wrap = document.createElement('div');
         wrap.className = 'field';
@@ -1447,7 +1327,6 @@ def apply_visibility(u8, idx_to_action_json):
         if (f.wide === true) wrap.classList.add('span-2');
         if (f.full === true) wrap.classList.add('full');
 
-        // label (address renders own)
         if (f.type !== 'address') {
           const label = document.createElement('label');
           label.htmlFor = f.id;
@@ -1461,7 +1340,6 @@ def apply_visibility(u8, idx_to_action_json):
           wrap.appendChild(label);
         }
 
-        // TEXT
         if (f.type === 'text') {
           const input = document.createElement('input');
           input.type = 'text';
@@ -1472,7 +1350,6 @@ def apply_visibility(u8, idx_to_action_json):
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
-        // NUMBER
         } else if (f.type === 'number') {
           const input = document.createElement('input');
           input.type = 'number';
@@ -1483,7 +1360,6 @@ def apply_visibility(u8, idx_to_action_json):
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
-        // SELECT
         } else if (f.type === 'select') {
           const input = document.createElement('select');
           input.id = f.id; input.name = f.id; input.style.width = '100%';
@@ -1498,14 +1374,11 @@ def apply_visibility(u8, idx_to_action_json):
           wrap.appendChild(input);
           inputRefs[f.id] = input;
 
-        // MULTICHOICE
         } else if (f.type === 'multichoice') {
-          // Container for all groups
           const mcContainer = document.createElement('div');
           mcContainer.className = 'mc-container';
           mcContainer.style.display = 'block';
 
-          // normalize items
           const items = [];
           if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
             f.mc.groups.forEach(g => (g.items || []).forEach(it =>
@@ -1531,7 +1404,6 @@ def apply_visibility(u8, idx_to_action_json):
             });
           }
 
-          // default selections
           if (!Array.isArray(values[f.id])) {
             const initial = items.filter(it => it.alwaysSelected || it.preselected).map(it => it.value);
             if (initial.length) values[f.id] = initial.slice();
@@ -1549,11 +1421,10 @@ def apply_visibility(u8, idx_to_action_json):
             const optId  = `${f.id}__${__slugifyMc(optVal)}`;
             const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
 
-          // CARD
-          const card = document.createElement('div');
-          card.className = 'mc-item';
-          try { card.dataset.optId = `${f.id}__opt__${__slugifyMc(optVal)}`; } catch {}
-          card.style.position = 'relative';
+            const card = document.createElement('div');
+            card.className = 'mc-item';
+            try { card.dataset.optId = `${f.id}__opt__${__slugifyMc(optVal)}`; } catch {}
+            card.style.position = 'relative';
             card.style.display = 'flex';
             card.style.flexDirection = 'column';
             card.style.alignItems = 'stretch';
@@ -1562,7 +1433,6 @@ def apply_visibility(u8, idx_to_action_json):
             card.style.borderRadius = '8px';
             card.style.padding = '10px 10px';
 
-            // HEADER
             const row1 = document.createElement('div');
             row1.className = 'row';
             row1.style.alignItems = 'center';
@@ -1594,7 +1464,6 @@ def apply_visibility(u8, idx_to_action_json):
             left.appendChild(txt);
             row1.appendChild(left);
 
-            // EXTRAS
             let extrasWrap = null;
             if (hasExtras) {
               extrasWrap = document.createElement('div');
@@ -1606,7 +1475,6 @@ def apply_visibility(u8, idx_to_action_json):
                 extrasWrap.innerHTML = '';
                 if (!item.fields.length) return;
 
-                // helper for extras: read a date for a given MC extra key
                 function getDateForExtraKey(key) {
                   const el = mcDateRefs[key];
                   const fp = el?._flatpickr;
@@ -1677,7 +1545,6 @@ def apply_visibility(u8, idx_to_action_json):
                     return;
                   }
 
-                  // NEW: computed DATEDIFF inside MC (read-only, not editable)
                   if (exType === 'datediff') {
                     const fromId = ex.fromId || ex.from || '';
                     const toId   = ex.toId   || ex.to   || '';
@@ -1694,7 +1561,6 @@ def apply_visibility(u8, idx_to_action_json):
                     line.appendChild(lab);
                     line.appendChild(out);
 
-                    // register in global recompute list
                     datediffRefs.push({
                       storeKey: exKey,
                       outEl: out,
@@ -1703,7 +1569,6 @@ def apply_visibility(u8, idx_to_action_json):
                     return;
                   }
 
-                  // default text
                   const input = document.createElement('input');
                   input.type = 'text';
                   input.value = values[exKey] ?? '';
@@ -1719,7 +1584,6 @@ def apply_visibility(u8, idx_to_action_json):
               mountExtraFields();
             }
 
-            // CARET
             let caretBtn = null, caretIcon = null;
             if (hasExtras) {
               caretBtn = document.createElement('button');
@@ -1746,7 +1610,6 @@ def apply_visibility(u8, idx_to_action_json):
               caretBtn.appendChild(svg);
               row1.appendChild(caretBtn);
 
-              // start collapsed
               setExtrasOpen(extrasWrap, caretIcon, false);
 
               caretBtn.addEventListener('click', (e) => {
@@ -1757,20 +1620,17 @@ def apply_visibility(u8, idx_to_action_json):
               });
             }
 
-            // checkbox persists selection; no auto-open
             cb.addEventListener('change', () => {
               if (locked) { cb.checked = true; return; }
               persistMainSelection();
               try { applyFieldVisibility(); } catch {}
             });
 
-            // assemble
             card.appendChild(row1);
             if (extrasWrap) card.appendChild(extrasWrap);
             parentHost.appendChild(card);
           }
 
-          // Render grouped when mc.groups exist; otherwise single grid
           if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
             f.mc.groups.forEach(g => {
               const section = document.createElement('div');
@@ -1829,7 +1689,6 @@ def apply_visibility(u8, idx_to_action_json):
 
           wrap.appendChild(mcContainer);
 
-        // DATE
         } else if (f.type === 'date') {
           const input = document.createElement('input');
           input.type = 'text';
@@ -1853,7 +1712,6 @@ def apply_visibility(u8, idx_to_action_json):
           if (fp.altInput) fp.altInput.readOnly = true;
           inputRefs[f.id] = input;
 
-        // ADDRESS
         } else if (f.type === 'address') {
           const host = document.createElement('div');
           host.className = 'addr-host';
@@ -1872,11 +1730,9 @@ def apply_visibility(u8, idx_to_action_json):
             onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
           });
 
-        // TABLE
         } else if (f.type === 'table') {
           renderTableField(wrap, f);
 
-        // DATEDIFF (top-level)
         } else if (f.type === 'datediff') {
           const fromId = f.fromId || f.from || '';
           const toId   = f.toId   || f.to   || '';
@@ -1897,7 +1753,6 @@ def apply_visibility(u8, idx_to_action_json):
 
           guardPairs.push({ fromId, toId });
 
-        // DEFAULT
         } else {
           const input = document.createElement('input');
           input.type = 'text';
@@ -1911,7 +1766,6 @@ def apply_visibility(u8, idx_to_action_json):
         form.appendChild(wrap);
       });
 
-      // bottom bar
       const bar = document.createElement('div');
       bar.className = 'bar';
       bar.style.gridColumn = '1 / -1';
@@ -1923,14 +1777,11 @@ def apply_visibility(u8, idx_to_action_json):
       btnExportMain.addEventListener('click', onExportFromOpenForm);
       bar.appendChild(btnExportMain);
       form.appendChild(bar);
-      // reactively apply field visibility on any change within the form
       form.addEventListener('change', () => { try { applyFieldVisibility(); } catch {} });
       mount.appendChild(form);
 
-      // initial apply based on current values
       try { applyFieldVisibility(); } catch {}
 
-      // date helpers
       function getDateForField(fid) {
         const el = inputRefs[fid];
         if (!el) return null;
@@ -1946,7 +1797,6 @@ def apply_visibility(u8, idx_to_action_json):
         return null;
       }
 
-      // labeled datediff (works for top-level AND MC extras we pushed)
       function recomputeDatediffs() {
         datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
           const { a, b } = resolve();
@@ -1966,7 +1816,6 @@ def apply_visibility(u8, idx_to_action_json):
       }
       window.recomputeDatediffs = recomputeDatediffs;
 
-      // guards for top-level pairs
       (function wireTopLevelDateGuards() {
         function nextDay(d) {
           if (!d) return null;
@@ -2010,19 +1859,16 @@ def apply_visibility(u8, idx_to_action_json):
         });
       })();
 
-      // initial compute
       recomputeDatediffs();
     }
 
 
 
-
-// ----- TABLE FIELD -----
+    // ----- TABLE FIELD -----
     function renderTableField(container, field) {
       if (!Array.isArray(values[field.id])) values[field.id] = [];
       const data = values[field.id];
 
-      // --- Inline editor (no special card/container) ---
       const editorWrap = document.createElement('div');
       editorWrap.style.display = 'flex';
       editorWrap.style.flexWrap = 'wrap';
@@ -2031,7 +1877,6 @@ def apply_visibility(u8, idx_to_action_json):
       const editorInputs = {};
       let editorState = emptyRow(field);
 
-      // helpers for sizing
       const measurer = document.createElement('canvas').getContext('2d');
       function textPx(str) {
         try { measurer.font = getComputedStyle(document.body).font; } catch {}
@@ -2041,7 +1886,6 @@ def apply_visibility(u8, idx_to_action_json):
         return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
       }
 
-      // helper: is a table row effectively empty?
       function rowIsEmpty(row) {
         return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
       }
@@ -2094,7 +1938,6 @@ def apply_visibility(u8, idx_to_action_json):
         editorWrap.appendChild(pair);
       });
 
-      // --- Toolbar ---
       const toolbar = document.createElement('div');
       toolbar.className = 'row';
       toolbar.style.gap = '8px';
@@ -2127,7 +1970,6 @@ def apply_visibility(u8, idx_to_action_json):
       status.className = 'muted';
       status.style.minHeight = '1.2em';
 
-      // --- Table preview (hidden until we have at least one non-empty row) ---
       const tableWrap = document.createElement('div');
       tableWrap.style.overflow = 'auto';
       const table = document.createElement('table');
@@ -2146,8 +1988,8 @@ def apply_visibility(u8, idx_to_action_json):
         trh.appendChild(th);
       });
 
-      let selectedIndex = -1;          // index in the *data* array
-      let visibleIndexMap = [];        // maps rendered row index -> data index
+      let selectedIndex = -1;
+      let visibleIndexMap = [];
 
       function applyPreviewVisibility() {
         const hasAnyNonEmpty = data.some(r => !rowIsEmpty(r));
@@ -2158,7 +2000,6 @@ def apply_visibility(u8, idx_to_action_json):
         tbody.innerHTML = '';
         visibleIndexMap = [];
 
-        // render ONLY non-empty rows
         data.forEach((row, realIdx) => {
           if (rowIsEmpty(row)) return;
 
@@ -2176,7 +2017,7 @@ def apply_visibility(u8, idx_to_action_json):
           }
 
           tr.addEventListener('click', () => {
-            selectedIndex = realIdx;      // keep selection in terms of the real data index
+            selectedIndex = realIdx;
             drawTable();
             loadIntoEditor(realIdx);
           });
@@ -2232,14 +2073,12 @@ def apply_visibility(u8, idx_to_action_json):
         }
       }
 
-      // initial rows (respect minRows) + first draw
       if (!data.length) {
         const min = Math.max(0, parseInt(field.minRows || 0, 10));
-        for (let i = 0; i < min; i++) data.push(emptyRow(field)); // these are empty placeholders
+        for (let i = 0; i < min; i++) data.push(emptyRow(field));
       }
-      drawTable(); // preview stays hidden unless a non-empty row exists
+      drawTable();
 
-      // actions
       btnAdd.addEventListener('click', () => {
         const max = Math.max(0, parseInt(field.maxRows || 0, 10));
         if (max && data.length >= max) return;
@@ -2277,19 +2116,16 @@ def apply_visibility(u8, idx_to_action_json):
         status.textContent = 'Auswahl aufgehoben.';
       });
 
-      // append so preview appears BELOW the buttons
       container.appendChild(editorWrap);
       container.appendChild(toolbar);
       container.appendChild(status);
       container.appendChild(tableWrap);
 
-      // initial visibility check
       applyPreviewVisibility();
     }
 
     function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
 
-    // Debounced state save
     let __saveTimer = null;
     function scheduleSaveState() {
       clearTimeout(__saveTimer);
@@ -2308,14 +2144,44 @@ def apply_visibility(u8, idx_to_action_json):
 
     // ---------- Export (Open Form) ----------
     async function onExportFromOpenForm() {
-      if (!currentDoc?.docId) { alert('No active document. Open or pick a DOCX first.'); return; }
+      if (!currentDoc?.docId) {
+        alert('No active document. Open or pick a DOCX first.');
+        return;
+      }
 
       const canBytes = await fetchWorkingDocBytes();
       if (!canBytes) { await hardResetOpenForm('no bytes / no permission'); return; }
 
+      let fileHandle = null;
+      let skipPickerReason = '';
+      if (supportsFS && window.showSaveFilePicker) {
+        try {
+          const suggested = (currentDoc.name?.replace(/\.docx$/i, '') || 'document') + ' (export).docx';
+          fileHandle = await showSaveFilePicker({
+            suggestedName: suggested,
+            types: [{
+              description: 'Word document',
+              accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
+            }]
+          });
+        } catch (e) {
+          const msg = String(e?.message || '');
+          if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
+          if (e?.name === 'SecurityError' || e?.name === 'NotAllowedError' || /Must be handling a user gesture/i.test(msg)) {
+            skipPickerReason = e?.name || 'SecurityError';
+          } else {
+            console.error('Save picker failed:', e);
+            alert('Export failed: ' + (e?.message || e));
+            return;
+          }
+        }
+      }
+
       const attempt = async () => {
         await ensurePy();
-        const docBytes = await fetchWorkingDocBytes(); if (!docBytes) return;
+
+        const docBytes = await fetchWorkingDocBytes();
+        if (!docBytes) return;
 
         const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
         const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
@@ -2323,8 +2189,7 @@ def apply_visibility(u8, idx_to_action_json):
                     || (state?.CRONOS_PAYLOAD?.tagMap)
                     || (state?.tagMap)
                     || {};
-
-        const validIds = new Set((schema?.fields || []).map(f => f.id));
+        const validIds   = new Set((schema?.fields || []).map(f => f.id));
         const safeValues = sanitizeValues(schema, values || {});
         const cleanTagMap = sanitizeTagMap(tagMap, validIds);
 
@@ -2338,7 +2203,7 @@ def apply_visibility(u8, idx_to_action_json):
         // 1) write CRONOS_PAYLOAD → settings.xml
         const updated = await writeDocVar(docBytes, PAYLOAD_KEY, payload);
 
-        // 2) fill SDTs (prefer formatted string for address objects)
+        // 2) fill SDTs
         const sdtMap = {};
         for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
           let v = safeValues?.[fieldId];
@@ -2354,44 +2219,60 @@ def apply_visibility(u8, idx_to_action_json):
         const rules = loadRulesForDoc(state);
         const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules);
 
-        // 4) apply visibility using fsHidden (non-destructive)
+        // 4) REMOVE sections and embed backup (only mode)
         if (Object.keys(visibilityMap).length) {
-          updated2 = await applyVisibilityByRules(updated2, visibilityMap);
+          updated2 = await applyRemovalWithBackup(updated2, visibilityMap);
         }
 
-        // keep OPFS in sync for the workspace
         await window.formSuitePersist.putBytes?.(currentDoc.docId, updated2);
 
-        // 5) Save As...
-        if (supportsFS && window.showSaveFilePicker) {
+        let saved = false;
+        if (fileHandle) {
           try {
-            const suggested = (currentDoc.name?.replace(/\.docx$/i,'') || 'document') + ' (export).docx';
-            const handle = await showSaveFilePicker({
-              suggestedName: suggested,
-              types: [{ description: 'Word document', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }]
-            });
-            const stream = await handle.createWritable(); await stream.write(updated2); await stream.close();
-          } catch (e) { if (e?.name === 'AbortError') return; throw e; }
-        } else {
-          const blob = new Blob([updated2], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
-          const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-          a.download = (currentDoc?.name||'document').replace(/\.docx$/i,' (export).docx');
-          a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+            const stream = await fileHandle.createWritable();
+            await stream.write(updated2);
+            await stream.close();
+            saved = true;
+          } catch (e) {
+            const msg = String(e?.message || '');
+            if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
+            console.warn('Writing to handle failed, falling back to download:', e);
+          }
+        }
+
+        if (!saved) {
+          if (skipPickerReason) {
+            console.info(`Falling back to download due to: ${skipPickerReason}`);
+          }
+          const blob = new Blob([updated2], {
+            type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+          });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = (currentDoc?.name || 'document').replace(/\.docx$/i, ' (export).docx');
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
         }
       };
 
-      try { await attempt(); }
-      catch (e) {
+      try {
+        await attempt();
+      } catch (e) {
         const msg = String(e?.message || e || '');
         if (msg.includes('already been destroyed') || msg.includes('proxy has been destroyed')) {
           await ensurePy(true);
           try { await attempt(); return; } catch (e2) {
-            if (e2?.name === 'AbortError' || /export canceled/.test((e2?.message||'').toLowerCase())) return;
-            console.error('Export failed after retry:', e2); alert('Export failed: ' + (e2?.message || e2)); return;
+            const m2 = String(e2?.message || '');
+            if (e2?.name === 'AbortError' || /export canceled/i.test(m2)) return;
+            console.error('Export failed after retry:', e2);
+            alert('Export failed: ' + (e2?.message || e2));
+            return;
           }
         }
-        if (e?.name === 'AbortError' || /export canceled/.test((e?.message||'').toLowerCase())) return;
-        console.error('Export failed (Open Form):', e); alert('Export failed: ' + (e?.message || e));
+        if (e?.name === 'AbortError' || /export canceled/i.test(msg.toLowerCase())) return;
+        console.error('Export failed (Open Form):', e);
+        alert('Export failed: ' + (e?.message || e));
       }
     }
 
@@ -2446,7 +2327,6 @@ def apply_visibility(u8, idx_to_action_json):
         const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
 
-        // New matching supporting boolean pseudo options and date ops
         let match = false;
         if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
           const [baseId, slug] = fieldId.split('__opt__');
@@ -2471,11 +2351,10 @@ def apply_visibility(u8, idx_to_action_json):
             const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
             const a = toDay(actual);
             const b = toDay(expStr);
-            if (!Number.isNaN(a) && !Number.isNaN(b)) {
-              if (op === 'before') match = a < b;
-              else if (op === 'after') match = a > b;
-              else if (op === 'equals') match = a === b;
-            }
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false;  // <-- fix here
+            else if (op === 'before') match = a < b;
+            else if (op === 'after') match = a > b;
+            else if (op === 'equals') match = a == b;
           } else if (t === 'text' || t === 'number' || t === 'select') {
             const expVal = Array.isArray(exp) ? exp[0] : exp;
             if (op === 'equals') match = String(actual) === String(expVal);
@@ -2514,7 +2393,7 @@ def apply_visibility(u8, idx_to_action_json):
     }
 
     function evaluateFieldRulesToVisibility(schema, values, rules) {
-      const out = Object.create(null); // fieldId -> 'SHOW'|'HIDE'|'DISABLE'
+      const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
 
       const cleanVals = sanitizeValues(schema, values || {});
@@ -2533,14 +2412,12 @@ def apply_visibility(u8, idx_to_action_json):
         const targets = Array.isArray(r.targets) ? r.targets : [];
         const effect = (String(r.hideMode||'hide').toLowerCase() === 'disable') ? 'DISABLE' : 'HIDE';
 
-        // Support boolean pseudo-field for multichoice option: <fieldId>__opt__<slug>
         let match = false;
         if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
           const [baseId, slug] = fieldId.split('__opt__');
           const base = baseId;
           const raw = getVal(base);
           const arr = Array.isArray(raw) ? raw.map(String) : [];
-          // slugify comparable
           const toSlug = (s) => String(s||'')
             .normalize('NFKD')
             .replace(/[\u0300-\u036f]/g, '')
@@ -2552,7 +2429,6 @@ def apply_visibility(u8, idx_to_action_json):
           const expectBool = (String(expect) === 'true');
           if (op === 'equals') match = (selected === expectBool);
         } else {
-          // Resolve field type
           const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
           const t = String(fld?.type||'').toLowerCase();
           const actual = getVal(fieldId);
@@ -2561,10 +2437,10 @@ def apply_visibility(u8, idx_to_action_json):
             const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
             const a = toDay(actual);
             const b = toDay(expStr);
-            if (Number.isNaN(a) || Number.isNaN(b)) match = false;
+            if (Number.isNaN(a) || Number.isNaN(b)) match = False
             else if (op === 'before') match = a < b;
             else if (op === 'after') match = a > b;
-            else if (op === 'equals') match = a === b;
+            else if (op === 'equals') match = a == b;
           } else if (t === 'text' || t === 'number') {
             const expVal = Array.isArray(exp) ? exp[0] : exp;
             if (op === 'equals') match = String(actual) === String(expVal);
@@ -2574,10 +2450,8 @@ def apply_visibility(u8, idx_to_action_json):
             if (op === 'equals') match = String(actual) === String(expVal);
             else if (op === 'notEquals') match = String(actual) !== String(expVal);
           } else if (t === 'multichoice') {
-            // legacy compatibility: anyOf/allOf/equals
             match = ruleMatchesValue(op, exp, actual);
           } else {
-            // fallback to generic
             match = ruleMatchesValue(op, exp, actual);
           }
         }
@@ -2590,7 +2464,7 @@ def apply_visibility(u8, idx_to_action_json):
           if (action === 'SHOW') out[id] = 'SHOW';
           else if (action === 'HIDE' && prev !== 'SHOW') {
             if (prev === 'HIDE') out[id] = 'HIDE';
-            else out[id] = effect; // DISABLE or HIDE
+            else out[id] = effect;
           }
         }
       }
@@ -2601,7 +2475,6 @@ def apply_visibility(u8, idx_to_action_json):
       try {
         if (!schema || !Array.isArray(schema.fields)) return;
         const visMap = evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
-        // First reset shown/enabled state
         const clearDisabled = (el) => {
           el.style.opacity = '';
           el.style.pointerEvents = '';
@@ -2610,14 +2483,14 @@ def apply_visibility(u8, idx_to_action_json):
         };
         document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
         document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
-        // Apply per mapping key
+
         const esc = (window.CSS && CSS.escape) ? CSS.escape : (s => String(s)
           .replace(/\\/g,'\\\\')
           .replace(/"/g,'\\"')
           .replace(/\]/g,'\\]')
           .replace(/\[/g,'\\[')
         );
-        // helpers to clear selections when hiding/greying
+
         const deselectMcItem = (mcEl) => {
           const cb = mcEl.querySelector('input[type="checkbox"][data-mc="1"]');
           if (!cb) return;
@@ -2629,7 +2502,7 @@ def apply_visibility(u8, idx_to_action_json):
           values[fid] = next;
           scheduleSaveState();
         };
-                const deselectFieldWrapper = (wrapEl) => {
+        const deselectFieldWrapper = (wrapEl) => {
           const fid = wrapEl?.dataset?.fieldId || '';
           if (!fid) return;
           const fld = (schema?.fields || []).find(f => String(f.id) === String(fid));
@@ -2677,16 +2550,12 @@ def apply_visibility(u8, idx_to_action_json):
       } catch (e) { /* no-op */ }
     }
 
-    // Expose for cross-callbacks
-    try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
-
-    // ---------- Bridge to Python: apply visibility using fsHidden ----------
-    async function applyVisibilityByRules(bytesU8, visibilityMap) {
-      if (!visibilityMap || !Object.keys(visibilityMap).length) return bytesU8;
+    // ---------- JS bridge to Python removal-with-backup ----------
+    async function applyRemovalWithBackup(bytesU8, visibilityMap) {
       await ensurePy();
-      const fn = py.globals.get('apply_visibility');
+      const fn = py.globals.get('apply_removal_with_backup');
       const pyBytes = py.toPy(bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8));
-      const pyMap   = py.toPy(JSON.stringify(visibilityMap));
+      const pyMap   = py.toPy(JSON.stringify(visibilityMap || {}));
       let pyOut;
       try { pyOut = fn(pyBytes, pyMap); }
       finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
@@ -2694,11 +2563,25 @@ def apply_visibility(u8, idx_to_action_json):
       if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
       else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
       else u8 = new Uint8Array([]);
-      try { pyOut.destroy?.(); } catch {}
+      try { pyOut?.destroy?.(); } catch {}
       return u8;
     }
 
-    // ---------- Logo triple-click: focus mode (kept minimal) ----------
+    // ---------- Field rules evaluation for UI ----------
+    function loadRulesForDoc(state) {
+      return (
+        state?.rules ||
+        state?.payload?.rules ||
+        state?.CRONOS_RULES ||
+        state?.cronos_rules ||
+        []
+      );
+    }
+
+    // Expose for cross-callbacks
+    try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
+
+    // ---------- Logo triple-click: focus mode ----------
     (function() {
       const logo = document.querySelector('header .logo');
       const header = document.querySelector('header .row');
@@ -2733,4 +2616,3 @@ def apply_visibility(u8, idx_to_action_json):
   </script>
 </body>
 </html>
-

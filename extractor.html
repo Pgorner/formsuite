@@ -982,23 +982,32 @@
                 zout.writestr(name, ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else data)
         return out.getvalue()
 
+      # ---------------------- NEW: visibility tooling ----------------------
       def _ensure_fsHidden_style(zfin, names):
           if "word/styles.xml" in names:
-              try: root = ET.fromstring(zfin.read("word/styles.xml"))
-              except ET.ParseError: root = ET.Element(_q("styles"))
+              try:
+                  root = ET.fromstring(zfin.read("word/styles.xml"))
+              except ET.ParseError:
+                  root = ET.Element(_q("styles"))
           else:
               root = ET.Element(_q("styles"))
+
           have = False
           for st in root.findall(_q("style")):
               if st.get(_q("type")) == "character" and st.get(_q("styleId")) == "fsHidden":
-                  have = True; break
+                  have = True
+                  break
+
           if not have:
               st = ET.Element(_q("style"), {_q("type"): "character", _q("styleId"): "fsHidden"})
               ET.SubElement(st, _q("name"), {_q("val"): "fsHidden"})
               rpr = ET.SubElement(st, _q("rPr"))
               ET.SubElement(rpr, _q("vanish"))
               root.append(st)
+
           return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
 
     def _heading_level(p_el):
         ppr = p_el.find(_q("pPr"))
@@ -1110,7 +1119,8 @@
             for n in names:
                 if n == "word/styles.xml": continue
                 zfout.writestr(n, zfin.read(n))
-            _ensure_fsHidden_style(zfin, zfout, set(names))
+            styles_bytes = _ensure_fsHidden_style(zfin, set(names))
+            zfout.writestr("word/styles.xml", styles_bytes)
             def is_doc_part(n):
                 if not (n.startswith("word/") and n.endswith(".xml")): return False
                 skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
