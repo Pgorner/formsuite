@@ -145,6 +145,8 @@
     let gDocId         = null;
     let gDirty         = false;
     let gSDTs          = [];
+    let gHeadingsFlat  = [];
+    let gHeadingIndex  = null;
     let gLastSchemaPushTs = 0;
     let gPreferDocOnNextLoad = false;   // prefer DOCX payload only right after doOpen()
     let gFileExt = 'docx'; // 'docx' | 'docm' | 'dotx' | 'dotm'
@@ -535,14 +537,23 @@
           });
         }
 
-        // Keep only numeric-like targets (heading indices)
         if (Array.isArray(rr.targets)) {
-          rr.targets = rr.targets.filter(t => {
-            const key = t?.key ?? t?.idx ?? t?.id;
-            if (key == null) return false;
-            const n = Number(key);
-            return Number.isFinite(n) && n > 0;
-          });
+          rr.targets = rr.targets
+            .map(t => {
+              if (!t || typeof t !== 'object') return null;
+              const clone = { ...t };
+              if (clone.idx != null) {
+                const n = Number(clone.idx);
+                if (Number.isFinite(n) && n > 0) clone.idx = n;
+              }
+              return clone;
+            })
+            .filter(t => {
+              if (!t) return false;
+              const raw = t.idx ?? t.key ?? t.id ?? t.stableKey ?? t.normKey ?? t.normalizedKey ?? t.headingKey;
+              if (raw == null) return false;
+              return String(raw).trim() !== '';
+            });
         }
 
         out.push(rr);
@@ -1289,6 +1300,9 @@
           try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
         }
 
+        gHeadingsFlat = headingsParsed.flat || [];
+        gHeadingIndex = rebuildHeadingIndex(gHeadingsFlat);
+
         // 3) Payload (schema/values/tagMap/rules)
         let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
         if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
@@ -1516,7 +1530,7 @@
       return false;
     }
 
-    function evaluateRulesToVisibility(schema, values, rules) {
+    function evaluateRulesToVisibility(schema, values, rules, headingIndex) {
       const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
 
@@ -1539,9 +1553,7 @@
         if (!ruleMatchesValue(op, exp, actual)) continue;
 
         for (const t of targets) {
-          const key = t?.key ?? t?.idx ?? t?.id;
-          if (key == null) continue;
-          const idx = Number(key);
+          const idx = resolveHeadingTargetIdx(t, headingIndex);
           if (!Number.isFinite(idx)) continue;
           const prev = out[idx];
           if (action === 'SHOW') out[idx] = 'SHOW';
@@ -1749,8 +1761,13 @@
         let updated2 = await writeSDTs(updated, sdtMap);
         gArrayBuffer = updated2.buffer;
 
+        const headingSource = gHeadingsFlat?.length ? gHeadingsFlat : (restored?.headings || []);
+        const headingIndex = (gHeadingIndex && gHeadingIndex.byIdx instanceof Map)
+          ? gHeadingIndex
+          : rebuildHeadingIndex(headingSource);
+
         // 3.5) evaluate rules → visibility map (SHOW supersedes HIDE)
-        const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, loadRulesForDoc(restored));
+        const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, rules, headingIndex);
 
         // 4) apply visibility (reset all fsHidden, then apply current HIDE ranges)
         if (Object.keys(visibilityMap).length) {
@@ -1947,6 +1964,92 @@
     // =========================
     // HEADINGS (H1..H9) PARSING & TREE
     // =========================
+    function normalizeHeadingText(str) {
+      return String(str ?? '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function stripLeadingHeadingNumber(str) {
+      return String(str || '')
+        .replace(/^[\s\t\u00A0]*\d+(?:[.\u00A0 \t]+\d+)*[.\u00A0 \t]*/, '')
+        .trim();
+    }
+
+    function buildStableHeadingKey(level, text) {
+      const lvl = Math.max(1, Number(level) || 1);
+      const normalized = stripLeadingHeadingNumber(
+        normalizeHeadingText(text)
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g, '')
+      ).toLowerCase();
+      return `${lvl}::${normalized}`;
+    }
+
+    function rebuildHeadingIndex(flat) {
+      const byIdx = new Map();
+      const byKey = new Map();
+      (flat || []).forEach(h => {
+        if (!h) return;
+        const idx = Number(h.idx);
+        if (!Number.isFinite(idx) || idx <= 0) return;
+        const entry = {
+          idx,
+          level: Number(h.level) || 1,
+          text: String(h.text || ''),
+        };
+        byIdx.set(idx, entry);
+        const candidates = [
+          h.stableKey,
+          h.key,
+          h.normKey,
+          h.normalizedKey,
+          h.headingKey,
+          h.label,
+          buildStableHeadingKey(entry.level, entry.text),
+          buildStableHeadingKey(entry.level, h.label || entry.text)
+        ];
+        candidates.forEach(raw => {
+          if (raw == null) return;
+          const str = String(raw);
+          if (!str) return;
+          if (!byKey.has(str)) byKey.set(str, entry);
+        });
+      });
+      return { byIdx, byKey };
+    }
+
+    function resolveHeadingTargetIdx(target, headingIndex) {
+      if (target == null) return null;
+      if (typeof target === 'number') return Number.isFinite(target) ? target : null;
+      if (typeof target === 'string') {
+        return resolveHeadingTargetIdx({ key: target }, headingIndex);
+      }
+      if (typeof target !== 'object') return null;
+      const { byIdx, byKey } = headingIndex || {};
+      const stable = target.stableKey ?? target.normKey ?? target.normalizedKey ?? target.headingKey;
+      if (stable != null && byKey?.has(String(stable))) return byKey.get(String(stable)).idx;
+      const raw = target.idx ?? target.key ?? target.id;
+      if (raw == null) return null;
+      const n = Number(raw);
+      if (Number.isFinite(n)) {
+        if (!byIdx || !byIdx.size || byIdx.has(n)) return n;
+      }
+      const str = String(raw);
+      if (byKey?.has(str)) return byKey.get(str).idx;
+      if (str.includes('|')) {
+        const [numbering, ...rest] = str.split('|');
+        const level = Math.max(1, (numbering.match(/\d+/g) || []).length);
+        const title = rest.join('|').trim();
+        const guess = buildStableHeadingKey(level, title);
+        if (byKey?.has(guess)) return byKey.get(guess).idx;
+      }
+      const fallback = buildStableHeadingKey(1, str);
+      if (byKey?.has(fallback)) return byKey.get(fallback).idx;
+      return null;
+    }
+
     function levelFromStyleHint(str) {
       if (!str) return 0;
       const s = String(str).trim().toLowerCase();
@@ -2103,11 +2206,14 @@
               if (!lvl) continue;
               const text = paraText(p);
               if (!text) continue;
+              const stableKey = buildStableHeadingKey(lvl, text);
               out.push({
                 idx: ++idx,
                 level: lvl,
                 text,
-                part: f.name.split('/').pop().replace('.xml','')
+                part: f.name.split('/').pop().replace('.xml',''),
+                key: stableKey,
+                stableKey
               });
             }
             pf.end({ added: idx });

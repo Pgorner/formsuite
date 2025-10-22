@@ -2334,7 +2334,9 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
         // 1) numeric already?
         const n = Number(raw);
-        if(Number.isFinite(n) && byIdx.has(n)) return n;
+        if(Number.isFinite(n)){
+          if(!byIdx || byIdx.size===0 || byIdx.has(n)) return n;
+        }
 
         // 2) legacy "1.2|Some Title"
         if(typeof raw === 'string' && raw.includes('|')){
@@ -2367,9 +2369,10 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     }
 
     async function materializeRulesNow(docBytes, rules){
-      const { byIdx, byKey } = await buildLiveHeadingIndexFromBytes(docBytes);
-      const resolve = resolveTargetToIdxFactory(byIdx, byKey);
-      return materializeRuleTargets(rules, resolve);
+      const headingIndex = await buildLiveHeadingIndexFromBytes(docBytes);
+      const resolve = resolveTargetToIdxFactory(headingIndex.byIdx, headingIndex.byKey);
+      const materialized = materializeRuleTargets(rules, resolve);
+      return { rules: materialized, headingIndex };
     }
     // ============================================================
 
@@ -2455,18 +2458,11 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         let updated2 = await writeSDTs(updated, sdtMap);
 
         // (3) rules → visibility (using LIVE indices)
-        const rulesLive = await materializeRulesNow(originalBytes, rules);
-        let visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
+        const { rules: rulesLive, headingIndex } = await materializeRulesNow(originalBytes, rules);
+        let visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive, headingIndex);
 
         if (!Object.keys(visibilityMap).length) {
-          const fallbackResolver = (t) => {
-            const raw = t?.idx ?? t?.key ?? t?.id;
-            const n = Number(raw);
-            return Number.isFinite(n) ? n : null;
-          };
-
-          const fallbackRules = materializeRuleTargets(rules, fallbackResolver);
-          const fallbackMap = evaluateRulesToVisibility(schema, safeValues, fallbackRules);
+          const fallbackMap = evaluateRulesToVisibility(schema, safeValues, rules, headingIndex);
           if (Object.keys(fallbackMap).length) {
             visibilityMap = fallbackMap;
           }
@@ -2653,7 +2649,35 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       return false;
     }
 
-    function evaluateRulesToVisibility(schema, values, rules) {
+    function resolveHeadingTargetIdxGeneric(target, headingIndex) {
+      if (target == null) return null;
+      if (typeof target === 'number') return Number.isFinite(target) ? target : null;
+      if (typeof target === 'string') return resolveHeadingTargetIdxGeneric({ key: target }, headingIndex);
+      if (typeof target !== 'object') return null;
+      const { byIdx, byKey } = headingIndex || {};
+      const stable = target.stableKey ?? target.normKey ?? target.normalizedKey ?? target.headingKey;
+      if (stable != null && byKey?.has(String(stable))) return byKey.get(String(stable)).idx;
+      const raw = target.idx ?? target.key ?? target.id;
+      if (raw == null) return null;
+      const n = Number(raw);
+      if (Number.isFinite(n)) {
+        if (!byIdx || !byIdx.size || byIdx.has(n)) return n;
+      }
+      const str = String(raw);
+      if (byKey?.has(str)) return byKey.get(str).idx;
+      if (str.includes('|')) {
+        const [numbering, ...rest] = str.split('|');
+        const level = Math.max(1, (numbering.match(/\d+/g) || []).length);
+        const title = rest.join('|').trim();
+        const guess = _normKeyJs(level, title);
+        if (byKey?.has(guess)) return byKey.get(guess).idx;
+      }
+      const fallback = _normKeyJs(1, str);
+      if (byKey?.has(fallback)) return byKey.get(fallback).idx;
+      return null;
+    }
+
+    function evaluateRulesToVisibility(schema, values, rules, headingIndex) {
       const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
 
@@ -2714,8 +2738,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         if (!match) continue;
 
         for (const t of targets) {
-          // After materialization, targets are { idx }
-          const idx = Number(t?.idx ?? t?.key ?? t?.id);
+          const idx = resolveHeadingTargetIdxGeneric(t, headingIndex);
           if (!Number.isFinite(idx)) continue;
           const prev = out[idx];
           if (action === 'SHOW') out[idx] = 'SHOW';
