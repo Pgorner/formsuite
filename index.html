@@ -2454,9 +2454,23 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         }
         let updated2 = await writeSDTs(updated, sdtMap);
 
-        // (3) rules → visibility (using LIVE indices)  <<<<< NEW
-        const rulesLive = await materializeRulesNow(updated2, rules);
-        const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
+        // (3) rules → visibility (using LIVE indices)
+        const rulesLive = await materializeRulesNow(originalBytes, rules);
+        let visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
+
+        if (!Object.keys(visibilityMap).length) {
+          const fallbackResolver = (t) => {
+            const raw = t?.idx ?? t?.key ?? t?.id;
+            const n = Number(raw);
+            return Number.isFinite(n) ? n : null;
+          };
+
+          const fallbackRules = materializeRuleTargets(rules, fallbackResolver);
+          const fallbackMap = evaluateRulesToVisibility(schema, safeValues, fallbackRules);
+          if (Object.keys(fallbackMap).length) {
+            visibilityMap = fallbackMap;
+          }
+        }
 
         // 4) REMOVE sections (if requested) + embed untouched original backup
         const updated3 = await applyRemovalWithBackup(updated2, visibilityMap, originalBytes);
