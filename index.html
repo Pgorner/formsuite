@@ -2458,19 +2458,14 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const rulesLive = await materializeRulesNow(originalBytes, rules);
         let visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
 
-        if (!Object.keys(visibilityMap).length && rules.length) {
+        if (!Object.keys(visibilityMap).length) {
           const fallbackResolver = (t) => {
             const raw = t?.idx ?? t?.key ?? t?.id;
             const n = Number(raw);
             return Number.isFinite(n) ? n : null;
           };
 
-          const fallbackRules = materializeRuleTargets(rules, fallbackResolver)
-            .map(r => ({
-              ...r,
-              targets: (r.targets || []).filter(t => Number.isFinite(t?.idx))
-            }))
-            .filter(r => (r.targets || []).length);
+          const fallbackRules = materializeRuleTargets(rules, fallbackResolver);
           const fallbackMap = evaluateRulesToVisibility(schema, safeValues, fallbackRules);
           if (Object.keys(fallbackMap).length) {
             visibilityMap = fallbackMap;
