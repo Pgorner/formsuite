@@ -2427,7 +2427,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const validIds   = new Set((schema?.fields || []).map(f => f.id));
         const safeValues = sanitizeValues(schema, values || {});
         const cleanTagMap = sanitizeTagMap(tagMap, validIds);
-        const rules = loadRulesForDoc(state);               // heading rules (raw)
+        const rules = await resolveHeadingRules(state, originalBytes, schema);
         const fieldRulesForDoc = loadFieldRulesForDoc(state);
 
         const payload = JSON.stringify({
@@ -2454,9 +2454,28 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         }
         let updated2 = await writeSDTs(updated, sdtMap);
 
-        // (3) rules → visibility (using LIVE indices)  <<<<< NEW
-        const rulesLive = await materializeRulesNow(updated2, rules);
-        const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
+        // (3) rules → visibility (using LIVE indices)
+        const rulesLive = await materializeRulesNow(originalBytes, rules);
+        let visibilityMap = evaluateRulesToVisibility(schema, safeValues, rulesLive);
+
+        if (!Object.keys(visibilityMap).length && rules.length) {
+          const fallbackResolver = (t) => {
+            const raw = t?.idx ?? t?.key ?? t?.id;
+            const n = Number(raw);
+            return Number.isFinite(n) ? n : null;
+          };
+
+          const fallbackRules = materializeRuleTargets(rules, fallbackResolver)
+            .map(r => ({
+              ...r,
+              targets: (r.targets || []).filter(t => Number.isFinite(t?.idx))
+            }))
+            .filter(r => (r.targets || []).length);
+          const fallbackMap = evaluateRulesToVisibility(schema, safeValues, fallbackRules);
+          if (Object.keys(fallbackMap).length) {
+            visibilityMap = fallbackMap;
+          }
+        }
 
         // 4) REMOVE sections (if requested) + embed untouched original backup
         const updated3 = await applyRemovalWithBackup(updated2, visibilityMap, originalBytes);
@@ -2523,6 +2542,99 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         state?.cronos_rules ||
         []
       );
+    }
+
+    function normalizeRulesInput(rules) {
+      if (!Array.isArray(rules)) return [];
+      return rules.filter(r => r && typeof r === 'object');
+    }
+
+    function getValidFieldIdSet(schema) {
+      const out = new Set();
+      const fields = Array.isArray(schema?.fields) ? schema.fields : [];
+      const slug = (window.slugifyMc) ? window.slugifyMc : slugifyMc;
+
+      for (const f of fields) {
+        const idStr = String(f?.id ?? '');
+        if (!idStr) continue;
+        out.add(idStr);
+
+        if (String(f?.type || '').toLowerCase() === 'multichoice') {
+          const opts = [];
+          if (Array.isArray(f.options)) opts.push(...f.options);
+          if (f.mc && Array.isArray(f.mc.groups)) {
+            for (const g of f.mc.groups) {
+              (g.items || []).forEach(it => opts.push(it));
+            }
+          }
+          for (const opt of opts) {
+            const rawVal = (opt && typeof opt === 'object')
+              ? (opt.value ?? opt.label ?? opt.text ?? opt.name ?? '')
+              : opt;
+            const slugStr = slug(String(rawVal || ''));
+            if (slugStr) out.add(`${idStr}__opt__${slugStr}`);
+          }
+        }
+      }
+
+      return out;
+    }
+
+    function normalizeRulesForSchema(schema, rulesIn) {
+      const valid = getValidFieldIdSet(schema);
+      const rules = normalizeRulesInput(rulesIn);
+      if (!rules.length) return [];
+
+      const out = [];
+      for (const rule of rules) {
+        const fidRaw = rule.fieldId ?? rule.field ?? rule.whenField;
+        const fieldId = String(fidRaw ?? '');
+        if (!fieldId) continue;
+        if (valid.size && !valid.has(fieldId)) continue;
+
+        let clone;
+        try {
+          clone = JSON.parse(JSON.stringify(rule));
+        } catch {
+          clone = { ...rule };
+        }
+
+        clone.fieldId = fieldId;
+        if (!Array.isArray(clone.targets)) clone.targets = [];
+        clone.targets = clone.targets.filter(t => t && typeof t === 'object');
+        out.push(clone);
+      }
+
+      return out;
+    }
+
+    async function resolveHeadingRules(state, docBytes, schema) {
+      let normalized = normalizeRulesForSchema(schema, loadRulesForDoc(state));
+
+      if (!normalized.length && docBytes) {
+        try {
+          const payloadTxt = await readPayloadFromDocx(docBytes);
+          if (payloadTxt) {
+            try {
+              const payloadJson = JSON.parse(payloadTxt);
+              const embeddedRaw = (
+                payloadJson?.rules ||
+                payloadJson?.CRONOS_PAYLOAD?.rules ||
+                payloadJson?.payload?.rules ||
+                []
+              );
+              const embedded = normalizeRulesForSchema(schema, embeddedRaw);
+              if (embedded.length) normalized = embedded;
+            } catch (err) {
+              console.warn('Failed to parse embedded rules payload', err);
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to read embedded payload for rules', e);
+        }
+      }
+
+      return normalized;
     }
 
     function ruleMatchesValue(op, expected, actual) {
