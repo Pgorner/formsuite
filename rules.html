@@ -37,7 +37,7 @@
         <button id="btnAddRule" class="btn btn-primary">Add rule</button>
       </div>
     </div>
-    <div class="muted-note" style="margin-top:6px">
+    <div class="muted-note" id="rulesHint" style="margin-top:6px">
       SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).
     </div>
   </section>
@@ -55,12 +55,21 @@
 </main>
 
 <script>
-  // ===== debug =====
-  const DEBUG = { seq:0 };
+  // ===== Debug framework =====
+  const DEBUG = {
+    seq: 0,
+    on:  true,     // master switch
+    deep: true,    // include verbose validation/build logs
+    tables: true   // use console.table where helpful
+  };
   const _t = () => new Date().toISOString().slice(11,23);
   const tag = name => "%c[Rules "+_t()+" #"+(++DEBUG.seq)+"] "+name;
   const tagStyle = "color:#6b7280;font-weight:600";
   function TRACE(name, details){
+    if (!DEBUG.on) {
+      // Return a no-op tracer
+      return { step(){}, warn(){}, error(){}, end(){} };
+    }
     const label = name+" :: "+_t()+" :: #"+(DEBUG.seq+1);
     console.groupCollapsed(tag(name), tagStyle, details || "");
     console.time(label);
@@ -71,6 +80,38 @@
       end:(x)=>{ if(x) console.log(tag("done"),tagStyle,x); console.timeEnd(label); console.groupEnd(); }
     };
   }
+
+  // Quick helpers available in DevTools
+  window.RulesDebug = {
+    dump(){
+      console.log("[RulesDump] docId:", gDocId, "mode:", gMode);
+      console.log("[RulesDump] schema fields:", (gSchema?.fields||[]).length);
+      console.log("[RulesDump] headingsTree nodes:", (gHeadingsTree||[]).length);
+      if (DEBUG.tables) {
+        console.table((gSchema?.fields||[]).map(f=>({id:f.id,label:f.label,type:f.type,options:(f.options||[]).length})));
+      }
+      console.log("[RulesDump] rules (view):", gRules.length, gRules);
+      if (DEBUG.tables) console.table(gRules);
+      console.log("[RulesDump] rulesHeadings:", gRulesHeadings.length);
+      console.log("[RulesDump] rulesFields:", gRulesFields.length);
+    },
+    validateAll(){
+      const tr = TRACE("validateAll");
+      let ok=0, bad=0;
+      for (const r of gRules){
+        const v = isRuleValid(r, gSchema, gHeadingsTree, gMode);
+        v ? ok++ : bad++;
+        if (!v) console.warn("[Invalid Rule]", r);
+      }
+      tr.end({ ok, bad });
+    },
+    simulatePersist(){
+      const tr=TRACE("simulatePersist");
+      const s = sanitizeRules(gRules, gMode);
+      tr.step("sanitize summary", s);
+      tr.end();
+    }
+  };
 
   // ===== constants & state =====
   const ACTIVE_LS_KEY= "FS_ACTIVE_DOC_META";
@@ -129,7 +170,10 @@
   }
 
   function getChoiceFields(schema){
-    return (schema?.fields||[]).filter(f => CHOICE_TYPES.has(String(f.type||"").toLowerCase()));
+    const t = TRACE("getChoiceFields", { fields: (schema?.fields||[]).length });
+    const list = (schema?.fields||[]).filter(f => CHOICE_TYPES.has(String(f.type||"").toLowerCase()));
+    t.end({ choiceFields: list.length });
+    return list;
   }
 
   function slugify(s){
@@ -144,12 +188,12 @@
   // Build condition sources: includes normal fields and boolean pseudo-fields for each multichoice option
   // Returns items: { id, label, type, options? }
   function buildConditionSources(schema){
+    const tr = DEBUG.deep ? TRACE("buildConditionSources.start", { fields:(schema?.fields||[]).length }) : { step(){}, end(){} };
     const out = [];
     const seen = new Set();
     for (const f of (schema?.fields||[])){
       const t = String(f.type||'').toLowerCase();
       if (t === 'multichoice'){
-        // add one boolean pseudo source per option
         const items = [];
         if (Array.isArray(f.options)) items.push(...f.options);
         if (f.mc && Array.isArray(f.mc.groups)){
@@ -161,16 +205,14 @@
           const valStr = String(rawVal || '').trim();
           const lblStr = String(rawLbl || '').trim();
           const slug = slugify(valStr);
-          if (!valStr || !slug) return; // skip empties
+          if (!valStr || !slug) return;
           const id = `${f.id}__opt__${slug}`;
-          if (seen.has(id)) return; // dedupe
+          if (seen.has(id)) return;
           seen.add(id);
           out.push({ id, label: `${f.label||f.id}: ${lblStr}`, type: 'boolean' });
         });
-        // Also allow matching the whole multichoice as set via equals/notEquals with a value? We skip per request
       } else if (t === 'date') {
-        const id = String(f.id);
-        if (!seen.has(id)) { seen.add(id); out.push({ id, label: f.label||f.id, type: 'date' }); }
+        const id = String(f.id); if (!seen.has(id)) { seen.add(id); out.push({ id, label: f.label||f.id, type: 'date' }); }
       } else if (t === 'select' || t === 'dropdown' || t === 'singlechoice' || t === 'choice' || t === 'single' || t === 'combobox' || t === 'list'){
         const id = String(f.id);
         if (!seen.has(id)) {
@@ -179,13 +221,16 @@
           out.push({ id, label: f.label||f.id, type: 'select', options });
         }
       } else if (t === 'text') {
-        const id = String(f.id);
-        if (!seen.has(id)) { seen.add(id); out.push({ id, label: f.label||f.id, type: 'text' }); }
+        const id = String(f.id); if (!seen.has(id)) { seen.add(id); out.push({ id, label: f.label||f.id, type: 'text' }); }
       } else if (t === 'number') {
-        const id = String(f.id);
-        if (!seen.has(id)) { seen.add(id); out.push({ id, label: f.label||f.id, type: 'number' }); }
+        const id = String(f.id); if (!seen.has(id)) { seen.add(id); out.push({ id, label: f.label||f.id, type: 'number' }); }
       }
     }
+    if (DEBUG.tables) {
+      console.log("[buildConditionSources] result=", out.length);
+      try { console.table(out); } catch {}
+    }
+    tr.end({ sources: out.length });
     return out;
   }
 
@@ -202,6 +247,7 @@
   }
 
   function flattenWithNumbers(tree){
+    const tr = DEBUG.deep ? TRACE("flattenWithNumbers", { nodes: (tree||[]).length }) : { end(){} };
     const out=[], counters=[];
     function walk(nodes, depth){
       counters[depth]=0;
@@ -214,27 +260,28 @@
       }
     }
     walk(tree||[],0);
+    if (DEBUG.tables) try { console.table(out); } catch {}
+    tr.end({ flat: out.length });
     return out;
   }
+
   // ===== validation that tolerates missing context =====
   function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree, mode = gMode){
-    if (!rule || !ACTIONS.has(rule.action)) return false;
+    const tr = DEBUG.deep ? TRACE("isRuleValid", { mode, action: rule?.action, fieldId: rule?.fieldId }) : { step(){}, end(){} };
+    if (!rule || !ACTIONS.has(rule.action)) { tr.end("fail: action"); return false; }
 
-    // If we have NO schema yet, accept the rule (defer strict checks).
     const haveSchema = Array.isArray(schema?.fields) && schema.fields.length > 0;
     const haveHeads  = Array.isArray(headingsTree) && headingsTree.length > 0;
 
-    // When no schema yet → don't reject; only minimal shape check
     if (!haveSchema) {
-      if (!rule.fieldId || !rule.op || !Array.isArray(rule.values)) return false;
-      // Targets are optional until we know the tree
-      return true;
+      const ok = !!(rule.fieldId && rule.op && Array.isArray(rule.values));
+      tr.end(ok ? "ok: no schema yet" : "fail: shape");
+      return ok;
     }
 
-    // Normal validation when schema is present
     const sources = buildConditionSources(schema);
     const src = sources.find(s => String(s.id) === String(rule.fieldId));
-    if (!src) return false;
+    if (!src) { tr.end("fail: no source"); return false; }
 
     const allowedOps = (src.type==='boolean') ? ['equals']
                     : (src.type==='date')    ? ['before','after','equals']
@@ -242,43 +289,39 @@
                     : (src.type==='number')  ? ['equals','notEquals']
                     : (src.type==='select')  ? ['equals','notEquals']
                     : [];
-    if (!allowedOps.includes(rule.op)) return false;
+    if (!allowedOps.includes(rule.op)) { tr.end("fail: op not allowed"); return false; }
 
-    if (!Array.isArray(rule.values)) return false;
+    if (!Array.isArray(rule.values)) { tr.end("fail: values not array"); return false; }
     if (src.type==='boolean') {
-      if (rule.values.length!==1) return false;
+      if (rule.values.length!==1) { tr.end("fail: boolean len"); return false; }
       const v = rule.values[0];
-      if (!(v === true || v === false || v === 'true' || v === 'false')) return false;
+      if (!(v === true || v === false || v === 'true' || v === 'false')) { tr.end("fail: boolean val"); return false; }
     } else if (src.type==='date') {
-      if (rule.values.length!==1 || !String(rule.values[0])) return false;
+      if (rule.values.length!==1 || !String(rule.values[0])) { tr.end("fail: date val"); return false; }
     } else if (src.type==='text') {
-      if (rule.values.length!==1) return false;
+      if (rule.values.length!==1) { tr.end("fail: text len"); return false; }
     } else if (src.type==='number') {
-      if (rule.values.length!==1 || isNaN(Number(rule.values[0]))) return false;
+      if (rule.values.length!==1 || isNaN(Number(rule.values[0]))) { tr.end("fail: number val"); return false; }
     } else if (src.type==='select') {
-      if (rule.values.length!==1) return false;
+      if (rule.values.length!==1) { tr.end("fail: select len"); return false; }
       const opts = new Set((src.options||[]).map(String));
-      if (!opts.has(String(rule.values[0]))) return false;
+      if (!opts.has(String(rule.values[0]))) { tr.end("fail: select not in options"); return false; }
     }
 
-    // Targets:
     if (mode === 'headings') {
-      // If headings not loaded yet, accept (defer)
-      if (!haveHeads) return true;
+      if (!haveHeads) { tr.end("ok: no headings yet"); return true; }
       const allowedHeads = new Set(flattenWithNumbers(headingsTree).map(h=>String(h.key)));
-      if (!Array.isArray(rule.targets) || rule.targets.length===0) return false;
-      if (!rule.targets.every(t => allowedHeads.has(String(t.key)))) return false;
+      const ok = Array.isArray(rule.targets) && rule.targets.length>0 && rule.targets.every(t => allowedHeads.has(String(t.key)));
+      tr.end(ok ? "ok" : "fail: targets(headings)");
+      return ok;
     } else {
       const allowedTargetIds = new Set(buildConditionSources(schema).map(s=>String(s.id)));
-      if (!Array.isArray(rule.targets) || rule.targets.length===0) return false;
-      if (!rule.targets.every(t => allowedTargetIds.has(String(t.id)))) return false;
+      const ok = Array.isArray(rule.targets) && rule.targets.length>0 && rule.targets.every(t => allowedTargetIds.has(String(t.id)));
+      tr.end(ok ? "ok" : "fail: targets(fields)");
+      return ok;
     }
-
-    return true;
   }
 
-  // Only drop rules when we truly have enough context to judge.
-  // Otherwise keep them as drafts (never erase user input).
   function cloneRules(rules){
     const src = Array.isArray(rules) ? rules : [];
     if (typeof structuredClone === 'function') {
@@ -287,75 +330,111 @@
     return JSON.parse(JSON.stringify(src));
   }
 
-  function sanitizeRules(rules, mode){
+  function sanitizeRules(rules = gRules, mode = gMode){
+    const tr = TRACE("sanitizeRules", { inCount: (rules||[]).length, mode });
     const working = cloneRules(rules);
     const haveSchema = Array.isArray(gSchema?.fields) && gSchema.fields.length > 0;
     const haveHeads  = (mode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
 
     if (!haveSchema) {
+      tr.end("blocked: no schema");
       return { rules: working, removed: 0, status: 'Saved (awaiting schema).', blocked: true };
     }
     if (mode==='headings' && !haveHeads) {
+      tr.end("blocked: no headings");
       return { rules: working, removed: 0, status: 'Saved (awaiting headings).', blocked: true };
     }
 
     const filtered = working.filter(r => isRuleValid(r, gSchema, gHeadingsTree, mode));
     const removed = working.length - filtered.length;
     const status = removed>0 ? `Removed ${removed} invalid rule${removed>1?'s':''}.` : null;
+    if (DEBUG.tables) try { console.table(filtered); } catch {}
+    tr.end({ outCount: filtered.length, removed, status, blocked: false });
     return { rules: filtered, removed, status, blocked: false };
   }
 
-  // Never wipe arrays just because context isn’t loaded yet.
-  // Persist both per-mode arrays; other tabs will normalize.
-  async function persistRulesInternal(reasonOrOptions, maybeOptions){
-    if (!gDocId) return;
-
-    const tr = TRACE('persistRules', { docId: gDocId, mode: gMode, count: gRules.length });
-    try {
-      // Clean only when we have context
-      sanitizeRules();
-
-      if (gMode === 'headings') {
-        gRulesHeadings = gRules.slice();
-      } else {
-        gRulesFields = gRules.slice();
-      }
-      tr.step('normalized rules', { headings: gRulesHeadings.length, fields: gRulesFields.length });
-
-      let payloadUpdate = null;
-      try {
-        const st = await window.formSuitePersist?.loadState?.(gDocId);
-        const existingPayload = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || {};
-        payloadUpdate = { ...existingPayload, rules: gRulesHeadings, fieldRules: gRulesFields };
-        tr.step('payload prepared', { hasExisting: !!Object.keys(existingPayload||{}).length });
-      } catch (e) {
-        tr.warn('payload load failed', e);
-      }
-
-      const saveInput = {
-        // keep both arrays updated so Extractor/Index can merge
-        rules: gRulesHeadings,
-        fieldRules: gRulesFields
-      };
-      if (payloadUpdate) {
-        saveInput.payload = { CRONOS_PAYLOAD: payloadUpdate };
-      } else {
-        saveInput.payload = { CRONOS_PAYLOAD: { rules: gRulesHeadings, fieldRules: gRulesFields } };
-      }
-
-      await window.formSuitePersist?.saveState?.(gDocId, saveInput);
-
-      // Broadcast so other tabs refresh immediately
-      try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
-      try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
-
-      setStatus(`Rules saved — ${gRules.length}`);
-      tr.end('saved');
-    } catch (e) {
-      tr.error('persist failed', e);
-      tr.end();
+  // ===== persistence =====
+  async function persistRules(reasonOrOptions, _maybeOptions){
+    if (!gDocId) {
+      console.warn("[persistRules] skipped — no docId");
+      return;
     }
+
+    // Serialize writes to avoid races with cross-tab reloads
+    gPersistTail = gPersistTail.then(async () => {
+      const tr = TRACE('persistRules', { docId: gDocId, mode: gMode, count: gRules.length, reason: reasonOrOptions });
+      try {
+        const before = { headings: gRulesHeadings.length, fields: gRulesFields.length };
+
+        // Sanitize ONLY current view so we don’t clobber the other tab’s rules
+        const san = sanitizeRules(gRules, gMode);
+        tr.step('sanitize summary', san);
+
+        const nextHeadings = (gMode === 'headings') ? san.rules.slice() : gRulesHeadings.slice();
+        const nextFields   = (gMode === 'fields')   ? san.rules.slice() : gRulesFields.slice();
+
+        // Commit to memory
+        gRulesHeadings = nextHeadings;
+        gRulesFields   = nextFields;
+
+        tr.step('normalized rules', { before, after: { headings: gRulesHeadings.length, fields: gRulesFields.length } });
+
+        // Load existing state so we can merge payload (keep title/fields/values/tagMap/etc.)
+        let existingPayload = {};
+        try {
+          const st = await window.formSuitePersist?.loadState?.(gDocId);
+          // Be defensive: accept any of the known slots
+          existingPayload = (st?.payload?.CRONOS_PAYLOAD)
+                        || (st?.CRONOS_PAYLOAD)
+                        || (st?.cronos_payload)
+                        || {};
+          tr.step('payload loaded', { hadExisting: !!Object.keys(existingPayload||{}).length });
+        } catch (e) {
+          tr.warn('payload load failed', e);
+        }
+
+        const canonical = {
+          ...(existingPayload || {}),
+          rules: gRulesHeadings,
+          fieldRules: gRulesFields,
+          updatedAt: new Date().toISOString()
+        };
+
+        const saveInput = {
+          // Keep explicit arrays for older tabs that rely on these
+          rules: gRulesHeadings,
+          fieldRules: gRulesFields,
+
+          // Mirror across all common payload slots so every page can find them
+          payload: { CRONOS_PAYLOAD: canonical },
+          CRONOS_PAYLOAD: canonical,
+          cronos_payload: canonical
+        };
+
+        if (DEBUG.tables) {
+          console.log("[persistRules] saveInput.rules:");      try{ console.table(saveInput.rules);}catch{}
+          console.log("[persistRules] saveInput.fieldRules:"); try{ console.table(saveInput.fieldRules);}catch{}
+        }
+
+        await window.formSuitePersist?.saveState?.(gDocId, saveInput);
+
+        // Broadcast so other tabs refresh immediately
+        try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now(), from:'rules' }); } catch {}
+        try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now(), from:'rules' }); } catch {}
+
+        setStatus(`Rules saved — ${san.rules.length}${san.status ? " · "+san.status : ""}`);
+        tr.end('saved');
+      } catch (e) {
+        tr.error('persist failed', e);
+        setStatus('Save failed');
+        tr.end();
+      }
+    });
+
+    // Wait for this write chain before returning (important on tab-switch)
+    try { await gPersistTail; } catch {}
   }
+
   // ===== editor (single) =====
   function currentEditorRule(){
     if (gDraft) return gDraft;
@@ -364,18 +443,24 @@
   }
 
   function renderEditor(){
-    const tr = TRACE("renderEditor", { draft: !!gDraft, editingId: gEditingId });
+    const tr = TRACE("renderEditor", { draft: !!gDraft, editingId: gEditingId, mode: gMode });
     try{
       editorMount.innerHTML = "";
       const rule = currentEditorRule();
       if (!rule){
         editorMount.innerHTML = '<div class="empty">No rules yet — click “Add rule”.</div>';
+        tr.end("no rule");
         return;
       }
 
       const fields = getChoiceFields(gSchema);
       const allHeadings = flattenWithNumbers(gHeadingsTree);
       const isDraft = !!gDraft;
+
+      if (DEBUG.tables) {
+        console.log("[renderEditor] fields (choice):"); try{ console.table(fields);}catch{}
+        console.log("[renderEditor] headings (flat):"); try{ console.table(allHeadings);}catch{}
+      }
 
       const card = document.createElement("div");
       card.className = "rule-card";
@@ -385,9 +470,10 @@
       if (isDraft){
         const top = document.createElement("div"); top.className="row"; top.style.justifyContent="flex-end"; top.style.gap="8px";
         const btnCancel = document.createElement("button"); btnCancel.className="btn btn-ghost"; btnCancel.textContent="Cancel";
-        btnCancel.addEventListener("click", ()=>{ gDraft=null; renderEditor(); });
+        btnCancel.addEventListener("click", ()=>{ console.log("[Editor] Cancel draft"); gDraft=null; renderEditor(); });
         const btnSave = document.createElement("button"); btnSave.className="btn btn-primary"; btnSave.textContent="Save rule"; btnSave.disabled = !isRuleValid(rule, gSchema, gHeadingsTree, gMode);
         btnSave.addEventListener("click", ()=>{
+          console.log("[Editor] Save draft click", rule);
           if (!isRuleValid(rule, gSchema, gHeadingsTree, gMode)){ alert("Please complete the rule."); return; }
           rule.id = "r_"+Math.random().toString(36).slice(2,8);
           gRules.push(rule);
@@ -416,7 +502,8 @@
       });
       selA.addEventListener("change", () => {
         rule.action = selA.value || null;
-        if (!isDraft){ persistRules(); renderList(); }
+        console.log("[Editor] action changed:", rule.action);
+        if (!isDraft){ persistRules("change:action"); renderList(); }
         card._updateSave?.();
       });
       pAction.appendChild(lblA); pAction.appendChild(selA);
@@ -427,7 +514,7 @@
       const selE = document.createElement('select');
       const addOpt = (v,t) => { const o=document.createElement('option'); o.value=v; o.textContent=t; if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o); };
       addOpt('hide','hide (remove)'); addOpt('disable','disable (greyed)');
-      selE.addEventListener('change', ()=>{ rule.hideMode = selE.value || 'hide'; if(!isDraft){ persistRules(); renderList(); } });
+      selE.addEventListener('change', ()=>{ rule.hideMode = selE.value || 'hide'; console.log("[Editor] hideMode changed:", rule.hideMode); if(!isDraft){ persistRules("change:hideMode"); renderList(); } });
 
       row1.appendChild(pAction);
       if (gMode==='fields') { pEffect.appendChild(lblE); pEffect.appendChild(selE); row1.appendChild(pEffect); }
@@ -449,6 +536,7 @@
       }
       selF.addEventListener("change", () => {
         rule.fieldId = selF.value || "";
+        console.log("[Editor] fieldId changed:", rule.fieldId);
         if (!rule.fieldId){ rule.values=[]; rule.op=null; }
         else {
           const src = __sources.find(x=>String(x.id)===String(rule.fieldId));
@@ -460,7 +548,7 @@
             else if (src.type==='select') { rule.op='equals'; rule.values=['']; }
           } else { rule.op=null; rule.values=[]; }
         }
-        if (!isDraft){ persistRules(); renderEditor(); renderList(); }
+        if (!isDraft){ persistRules("change:fieldId"); renderEditor(); renderList(); }
         else { renderEditor(); }
       });
       pField.appendChild(lblF); pField.appendChild(selF);
@@ -476,16 +564,15 @@
         const lblC = document.createElement("label"); lblC.textContent="Condition";
         pCond.appendChild(lblC);
 
-        // New per-type operators using unified sources
         const src = chosenSource;
         if (!Array.isArray(rule.values)) rule.values = [];
         if (src?.type !== 'boolean'){
           const opSel = document.createElement('select');
           const ops = (src?.type==='date') ? [{v:'before',l:'before'},{v:'equals',l:'equals'},{v:'after',l:'after'}]
                     : (src?.type==='text') ? [{v:'equals',l:'equals'},{v:'notEquals',l:'not equals'},{v:'contains',l:'contains'}]
-                    : /* number/select */ [{v:'equals',l:'equals'},{v:'notEquals',l:'not equals'}];
+                    : [{v:'equals',l:'equals'},{v:'notEquals',l:'not equals'}];
           ops.forEach(({v,l})=>{ const o=document.createElement('option'); o.value=v; o.textContent=l; if(rule.op===v) o.selected=true; opSel.appendChild(o); });
-          opSel.addEventListener('change', ()=>{ rule.op = opSel.value; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); });
+          opSel.addEventListener('change', ()=>{ rule.op = opSel.value; console.log("[Editor] op changed:", rule.op); if(!isDraft){ persistRules("change:op"); renderList(); } card._updateSave?.(); });
           pCond.appendChild(opSel);
         } else {
           const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='is'; pCond.appendChild(spanIs);
@@ -495,21 +582,21 @@
         if (src?.type==='boolean'){
           const sel = document.createElement('select');
           ;[{v:true,l:'true'},{v:false,l:'false'}].forEach(({v,l})=>{ const o=document.createElement('option'); o.value=String(v); o.textContent=l; if(String(rule.values?.[0])===String(v)) o.selected=true; sel.appendChild(o); });
-          sel.addEventListener('change', ()=>{ rule.values=[sel.value==='true']; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); });
+          sel.addEventListener('change', ()=>{ rule.values=[sel.value==='true']; console.log("[Editor] value changed (boolean):", rule.values[0]); if(!isDraft){ persistRules("change:value"); renderList(); } card._updateSave?.(); });
           pCond.appendChild(sel);
         } else if (src?.type==='date'){
           const inp = document.createElement('input'); inp.type='text'; inp.placeholder='YYYY-MM-DD'; inp.style.minWidth='140px';
           inp.value = String(rule.values?.[0]||'');
-          setTimeout(()=>{ try{ flatpickr(inp,{ allowInput:true, dateFormat:'Y-m-d', onChange:()=>{ rule.values=[inp.value]; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); } }); }catch{} },0);
-          inp.addEventListener('change', ()=>{ rule.values=[inp.value]; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); });
+          setTimeout(()=>{ try{ flatpickr(inp,{ allowInput:true, dateFormat:'Y-m-d', onChange:()=>{ rule.values=[inp.value]; console.log("[Editor] value changed (date via FP):", rule.values[0]); if(!isDraft){ persistRules("change:value"); renderList(); } card._updateSave?.(); } }); }catch{} },0);
+          inp.addEventListener('change', ()=>{ rule.values=[inp.value]; console.log("[Editor] value changed (date):", rule.values[0]); if(!isDraft){ persistRules("change:value"); renderList(); } card._updateSave?.(); });
           pCond.appendChild(inp);
         } else if (src?.type==='text'){
           const inp = document.createElement('input'); inp.type='text'; inp.value=String(rule.values?.[0]||'');
-          inp.addEventListener('change', ()=>{ rule.values=[inp.value]; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); });
+          inp.addEventListener('change', ()=>{ rule.values=[inp.value]; console.log("[Editor] value changed (text):", rule.values[0]); if(!isDraft){ persistRules("change:value"); renderList(); } card._updateSave?.(); });
           pCond.appendChild(inp);
         } else if (src?.type==='number'){
           const inp = document.createElement('input'); inp.type='number'; inp.value=String(rule.values?.[0]??'');
-          inp.addEventListener('change', ()=>{ const v=inp.value; rule.values=[v===''? '': Number(v)]; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); });
+          inp.addEventListener('change', ()=>{ const v=inp.value; rule.values=[v===''? '': Number(v)]; console.log("[Editor] value changed (number):", rule.values[0]); if(!isDraft){ persistRules("change:value"); renderList(); } card._updateSave?.(); });
           pCond.appendChild(inp);
         } else if (src?.type==='select'){
           const sel = document.createElement('select');
@@ -517,7 +604,7 @@
           const base = (gSchema.fields||[]).find(ff => String(ff.id)===String(src.id));
           const opts = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
           opts.forEach(opt=>{ const o=document.createElement('option'); o.value=String(opt.value); o.textContent=String(opt.label); if(String(rule.values?.[0])===String(opt.value)) o.selected=true; sel.appendChild(o); });
-          sel.addEventListener('change', ()=>{ rule.values = sel.value ? [sel.value] : ['']; if(!isDraft){ persistRules(); renderList(); } card._updateSave?.(); });
+          sel.addEventListener('change', ()=>{ rule.values = sel.value ? [sel.value] : ['']; console.log("[Editor] value changed (select):", rule.values[0]); if(!isDraft){ persistRules("change:value"); renderList(); } card._updateSave?.(); });
           pCond.appendChild(sel);
         }
 
@@ -527,23 +614,25 @@
 
       // Row 3: Targets selector (Headings or Fields)
       if (gMode === 'headings') {
-        if (flattenWithNumbers(gHeadingsTree).length){
+        const flatHeads = flattenWithNumbers(gHeadingsTree);
+        if (flatHeads.length){
           const row3 = document.createElement("div"); row3.className="rule-row";
           const pHead = document.createElement("div"); pHead.className="pair";
           const lblH = document.createElement("label"); lblH.textContent="Add heading";
           const chosenKeys = new Set((rule.targets||[]).map(t=>t.key));
-          const remainingHeads = flattenWithNumbers(gHeadingsTree).filter(h => !chosenKeys.has(h.key));
+          const remainingHeads = flatHeads.filter(h => !chosenKeys.has(h.key));
           const selH = document.createElement("select");
           const defH = document.createElement("option"); defH.value=""; defH.textContent="Select…"; selH.appendChild(defH);
           remainingHeads.forEach(h=>{ const o=document.createElement("option"); o.value=h.key; o.textContent=h.label; selH.appendChild(o); });
           selH.addEventListener("change", ()=>{
             const key = selH.value; if (!key) return;
-            const h = flattenWithNumbers(gHeadingsTree).find(x=>x.key===key);
+            const h = flatHeads.find(x=>x.key===key);
             if (!h) return;
             rule.targets = rule.targets || [];
             rule.targets.push({ key:h.key, label:h.label });
-            if (!isDraft){ persistRules(); renderEditor(); renderList(); }
-            else { renderEditor(); }
+            console.log("[Editor] +heading target:", h);
+            if (!isDraft) { persistRules("change:addHeading"); }
+            renderEditor(); renderList();
           });
           pHead.appendChild(lblH); pHead.appendChild(selH);
           row3.appendChild(pHead);
@@ -565,8 +654,8 @@
             if (!s) return;
             rule.targets = rule.targets || [];
             rule.targets.push({ id:s.id, label:s.label });
-            if (!isDraft){ persistRules(); renderEditor(); renderList(); }
-            else { renderEditor(); }
+            console.log("[Editor] +field target:", s);
+            persistRules("change:addField"); renderEditor(); renderList();
           });
           pFld.appendChild(lblF); pFld.appendChild(selF);
           row3.appendChild(pFld);
@@ -583,10 +672,10 @@
         const txt = document.createElement("span"); txt.textContent=t.label;
         const x = document.createElement("button"); x.setAttribute("aria-label","Remove"); x.textContent="×";
         x.addEventListener("click", ()=>{
+          console.log("[Editor] −remove target:", t);
           if (gMode==='headings') rule.targets = (rule.targets||[]).filter(z=>z.key!==t.key);
           else rule.targets = (rule.targets||[]).filter(z=>String(z.id)!==String(t.id));
-          if (!isDraft){ persistRules(); renderEditor(); renderList(); }
-          else { renderEditor(); }
+          persistRules("change:removeTarget"); renderEditor(); renderList();
         });
         pill.appendChild(txt); pill.appendChild(x);
         hpills.appendChild(pill);
@@ -601,7 +690,8 @@
       editorMount.appendChild(card);
 
       if (isDraft) card._updateSave?.();
-    } finally { tr.end(); }
+      tr.end("rendered");
+    } catch(e){ tr.error("renderEditor error", e); tr.end(); }
   }
 
   // ===== list =====
@@ -630,75 +720,125 @@
   }
 
   function renderList(){
-    rulesList.innerHTML = "";
-    if (!gRules.length){
-      rulesList.innerHTML = '<div class="empty">None.</div>';
-      return;
-    }
-    gRules.forEach(r=>{
-      const div=document.createElement("div"); div.className="item";
-      const left=document.createElement("div");
-      const targets = (r.targets||[]).map(t=>t.label).join(", ") || (gMode==='headings' ? "(no headings selected)" : "(no fields selected)");
-      left.innerHTML = `<strong>${r.action}</strong> — <em>${targets}</em> <span class="muted"> ${summarizeCondition(r)}</span>`;
-      const right=document.createElement("div"); right.style.display='flex'; right.style.gap='8px';
+    const tr = TRACE("renderList", { mode: gMode, count: gRules.length });
+    try{
+      rulesList.innerHTML = "";
+      if (!gRules.length){
+        rulesList.innerHTML = '<div class="empty">None.</div>';
+        tr.end("empty");
+        return;
+      }
+      if (DEBUG.tables) try{ console.table(gRules);}catch{}
 
-      const edit=document.createElement("button"); edit.className="btn btn-ghost"; edit.textContent="Edit";
-      edit.addEventListener("click", ()=>{
-        gDraft = null;
-        gEditingId = r.id;
-        renderEditor();
-        editorMount.scrollIntoView({behavior:"smooth", block:"start"});
+      gRules.forEach(r=>{
+        const div=document.createElement("div"); div.className="item";
+        const left=document.createElement("div");
+        const targets = (r.targets||[]).map(t=>t.label).join(", ") || (gMode==='headings' ? "(no headings selected)" : "(no fields selected)");
+        left.innerHTML = `<strong>${r.action}</strong> — <em>${targets}</em> <span class="muted"> ${summarizeCondition(r)}</span>`;
+        const right=document.createElement("div"); right.style.display='flex'; right.style.gap='8px';
+
+        const edit=document.createElement("button"); edit.className="btn btn-ghost"; edit.textContent="Edit";
+        edit.addEventListener("click", ()=>{
+          console.log("[List] Edit clicked:", r.id);
+          gDraft = null;
+          gEditingId = r.id;
+          renderEditor();
+          editorMount.scrollIntoView({behavior:"smooth", block:"start"});
+        });
+
+        const del=document.createElement("button"); del.className="btn btn-danger"; del.textContent="Delete";
+        del.addEventListener("click", ()=>{
+          console.log("[List] Delete clicked:", r.id);
+          if (!confirm("Delete this rule?")) return;
+          const idx = gRules.findIndex(x=>x.id===r.id);
+          if (idx >= 0) gRules.splice(idx,1);
+          if (gEditingId === r.id) gEditingId = null;
+          persistRules('delete'); renderEditor(); renderList();
+        });
+
+        right.appendChild(edit);
+        right.appendChild(del);
+        div.appendChild(left); div.appendChild(right);
+        rulesList.appendChild(div);
       });
-
-      const del=document.createElement("button"); del.className="btn btn-danger"; del.textContent="Delete";
-      del.addEventListener("click", ()=>{
-        if (!confirm("Delete this rule?")) return;
-        const idx = gRules.findIndex(x=>x.id===r.id);
-        if (idx >= 0) gRules.splice(idx,1);
-        if (gEditingId === r.id) gEditingId = null;
-        persistRules('delete'); renderEditor(); renderList();
-      });
-
-      right.appendChild(edit);
-      right.appendChild(del);
-      div.appendChild(left); div.appendChild(right);
-      rulesList.appendChild(div);
-    });
+      tr.end("rendered");
+    } catch(e){ tr.error("renderList error", e); tr.end(); }
   }
 
-  // ===== sync & state =====
+  // ===== reloadState (defensive hydrate across all payload slots) =====
   async function reloadState(reason){
     const tr = TRACE("reloadState",{reason, docId:gDocId});
     try {
-      if (!gDocId) return;
-      const st = await window.formSuitePersist?.loadState?.(gDocId);
-      if (!st) return;
+      if (!gDocId) { tr.end("no docId"); return; }
 
+      const st = await window.formSuitePersist?.loadState?.(gDocId);
+      if (!st) { tr.end("no state"); return; }
+
+      // Update schema & headings if present
       if (st.schema) gSchema = st.schema;
       if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
 
-      // Prefer explicit arrays; otherwise fall back to payload (if present)
-      const payloadRules   = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.rules)      ? st.payload.CRONOS_PAYLOAD.rules : [];
-      const payloadFieldR  = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.fieldRules) ? st.payload.CRONOS_PAYLOAD.fieldRules : [];
+      if (DEBUG.tables) {
+        console.log("[reloadState] schema fields:"); try{ console.table(gSchema?.fields||[]);}catch{}
+        console.log("[reloadState] headingsTree (flat):"); try{ console.table(flattenWithNumbers(gHeadingsTree)); }catch{}
+      }
 
-      const nextHeadings = Array.isArray(st.rules)     && st.rules.length     ? st.rules     : payloadRules;
-      const nextFields   = Array.isArray(st.fieldRules)&& st.fieldRules.length? st.fieldRules: payloadFieldR;
+      // Workspace arrays (preferred if non-empty)
+      const wsHeadings = Array.isArray(st.rules) ? st.rules : [];
+      const wsFields   = Array.isArray(st.fieldRules) ? st.fieldRules : [];
 
+      // Payload variants (mirror-friendly)
+      const plNested  = st?.payload?.CRONOS_PAYLOAD;
+      const plTop     = st?.CRONOS_PAYLOAD;
+      const plAlt     = st?.cronos_payload;
+
+      const plHeadings = Array.isArray(plNested?.rules)   ? plNested.rules
+                      : Array.isArray(plTop?.rules)      ? plTop.rules
+                      : Array.isArray(plAlt?.rules)      ? plAlt.rules : [];
+
+      const plFields   = Array.isArray(plNested?.fieldRules) ? plNested.fieldRules
+                      : Array.isArray(plTop?.fieldRules)    ? plTop.fieldRules
+                      : Array.isArray(plAlt?.fieldRules)    ? plAlt.fieldRules : [];
+
+      // Pick sources: workspace wins; else payload; else keep in-memory as last resort
+      const nextHeadings = wsHeadings.length ? wsHeadings
+                          : (plHeadings.length ? plHeadings : gRulesHeadings);
+
+      const nextFields   = wsFields.length ? wsFields
+                          : (plFields.length ? plFields : gRulesFields);
+
+      // Commit
       gRulesHeadings = cloneRules(nextHeadings);
       gRulesFields   = cloneRules(nextFields);
-
       gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
 
-      // Do NOT hard-sanitize here; we may not have schema/headings yet.
-      if (!gRules.find(r=>r.id===gEditingId)) gEditingId = null;
+      // Editor safety
+      if (!gRules.find(r=>r?.id===gEditingId)) gEditingId = null;
+
+      // Logs for visibility
+      tr.step("hydrate chosen", {
+        wsHeadings: wsHeadings.length, wsFields: wsFields.length,
+        plHeadings: plHeadings.length, plFields: plFields.length,
+        intoView: gRules.length, mode: gMode
+      });
+
       setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
+
+      if (DEBUG.tables) {
+        console.log("[reloadState] gRulesHeadings"); try{ console.table(gRulesHeadings);}catch{}
+        console.log("[reloadState] gRulesFields");   try{ console.table(gRulesFields);}catch{}
+      }
+
       renderEditor(); renderList();
-    } catch(e){ tr.error("failed", e); }
-    finally{ tr.end(); }
+      tr.end("ok");
+    } catch(e){ tr.error("failed", e); tr.end(); }
   }
+
   function hookSync(){
+    const tr = TRACE("hookSync");
     bcLegacy?.addEventListener("message",(ev)=>{
       const m = ev?.data || {};
+      console.log("[BC:legacy]", m);
       if (m.type==="schema-updated"   && m.docId===gDocId) reloadState("schema-updated");
       if (m.type==="headings-updated" && m.docId===gDocId) reloadState("headings-updated");
       if (m.type==="doc-updated"      && m.docId===gDocId) reloadState("doc-updated");
@@ -707,6 +847,7 @@
     });
     bcCanon?.addEventListener("message",(ev)=>{
       const m = ev?.data || {};
+      console.log("[BC:canon]", m);
       if (m.type==="active:set"){ if (m.docId && m.docId!==gDocId){ gDocId=m.docId; reloadState("active:set"); } }
       if (m.type==="active:updated"){ if (m.docId===gDocId) reloadState("active:updated"); }
       if (m.type==="active:clear"){ gDocId=null; setStatus("Cleared."); }
@@ -714,13 +855,16 @@
     window.addEventListener("storage",(e)=>{
       if (e.key===ACTIVE_LS_KEY && e.newValue){
         const meta = JSON.parse(e.newValue||"null");
+        console.log("[storage] ACTIVE_LS_KEY changed:", meta);
         if (meta?.docId && meta.docId!==gDocId){ gDocId=meta.docId; reloadState("storage switch"); }
       }
     });
+    tr.end("listeners attached");
   }
 
   // ===== add rule (draft only; not persisted) =====
   btnAddRule.addEventListener("click", ()=>{
+    console.log("[UI] Add rule clicked");
     gEditingId = null;
     gDraft = {
       id: null,
@@ -736,6 +880,7 @@
 
   // ===== tabs =====
   function applyTabUI(){
+    const tr = TRACE("applyTabUI", { mode: gMode });
     const isHead = gMode==='headings';
     if (tabHeadings) {
       tabHeadings.setAttribute('aria-pressed', String(isHead));
@@ -750,9 +895,11 @@
         ? 'SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).'
         : 'SHOW or HIDE specific form fields based on another field’s selected value(s).';
     }
+    tr.end("ok");
   }
   tabHeadings?.addEventListener('click', async ()=>{
     if (gMode==='headings') return;
+    console.log("[Tabs] -> headings");
     await persistRules('tab-switch', { mode: gMode, rules: gRules });
     gMode='headings';
     gDraft = null; gEditingId = null;
@@ -762,6 +909,7 @@
   });
   tabFields?.addEventListener('click', async ()=>{
     if (gMode==='fields') return;
+    console.log("[Tabs] -> fields");
     await persistRules('tab-switch', { mode: gMode, rules: gRules });
     gMode='fields';
     gDraft = null; gEditingId = null;
@@ -776,8 +924,9 @@
     try{
       hookSync();
       let meta = window.formSuitePersist?.getCurrentDocMeta?.() || readActiveMeta();
-      if (!meta?.docId){ setStatus("No active document. Open one first."); return; }
+      if (!meta?.docId){ setStatus("No active document. Open one first."); tr.end("no active doc"); return; }
       gDocId = meta.docId;
+      tr.step("active doc", meta);
       applyTabUI();
       await reloadState("boot");
     } catch(e){ tr.error("boot failed", e); setStatus("Failed to load state."); }
