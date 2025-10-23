@@ -287,26 +287,51 @@
   async function persistRules(){
     if (!gDocId) return;
 
-    // Clean only when we have context
-    sanitizeRules();
+    const tr = TRACE('persistRules', { docId: gDocId, mode: gMode, count: gRules.length });
+    try {
+      // Clean only when we have context
+      sanitizeRules();
 
-    if (gMode === 'headings') {
-      gRulesHeadings = gRules.slice();
-    } else {
-      gRulesFields = gRules.slice();
+      if (gMode === 'headings') {
+        gRulesHeadings = gRules.slice();
+      } else {
+        gRulesFields = gRules.slice();
+      }
+      tr.step('normalized rules', { headings: gRulesHeadings.length, fields: gRulesFields.length });
+
+      let payloadUpdate = null;
+      try {
+        const st = await window.formSuitePersist?.loadState?.(gDocId);
+        const existingPayload = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || {};
+        payloadUpdate = { ...existingPayload, rules: gRulesHeadings, fieldRules: gRulesFields };
+        tr.step('payload prepared', { hasExisting: !!Object.keys(existingPayload||{}).length });
+      } catch (e) {
+        tr.warn('payload load failed', e);
+      }
+
+      const saveInput = {
+        // keep both arrays updated so Extractor/Index can merge
+        rules: gRulesHeadings,
+        fieldRules: gRulesFields
+      };
+      if (payloadUpdate) {
+        saveInput.payload = { CRONOS_PAYLOAD: payloadUpdate };
+      } else {
+        saveInput.payload = { CRONOS_PAYLOAD: { rules: gRulesHeadings, fieldRules: gRulesFields } };
+      }
+
+      await window.formSuitePersist?.saveState?.(gDocId, saveInput);
+
+      // Broadcast so other tabs refresh immediately
+      try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
+      try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
+
+      setStatus(`Rules saved — ${gRules.length}`);
+      tr.end('saved');
+    } catch (e) {
+      tr.error('persist failed', e);
+      tr.end();
     }
-
-    await window.formSuitePersist?.saveState?.(gDocId, {
-      // keep both arrays updated so Extractor/Index can merge
-      rules: gRulesHeadings,
-      fieldRules: gRulesFields
-    });
-
-    // Broadcast so other tabs refresh immediately
-    try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
-    try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
-
-    setStatus(`Rules saved — ${gRules.length}`);
   }
   // ===== editor (single) =====
   function currentEditorRule(){
