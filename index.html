@@ -1127,16 +1127,6 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     }
 
     // ---- DATEDIFF helpers ----
-    function parseDateByFormat(str, fmt) {
-      if (!str) return null;
-      try {
-        const d = (window.flatpickr && window.flatpickr.parseDate)
-          ? window.flatpickr.parseDate(String(str), fmt || 'Y-m-d')
-          : new Date(String(str));
-        return (d && !isNaN(d.getTime())) ? d : null;
-      } catch { return null; }
-    }
-
     function diffInDays(a, b) {
       const A = new Date(a.getFullYear(), a.getMonth(), a.getDate());
       const B = new Date(b.getFullYear(), b.getMonth(), b.getDate());
@@ -1153,14 +1143,6 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const bBeforeAnniversary = (b.getMonth() < a.getMonth()) || (b.getMonth() === a.getMonth() && b.getDate() < a.getDate());
       if (bBeforeAnniversary) years -= 1;
       return years;
-    }
-
-    function computeDateDiff(fromDate, toDate, unit = 'days') {
-      if (!fromDate || !toDate) return null;
-      const u = String(unit || 'days').toLowerCase();
-      if (u === 'years')  return diffInYears(fromDate, toDate);
-      if (u === 'months') return diffInMonths(fromDate, toDate);
-      return diffInDays(fromDate, toDate);
     }
 
     function createPrettyDatepicker(input, extraOpts = {}) {
@@ -1205,7 +1187,6 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
       return flatpickr(input, { ...baseOpts, ...extraOpts });
     }
-
 
     function slugifyMc(s) {
       return String(s || '')
@@ -2397,7 +2378,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
             const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
             const a = toDay(actual);
             const b = toDay(expStr);
-            if (Number.isNaN(a) || Number.isNaN(b)) match = false;  // <-- fix here
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false;
             else if (op === 'before') match = a < b;
             else if (op === 'after') match = a > b;
             else if (op === 'equals') match = a == b;
@@ -2483,7 +2464,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
             const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
             const a = toDay(actual);
             const b = toDay(expStr);
-            if (Number.isNaN(a) || Number.isNaN(b)) match = False
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false; // <-- fixed (was "False")
             else if (op === 'before') match = a < b;
             else if (op === 'after') match = a > b;
             else if (op === 'equals') match = a == b;
@@ -2630,17 +2611,6 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       else u8 = new Uint8Array([]);
       try { pyOut?.destroy?.(); } catch {}
       return u8;
-    }
-
-    // ---------- Field rules evaluation for UI ----------
-    function loadRulesForDoc(state) {
-      return (
-        state?.rules ||
-        state?.payload?.rules ||
-        state?.CRONOS_RULES ||
-        state?.cronos_rules ||
-        []
-      );
     }
 
     // Expose for cross-callbacks

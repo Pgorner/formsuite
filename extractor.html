@@ -54,7 +54,7 @@
 
     <div class="grid-3">
       <section class="panel">
-        <details close>
+        <details>
           <summary><strong>Found SDTs</strong></summary>
           <div style="overflow:auto;">
             <table id="sdt-table">
@@ -74,7 +74,7 @@
       </section>
 
       <section class="panel">
-        <details close>
+        <details>
           <summary><strong>CRONOS_PAYLOAD Preview</strong></summary>
           <textarea id="payloadPreview" spellcheck="false" style="min-height:420px"></textarea>
           <div class="row" style="margin-top:6px; gap:8px;">
@@ -85,14 +85,14 @@
       </section>
 
       <section class="panel">
-        <details close>
+        <details>
           <summary><strong>Headers/Subheaders</strong></summary>
           <div id="headersTree" class="tree" style="max-height:420px;overflow:auto;padding:6px 4px;"></div>
         </details>
       </section>
 
       <section class="panel">
-        <details close>
+        <details>
           <summary><strong>Live Form (from payload schema)</strong></summary>
           <div id="formMount"></div>
         </details>
@@ -200,6 +200,10 @@
       const tr = TRACE('setStatus', { text: m });
       try { statusEl.textContent = m; } finally { tr.end(); }
     };
+
+    // ===== Helpers to normalize/compact Pyodide byte outputs =====
+    const toU8 = (x) => (x instanceof Uint8Array ? x : new Uint8Array(x));
+    const compactU8 = (u8) => (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) ? u8 : u8.slice();
 
     // =========================
     // PERSISTENCE SHIM (if missing)
@@ -523,7 +527,7 @@
       for (const r of rules) {
         if (!r) continue;
         const fieldId = String(r.fieldId ?? r.field ?? r.whenField ?? '');
-        if (!fieldId || !valid.has(fieldId)) continue; // drop whole rule
+               if (!fieldId || !valid.has(fieldId)) continue; // drop whole rule
 
         const rr = JSON.parse(JSON.stringify(r)); // safe clone
 
@@ -766,16 +770,31 @@
             // seed local state for collectFormValues()
             __addressValues[f.id] = initial || null;
 
-            AddressAuto.mount(mountDiv, {
-              id: f.id,
-              label: f.label || 'Address',
-              required: !!f.required,
-              value: initial || null,
-              onChange: (val) => {
-                __addressValues[f.id] = val;     // keep full object
-                schedulePreviewUpdate();          // reflect in preview + persistence
-              }
-            });
+            try {
+              AddressAuto.mount(mountDiv, {
+                id: f.id,
+                label: f.label || 'Address',
+                required: !!f.required,
+                value: initial || null,
+                onChange: (val) => {
+                  __addressValues[f.id] = val;     // keep full object
+                  schedulePreviewUpdate();          // reflect in preview + persistence
+                }
+              });
+            } catch (err) {
+              // Fallback: plain text input if AddressAuto is unavailable
+              const fallback = document.createElement('input');
+              fallback.type = 'text';
+              fallback.id = f.id;
+              fallback.name = f.id;
+              fallback.placeholder = 'Address';
+              if (initial?.formatted) fallback.value = initial.formatted;
+              fallback.addEventListener('input', () => {
+                __addressValues[f.id] = { formatted: fallback.value };
+                schedulePreviewUpdate();
+              });
+              mountDiv.appendChild(fallback);
+            }
 
             form.appendChild(wrap);
             w.end();
@@ -1549,7 +1568,7 @@
 
         const fieldId = r.fieldId || r.field || r.whenField;
         const op      = r.op || r.operator || 'equals';
-        const exp     = r.values ?? r.value ?? r.expected;
+               const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
 
         const actual  = getVal(fieldId);
@@ -1685,14 +1704,16 @@
           updatedAt: new Date().toISOString()
         });
 
+        // Normalize Pyodide output → compact Uint8Array, then update state/persistence
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
-        gArrayBuffer = updated.buffer;
+        const updatedU8 = compactU8(toU8(updated));
+        gArrayBuffer = updatedU8.slice().buffer;
 
         if (gDocId) await window.formSuitePersist.saveState(gDocId, {
           schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap
         });
-        if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated);
-        const metaObj = await persistCurrentDoc(updated, gFileHandle, gFileName, gFileExt);
+        if (gDocId) await window.formSuitePersist.putBytes(gDocId, updatedU8);
+        const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
         gDocId = metaObj.docId;
         persistActiveMeta(metaObj);
         announceDocUpdate();
@@ -1703,7 +1724,7 @@
             const perm = await ensureWritePermission(handle);
             if (perm === 'granted') {
               const stream = await handle.createWritable();
-              await stream.write(updated);
+              await stream.write(updatedU8);
               await stream.close();
               setStatus(`Saved back to "${handle.name || (gFileName + '.' + gFileExt)}".`);
               gFileHandle = handle;
@@ -1717,7 +1738,7 @@
         }
 
         const mime = wordMimeFor(gFileExt);
-        const blob = new Blob([updated], { type: mime });
+        const blob = new Blob([updatedU8], { type: mime });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `${gFileName}.${gFileExt}`;
@@ -1764,6 +1785,7 @@
           updatedAt: new Date().toISOString()
         });
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
+        const updatedU8 = compactU8(toU8(updated));
 
         // 2) replace SDTs using tagMap → values
         const sdtMap = {};
@@ -1776,24 +1798,27 @@
           }
           sdtMap[tag] = String(v);
         }
-        let updated2 = await writeSDTs(updated, sdtMap);
-        gArrayBuffer = updated2.buffer;
+        let updated2 = await writeSDTs(updatedU8, sdtMap);
+        let updated2U8 = compactU8(toU8(updated2));
+        gArrayBuffer = updated2U8.slice().buffer;
 
         // 3.5) evaluate rules → visibility map (SHOW supersedes HIDE)
         const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, loadRulesForDoc(restored));
 
         // 4) apply visibility (reset all fsHidden, then apply current HIDE ranges)
         if (Object.keys(visibilityMap).length) {
-          updated2 = await applyVisibilityByRules(updated2, visibilityMap);
-          gArrayBuffer = updated2.buffer;
+          const visU8 = await applyVisibilityByRules(updated2U8, visibilityMap);
+          const visU8Compact = compactU8(toU8(visU8));
+          updated2U8 = visU8Compact;
+          gArrayBuffer = visU8Compact.slice().buffer;
         }
 
         // 5) persist state + bytes in workspace
         if (gDocId) await window.formSuitePersist.saveState(gDocId, {
           schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap
         });
-        if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2);
-        const metaObj = await persistCurrentDoc(updated2, gFileHandle, gFileName, gFileExt);
+        if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2U8);
+        const metaObj = await persistCurrentDoc(updated2U8, gFileHandle, gFileName, gFileExt);
         gDocId = metaObj.docId;
         persistActiveMeta(metaObj);
         announceDocUpdate();
@@ -1808,7 +1833,7 @@
               types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
             });
             const stream = await handle.createWritable();
-            await stream.write(updated2);
+            await stream.write(updated2U8);
             await stream.close();
             setStatus(`Exported as “${handle.name || suggested}”.`);
             gDirty = false;
@@ -1820,7 +1845,7 @@
         }
 
         const mime = wordMimeFor(gFileExt);
-        const blob = new Blob([updated2], { type: mime });
+        const blob = new Blob([updated2U8], { type: mime });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = suggested;

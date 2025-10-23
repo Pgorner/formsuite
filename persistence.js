@@ -4,8 +4,9 @@
    • Keep ONE canonical “active doc” signal across tabs (localStorage + BroadcastChannel)
    • Store FileSystemFileHandle in IndexedDB
    • Maintain a working copy of bytes in OPFS (Origin Private File System)
-   • Persist per-doc state (schema/values/tagMap) in localStorage
+   • Persist per-doc state (schema/values/tagMap/rules/…) in localStorage
    • Provide safe, atomic helpers (locks + coalescers) used by pages
+   • Broadcast payload patches across tabs + snapshot/rehydration
 */
 
 (() => {
@@ -23,8 +24,9 @@
   ];
 
   const BC = {
-    CANON: 'fs-active-doc',  // {active:set|active:updated|active:clear}
-    LEGACY: 'form-suite-doc' // {doc-switched|doc-updated|doc-cleared}
+    CANON: 'fs-active-doc',   // {active:set|active:updated|active:clear}
+    LEGACY: 'form-suite-doc', // {doc-switched|doc-updated|doc-cleared}
+    PAYLOAD: 'fs-payload-v1', // {t:'payload'|'request-snapshot'|'snapshot', ...}
   };
 
   const DB_NAME = 'formsuite_v1';
@@ -36,6 +38,26 @@
 
   const readJSON = (k) => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch { return null; } };
   const writeJSON = (k, v) => { try { (v == null) ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+  const isPlainObject = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+
+  function deepMerge(a, b) {
+    if (Array.isArray(b)) return b.slice();
+    if (!isPlainObject(b)) return (b === undefined) ? a : b;
+    const out = isPlainObject(a) ? { ...a } : {};
+    for (const [k, v] of Object.entries(b)) {
+      out[k] = deepMerge(a?.[k], v);
+    }
+    return out;
+  }
+
+  function isEmptyState(st) {
+    if (!st || typeof st !== 'object') return true;
+    const keys = Object.keys(st).filter(k => !k.startsWith('__'));
+    return keys.length === 0;
+  }
+
+  const debounce = (fn, ms) => { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; };
 
   // ===== IndexedDB for FileSystemFileHandle =====
   function openDB() {
@@ -84,21 +106,15 @@
         const req = store.openCursor();
         req.onsuccess = () => {
           const cursor = req.result;
-          if (cursor) {
-            items.push(cursor.value);
-            cursor.continue();
-          }
+          if (cursor) { items.push(cursor.value); cursor.continue(); }
         };
         req.onerror = () => rej(req.error);
         tx.oncomplete = () => res(items);
         tx.onerror = () => rej(tx.error);
       });
-    } catch {
-      rows = [];
-    }
+    } catch { rows = []; }
     for (const { docId, handle } of rows) {
-      try { await cb(docId, handle); }
-      catch {}
+      try { await cb(docId, handle); } catch {}
     }
   }
 
@@ -125,40 +141,64 @@
     } catch { return null; }
   }
 
-  // ===== State (schema/values/etc.) =====
-  // Drop-in idea for persistence.js
-  async function saveState(docId, obj){
-    const prev = await loadState(docId) || {};
-    const next = { ...prev };
+  // ===== Cross-tab plumbing (active/payload) =====
+  const bcLegacy  = ('BroadcastChannel' in window) ? new BroadcastChannel(BC.LEGACY)  : null;
+  const bcCanon   = ('BroadcastChannel' in window) ? new BroadcastChannel(BC.CANON)   : null;
+  const bcPayload = ('BroadcastChannel' in window) ? new BroadcastChannel(BC.PAYLOAD) : null;
 
-    // Only overwrite arrays if the new value is actually an array;
-    // and if it's empty, keep the previous non-empty array.
-    function keepArray(key){
-      const incoming = obj?.[key];
-      if (Array.isArray(incoming)) {
-        next[key] = incoming.length ? incoming.slice() : (Array.isArray(prev[key]) ? prev[key] : []);
-      } else if (incoming !== undefined) {
-        // non-array value provided – assign as-is
-        next[key] = incoming;
+  const TAB = (crypto?.randomUUID?.() || (Date.now() + '_' + Math.random().toString(16).slice(2)));
+
+  const listeners = {
+    active:  new Set(), // fn(meta)
+    payload: new Set(), // fn({docId, patch, v, from})
+  };
+  function subscribe(kind, fn) { listeners[kind]?.add(fn); return () => listeners[kind]?.delete(fn); }
+  function emit(kind, data) { listeners[kind]?.forEach(fn => { try { fn(data); } catch {} }); }
+
+  // ===== State (schema/values/etc.) =====
+  function keyFor(docId) { return LS_KEYS.STATE_PREFIX + docId; }
+
+  function getState(docId) {
+    if (!docId) return {};
+    return readJSON(keyFor(docId)) || {};
+  }
+
+  // Save & broadcast a partial patch to the per-doc state
+  function setState(docId, patch) {
+    if (!docId || !patch || typeof patch !== 'object') return getState(docId);
+    const prev = getState(docId);
+
+    // Special-case: top-level arrays that should not be clobbered by empty arrays
+    const arrayKeys = ['rules', 'fieldRules'];
+    const normalizedPatch = { ...patch };
+    for (const k of arrayKeys) {
+      if (k in normalizedPatch && Array.isArray(normalizedPatch[k])) {
+        const inc = normalizedPatch[k];
+        if (!inc.length && Array.isArray(prev[k]) && prev[k].length) {
+          // keep previous non-empty array
+          delete normalizedPatch[k];
+        }
       }
     }
 
-    // Keys we care about
-    for (const k of ['schema','values','tagMap','headings','headingsTree','rules','fieldRules','payload']){
-      if (k==='rules' || k==='fieldRules') { keepArray(k); continue; }
-      if (obj && Object.prototype.hasOwnProperty.call(obj,k)) next[k] = obj[k];
-    }
+    const next = deepMerge(prev, normalizedPatch);
+    next.__v = (prev.__v|0) + 1;
+    writeJSON(keyFor(docId), next);
 
-    // … write `next` to storage/opfs/IDB as you already do …
+    // Broadcast to peers
+    try { bcPayload?.postMessage({ t: 'payload', docId, patch: normalizedPatch, v: next.__v, from: TAB }); } catch {}
+    // In-tab listeners
+    emit('payload', { docId, patch: normalizedPatch, v: next.__v, from: TAB });
+
     return next;
   }
 
-  async function loadState(docId) {
-    if (!docId) return null;
-    return readJSON(LS_KEYS.STATE_PREFIX + docId) || null;
-  }
+  // Back-compat alias with the previous signature (async)
+  async function saveState(docId, obj) { return setState(docId, obj); }
+  async function loadState(docId) { return getState(docId); }
+
   function getLastKnownValues(docId) {
-    try { return (readJSON(LS_KEYS.STATE_PREFIX + docId) || {}).values || {}; }
+    try { return (getState(docId) || {}).values || {}; }
     catch { return {}; }
   }
 
@@ -168,9 +208,7 @@
     try {
       let q = await handle.queryPermission?.({ mode });
       if (q === 'granted') return 'granted';
-      if (q === 'prompt') {
-        q = await handle.requestPermission?.({ mode }) || q;
-      }
+      if (q === 'prompt') q = await handle.requestPermission?.({ mode }) || q;
       return q || 'denied';
     } catch { return 'denied'; }
   }
@@ -185,17 +223,9 @@
   }
 
   // ===== Active doc single-source-of-truth (BC + LS) =====
-  const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel(BC.LEGACY) : null;
-  const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel(BC.CANON)  : null;
-
   let _active = null; // { docId, name }
 
-  // Small debug helper
-  function dbg(where, data) {
-    try {
-      console.log('%c[Persist]', 'color:#2563eb;font-weight:600', where, data || '');
-    } catch {}
-  }
+  function dbg(where, data) { try { console.log('%c[Persist]', 'color:#2563eb;font-weight:600', where, data || ''); } catch {} }
 
   function readActiveFromStorage() {
     for (const k of ACTIVE_KEYS_READ_ORDER) {
@@ -206,7 +236,6 @@
   }
 
   function writeActiveToStorage(metaOrNull) {
-    // Always write canonical + legacy mirrors
     writeJSON(LS_KEYS.CANON_ACTIVE,  metaOrNull);
     writeJSON(LS_KEYS.LEGACY_ACTIVE, metaOrNull);
     writeJSON(LS_KEYS.INTERNAL_ACTIVE, metaOrNull);
@@ -225,15 +254,16 @@
       writeActiveToStorage(null);
       try { bcCanon?.postMessage({ type: 'active:clear', ts: Date.now() }); } catch {}
       try { bcLegacy?.postMessage({ type: 'doc-cleared', ts: Date.now() }); } catch {}
+      emit('active', null);
       return null;
     }
     const next = { docId: metaOrNull.docId, name: metaOrNull.name || 'document' };
     _active = next;
     writeActiveToStorage(next);
-    // Broadcast on both channels
     const payload = { docId: next.docId, name: next.name, ts: Date.now() };
     try { bcCanon?.postMessage({ type: 'active:set', ...payload }); } catch {}
     try { bcLegacy?.postMessage({ type: 'doc-switched', ...payload }); } catch {}
+    emit('active', next);
     return next;
   }
 
@@ -248,6 +278,7 @@
     if (!e.key) return;
     if (ACTIVE_KEYS_READ_ORDER.includes(e.key)) {
       try { _active = e.newValue ? JSON.parse(e.newValue) : null; } catch { _active = null; }
+      emit('active', _active);
     }
   });
 
@@ -259,9 +290,8 @@
     let release;
     const gate = new Promise(r => (release = r));
     __locks.set(docId, prev.then(() => gate));
-    try {
-      return await fn();
-    } finally {
+    try { return await fn(); }
+    finally {
       release();
       if (__locks.get(docId) === gate) __locks.delete(docId);
     }
@@ -310,7 +340,6 @@
   }
 
   // ===== High-level “set current” APIs =====
-  // Keep the SAME docId if one already exists; otherwise mint a new one.
   async function setCurrentDoc({ bytes, handle, name }) {
     const prev = readActiveFromStorage();
 
@@ -351,16 +380,65 @@
       await saveState(docId, { fingerprint: newFp });
     }
 
-    await setActiveDoc(meta); // BC + LS (both canonical + legacy)
-    // Hydrate immediately (no debounce) so pages update fast
+    await setActiveDoc(meta); // BC + LS
     try { await hydrateFromDocxIfEmpty(docId); } catch {}
     return meta;
   }
 
-  // Convenience: when caller only has bytes + plain meta
   async function setCurrentDocFromBytes(bytes, meta = {}) {
     return await setCurrentDoc({ bytes, handle: meta.handle, name: meta.name });
   }
+
+  // ===== Auto-hydration + cross-tab sync helpers =====
+  function ensureHydrated(optionalHydrator) {
+    const meta = getActiveDocMeta(); if (!meta?.docId) return;
+    const st = getState(meta.docId);
+    if (isEmptyState(st)) {
+      // Ask siblings for a snapshot
+      try { bcPayload?.postMessage({ t:'request-snapshot', docId: meta.docId, from:TAB }); } catch {}
+      // Optional: let a page (Extractor) try to hydrate from DOCX
+      if (typeof optionalHydrator === 'function') {
+        Promise.resolve(optionalHydrator(meta)).catch(()=>{});
+      }
+    }
+  }
+
+  function connectAutoSave({ readLocal, applyRemote, debounceMs = 150 } = {}) {
+    const meta = getActiveDocMeta(); if (!meta?.docId) return { save: ()=>{}, dispose: ()=>{} };
+    let skip = false;
+    const dispose = subscribe('payload', ({ docId, patch, from }) => {
+      if (docId !== meta.docId || from === TAB) return;
+      if (!patch || !applyRemote) return;
+      skip = true;
+      try { applyRemote(patch); } finally { skip = false; }
+    });
+    const save = debounce(() => {
+      if (skip) return;
+      const partial = readLocal ? readLocal() : null;
+      if (partial && Object.keys(partial).length) setState(meta.docId, partial);
+    }, debounceMs);
+    return { save, dispose };
+  }
+
+  // ===== Cross-tab payload channel =====
+  bcPayload && (bcPayload.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.from === TAB) return;
+    if (msg.t === 'payload') {
+      emit('payload', msg);
+    } else if (msg.t === 'request-snapshot') {
+      const st = getState(msg.docId);
+      if (!isEmptyState(st)) {
+        try { bcPayload.postMessage({ t:'snapshot', docId: msg.docId, state: st, from:TAB }); } catch {}
+      }
+    } else if (msg.t === 'snapshot') {
+      const cur = getState(msg.docId);
+      if (isEmptyState(cur)) {
+        writeJSON(keyFor(msg.docId), msg.state);
+        emit('payload', { docId: msg.docId, patch: msg.state, v: (msg.state.__v|0), from:'remote-snapshot' });
+      }
+    }
+  });
 
   // ===== Public API surface =====
   const api = {
@@ -375,7 +453,8 @@
     // Back-compat (names some pages call)
     getCurrentDocMeta: getActiveDocMeta,
     getActiveDoc: async () => getActiveDocMeta(),
-    getState: loadState,
+    getState,
+    loadState,
     getActiveDocMetaSync: getActiveDocMeta,
 
     // Meta/bytes
@@ -388,7 +467,7 @@
 
     // State
     saveState,
-    loadState,
+    setState,
     getLastKnownValues,
 
     // Permissions
@@ -398,7 +477,12 @@
     // Concurrency helpers
     withDocLock,
     coalesce,
-    // Restore
+
+    // Sync helpers
+    ensureHydrated,
+    connectAutoSave,
+
+    // Restore from DOCX if empty
     hydrateFromDocxIfEmpty,
   };
 
@@ -527,6 +611,7 @@
     try {
       await ensureJSZip();
       const zip = await window.JSZip.loadAsync(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      // Try word/settings.xml (docVars)
       const settings = zip.file('word/settings.xml');
       if (settings) {
         const xmlText = await settings.async('string');
@@ -541,11 +626,12 @@
             const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
             if (name === PAYLOAD_KEY) {
               const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
-              return val || null;
+              if (val) return val;
             }
           }
         }
       }
+      // Fallback: docProps/custom.xml custom property
       const custom = zip.file('docProps/custom.xml');
       if (custom) {
         const xmlText = await custom.async('string');
@@ -572,6 +658,7 @@
       const st = await loadState(docId);
       const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
       if (hasSchema) return false;
+      __hydrating = true;
       dbg('hydrate:begin', { docId });
       let bytes = await getBytes(docId);
       if (!bytes) bytes = await getCurrentDocBytes();
@@ -584,7 +671,8 @@
       const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
       const cleanValues = (window.formSuiteUtils?.sanitizeValues ? window.formSuiteUtils.sanitizeValues(nextSchema, payload.values || {}) : (payload.values || {}));
       const tagMap = payload.tagMap || {};
-      const rules  = Array.isArray(payload.rules) ? payload.rules : [];
+      // rules shape can be either array or object depending on previous builds; keep as-is
+      const rules  = payload.rules ?? {};
       await saveState(docId, { schema: nextSchema, values: cleanValues, tagMap, rules, schemaUpdatedAt: new Date().toISOString() });
       // Notify other tabs/pages
       try { bcCanon?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
@@ -593,6 +681,7 @@
       dbg('hydrate:done', { docId, fields: nextSchema.fields.length });
       return true;
     } catch (e) { dbg('hydrate:error', e); return false; }
+    finally { __hydrating = false; }
   }
 
   // Trigger hydration on key events across tabs
@@ -602,6 +691,8 @@
       if ((m.type === 'active:set' || m.type === 'active:updated') && m.docId) {
         coalesce('hydrate:'+m.docId, () => hydrateFromDocxIfEmpty(m.docId));
       }
+      if (m.type === 'active:set') emit('active', { docId: m.docId, name: m.name });
+      if (m.type === 'active:clear') emit('active', null);
     });
   } catch {}
 
@@ -611,7 +702,7 @@
   });
 
   // Expose
-  window.formSuitePersist = api;
+  window.formSuitePersist = Object.freeze(api);
   window.formSuiteUtils = Object.freeze(utils);
 })();
 
@@ -745,7 +836,6 @@
             resolve({ file: f, bytes, handle: null });
           } catch (e) { reject(e); }
         }, { once: true });
-        // Kick off picker; if user cancels, no 'change' — input is auto-removed after 60s.
         setTimeout(() => { try { input.click(); } catch {} }, 0);
         setTimeout(() => { if (document.body.contains(input)) input.remove(); }, 60000);
       });
@@ -821,7 +911,7 @@
     ov._setDocName(name || jget(ACTIVE_LS_KEY)?.name || '(no name)');
     ov.style.display = 'block';
     visible = true;
-    document.documentElement.style.overflow = 'hidden'; // lock scroll behind
+    document.documentElement.style.overflow = 'hidden';
   }
   function hide() {
     if (!overlay) return;

@@ -9,7 +9,6 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css">
   <script src="persistence.js"></script>
-
 </head>
 <body>
   <header>
@@ -487,8 +486,19 @@
 
     function fieldDetails(f) {
       if (f.type === 'date') return `Datepicker (${f.dateFormat || 'Y-m-d'})`;
-      if (f.type === 'select') return `Select: ${(f.options||[]).join(', ') || '—'}`;
-      if (f.type === 'multichoice') return `Multiple: ${(f.options||[]).join(', ') || '—'}`;
+      if (f.type === 'select') {
+        const opts = Array.isArray(f.options) ? f.options : [];
+        return `Select: ${opts.join(', ') || '—'}`;
+      }
+      if (f.type === 'multichoice') {
+        const groups = Array.isArray(f.mc?.groups) ? f.mc.groups : [];
+        const optCount = groups.length
+          ? groups.reduce((n, g) => n + (g.items?.length || 0), 0)
+          : (Array.isArray(f.options) ? f.options.length : 0);
+        const extras = groups.reduce((n,g)=> n + (g.items||[]).reduce((m,it)=> m + (Array.isArray(it.fields)? it.fields.length:0), 0), 0);
+        const gTxt = groups.length ? `${groups.length} group${groups.length>1?'s':''}` : '1 group';
+        return `Multiple: ${optCount || 0} option(s) in ${gTxt}${extras?`, ${extras} extra field(s)`:''}`;
+      }
       if (f.type === 'table') {
         const cols = (f.columns||[]).map(c => `${c.label||c.id}${c.type?`:${c.type}${(c.type==='select'&&c.options?.length)?':'+c.options.join('/'):''}`:''}`);
         return `Table with ${f.columns?.length||0} column(s)${(f.minRows||f.maxRows)?` ${f.minRows||0}–${f.maxRows||'∞'}`:''} → [ ${cols.join(' | ')} ]`;
@@ -838,8 +848,8 @@
               x.style.fontSize = '14px';
               x.style.padding = '0';
               x.style.cursor = 'pointer';
-              x.style.color = '#000';                      // black by default
-              x.addEventListener('mouseenter', () => { x.style.color = '#6b7280'; });   // grey on hover
+              x.style.color = '#000';
+              x.addEventListener('mouseenter', () => { x.style.color = '#6b7280'; });
               x.addEventListener('mouseleave', () => { x.style.color = '#000'; });
 
               x.addEventListener('click', (ev) => {
@@ -848,7 +858,6 @@
                 drawChips();
                 api.serializeToHidden();
               });
-
 
               // Drag handlers
               chip.addEventListener('dragstart', (e) => {
@@ -929,8 +938,6 @@
 
         api.serializeToHidden();
       }
-
-
 
       cfg.addBtn?.addEventListener('click', () => api.addEmpty());
       cfg.addBtn2?.addEventListener('click', () => api.addEmpty());
@@ -1697,9 +1704,7 @@
           const flat = designer.getFlatOptions();
           f.mc = mc;                 // advanced config (groups + extras)
           f.options = flat;          // compatibility (flat list of labels)
-          // Optional: columns hint – you can keep your existing column UI elsewhere if needed
         } else {
-          // fallback (shouldn't happen)
           f.options = [];
           f.mc = { groups: [] };
         }

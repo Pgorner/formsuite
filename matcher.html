@@ -192,7 +192,7 @@
                         : Array.isArray(state?.schema) ? state.schema : [];
       const title = schemaObj?.title || state?.schemaTitle || state?.title || 'Schema';
 
-      // local helpers (mirror index.html)
+      // local helpers (match other pages)
       const slugifyMc = (s) => String(s || '')
         .normalize('NFKD')
         .replace(/[\u0300-\u036f]/g, '')
@@ -228,7 +228,7 @@
                 }
                 if (!exId) continue;
                 const k = mcExtraKey(f.id, optVal, exId);
-                // Show just the subfield id as the label
+                // Label = just the subfield id (clearer for users)
                 addField(k, ex?.type || 'text', exId);
               }
             }
@@ -278,22 +278,36 @@
       return out;
     }
 
-    function mergeTagMapIntoPayload(state, tagMap) {
-      const ns = 'CRONOS_PAYLOAD';
-      const lc = 'cronos_payload';
-      const next = { ...(state || {}) };
+    // Build a patch that mirrors to all known slots and uses setState (instant, cross-tab)
+    async function persistTagMapPatch(docId, cleanedMap) {
+      const state = await window.formSuitePersist?.loadState?.(docId);
+      const basePayload = (state?.payload?.CRONOS_PAYLOAD)
+                       || (state?.CRONOS_PAYLOAD)
+                       || (state?.cronos_payload)
+                       || {};
+      const canonical = { ...basePayload, tagMap: cleanedMap, updatedAt: new Date().toISOString() };
 
-      // legacy mirror
-      next.tagMap = { ...(tagMap || {}) };
+      const patch = {
+        tagMap: cleanedMap,                    // legacy convenience
+        payload: { CRONOS_PAYLOAD: canonical },
+        CRONOS_PAYLOAD: canonical,
+        cronos_payload: canonical
+      };
 
-      // nested payload (preferred)
-      next.payload = next.payload || {};
-      next.payload[ns] = { ...(next.payload[ns] || {}), tagMap: { ...(tagMap || {}) } };
-
-      // optional lowercase mirror
-      next[lc] = { ...(next[lc] || {}), tagMap: { ...(tagMap || {}) } };
-
-      return next;
+      try {
+        if (window.formSuitePersist?.setState) {
+          window.formSuitePersist.setState(docId, patch); // broadcasts via fs-payload-v1
+        } else {
+          await window.formSuitePersist?.saveState?.(docId, patch);
+          // Fallback broadcast for older tabs
+          try {
+            bcCanon?.postMessage({ type: 'active:updated', docId, ts: Date.now(), from: 'matcher' });
+            bcLegacy?.postMessage({ type: 'schema-updated', docId, ts: Date.now(), from: 'matcher' });
+          } catch {}
+        }
+      } catch (e) {
+        console.warn('persistTagMapPatch failed', e);
+      }
     }
 
     function renderRows(sdts, fields, tagMap, onChange) {
@@ -349,7 +363,9 @@
     }
 
     // ---------- Live sync / guards ----------
-    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+    const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc')  : null;
+    const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc')   : null;
+    const bcPayload= ('BroadcastChannel' in window) ? new BroadcastChannel('fs-payload-v1')   : null;
 
     let gDocId = null;
     let gSDTs = []; // cache parsed SDTs to avoid re-parse on schema-only updates
@@ -359,7 +375,9 @@
       if (__refreshBusy) { __refreshPending = true; return; }
       __refreshBusy = true;
       try {
-        const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+        const meta = window.formSuitePersist?.getActiveDocMeta?.()
+                  || window.formSuitePersist?.getCurrentDocMeta?.()
+                  || null;
         if (!meta?.docId) { await hardResetMatcher('no meta'); return; }
         gDocId = meta.docId;
         renderDocPill(meta);
@@ -395,22 +413,16 @@
 
         // If sanitization removed entries, persist the cleaned map
         const orig = payload.tagMap || state?.tagMap || {};
-        const changed = JSON.stringify(tagMap) !== JSON.stringify(orig);
-        if (changed) {
-          const nextState = mergeTagMapIntoPayload(state || {}, tagMap);
-          await window.formSuitePersist?.saveState?.(gDocId, nextState);
+        if (JSON.stringify(tagMap) !== JSON.stringify(orig)) {
+          await persistTagMapPatch(gDocId, tagMap);
         }
 
         renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
           const nextMap = { ...(tagMap || {}) };
           if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
           const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
-          const nextState = mergeTagMapIntoPayload(await window.formSuitePersist?.loadState?.(gDocId), cleaned);
-          await window.formSuitePersist?.saveState?.(gDocId, nextState);
+          await persistTagMapPatch(gDocId, cleaned);
           tagMap = cleaned;
-
-          // Notify other tabs (Extractor will refresh payload preview)
-          try { bc?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
         });
 
         DBG('refreshAll done', reason);
@@ -420,8 +432,8 @@
       }
     }
 
-    // Broadcast listeners
-    bc?.addEventListener('message', async (ev) => {
+    // Broadcast listeners (legacy + canonical + payload)
+    bcLegacy?.addEventListener('message', async (ev) => {
       const m = ev?.data || {};
       try {
         if (m.type === 'doc-cleared') {
@@ -429,63 +441,63 @@
           return;
         }
         if (m.type === 'doc-switched') {
-          const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+          const meta = window.formSuitePersist?.getActiveDocMeta?.()
+                    || window.formSuitePersist?.getCurrentDocMeta?.()
+                    || null;
           if (!meta?.docId || (m.docId && meta.docId !== m.docId)) return;
           await refreshAll('doc-switched');
           return;
         }
-        if (m.type === 'doc-updated') {
-          const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+        if (m.type === 'doc-updated' || m.type === 'schema-updated') {
+          const meta = window.formSuitePersist?.getActiveDocMeta?.()
+                    || window.formSuitePersist?.getCurrentDocMeta?.()
+                    || null;
           if (!meta?.docId) return;
           if (m.docId != null && m.docId !== meta.docId) return;
-          await refreshAll('doc-updated');
-          return;
-        }
-        if (m.type === 'schema-updated') {
-          const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
-          if (meta?.docId) {
-            if (m.docId != null && m.docId !== meta.docId) return;
-            // schema changed elsewhere; reuse cached SDTs but refresh schema+map
-            const bytes = await getWorkingBytes(meta.docId);
-            if (!bytes) { await hardResetMatcher('no bytes / no permission'); return; }
-            const state = await window.formSuitePersist?.loadState?.(meta.docId);
-            const { title, fields } = deriveSchemaInfo(state || {});
-            renderSchemaPill({ title, count: fields.length });
-
-            const payload = (state?.payload?.CRONOS_PAYLOAD)
-                         || (state?.cronos_payload)
-                         || state?.CRONOS_PAYLOAD
-                         || {};
-            let tagMap = sanitizeTagMap(payload.tagMap || state?.tagMap || {}, fields, gSDTs);
-
-            // persist cleanup if needed
-            const orig = payload.tagMap || state?.tagMap || {};
-            if (JSON.stringify(tagMap) !== JSON.stringify(orig)) {
-              const nextState = mergeTagMapIntoPayload(state || {}, tagMap);
-              await window.formSuitePersist?.saveState?.(meta.docId, nextState);
-            }
-
-            // Parse SDTs once if we don't have them yet
-            if (!Array.isArray(gSDTs) || !gSDTs.length) {
-              try { gSDTs = await readSDTsFromDocx(bytes); } catch { gSDTs = []; }
-            }
-
-            renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
-              const nextMap = { ...(tagMap || {}) };
-              if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
-              const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
-              const nextState = mergeTagMapIntoPayload(await window.formSuitePersist?.loadState?.(meta.docId), cleaned);
-              await window.formSuitePersist?.saveState?.(meta.docId, nextState);
-              tagMap = cleaned;
-              try { bc?.postMessage({ type: 'schema-updated', docId: meta.docId, ts: Date.now() }); } catch {}
-            });
-          } else {
-            await hardResetMatcher('no meta on schema-updated');
-          }
+          await refreshAll(m.type);
           return;
         }
       } catch (e) {
-        console.warn('Matcher broadcast handling failed:', e);
+        console.warn('Matcher legacy broadcast handling failed:', e);
+      }
+    });
+
+    bcCanon?.addEventListener('message', async (ev) => {
+      const m = ev?.data || {};
+      try {
+        if (m.type === 'active:clear') { await hardResetMatcher('active:clear'); return; }
+        if (m.type === 'active:set')   { await refreshAll('active:set'); return; }
+        if (m.type === 'active:updated') {
+          if (!gDocId || (m.docId && m.docId !== gDocId)) return;
+          await refreshAll('active:updated');
+        }
+      } catch (e) { console.warn('Matcher canon broadcast failed:', e); }
+    });
+
+    // Instant payload patches from any tab
+    bcPayload?.addEventListener('message', async (ev) => {
+      const msg = ev?.data || {};
+      if (msg?.t !== 'payload' || !msg.docId || msg.docId !== gDocId) return;
+      // Only react to tagMap/schema relevant changes; keep current SDTs (already parsed)
+      try {
+        const st = await window.formSuitePersist?.loadState?.(gDocId);
+        const { title, fields } = deriveSchemaInfo(st || {});
+        renderSchemaPill({ title, count: fields.length });
+
+        const srcMap = (st?.payload?.CRONOS_PAYLOAD?.tagMap)
+                    || (st?.CRONOS_PAYLOAD?.tagMap)
+                    || (st?.cronos_payload?.tagMap)
+                    || st?.tagMap
+                    || {};
+        const tagMap = sanitizeTagMap(srcMap, fields, gSDTs);
+        renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
+          const nextMap = { ...(tagMap || {}) };
+          if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
+          const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
+          await persistTagMapPatch(gDocId, cleaned);
+        });
+      } catch (e) {
+        console.warn('payload listener refresh failed', e);
       }
     });
 
@@ -498,7 +510,10 @@
 
     // ---------- Boot ----------
     (async function init() {
-      const meta = window.formSuitePersist?.getCurrentDocMeta?.() || null;
+      try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
+      const meta = window.formSuitePersist?.getActiveDocMeta?.()
+                || window.formSuitePersist?.getCurrentDocMeta?.()
+                || null;
       renderDocPill(meta);
       if (!meta?.docId) { await hardResetMatcher('no meta at boot'); return; }
       gDocId = meta.docId;
@@ -533,18 +548,15 @@
       // persist cleanup if needed
       const orig = payload.tagMap || state?.tagMap || {};
       if (JSON.stringify(tagMap) !== JSON.stringify(orig)) {
-        const nextState = mergeTagMapIntoPayload(state || {}, tagMap);
-        await window.formSuitePersist?.saveState?.(gDocId, nextState);
+        await persistTagMapPatch(gDocId, tagMap);
       }
 
       renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
         const nextMap = { ...(tagMap || {}) };
         if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
         const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
-        const nextState = mergeTagMapIntoPayload(await window.formSuitePersist?.loadState?.(gDocId), cleaned);
-        await window.formSuitePersist?.saveState?.(gDocId, nextState);
+        await persistTagMapPatch(gDocId, cleaned);
         tagMap = cleaned;
-        try { bc?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
       });
     })();
 
