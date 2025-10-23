@@ -95,6 +95,15 @@
   let gEditingId = null; // editing existing rule id
   let gDraft   = null;   // unsaved draft rule
 
+  function cloneRulesArray(rules){
+    if (!Array.isArray(rules)) return [];
+    if (typeof structuredClone === 'function'){
+      try { return structuredClone(rules); }
+      catch (_) { /* fall back */ }
+    }
+    return JSON.parse(JSON.stringify(rules));
+  }
+
   const ACTIONS = new Set(["SHOW","HIDE"]);
   const CHOICE_TYPES = new Set(["select","multichoice","radio","dropdown","singlechoice","choice","single","options","combobox","list"]);
 
@@ -273,40 +282,87 @@
     const haveSchema = Array.isArray(gSchema?.fields) && gSchema.fields.length > 0;
     const haveHeads  = (gMode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
 
-    if (!haveSchema) { setStatus('Saved (awaiting schema).'); return; }
-    if (gMode==='headings' && !haveHeads) { setStatus('Saved (awaiting headings).'); return; }
+    if (!haveSchema) { setStatus('Saved (awaiting schema).'); return { blocked: true, removed: 0 }; }
+    if (gMode==='headings' && !haveHeads) { setStatus('Saved (awaiting headings).'); return { blocked: true, removed: 0 }; }
 
     const before = gRules.length;
     gRules = gRules.filter(r => isRuleValid(r));
     const removed = before - gRules.length;
     if (removed>0) setStatus(`Removed ${removed} invalid rule${removed>1?'s':''}.`);
+    return { blocked: false, removed };
   }
 
   // Never wipe arrays just because context isn’t loaded yet.
   // Persist both per-mode arrays; other tabs will normalize.
-  async function persistRules(){
+  async function persistRules(reason){
     if (!gDocId) return;
 
-    // Clean only when we have context
-    sanitizeRules();
+    const tr = TRACE("persistRules", { docId: gDocId, mode: gMode, reason: reason || "update", count: gRules.length });
+    try {
+      // Clean only when we have context
+      const sanitizeResult = sanitizeRules();
 
-    if (gMode === 'headings') {
-      gRulesHeadings = gRules.slice();
-    } else {
-      gRulesFields = gRules.slice();
+      const activeClone = cloneRulesArray(gRules);
+      if (gMode === 'headings') {
+        gRulesHeadings = activeClone;
+      } else {
+        gRulesFields = activeClone;
+      }
+      gRules = (gMode === 'headings') ? gRulesHeadings : gRulesFields;
+
+      let existingPayload = {};
+      let existingPayloadWrapper = {};
+      try {
+        const st = await window.formSuitePersist?.loadState?.(gDocId);
+        if (st?.payload && typeof st.payload === 'object') {
+          existingPayloadWrapper = st.payload;
+          if (st.payload.CRONOS_PAYLOAD && typeof st.payload.CRONOS_PAYLOAD === 'object') {
+            existingPayload = st.payload.CRONOS_PAYLOAD;
+          }
+        } else if (st?.CRONOS_PAYLOAD && typeof st.CRONOS_PAYLOAD === 'object') {
+          existingPayload = st.CRONOS_PAYLOAD;
+        }
+        tr.step("loaded state", { hasPayload: Object.keys(existingPayload).length > 0 });
+      } catch (err) {
+        tr.warn("loadState failed", err);
+      }
+
+      const headingsClone = cloneRulesArray(gRulesHeadings);
+      const fieldsClone   = cloneRulesArray(gRulesFields);
+      tr.step("normalized arrays", {
+        blocked: !!sanitizeResult?.blocked,
+        headings: headingsClone.length,
+        fields: fieldsClone.length
+      });
+      const nextCronosPayload = {
+        ...existingPayload,
+        rules: headingsClone,
+        fieldRules: fieldsClone
+      };
+      const payloadWrapper = {
+        ...existingPayloadWrapper,
+        CRONOS_PAYLOAD: nextCronosPayload
+      };
+
+      await window.formSuitePersist?.saveState?.(gDocId, {
+        rules: headingsClone,
+        fieldRules: fieldsClone,
+        payload: payloadWrapper,
+        CRONOS_PAYLOAD: nextCronosPayload
+      });
+
+      // Broadcast so other tabs refresh immediately
+      try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
+      try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
+
+      if (!sanitizeResult?.blocked) {
+        setStatus(`Rules saved — ${gRules.length}`);
+      }
+      tr.end("saved");
+    } catch (err) {
+      tr.error("persist failed", err);
+      tr.end();
     }
-
-    await window.formSuitePersist?.saveState?.(gDocId, {
-      // keep both arrays updated so Extractor/Index can merge
-      rules: gRulesHeadings,
-      fieldRules: gRulesFields
-    });
-
-    // Broadcast so other tabs refresh immediately
-    try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
-    try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
-
-    setStatus(`Rules saved — ${gRules.length}`);
   }
   // ===== editor (single) =====
   function currentEditorRule(){
@@ -344,7 +400,7 @@
           rule.id = "r_"+Math.random().toString(36).slice(2,8);
           gRules.push(rule);
           gDraft=null;
-          persistRules(); renderEditor(); renderList();
+          persistRules('create'); renderEditor(); renderList();
         });
         const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule()); };
         card.dataset._updateSaveState = "1";
@@ -608,7 +664,7 @@
         const idx = gRules.findIndex(x=>x.id===r.id);
         if (idx >= 0) gRules.splice(idx,1);
         if (gEditingId === r.id) gEditingId = null;
-        persistRules(); renderEditor(); renderList();
+        persistRules('delete'); renderEditor(); renderList();
       });
 
       right.appendChild(edit);
@@ -702,6 +758,7 @@
   }
   tabHeadings?.addEventListener('click', async ()=>{
     if (gMode==='headings') return;
+    await persistRules('tab-switch');
     gMode='headings';
     gDraft = null; gEditingId = null;
     gRules = gRulesHeadings.slice();
@@ -710,6 +767,7 @@
   });
   tabFields?.addEventListener('click', async ()=>{
     if (gMode==='fields') return;
+    await persistRules('tab-switch');
     gMode='fields';
     gDraft = null; gEditingId = null;
     gRules = gRulesFields.slice();
