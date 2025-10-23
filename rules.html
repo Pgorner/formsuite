@@ -94,6 +94,7 @@
   let gRulesFields   = [];
   let gEditingId = null; // editing existing rule id
   let gDraft   = null;   // unsaved draft rule
+  let gPersistTail = Promise.resolve();
 
   function cloneRulesArray(rules){
     if (!Array.isArray(rules)) return [];
@@ -216,7 +217,7 @@
     return out;
   }
   // ===== validation that tolerates missing context =====
-  function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree){
+  function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree, mode = gMode){
     if (!rule || !ACTIONS.has(rule.action)) return false;
 
     // If we have NO schema yet, accept the rule (defer strict checks).
@@ -261,7 +262,7 @@
     }
 
     // Targets:
-    if (gMode === 'headings') {
+    if (mode === 'headings') {
       // If headings not loaded yet, accept (defer)
       if (!haveHeads) return true;
       const allowedHeads = new Set(flattenWithNumbers(headingsTree).map(h=>String(h.key)));
@@ -278,89 +279,80 @@
 
   // Only drop rules when we truly have enough context to judge.
   // Otherwise keep them as drafts (never erase user input).
-  function sanitizeRules(){
+  function cloneRules(rules){
+    const src = Array.isArray(rules) ? rules : [];
+    if (typeof structuredClone === 'function') {
+      try { return structuredClone(src); } catch {}
+    }
+    return JSON.parse(JSON.stringify(src));
+  }
+
+  function sanitizeRules(rules, mode){
+    const working = cloneRules(rules);
     const haveSchema = Array.isArray(gSchema?.fields) && gSchema.fields.length > 0;
-    const haveHeads  = (gMode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
+    const haveHeads  = (mode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
 
-    if (!haveSchema) { setStatus('Saved (awaiting schema).'); return { blocked: true, removed: 0 }; }
-    if (gMode==='headings' && !haveHeads) { setStatus('Saved (awaiting headings).'); return { blocked: true, removed: 0 }; }
+    if (!haveSchema) {
+      return { rules: working, removed: 0, status: 'Saved (awaiting schema).', blocked: true };
+    }
+    if (mode==='headings' && !haveHeads) {
+      return { rules: working, removed: 0, status: 'Saved (awaiting headings).', blocked: true };
+    }
 
-    const before = gRules.length;
-    gRules = gRules.filter(r => isRuleValid(r));
-    const removed = before - gRules.length;
-    if (removed>0) setStatus(`Removed ${removed} invalid rule${removed>1?'s':''}.`);
-    return { blocked: false, removed };
+    const filtered = working.filter(r => isRuleValid(r, gSchema, gHeadingsTree, mode));
+    const removed = working.length - filtered.length;
+    const status = removed>0 ? `Removed ${removed} invalid rule${removed>1?'s':''}.` : null;
+    return { rules: filtered, removed, status, blocked: false };
   }
 
   // Never wipe arrays just because context isn’t loaded yet.
   // Persist both per-mode arrays; other tabs will normalize.
-  async function persistRules(reason){
+  async function persistRulesInternal(reasonOrOptions, maybeOptions){
     if (!gDocId) return;
 
-    const tr = TRACE("persistRules", { docId: gDocId, mode: gMode, reason: reason || "update", count: gRules.length });
+    const tr = TRACE('persistRules', { docId: gDocId, mode: gMode, count: gRules.length });
     try {
       // Clean only when we have context
-      const sanitizeResult = sanitizeRules();
+      sanitizeRules();
 
-      const activeClone = cloneRulesArray(gRules);
       if (gMode === 'headings') {
-        gRulesHeadings = activeClone;
+        gRulesHeadings = gRules.slice();
       } else {
-        gRulesFields = activeClone;
+        gRulesFields = gRules.slice();
       }
-      gRules = (gMode === 'headings') ? gRulesHeadings : gRulesFields;
+      tr.step('normalized rules', { headings: gRulesHeadings.length, fields: gRulesFields.length });
 
-      let existingPayload = {};
-      let existingPayloadWrapper = {};
+      let payloadUpdate = null;
       try {
         const st = await window.formSuitePersist?.loadState?.(gDocId);
-        if (st?.payload && typeof st.payload === 'object') {
-          existingPayloadWrapper = st.payload;
-          if (st.payload.CRONOS_PAYLOAD && typeof st.payload.CRONOS_PAYLOAD === 'object') {
-            existingPayload = st.payload.CRONOS_PAYLOAD;
-          }
-        } else if (st?.CRONOS_PAYLOAD && typeof st.CRONOS_PAYLOAD === 'object') {
-          existingPayload = st.CRONOS_PAYLOAD;
-        }
-        tr.step("loaded state", { hasPayload: Object.keys(existingPayload).length > 0 });
-      } catch (err) {
-        tr.warn("loadState failed", err);
+        const existingPayload = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || {};
+        payloadUpdate = { ...existingPayload, rules: gRulesHeadings, fieldRules: gRulesFields };
+        tr.step('payload prepared', { hasExisting: !!Object.keys(existingPayload||{}).length });
+      } catch (e) {
+        tr.warn('payload load failed', e);
       }
 
-      const headingsClone = cloneRulesArray(gRulesHeadings);
-      const fieldsClone   = cloneRulesArray(gRulesFields);
-      tr.step("normalized arrays", {
-        blocked: !!sanitizeResult?.blocked,
-        headings: headingsClone.length,
-        fields: fieldsClone.length
-      });
-      const nextCronosPayload = {
-        ...existingPayload,
-        rules: headingsClone,
-        fieldRules: fieldsClone
+      const saveInput = {
+        // keep both arrays updated so Extractor/Index can merge
+        rules: gRulesHeadings,
+        fieldRules: gRulesFields
       };
-      const payloadWrapper = {
-        ...existingPayloadWrapper,
-        CRONOS_PAYLOAD: nextCronosPayload
-      };
+      if (payloadUpdate) {
+        saveInput.payload = { CRONOS_PAYLOAD: payloadUpdate };
+      } else {
+        saveInput.payload = { CRONOS_PAYLOAD: { rules: gRulesHeadings, fieldRules: gRulesFields } };
+      }
 
-      await window.formSuitePersist?.saveState?.(gDocId, {
-        rules: headingsClone,
-        fieldRules: fieldsClone,
-        payload: payloadWrapper,
-        CRONOS_PAYLOAD: nextCronosPayload
-      });
+      await window.formSuitePersist?.saveState?.(gDocId, saveInput);
 
       // Broadcast so other tabs refresh immediately
       try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
       try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
 
-      if (!sanitizeResult?.blocked) {
-        setStatus(`Rules saved — ${gRules.length}`);
-      }
-      tr.end("saved");
-    } catch (err) {
-      tr.error("persist failed", err);
+      setStatus(`Rules saved — ${gRules.length}`);
+      tr.end('saved');
+    } catch (e) {
+      tr.error('persist failed', e);
       tr.end();
     }
   }
@@ -394,15 +386,15 @@
         const top = document.createElement("div"); top.className="row"; top.style.justifyContent="flex-end"; top.style.gap="8px";
         const btnCancel = document.createElement("button"); btnCancel.className="btn btn-ghost"; btnCancel.textContent="Cancel";
         btnCancel.addEventListener("click", ()=>{ gDraft=null; renderEditor(); });
-        const btnSave = document.createElement("button"); btnSave.className="btn btn-primary"; btnSave.textContent="Save rule"; btnSave.disabled = !isRuleValid(rule);
+        const btnSave = document.createElement("button"); btnSave.className="btn btn-primary"; btnSave.textContent="Save rule"; btnSave.disabled = !isRuleValid(rule, gSchema, gHeadingsTree, gMode);
         btnSave.addEventListener("click", ()=>{
-          if (!isRuleValid(rule)){ alert("Please complete the rule."); return; }
+          if (!isRuleValid(rule, gSchema, gHeadingsTree, gMode)){ alert("Please complete the rule."); return; }
           rule.id = "r_"+Math.random().toString(36).slice(2,8);
           gRules.push(rule);
           gDraft=null;
           persistRules('create'); renderEditor(); renderList();
         });
-        const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule()); };
+        const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule(), gSchema, gHeadingsTree, gMode); };
         card.dataset._updateSaveState = "1";
         card.appendChild(top);
         top.appendChild(btnCancel);
@@ -689,8 +681,11 @@
       const payloadRules   = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.rules)      ? st.payload.CRONOS_PAYLOAD.rules : [];
       const payloadFieldR  = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.fieldRules) ? st.payload.CRONOS_PAYLOAD.fieldRules : [];
 
-      gRulesHeadings = Array.isArray(st.rules)     && st.rules.length     ? st.rules     : payloadRules;
-      gRulesFields   = Array.isArray(st.fieldRules)&& st.fieldRules.length? st.fieldRules: payloadFieldR;
+      const nextHeadings = Array.isArray(st.rules)     && st.rules.length     ? st.rules     : payloadRules;
+      const nextFields   = Array.isArray(st.fieldRules)&& st.fieldRules.length? st.fieldRules: payloadFieldR;
+
+      gRulesHeadings = cloneRules(nextHeadings);
+      gRulesFields   = cloneRules(nextFields);
 
       gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
 
@@ -758,7 +753,7 @@
   }
   tabHeadings?.addEventListener('click', async ()=>{
     if (gMode==='headings') return;
-    await persistRules('tab-switch');
+    await persistRules('tab-switch', { mode: gMode, rules: gRules });
     gMode='headings';
     gDraft = null; gEditingId = null;
     gRules = gRulesHeadings.slice();
@@ -767,7 +762,7 @@
   });
   tabFields?.addEventListener('click', async ()=>{
     if (gMode==='fields') return;
-    await persistRules('tab-switch');
+    await persistRules('tab-switch', { mode: gMode, rules: gRules });
     gMode='fields';
     gDraft = null; gEditingId = null;
     gRules = gRulesFields.slice();
