@@ -301,56 +301,23 @@
   async function persistRulesInternal(reasonOrOptions, maybeOptions){
     if (!gDocId) return;
 
-    let reason = 'update';
-    let opts = {};
-    if (typeof reasonOrOptions === 'string') {
-      reason = reasonOrOptions || 'update';
-      opts = maybeOptions || {};
-    } else if (reasonOrOptions && typeof reasonOrOptions === 'object') {
-      opts = reasonOrOptions;
-      if (typeof reasonOrOptions.reason === 'string') reason = reasonOrOptions.reason;
-    }
-
-    const modeAtCall = opts.mode || gMode;
-    const sourceRules = Array.isArray(opts.rules) ? opts.rules : gRules;
-    const snapshot = cloneRules(sourceRules);
-
-    const tr = TRACE('persistRules', { docId: gDocId, mode: modeAtCall, count: snapshot.length, reason });
+    const tr = TRACE('persistRules', { docId: gDocId, mode: gMode, count: gRules.length });
     try {
-      const { rules: cleaned, status: sanitizeStatus, blocked } = sanitizeRules(snapshot, modeAtCall);
-      if (sanitizeStatus) setStatus(sanitizeStatus);
-      if (blocked) {
-        tr.step('sanitize deferred', { mode: modeAtCall, reason: sanitizeStatus });
-        if (modeAtCall === 'headings') {
-          gRulesHeadings = cloneRules(cleaned);
-          if (gMode === modeAtCall) gRules = gRulesHeadings;
-        } else {
-          gRulesFields = cloneRules(cleaned);
-          if (gMode === modeAtCall) gRules = gRulesFields;
-        }
-        tr.end('deferred');
-        return;
-      }
+      // Clean only when we have context
+      sanitizeRules();
 
-      const finalRules = cloneRules(cleaned);
-      if (modeAtCall === 'headings') {
-        gRulesHeadings = finalRules;
-        if (gMode === modeAtCall) gRules = gRulesHeadings;
+      if (gMode === 'headings') {
+        gRulesHeadings = gRules.slice();
       } else {
-        gRulesFields = finalRules;
-        if (gMode === modeAtCall) gRules = gRulesFields;
+        gRulesFields = gRules.slice();
       }
-      tr.step('normalized rules', { headings: gRulesHeadings.length, fields: gRulesFields.length, modeAtCall });
+      tr.step('normalized rules', { headings: gRulesHeadings.length, fields: gRulesFields.length });
 
       let payloadUpdate = null;
       try {
         const st = await window.formSuitePersist?.loadState?.(gDocId);
         const existingPayload = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || {};
-        payloadUpdate = {
-          ...existingPayload,
-          rules: cloneRules(gRulesHeadings),
-          fieldRules: cloneRules(gRulesFields)
-        };
+        payloadUpdate = { ...existingPayload, rules: gRulesHeadings, fieldRules: gRulesFields };
         tr.step('payload prepared', { hasExisting: !!Object.keys(existingPayload||{}).length });
       } catch (e) {
         tr.warn('payload load failed', e);
@@ -358,13 +325,13 @@
 
       const saveInput = {
         // keep both arrays updated so Extractor/Index can merge
-        rules: cloneRules(gRulesHeadings),
-        fieldRules: cloneRules(gRulesFields)
+        rules: gRulesHeadings,
+        fieldRules: gRulesFields
       };
       if (payloadUpdate) {
         saveInput.payload = { CRONOS_PAYLOAD: payloadUpdate };
       } else {
-        saveInput.payload = { CRONOS_PAYLOAD: { rules: cloneRules(gRulesHeadings), fieldRules: cloneRules(gRulesFields) } };
+        saveInput.payload = { CRONOS_PAYLOAD: { rules: gRulesHeadings, fieldRules: gRulesFields } };
       }
 
       await window.formSuitePersist?.saveState?.(gDocId, saveInput);
@@ -372,20 +339,13 @@
       // Broadcast so other tabs refresh immediately
       try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
       try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
-      if (!sanitizeStatus) setStatus(`Rules saved — ${finalRules.length}`);
+
+      setStatus(`Rules saved — ${gRules.length}`);
       tr.end('saved');
     } catch (e) {
       tr.error('persist failed', e);
       tr.end();
     }
-  }
-  function persistRules(reasonOrOptions, maybeOptions){
-    gPersistTail = gPersistTail.then(()=>persistRulesInternal(reasonOrOptions, maybeOptions)).catch(e=>{
-      const tr = TRACE('persistRules:queueError');
-      tr.error('queue failed', e);
-      tr.end();
-    });
-    return gPersistTail;
   }
   // ===== editor (single) =====
   function currentEditorRule(){
