@@ -96,6 +96,15 @@
   let gDraft   = null;   // unsaved draft rule
   let gPersistTail = Promise.resolve();
 
+  function cloneRulesArray(rules){
+    if (!Array.isArray(rules)) return [];
+    if (typeof structuredClone === 'function'){
+      try { return structuredClone(rules); }
+      catch (_) { /* fall back */ }
+    }
+    return JSON.parse(JSON.stringify(rules));
+  }
+
   const ACTIONS = new Set(["SHOW","HIDE"]);
   const CHOICE_TYPES = new Set(["select","multichoice","radio","dropdown","singlechoice","choice","single","options","combobox","list"]);
 
@@ -383,7 +392,7 @@
           rule.id = "r_"+Math.random().toString(36).slice(2,8);
           gRules.push(rule);
           gDraft=null;
-          persistRules(); renderEditor(); renderList();
+          persistRules('create'); renderEditor(); renderList();
         });
         const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule(), gSchema, gHeadingsTree, gMode); };
         card.dataset._updateSaveState = "1";
@@ -647,7 +656,7 @@
         const idx = gRules.findIndex(x=>x.id===r.id);
         if (idx >= 0) gRules.splice(idx,1);
         if (gEditingId === r.id) gEditingId = null;
-        persistRules(); renderEditor(); renderList();
+        persistRules('delete'); renderEditor(); renderList();
       });
 
       right.appendChild(edit);
