@@ -94,6 +94,7 @@
   let gRulesFields   = [];
   let gEditingId = null; // editing existing rule id
   let gDraft   = null;   // unsaved draft rule
+  let gPersistTail = Promise.resolve();
 
   const ACTIONS = new Set(["SHOW","HIDE"]);
   const CHOICE_TYPES = new Set(["select","multichoice","radio","dropdown","singlechoice","choice","single","options","combobox","list"]);
@@ -207,7 +208,7 @@
     return out;
   }
   // ===== validation that tolerates missing context =====
-  function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree){
+  function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree, mode = gMode){
     if (!rule || !ACTIONS.has(rule.action)) return false;
 
     // If we have NO schema yet, accept the rule (defer strict checks).
@@ -252,7 +253,7 @@
     }
 
     // Targets:
-    if (gMode === 'headings') {
+    if (mode === 'headings') {
       // If headings not loaded yet, accept (defer)
       if (!haveHeads) return true;
       const allowedHeads = new Set(flattenWithNumbers(headingsTree).map(h=>String(h.key)));
@@ -269,44 +270,122 @@
 
   // Only drop rules when we truly have enough context to judge.
   // Otherwise keep them as drafts (never erase user input).
-  function sanitizeRules(){
+  function cloneRules(rules){
+    const src = Array.isArray(rules) ? rules : [];
+    if (typeof structuredClone === 'function') {
+      try { return structuredClone(src); } catch {}
+    }
+    return JSON.parse(JSON.stringify(src));
+  }
+
+  function sanitizeRules(rules, mode){
+    const working = cloneRules(rules);
     const haveSchema = Array.isArray(gSchema?.fields) && gSchema.fields.length > 0;
-    const haveHeads  = (gMode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
+    const haveHeads  = (mode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
 
-    if (!haveSchema) { setStatus('Saved (awaiting schema).'); return; }
-    if (gMode==='headings' && !haveHeads) { setStatus('Saved (awaiting headings).'); return; }
+    if (!haveSchema) {
+      return { rules: working, removed: 0, status: 'Saved (awaiting schema).', blocked: true };
+    }
+    if (mode==='headings' && !haveHeads) {
+      return { rules: working, removed: 0, status: 'Saved (awaiting headings).', blocked: true };
+    }
 
-    const before = gRules.length;
-    gRules = gRules.filter(r => isRuleValid(r));
-    const removed = before - gRules.length;
-    if (removed>0) setStatus(`Removed ${removed} invalid rule${removed>1?'s':''}.`);
+    const filtered = working.filter(r => isRuleValid(r, gSchema, gHeadingsTree, mode));
+    const removed = working.length - filtered.length;
+    const status = removed>0 ? `Removed ${removed} invalid rule${removed>1?'s':''}.` : null;
+    return { rules: filtered, removed, status, blocked: false };
   }
 
   // Never wipe arrays just because context isn’t loaded yet.
   // Persist both per-mode arrays; other tabs will normalize.
-  async function persistRules(){
+  async function persistRulesInternal(reasonOrOptions, maybeOptions){
     if (!gDocId) return;
 
-    // Clean only when we have context
-    sanitizeRules();
-
-    if (gMode === 'headings') {
-      gRulesHeadings = gRules.slice();
-    } else {
-      gRulesFields = gRules.slice();
+    let reason = 'update';
+    let opts = {};
+    if (typeof reasonOrOptions === 'string') {
+      reason = reasonOrOptions || 'update';
+      opts = maybeOptions || {};
+    } else if (reasonOrOptions && typeof reasonOrOptions === 'object') {
+      opts = reasonOrOptions;
+      if (typeof reasonOrOptions.reason === 'string') reason = reasonOrOptions.reason;
     }
 
-    await window.formSuitePersist?.saveState?.(gDocId, {
-      // keep both arrays updated so Extractor/Index can merge
-      rules: gRulesHeadings,
-      fieldRules: gRulesFields
+    const modeAtCall = opts.mode || gMode;
+    const sourceRules = Array.isArray(opts.rules) ? opts.rules : gRules;
+    const snapshot = cloneRules(sourceRules);
+
+    const tr = TRACE('persistRules', { docId: gDocId, mode: modeAtCall, count: snapshot.length, reason });
+    try {
+      const { rules: cleaned, status: sanitizeStatus, blocked } = sanitizeRules(snapshot, modeAtCall);
+      if (sanitizeStatus) setStatus(sanitizeStatus);
+      if (blocked) {
+        tr.step('sanitize deferred', { mode: modeAtCall, reason: sanitizeStatus });
+        if (modeAtCall === 'headings') {
+          gRulesHeadings = cloneRules(cleaned);
+          if (gMode === modeAtCall) gRules = gRulesHeadings;
+        } else {
+          gRulesFields = cloneRules(cleaned);
+          if (gMode === modeAtCall) gRules = gRulesFields;
+        }
+        tr.end('deferred');
+        return;
+      }
+
+      const finalRules = cloneRules(cleaned);
+      if (modeAtCall === 'headings') {
+        gRulesHeadings = finalRules;
+        if (gMode === modeAtCall) gRules = gRulesHeadings;
+      } else {
+        gRulesFields = finalRules;
+        if (gMode === modeAtCall) gRules = gRulesFields;
+      }
+      tr.step('normalized rules', { headings: gRulesHeadings.length, fields: gRulesFields.length, modeAtCall });
+
+      let payloadUpdate = null;
+      try {
+        const st = await window.formSuitePersist?.loadState?.(gDocId);
+        const existingPayload = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || {};
+        payloadUpdate = {
+          ...existingPayload,
+          rules: cloneRules(gRulesHeadings),
+          fieldRules: cloneRules(gRulesFields)
+        };
+        tr.step('payload prepared', { hasExisting: !!Object.keys(existingPayload||{}).length });
+      } catch (e) {
+        tr.warn('payload load failed', e);
+      }
+
+      const saveInput = {
+        // keep both arrays updated so Extractor/Index can merge
+        rules: cloneRules(gRulesHeadings),
+        fieldRules: cloneRules(gRulesFields)
+      };
+      if (payloadUpdate) {
+        saveInput.payload = { CRONOS_PAYLOAD: payloadUpdate };
+      } else {
+        saveInput.payload = { CRONOS_PAYLOAD: { rules: cloneRules(gRulesHeadings), fieldRules: cloneRules(gRulesFields) } };
+      }
+
+      await window.formSuitePersist?.saveState?.(gDocId, saveInput);
+
+      // Broadcast so other tabs refresh immediately
+      try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
+      try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
+      if (!sanitizeStatus) setStatus(`Rules saved — ${finalRules.length}`);
+      tr.end('saved');
+    } catch (e) {
+      tr.error('persist failed', e);
+      tr.end();
+    }
+  }
+  function persistRules(reasonOrOptions, maybeOptions){
+    gPersistTail = gPersistTail.then(()=>persistRulesInternal(reasonOrOptions, maybeOptions)).catch(e=>{
+      const tr = TRACE('persistRules:queueError');
+      tr.error('queue failed', e);
+      tr.end();
     });
-
-    // Broadcast so other tabs refresh immediately
-    try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
-    try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
-
-    setStatus(`Rules saved — ${gRules.length}`);
+    return gPersistTail;
   }
   // ===== editor (single) =====
   function currentEditorRule(){
@@ -338,15 +417,15 @@
         const top = document.createElement("div"); top.className="row"; top.style.justifyContent="flex-end"; top.style.gap="8px";
         const btnCancel = document.createElement("button"); btnCancel.className="btn btn-ghost"; btnCancel.textContent="Cancel";
         btnCancel.addEventListener("click", ()=>{ gDraft=null; renderEditor(); });
-        const btnSave = document.createElement("button"); btnSave.className="btn btn-primary"; btnSave.textContent="Save rule"; btnSave.disabled = !isRuleValid(rule);
+        const btnSave = document.createElement("button"); btnSave.className="btn btn-primary"; btnSave.textContent="Save rule"; btnSave.disabled = !isRuleValid(rule, gSchema, gHeadingsTree, gMode);
         btnSave.addEventListener("click", ()=>{
-          if (!isRuleValid(rule)){ alert("Please complete the rule."); return; }
+          if (!isRuleValid(rule, gSchema, gHeadingsTree, gMode)){ alert("Please complete the rule."); return; }
           rule.id = "r_"+Math.random().toString(36).slice(2,8);
           gRules.push(rule);
           gDraft=null;
           persistRules(); renderEditor(); renderList();
         });
-        const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule()); };
+        const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule(), gSchema, gHeadingsTree, gMode); };
         card.dataset._updateSaveState = "1";
         card.appendChild(top);
         top.appendChild(btnCancel);
@@ -633,8 +712,11 @@
       const payloadRules   = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.rules)      ? st.payload.CRONOS_PAYLOAD.rules : [];
       const payloadFieldR  = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.fieldRules) ? st.payload.CRONOS_PAYLOAD.fieldRules : [];
 
-      gRulesHeadings = Array.isArray(st.rules)     && st.rules.length     ? st.rules     : payloadRules;
-      gRulesFields   = Array.isArray(st.fieldRules)&& st.fieldRules.length? st.fieldRules: payloadFieldR;
+      const nextHeadings = Array.isArray(st.rules)     && st.rules.length     ? st.rules     : payloadRules;
+      const nextFields   = Array.isArray(st.fieldRules)&& st.fieldRules.length? st.fieldRules: payloadFieldR;
+
+      gRulesHeadings = cloneRules(nextHeadings);
+      gRulesFields   = cloneRules(nextFields);
 
       gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
 
@@ -702,6 +784,7 @@
   }
   tabHeadings?.addEventListener('click', async ()=>{
     if (gMode==='headings') return;
+    await persistRules('tab-switch', { mode: gMode, rules: gRules });
     gMode='headings';
     gDraft = null; gEditingId = null;
     gRules = gRulesHeadings.slice();
@@ -710,6 +793,7 @@
   });
   tabFields?.addEventListener('click', async ()=>{
     if (gMode==='fields') return;
+    await persistRules('tab-switch', { mode: gMode, rules: gRules });
     gMode='fields';
     gDraft = null; gEditingId = null;
     gRules = gRulesFields.slice();
