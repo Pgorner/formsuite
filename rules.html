@@ -206,43 +206,55 @@
     walk(tree||[],0);
     return out;
   }
-
-  function isRuleValid(rule, schema=gSchema, headingsTree=gHeadingsTree){
+  // ===== validation that tolerates missing context =====
+  function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree){
     if (!rule || !ACTIONS.has(rule.action)) return false;
+
+    // If we have NO schema yet, accept the rule (defer strict checks).
+    const haveSchema = Array.isArray(schema?.fields) && schema.fields.length > 0;
+    const haveHeads  = Array.isArray(headingsTree) && headingsTree.length > 0;
+
+    // When no schema yet → don't reject; only minimal shape check
+    if (!haveSchema) {
+      if (!rule.fieldId || !rule.op || !Array.isArray(rule.values)) return false;
+      // Targets are optional until we know the tree
+      return true;
+    }
+
+    // Normal validation when schema is present
     const sources = buildConditionSources(schema);
     const src = sources.find(s => String(s.id) === String(rule.fieldId));
     if (!src) return false;
 
-    // validate op per type
     const allowedOps = (src.type==='boolean') ? ['equals']
-                     : (src.type==='date')    ? ['before','after','equals']
-                     : (src.type==='text')    ? ['equals','notEquals','contains']
-                     : (src.type==='number')  ? ['equals','notEquals']
-                     : (src.type==='select')  ? ['equals','notEquals']
-                     : [];
+                    : (src.type==='date')    ? ['before','after','equals']
+                    : (src.type==='text')    ? ['equals','notEquals','contains']
+                    : (src.type==='number')  ? ['equals','notEquals']
+                    : (src.type==='select')  ? ['equals','notEquals']
+                    : [];
     if (!allowedOps.includes(rule.op)) return false;
 
-    // validate value(s)
     if (!Array.isArray(rule.values)) return false;
     if (src.type==='boolean') {
       if (rule.values.length!==1) return false;
       const v = rule.values[0];
       if (!(v === true || v === false || v === 'true' || v === 'false')) return false;
     } else if (src.type==='date') {
-      if (rule.values.length!==1) return false;
-      if (!String(rule.values[0])) return false;
+      if (rule.values.length!==1 || !String(rule.values[0])) return false;
     } else if (src.type==='text') {
       if (rule.values.length!==1) return false;
     } else if (src.type==='number') {
-      if (rule.values.length!==1) return false;
-      if (isNaN(Number(rule.values[0]))) return false;
+      if (rule.values.length!==1 || isNaN(Number(rule.values[0]))) return false;
     } else if (src.type==='select') {
       if (rule.values.length!==1) return false;
       const opts = new Set((src.options||[]).map(String));
       if (!opts.has(String(rule.values[0]))) return false;
     }
 
+    // Targets:
     if (gMode === 'headings') {
+      // If headings not loaded yet, accept (defer)
+      if (!haveHeads) return true;
       const allowedHeads = new Set(flattenWithNumbers(headingsTree).map(h=>String(h.key)));
       if (!Array.isArray(rule.targets) || rule.targets.length===0) return false;
       if (!rule.targets.every(t => allowedHeads.has(String(t.key)))) return false;
@@ -255,28 +267,47 @@
     return true;
   }
 
+  // Only drop rules when we truly have enough context to judge.
+  // Otherwise keep them as drafts (never erase user input).
   function sanitizeRules(){
+    const haveSchema = Array.isArray(gSchema?.fields) && gSchema.fields.length > 0;
+    const haveHeads  = (gMode === 'fields') || (Array.isArray(gHeadingsTree) && gHeadingsTree.length > 0);
+
+    if (!haveSchema) { setStatus('Saved (awaiting schema).'); return; }
+    if (gMode==='headings' && !haveHeads) { setStatus('Saved (awaiting headings).'); return; }
+
     const before = gRules.length;
     gRules = gRules.filter(r => isRuleValid(r));
     const removed = before - gRules.length;
     if (removed>0) setStatus(`Removed ${removed} invalid rule${removed>1?'s':''}.`);
   }
 
-  function persistRules(){
+  // Never wipe arrays just because context isn’t loaded yet.
+  // Persist both per-mode arrays; other tabs will normalize.
+  async function persistRules(){
     if (!gDocId) return;
+
+    // Clean only when we have context
     sanitizeRules();
+
     if (gMode === 'headings') {
       gRulesHeadings = gRules.slice();
     } else {
       gRulesFields = gRules.slice();
     }
-    window.formSuitePersist?.saveState?.(gDocId, { rules: gRulesHeadings, fieldRules: gRulesFields });
-    // Broadcast an update so other tabs (Form) reload rules
+
+    await window.formSuitePersist?.saveState?.(gDocId, {
+      // keep both arrays updated so Extractor/Index can merge
+      rules: gRulesHeadings,
+      fieldRules: gRulesFields
+    });
+
+    // Broadcast so other tabs refresh immediately
     try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, ts: Date.now() }); } catch {}
     try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: Date.now() }); } catch {}
+
     setStatus(`Rules saved — ${gRules.length}`);
   }
-
   // ===== editor (single) =====
   function currentEditorRule(){
     if (gDraft) return gDraft;
@@ -594,20 +625,26 @@
       if (!gDocId) return;
       const st = await window.formSuitePersist?.loadState?.(gDocId);
       if (!st) return;
+
       if (st.schema) gSchema = st.schema;
       if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
-      if (Array.isArray(st.rules)) gRulesHeadings = st.rules;
-      if (Array.isArray(st.fieldRules)) gRulesFields = st.fieldRules;
-      gRules = (gMode==='headings') ? (gRulesHeadings.slice()) : (gRulesFields.slice());
-      sanitizeRules();
+
+      // Prefer explicit arrays; otherwise fall back to payload (if present)
+      const payloadRules   = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.rules)      ? st.payload.CRONOS_PAYLOAD.rules : [];
+      const payloadFieldR  = Array.isArray(st?.payload?.CRONOS_PAYLOAD?.fieldRules) ? st.payload.CRONOS_PAYLOAD.fieldRules : [];
+
+      gRulesHeadings = Array.isArray(st.rules)     && st.rules.length     ? st.rules     : payloadRules;
+      gRulesFields   = Array.isArray(st.fieldRules)&& st.fieldRules.length? st.fieldRules: payloadFieldR;
+
+      gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
+
+      // Do NOT hard-sanitize here; we may not have schema/headings yet.
       if (!gRules.find(r=>r.id===gEditingId)) gEditingId = null;
-      if (gDraft && !isRuleValid(gDraft)) gDraft = gDraft;
       setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
       renderEditor(); renderList();
     } catch(e){ tr.error("failed", e); }
     finally{ tr.end(); }
   }
-
   function hookSync(){
     bcLegacy?.addEventListener("message",(ev)=>{
       const m = ev?.data || {};

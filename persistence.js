@@ -126,14 +126,33 @@
   }
 
   // ===== State (schema/values/etc.) =====
-  async function saveState(docId, patch) {
-    if (!docId) return null;
-    const key = LS_KEYS.STATE_PREFIX + docId;
-    const cur = readJSON(key) || {};
-    const next = { ...cur, ...(patch || {}) };
-    writeJSON(key, next);
+  // Drop-in idea for persistence.js
+  async function saveState(docId, obj){
+    const prev = await loadState(docId) || {};
+    const next = { ...prev };
+
+    // Only overwrite arrays if the new value is actually an array;
+    // and if it's empty, keep the previous non-empty array.
+    function keepArray(key){
+      const incoming = obj?.[key];
+      if (Array.isArray(incoming)) {
+        next[key] = incoming.length ? incoming.slice() : (Array.isArray(prev[key]) ? prev[key] : []);
+      } else if (incoming !== undefined) {
+        // non-array value provided – assign as-is
+        next[key] = incoming;
+      }
+    }
+
+    // Keys we care about
+    for (const k of ['schema','values','tagMap','headings','headingsTree','rules','fieldRules','payload']){
+      if (k==='rules' || k==='fieldRules') { keepArray(k); continue; }
+      if (obj && Object.prototype.hasOwnProperty.call(obj,k)) next[k] = obj[k];
+    }
+
+    // … write `next` to storage/opfs/IDB as you already do …
     return next;
   }
+
   async function loadState(docId) {
     if (!docId) return null;
     return readJSON(LS_KEYS.STATE_PREFIX + docId) || null;
