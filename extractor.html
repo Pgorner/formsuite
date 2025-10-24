@@ -505,6 +505,31 @@
       }
     }
 
+    function installRulesUpdatedListener() {
+      try {
+        bcCanon?.addEventListener?.('message', async (ev) => {
+          const tr = TRACE('bcCanon:rules-updated', ev?.data);
+          try {
+            const m = ev.data || {};
+            if (m.type !== 'rules-updated') return;
+            if (!m.docId || m.docId !== gDocId) return;
+
+            const st = await window.formSuitePersist.loadState(gDocId);
+            const wsCollected = extractRulesFromState(st || {});
+            const rules      = normalizeRulesForSchema(gSchema, wsCollected.rules);
+            const fieldRules = normalizeRulesForSchema(gSchema, wsCollected.fieldRules);
+
+            await window.formSuitePersist.saveState(gDocId, { rules, fieldRules });
+            await updatePreview(collectFormValues(gSchema));
+            setStatus('Rules updated from Rules tab.');
+          } catch (e) {
+            console.warn('rules-updated handler failed', e);
+          } finally { tr?.end?.(); }
+        });
+      } catch {}
+    }
+
+
     // =========================
     // TAG MAP / PREVIEW HELPERS
     // =========================
@@ -514,45 +539,169 @@
       return new Set((schema?.fields || []).map(f => String(f.id)));
     }
 
+
+    // Collect rules from workspace state regardless of where the Rules tab put them
+    function extractRulesFromState(state) {
+      const out = { rules: [], fieldRules: [] };
+      if (!state || typeof state !== 'object') return out;
+
+      // Workspace (authoritative while editing)
+      if (Array.isArray(state.rules))      out.rules.push(...state.rules);
+      if (Array.isArray(state.fieldRules)) out.fieldRules.push(...state.fieldRules);
+
+      // Payload mirrors (support nested + flat + legacy)
+      const payload =
+          state?.payload?.CRONOS_PAYLOAD
+      || state?.CRONOS_PAYLOAD
+      || state?.cronos_payload
+      || state?.payload
+      || {};
+
+      if (Array.isArray(payload.rules))      out.rules.push(...payload.rules);
+      if (Array.isArray(payload.fieldRules)) out.fieldRules.push(...payload.fieldRules);
+
+      // Ultra-legacy keys (very old)
+      if (Array.isArray(state.CRONOS_RULES))       out.rules.push(...state.CRONOS_RULES);
+      if (Array.isArray(state.cronos_rules))       out.rules.push(...state.cronos_rules);
+      if (Array.isArray(state.CRONOS_FIELD_RULES)) out.fieldRules.push(...state.CRONOS_FIELD_RULES);
+      if (Array.isArray(state.cronos_field_rules)) out.fieldRules.push(...state.cronos_field_rules);
+
+      // Deduplicate by JSON shape
+      const dedupe = (arr) => {
+        const seen = new Set(); const res = [];
+        for (const r of (arr || [])) {
+          const k = JSON.stringify(r || {});
+          if (!seen.has(k)) { seen.add(k); res.push(r); }
+        }
+        return res;
+      };
+
+      return { rules: dedupe(out.rules), fieldRules: dedupe(out.fieldRules) };
+    }
+
+
     /**
      * Keep only rules whose `fieldId` exists in the schema.
      * Also prune condition references to non-existing fields.
      * Targets (heading indices) are kept if they look numeric.
      */
-    function normalizeRulesForSchema(schema, rulesIn) {
-      const rules = Array.isArray(rulesIn) ? rulesIn : [];
-      const valid = getValidFieldIdSet(schema);
-      const out = [];
+    // --- helper: map label → id, and option label → parent field id
+    function __buildSchemaIndex(schema) {
+      const idx = { byId: new Map(), byLabel: new Map(), optionToField: new Map() };
+      for (const f of (schema?.fields || [])) {
+        const id = String(f.id);
+        idx.byId.set(id, f);
+        if (f.label) idx.byLabel.set(String(f.label).trim().toLowerCase(), f);
 
-      for (const r of rules) {
-        if (!r) continue;
-        const fieldId = String(r.fieldId ?? r.field ?? r.whenField ?? '');
-               if (!fieldId || !valid.has(fieldId)) continue; // drop whole rule
-
-        const rr = JSON.parse(JSON.stringify(r)); // safe clone
-
-        if (Array.isArray(rr.conditions)) {
-          rr.conditions = rr.conditions.filter(c => {
-            if (!c) return false;
-            const ref = c.fieldId ?? c.leftFieldId ?? c.rightFieldId;
-            return !ref || valid.has(String(ref));
-          });
+        const opts = [];
+        if (Array.isArray(f.options)) {
+          for (const o of f.options) {
+            const label = (o?.label ?? o?.text ?? o?.value ?? o);
+            if (label != null) opts.push(String(label));
+          }
         }
-
-        // Keep only numeric-like targets (heading indices)
-        if (Array.isArray(rr.targets)) {
-          rr.targets = rr.targets.filter(t => {
-            const key = t?.key ?? t?.idx ?? t?.id;
-            if (key == null) return false;
-            const n = Number(key);
-            return Number.isFinite(n) && n > 0;
-          });
+        if (f.mc?.groups) {
+          for (const g of f.mc.groups) {
+            for (const it of (g.items || [])) {
+              if (it?.value != null) opts.push(String(it.value));
+            }
+          }
         }
+        for (const label of opts) idx.optionToField.set(label.trim().toLowerCase(), f);
+      }
+      return idx;
+    }
 
-        out.push(rr);
+    function __resolveFieldRef(schema, raw) {
+      if (!raw) return null;
+      const s = String(raw).trim();
+      const idx = __buildSchemaIndex(schema);
+
+      // Option synthetic ids like "fieldId__opt__option_slug" → base field
+      if (s.includes('__opt__')) {
+        const baseId = s.split('__opt__')[0];
+        if (idx.byId.has(baseId)) return idx.byId.get(baseId);
+        const slug = s.split('__opt__').pop();
+        for (const [labelLower, field] of idx.optionToField.entries()) {
+          const labelSlug = labelLower
+            .normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+            .replace(/[^a-z0-9]+/gi,'_').replace(/^_+|_+$/g,'')
+            .toLowerCase();
+          if (labelSlug === String(slug).toLowerCase()) return field;
+        }
+      }
+
+      if (idx.byId.has(s)) return idx.byId.get(s);
+      const byLabel = idx.byLabel.get(s.toLowerCase());
+      if (byLabel) return byLabel;
+
+      const parts = s.split(':').map(x => x.trim());
+      if (parts.length >= 1) {
+        const tryLabel = idx.byLabel.get(parts[0].toLowerCase());
+        if (tryLabel) return tryLabel;
+      }
+
+      const own = idx.optionToField.get(s.toLowerCase());
+      if (own) return own;
+
+      console.warn('[resolveFieldRef] could not resolve field for:', s);
+      return null;
+    }
+
+    function __coerceRuleForMultichoiceOption(schema, rule, field) {
+      // Turn “option equals true” into multichoice anyOf
+      const out = JSON.parse(JSON.stringify(rule));
+      const idx = __buildSchemaIndex(schema);
+      const looksLikeOption = !idx.byId.has(String(out.fieldId || out.field || out.whenField));
+
+      if ((field?.type === 'multichoice' || field?.type === 'select') && looksLikeOption) {
+        const raw = String(out.fieldId || out.field || out.whenField).split(':').pop().trim();
+        out.fieldId = field.id;
+        out.op = 'anyOf';
+        out.values = [raw];
+        delete out.value; delete out.expected;
       }
       return out;
     }
+
+    // Normalize + prune against schema
+    function normalizeRulesForSchema(schema, rulesIn) {
+      const rules = Array.isArray(rulesIn) ? rulesIn : [];
+      const out = [];
+      for (const raw of rules) {
+        if (!raw) continue;
+
+        const got = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
+        if (!got) continue;
+
+        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw, fieldId: got.id }, got);
+
+        if (Array.isArray(r0.conditions)) {
+          r0.conditions = r0.conditions.filter(c => {
+            const ref = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
+            if (!ref) return false;
+            return !!__resolveFieldRef(schema, ref);
+          });
+        }
+
+        if (Array.isArray(r0.targets)) {
+          r0.targets = r0.targets
+            .map(t => {
+              let key = t?.key ?? t?.idx ?? t?.id;
+              if (key == null) return null;
+              const rawKey = String(key);
+              const head = rawKey.includes('|') ? rawKey.split('|')[0] : rawKey;
+              const n = Number(head);
+              return Number.isFinite(n) && n > 0 ? { key: n } : null;
+            })
+            .filter(Boolean);
+        }
+
+        out.push(r0);
+      }
+      return out;
+    }
+
 
     function normalizeRules(rules){
       return Array.isArray(rules) ? rules : [];
@@ -560,31 +709,37 @@
 
     function normalizeForSchema(schema, values, tagMap) {
       const fieldIds = new Set((schema?.fields || []).map(f => String(f.id)));
+
+      // Keep only values whose keys exist in schema
       const prunedValues = {};
       for (const [k, v] of Object.entries(values || {})) {
         if (fieldIds.has(String(k))) prunedValues[k] = v;
       }
-      // Optional: keep tagMap only if it points to an existing field id
+
+      // Keep only tag mappings that point to existing field ids
       const prunedTagMap = {};
       for (const [tag, fieldId] of Object.entries(tagMap || {})) {
         if (fieldIds.has(String(fieldId))) prunedTagMap[tag] = fieldId;
       }
+
       return { values: prunedValues, tagMap: prunedTagMap };
     }
 
+
     async function getTagMapFor(docId) {
-      const tr = TRACE('getTagMapFor', { docId });
       try {
         const state = docId ? (await window.formSuitePersist.loadState(docId)) : null;
         const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
-                    || (state?.cronos_payload?.tagMap)
                     || (state?.CRONOS_PAYLOAD?.tagMap)
+                    || (state?.cronos_payload?.tagMap)
                     || (state?.tagMap)
                     || {};
-        tr.end({ tagCount: Object.keys(tagMap).length });
         return tagMap;
-      } catch (e) { tr.error('failed', e); tr.end(); return {}; }
+      } catch {
+        return {};
+      }
     }
+
 
     function loadSchemaFromLocalStorage() {
       const tr = TRACE('loadSchemaFromLocalStorage');
@@ -595,91 +750,72 @@
     // Collect values from the live form.
     // NEW: returns structured address objects from __addressValues.
     function collectFormValues(schema) {
-      const tr = TRACE('collectFormValues', { fieldCount: schema?.fields?.length || 0 });
-      try {
-        const form = document.getElementById('liveForm');
-        const out = {};
-        if (!form || !schema) { tr.end('no form/schema'); return out; }
-        for (const f of schema.fields) {
-          if (f.type === 'multichoice') {
-            const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
-            out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
-            continue;
-          }
-          if (f.type === 'address') {
-            out[f.id] = __addressValues[f.id] ?? null;
-            continue;
-          }
-          const el = form.elements[f.id];
-          out[f.id] = el ? el.value : null;
+      const form = document.getElementById('liveForm');
+      const out = {};
+      if (!form || !schema) return out;
+      for (const f of (schema.fields || [])) {
+        if (f.type === 'multichoice') {
+          const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
+          out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
+          continue;
         }
-        tr.end({ keys: Object.keys(out).length });
-        return out;
-      } catch (e) { tr.error('failed', e); tr.end(); return {}; }
+        if (f.type === 'address') {
+          out[f.id] = __addressValues[f.id] ?? null; // structured
+          continue;
+        }
+        const el = form.elements[f.id];
+        out[f.id] = el ? el.value : null;
+      }
+      return out;
     }
 
+
     async function updatePreview(values) {
-      const tr = TRACE('updatePreview', { valueKeys: Object.keys(values||{}).length });
-      try {
-        if (!payloadEl) { tr.end('no payloadEl'); return; }
+      if (!payloadEl) return;
 
-        const tagMapRaw = await getTagMapFor(gDocId);
-        const wsState   = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+      const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
 
-        // Workspace arrays
-        const wsRules    = normalizeRules(wsState?.rules);
-        const wsFieldR   = normalizeRules(wsState?.fieldRules);
-
-        // Payload fallbacks (accept multiple common keys)
-        const pl = wsState?.payload?.CRONOS_PAYLOAD
+      // Gather rules from wherever they are (workspace preferred; else mirrors)
+      const wsCollected = extractRulesFromState(wsState || {});
+      const plObj = wsState?.payload?.CRONOS_PAYLOAD
                 || wsState?.CRONOS_PAYLOAD
                 || wsState?.cronos_payload
                 || {};
-        const plRules    = normalizeRules(pl.rules);
-        const plFieldR   = normalizeRules(pl.fieldRules);
+      const plCollected = extractRulesFromState(plObj || {});
 
-        // Merge: prefer workspace if present, else payload
-        const mergedRules  = wsRules.length  ? wsRules  : plRules;
-        const mergedFieldR = wsFieldR.length ? wsFieldR : plFieldR;
+      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
+      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
 
-        // Prune against current schema
-        const rules      = normalizeRulesForSchema(gSchema, mergedRules);
-        const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldR);
+      // Normalize against current schema
+      const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
+      const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
 
-        const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, values || {}, tagMapRaw);
+      const tagMapRaw = await getTagMapFor(gDocId);
 
-        payloadEl.value = JSON.stringify({
-          title:  gSchema?.title || 'Form',
-          fields: gSchema?.fields || [],
-          values: prunedValues,
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules
-        }, null, 2);
+      const { values: prunedValues, tagMap: prunedTagMap } =
+        normalizeForSchema(gSchema, values || {}, tagMapRaw);
 
-        tr.end({ ok:true });
-      } catch (e) { tr.error('failed', e); tr.end(); }
+      payloadEl.value = JSON.stringify({
+        title:  gSchema?.title || 'Form',
+        fields: gSchema?.fields || [],
+        values: prunedValues,
+        tagMap: prunedTagMap,
+        rules,
+        fieldRules
+      }, null, 2);
     }
 
 
     let previewTimer = null;
     function schedulePreviewUpdate() {
-      const tr = TRACE('schedulePreviewUpdate');
-      try {
-        clearTimeout(previewTimer);
-        previewTimer = setTimeout(async () => {
-          const tr2 = TRACE('previewUpdate:tick');
-          try {
-            const vals = collectFormValues(gSchema);
-            if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: vals });
-            await updatePreview(vals);
-            gDirty = true;
-            setStatus('Unsaved changes — press Save to update DOCX.');
-          } catch (e) { tr2.error('tick failed', e); }
-          finally { tr2.end(); }
-        }, 250);
-      } finally { tr.end(); }
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(async () => {
+        const vals = collectFormValues(gSchema);
+        if (gDocId) await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: vals });
+        await updatePreview(vals);
+        gDirty = true;
+        setStatus('Unsaved changes — press Save to update DOCX.');
+      }, 250);
     }
 
     function buildForm(container, schema, values) {
@@ -1308,94 +1444,94 @@
     // RENDER FROM CURRENT BYTES
     // =========================
     async function renderFromCurrentBytes(prefix = '') {
-      const tr = TRACE('renderFromCurrentBytes', { prefix, hasBuf: !!gArrayBuffer, len: gArrayBuffer?.byteLength });
+      setStatus((prefix || '') + 'Parsing…');
+
+      // 1) SDTs
+      const parsed = await parseSDTs_JS(gArrayBuffer);
+      gSDTs = parsed.sdts || [];
+      renderSDTsView(parsed);
+
+      // 2) Headings (best-effort)
+      let headingsParsed = { flat: [], tree: [], count: 0 };
       try {
-        tr.step('buffer sha', await sha256Hex(gArrayBuffer));
+        headingsParsed = await parseHeadings_JS(gArrayBuffer);
+        renderHeadingsTreeView(headingsParsed.tree);
+      } catch {
+        if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
+      }
 
-        // 1) SDTs
-        const parsed = await parseSDTs_JS(gArrayBuffer);
-        gSDTs = parsed.sdts || [];
-        renderSDTsView(parsed);
+      // 3) Payload from DOCX (settings/custom)
+      let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
+      if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
+      let payload = null; try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
 
-        // 2) Headings (best-effort)
-        let headingsParsed = { flat: [], tree: [], count: 0 };
-        try {
-          headingsParsed = await parseHeadings_JS(gArrayBuffer);
-          renderHeadingsTreeView(headingsParsed.tree);
-        } catch (e) {
-          tr.warn('headings parse/render failed', e);
-          try { if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>'; } catch {}
-        }
+      const wsState = await window.formSuitePersist.loadState(gDocId);
 
-        // 3) Payload (schema/values/tagMap/rules/fieldRules)
-        let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
-        if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
+      // Choose schema: newer wins (workspace vs payload)
+      const asTs = (x)=> { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
+      const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
+      const pUpdatedTs = asTs(payload?.updatedAt);
+      const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
 
-        let payload = null;
-        try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
+      let chosenSchema;
+      if (wsState?.schema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
+        chosenSchema = wsState.schema;
+      } else if (pHasSchema) {
+        chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
+      } else {
+        chosenSchema = loadSchemaFromLocalStorage() || { title: 'Form', fields: [] };
+      }
 
-        const wsState    = await window.formSuitePersist.loadState(gDocId);
-        const wsSchema   = wsState?.schema || null;
-        const wsValues   = wsState?.values || {};
-        const wsRules    = normalizeRules(wsState?.rules);
-        const wsFieldR   = normalizeRules(wsState?.fieldRules);
-        const wsTagMap   = wsState?.tagMap || {};
+      // Merge values/tagMap
+      const mergedValues = Object.assign({}, payload?.values || {}, wsState?.values || {});
+      const mergedTagMap = Object.assign({}, payload?.tagMap || {}, wsState?.tagMap || {});
 
-        const asTs = (x)=> { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
-        const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
-        const pUpdatedTs = asTs(payload?.updatedAt);
-        const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
+      // Merge rules (workspace preferred; else payload)
+      const wsCollected = extractRulesFromState(wsState || {});
+      const plCollected = extractRulesFromState(payload || {});
+      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
+      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
 
-        let chosenSchema, statusSource;
-        if (wsSchema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
-          chosenSchema = wsSchema; statusSource = 'Using newer schema from Builder/workspace.';
-        } else if (pHasSchema) {
-          chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
-          statusSource = 'Loaded schema from DOCX payload.';
-        } else {
-          chosenSchema = loadSchemaFromLocalStorage() || { title: 'Form', fields: [] };
-          statusSource = 'Fallback schema (local storage or empty).';
-        }
+      // Normalize everything to chosen schema
+      const rules      = normalizeRulesForSchema(chosenSchema, mergedRulesRaw);
+      const fieldRules = normalizeRulesForSchema(chosenSchema, mergedFieldRaw);
+      const { values: prunedValues, tagMap: prunedTagMap } =
+        normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
 
-        const mergedValues = Object.assign({}, payload?.values || {}, wsValues || {});
-        const mergedTagMap = Object.assign({}, payload?.tagMap || {}, wsTagMap || {});
+      // Adopt & persist mirrors so Save/Export see the same view
+      gSchema = chosenSchema;
+      gValues = prunedValues;
 
-        const payloadRules  = normalizeRules(payload?.rules);
-        const payloadFieldR = normalizeRules(payload?.fieldRules);
+      if (gDocId) {
+        const canonical = {
+          title: gSchema.title,
+          fields: gSchema.fields,
+          values: gValues,
+          tagMap: prunedTagMap,
+          rules, fieldRules,
+          updatedAt: new Date().toISOString()
+        };
+        await window.formSuitePersist.saveState(gDocId, {
+          schema: gSchema,
+          values: gValues,
+          tagMap: prunedTagMap,
+          rules, fieldRules,
+          headings: headingsParsed.flat,
+          headingsTree: headingsParsed.tree,
+          headingsUpdatedAt: new Date().toISOString(),
+          payload: { CRONOS_PAYLOAD: canonical },
+          CRONOS_PAYLOAD: canonical,
+          cronos_payload: canonical,
+          schemaUpdatedAt: new Date().toISOString()
+        });
+      }
 
-        const mergedRules   = wsRules.length    ? wsRules    : payloadRules;
-        const mergedFieldR  = wsFieldR.length   ? wsFieldR   : payloadFieldR;
-
-        const prunedRules   = normalizeRulesForSchema(chosenSchema, mergedRules);
-        const prunedFieldR  = normalizeRulesForSchema(chosenSchema, mergedFieldR);
-
-        const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
-
-        gSchema = chosenSchema;
-        gValues = prunedValues;
-
-        // Persist both arrays so they remain available for export/save
-        if (gDocId) {
-          const patch = {
-            schema: gSchema,
-            values: gValues,
-            tagMap: prunedTagMap,
-            headings: headingsParsed.flat,
-            headingsTree: headingsParsed.tree,
-            headingsUpdatedAt: new Date().toISOString()
-          };
-          if (Array.isArray(prunedRules) && prunedRules.length)     patch.rules = prunedRules;
-          if (Array.isArray(prunedFieldR) && prunedFieldR.length)   patch.fieldRules = prunedFieldR;
-          await window.formSuitePersist.saveState(gDocId, patch);
-        }
-
-        buildForm(document.getElementById('formMount'), gSchema, gValues);
-        await updatePreview(gValues);
-        setStatus(statusSource);
-        tr.end({ statusSource });
-      } catch (e) { tr.error('failed', e); tr.end(); }
+      buildForm(document.getElementById('formMount'), gSchema, gValues);
+      await updatePreview(gValues);
+      setStatus('Ready.');
     }
+
+
 
     function renderSDTsView(parsed) {
       const tr = TRACE('renderSDTsView', { total: parsed?.total, rows: parsed?.sdts?.length });
@@ -1435,7 +1571,7 @@
         if (!meta?.docId) { tr.end('no meta; idle'); return; }
 
         clearUiForNewDoc('Restoring document…');
-
+        installRulesUpdatedListener();
         let bytes = await window.formSuitePersist.getBytes?.(meta.docId)
                 || await window.formSuitePersist.getCurrentDocBytes?.();
         tr.step('persistence bytes', { len: bytes?.byteLength || bytes?.length });
@@ -1588,24 +1724,6 @@
       return out;
     }
 
-    // ---------- Bridge to Python: apply visibility using fsHidden ----------
-    async function applyVisibilityByRules(bytesU8, visibilityMap) {
-      if (!visibilityMap || !Object.keys(visibilityMap).length) return bytesU8;
-      const py = await pyodideReady;
-      const fn = py.globals.get('apply_visibility');
-      const pyBytes = py.toPy(bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8));
-      const pyMap   = py.toPy(JSON.stringify(visibilityMap));
-      let pyOut;
-      try { pyOut = fn(pyBytes, pyMap); }
-      finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
-      let u8;
-      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
-      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
-      else u8 = new Uint8Array([]);
-      try { pyOut.destroy?.(); } catch {}
-      return u8;
-    }
-
     // =========================
     // FILE OPEN / SAVE / EXPORT
     // =========================
@@ -1670,180 +1788,154 @@
     }
 
     async function doSave() {
-      const tr = TRACE('doSave', { hasBuf: !!gArrayBuffer, docId: gDocId });
-      try {
-        if (!gArrayBuffer) { tr.warn('no buffer'); return; }
+      if (!gArrayBuffer) return;
 
-        const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-        if (restored?.schema) gSchema = restored.schema;
+      const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+      if (restored?.schema) gSchema = restored.schema;
 
-        // --- values ---
-        const domVals  = collectFormValues(gSchema);
-        const baseVals = (restored && restored.values) ? restored.values : {};
+      const domVals  = collectFormValues(gSchema);
+      const baseVals = (restored && restored.values) ? restored.values : {};
 
-        // --- tag map ---
-        const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
+      const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-        // --- RULE SOURCING: prefer workspace, fall back to payload mirrors (like Preview) ---
-        const pl = restored?.payload?.CRONOS_PAYLOAD
+      const wsCollected = extractRulesFromState(restored || {});
+      const plObj = restored?.payload?.CRONOS_PAYLOAD
                 || restored?.CRONOS_PAYLOAD
                 || restored?.cronos_payload
                 || {};
+      const plCollected = extractRulesFromState(plObj || {});
+      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
+      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
 
-        const wsRules    = Array.isArray(restored?.rules)      ? restored.rules      : [];
-        const wsFieldR   = Array.isArray(restored?.fieldRules) ? restored.fieldRules : [];
-        const plRules    = Array.isArray(pl.rules)             ? pl.rules            : [];
-        const plFieldR   = Array.isArray(pl.fieldRules)        ? pl.fieldRules       : [];
+      const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
+      const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
 
-        const mergedRules  = wsRules.length  ? wsRules  : plRules;
-        const mergedFieldR = wsFieldR.length ? wsFieldR : plFieldR;
+      const { values: prunedValues, tagMap: prunedTagMap } =
+        normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
 
-        // --- Normalize / prune against current schema ---
-        const rules      = normalizeRulesForSchema(gSchema, mergedRules);
-        const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldR);
+      gValues = prunedValues;
+      await updatePreview(gValues);
 
-        const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
+      const payloadObj = {
+        title:  gSchema.title || 'Form',
+        fields: gSchema.fields || [],
+        values: gValues || {},
+        tagMap: prunedTagMap,
+        rules,
+        fieldRules,
+        updatedAt: new Date().toISOString()
+      };
 
-        gValues = prunedValues;
-        await updatePreview(gValues);
+      setStatus('Writing payload to DOCX…');
+      const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
+      const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
+      gArrayBuffer = updatedU8.slice().buffer;
 
-        setStatus('Writing payload to DOCX (settings.xml)…');
-
-        // --- Build payload (always include arrays for symmetry) ---
-        const payloadObj = {
-          title:     gSchema.title || 'Form',
-          fields:    gSchema.fields || [],
-          values:    gValues || {},
-          tagMap:    prunedTagMap,
-          rules,          // always present
-          fieldRules,     // always present
-          updatedAt: new Date().toISOString()
-        };
-        const payload = JSON.stringify(payloadObj);
-
-        // Write into DOCX settings
-        const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
-        const updatedU8 = compactU8(toU8(updated));
-        gArrayBuffer = updatedU8.slice().buffer;
-
-        // Persist workspace snapshot
-        if (gDocId) await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap
+      if (gDocId) {
+        await window.formSuitePersist.saveState(gDocId, {
+          schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap,
+          payload: { CRONOS_PAYLOAD: payloadObj },
+          CRONOS_PAYLOAD: payloadObj,
+          cronos_payload: payloadObj,
+          schemaUpdatedAt: new Date().toISOString()
         });
-        if (gDocId) await window.formSuitePersist.putBytes(gDocId, updatedU8);
-        const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
-        gDocId = metaObj.docId;
-        persistActiveMeta(metaObj);
-        announceDocUpdate();
+        await window.formSuitePersist.putBytes(gDocId, updatedU8);
+      }
+      const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
+      gDocId = metaObj.docId;
+      persistActiveMeta(metaObj);
+      announceDocUpdate();
 
-        if (supportsFS) {
-          const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-          if (handle) {
-            const p = await ensurePermission(handle, 'readwrite');
-            tr.step('ensurePermission', p);
-            if (p === 'granted') {
-              const stream = await handle.createWritable();
-              await stream.write(updatedU8);
-              await stream.close();
-              setStatus('Saved.');
-              gDirty = false;
-              return;
-            }
-          }
+      if (window.showSaveFilePicker && gFileHandle) {
+        const p = await ensureWritePermission(gFileHandle, 'readwrite');
+        if (p === 'granted') {
+          const stream = await gFileHandle.createWritable();
+          await stream.write(updatedU8);
+          await stream.close();
+          setStatus('Saved.');
+          gDirty = false;
+          return;
         }
-
-        setStatus('Saved in workspace (file system write not available).');
-        gDirty = false;
-      } catch (e) {
-        tr.error('save failed', e);
-        setStatus(`Error saving: ${e.message || e}`);
-      } finally { tr.end(); }
+      }
+      setStatus('Saved in workspace (file write not available).');
+      gDirty = false;
     }
 
+
     async function doExport() {
-      const tr = TRACE('doExport', { hasBuf: !!gArrayBuffer, docId: gDocId });
-      try {
-        if (!gArrayBuffer) { tr.warn('no buffer'); return; }
+      if (!gArrayBuffer) return;
 
-        const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-        if (restored?.schema) gSchema = restored.schema;
+      const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+      if (restored?.schema) gSchema = restored.schema;
 
-        // --- values ---
-        const domVals  = collectFormValues(gSchema);
-        const baseVals = (restored && restored.values) ? restored.values : {};
+      const domVals  = collectFormValues(gSchema);
+      const baseVals = (restored && restored.values) ? restored.values : {};
+      const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-        // --- tag map ---
-        const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
-
-        // --- RULE SOURCING (same logic as doSave/Preview) ---
-        const pl = restored?.payload?.CRONOS_PAYLOAD
+      const wsCollected = extractRulesFromState(restored || {});
+      const plObj = restored?.payload?.CRONOS_PAYLOAD
                 || restored?.CRONOS_PAYLOAD
                 || restored?.cronos_payload
                 || {};
+      const plCollected = extractRulesFromState(plObj || {});
+      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
+      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
 
-        const wsRules    = Array.isArray(restored?.rules)      ? restored.rules      : [];
-        const wsFieldR   = Array.isArray(restored?.fieldRules) ? restored.fieldRules : [];
-        const plRules    = Array.isArray(pl.rules)             ? pl.rules            : [];
-        const plFieldR   = Array.isArray(pl.fieldRules)        ? pl.fieldRules       : [];
+      const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
+      const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
 
-        const mergedRules  = wsRules.length  ? wsRules  : plRules;
-        const mergedFieldR = wsFieldR.length ? wsFieldR : plFieldR;
+      const { values: prunedValues, tagMap: prunedTagMap } =
+        normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
 
-        // --- Normalize / prune against current schema ---
-        const rules      = normalizeRulesForSchema(gSchema, mergedRules);
-        const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldR);
+      gValues = prunedValues;
 
-        const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
+      // 1) embed payload
+      const payloadObj = {
+        title:  gSchema.title || 'Form',
+        fields: gSchema.fields || [],
+        values: gValues || {},
+        tagMap: prunedTagMap,
+        rules,
+        fieldRules,
+        updatedAt: new Date().toISOString()
+      };
+      let updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
 
-        gValues = prunedValues;
-        setStatus('Preparing export…');
+      // 2) replace SDTs via tagMap
+      const sdtMap = {};
+      for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
+        let v = gValues?.[fieldId];
+        if (v == null) v = '';
+        if (typeof v === 'object') v = v.formatted ?? (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
+        sdtMap[tag] = String(v);
+      }
+      updated = await writeSDTs(updated, sdtMap);
+      const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
 
-        // 1) write CRONOS_PAYLOAD into the in-memory DOCX
-        const payload = JSON.stringify({
-          title:     gSchema.title || 'Form',
-          fields:    gSchema.fields || [],
-          values:    gValues || {},
-          tagMap:    prunedTagMap,
-          rules,          // always present
-          fieldRules,     // always present
-          updatedAt: new Date().toISOString()
-        });
-        const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
-        const updatedU8 = compactU8(toU8(updated));
-
-        // 2) save the updated bytes to the chosen file
-        const suggested = (gFileName?.replace(/\.docx$/i,'') || 'document') + '_export.' + gFileExt;
-        if (window.showSaveFilePicker) {
-          try {
-            const handle = await window.showSaveFilePicker({
-              suggestedName: suggested,
-              types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
-            });
-            const stream = await handle.createWritable();
-            await stream.write(updatedU8);
-            await stream.close();
-            setStatus(`Exported as “${handle.name || suggested}”.`);
-            gDirty = false;
-            return;
-          } catch (e) {
-            if (e?.name === 'AbortError') { setStatus('Export canceled.'); return; }
-            tr.warn('showSaveFilePicker failed, falling back', e);
-          }
+      // 3) download/save as a new file
+      const suggested = (gFileName?.replace(/\.(docx|docm|dotx|dotm)$/i,'') || 'document') + '_export.' + gFileExt;
+      if (window.showSaveFilePicker) {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: suggested,
+            types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
+          });
+          const stream = await handle.createWritable();
+          await stream.write(updatedU8);
+          await stream.close();
+          setStatus(`Exported as “${handle.name || suggested}”.`);
+          gDirty = false;
+          return;
+        } catch (e) {
+          if (e?.name === 'AbortError') { setStatus('Export canceled.'); return; }
         }
-
-        const mime = wordMimeFor(gFileExt);
-        const blob = new Blob([updatedU8], { type: mime });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = suggested; a.click();
-        URL.revokeObjectURL(url);
-        setStatus(`Exported as “${suggested}”.`);
-        gDirty = false;
-      } catch (e) {
-        tr.error('export failed', e);
-        setStatus(`Error exporting: ${e.message || e}`);
-      } finally { tr.end(); }
+      }
+      const blob = new Blob([updatedU8], { type: wordMimeFor(gFileExt) });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = suggested; a.click();
+      URL.revokeObjectURL(url);
+      setStatus(`Exported as “${suggested}”.`);
+      gDirty = false;
     }
 
     // =========================
@@ -1853,62 +1945,61 @@
     let __payloadEditBusy = false;
 
     async function applyPayloadObject(obj, { broadcast = true, save = true } = {}) {
-      const tr = TRACE('applyPayloadObject', { broadcast, save, keys: Object.keys(obj||{}).length });
-      try {
-        if (!obj || typeof obj !== 'object') { tr.warn('no object'); return; }
+      if (!obj || typeof obj !== 'object') return;
 
-        const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
-        const nextValues = (obj.values && typeof obj.values === 'object') ? obj.values : {};
-        const nextTagMap = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
+      const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
+      const rawValues  = (obj.values && typeof obj.values === 'object') ? obj.values : {};
+      const rawTagMap  = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
 
-        const rawRules    = normalizeRules(obj.rules);
-        const nextRules   = normalizeRulesForSchema(nextSchema, rawRules);
-        const rawField    = normalizeRules(obj.fieldRules);
-        const nextFieldsR = normalizeRulesForSchema(nextSchema, rawField);
+      const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
+      const rawFieldR  = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
 
-        const nowIso = new Date().toISOString();
+      const rules      = normalizeRulesForSchema(nextSchema, rawRules);
+      const fieldRules = normalizeRulesForSchema(nextSchema, rawFieldR);
+      const { values: prunedValues, tagMap: prunedTagMap } =
+        normalizeForSchema(nextSchema, rawValues, rawTagMap);
 
-        const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(nextSchema, nextValues, nextTagMap);
+      gSchema = nextSchema;
+      gValues = prunedValues;
 
-        gSchema = nextSchema;
-        gValues = prunedValues;
+      const payloadObj = {
+        title: gSchema.title,
+        fields: gSchema.fields,
+        values: gValues,
+        tagMap: prunedTagMap,
+        rules,
+        fieldRules,
+        updatedAt: new Date().toISOString()
+      };
 
-        if (gDocId && save) {
-          await window.formSuitePersist.saveState(gDocId, {
-            schema: gSchema,
-            values: gValues,
-            tagMap: prunedTagMap,
-            rules:  nextRules,
-            fieldRules: nextFieldsR,
-            payload: { CRONOS_PAYLOAD: {
-              title: gSchema.title,
-              fields: gSchema.fields,
-              values: gValues,
-              tagMap: prunedTagMap,
-              rules: nextRules,
-              fieldRules: nextFieldsR
-            }},
-            schemaUpdatedAt: nowIso
-          });
-        } else {
-          try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields })); } catch {}
-        }
+      if (gDocId && save) {
+        await window.formSuitePersist.saveState(gDocId, {
+          schema: gSchema,
+          values: gValues,
+          tagMap: prunedTagMap,
+          rules, fieldRules,
+          payload: { CRONOS_PAYLOAD: payloadObj },
+          CRONOS_PAYLOAD: payloadObj,
+          cronos_payload: payloadObj,
+          schemaUpdatedAt: new Date().toISOString()
+        });
+      } else {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields })); } catch {}
+      }
 
-        buildForm(document.getElementById('formMount'), gSchema, gValues);
-        await updatePreview(gValues);
+      buildForm(document.getElementById('formMount'), gSchema, gValues);
+      await updatePreview(gValues);
 
-        if (broadcast) {
-          try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
-          try { bcCanon?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
-        }
+      if (broadcast) {
+        try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
+        try { bcCanon?.postMessage({ type: 'schema-updated',  docId: gDocId, ts: Date.now() }); } catch {}
+      }
 
-        gDirty = true;
-        setStatus('Payload applied (normalized). Not yet saved to DOCX.');
-        if (previewStatus) { previewStatus.textContent = 'Applied'; setTimeout(()=> previewStatus.textContent='', 1200); }
-        tr.end('applied');
-      } catch (e) { tr.error('failed', e); tr.end(); }
+      gDirty = true;
+      setStatus('Payload applied (normalized). Not yet saved to DOCX.');
+      if (previewStatus) { previewStatus.textContent = 'Applied'; setTimeout(()=> previewStatus.textContent='', 900); }
     }
+
 
     if (payloadEl) {
       payloadEl.addEventListener('input', () => {

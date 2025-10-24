@@ -846,30 +846,49 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       try {
         if (__hydrating) return false;
         if (!currentDoc?.docId) return false;
+
         const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
         const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
         if (hasSchema) return false; // nothing to do
+
         setStatus('Restoring from document…');
         const bytes = await fetchWorkingDocBytes();
         if (!bytes) return false;
+
         __hydrating = true;
+
         let payloadRaw = await readPayloadFromDocx(bytes);
         if (!payloadRaw) return false;
+
         let payload = null;
         try { payload = JSON.parse(payloadRaw); } catch { payload = null; }
+
         if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) return false;
 
+        // Build next schema/values
         const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
         const cleanValues = sanitizeValues(nextSchema, payload.values || {});
         const tagMap = payload.tagMap || {};
-        const rules  = Array.isArray(payload.rules) ? payload.rules : [];
+
+        // Read BOTH rule sets (be tolerant of legacy key names/typos)
+        const rules =
+          Array.isArray(payload.rules) ? payload.rules :
+          Array.isArray(payload.headingRules) ? payload.headingRules : [];
+
+        const fieldRules =
+          Array.isArray(payload.fieldRules) ? payload.fieldRules :
+          Array.isArray(payload.fieldsRules) ? payload.fieldsRules : []; // legacy guard
+
+        // Persist complete state back into workspace
         await window.formSuitePersist.saveState(currentDoc.docId, {
           schema: nextSchema,
           values: cleanValues,
           tagMap,
           rules,
+          fieldRules,
           schemaUpdatedAt: new Date().toISOString()
         });
+
         // refresh local variables + UI
         schema = nextSchema;
         values = cleanValues;
@@ -2303,16 +2322,39 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       }
     }
 
-    // ---------- Rules → Visibility map (SHOW supersedes HIDE) ----------
+    // ---------- Rules → loaders (workspace first, then payload mirror) ----------
     function loadRulesForDoc(state) {
-      return (
-        state?.rules ||
-        state?.payload?.rules ||
-        state?.CRONOS_RULES ||
-        state?.cronos_rules ||
-        []
-      );
+      // workspace (authoritative during editing)
+      if (Array.isArray(state?.rules)) return state.rules;
+
+      // payload mirrors (support both nested + flat mirrors)
+      const pl = state?.payload?.CRONOS_PAYLOAD
+              || state?.CRONOS_PAYLOAD
+              || state?.cronos_payload
+              || state?.payload;
+
+      if (Array.isArray(pl?.rules)) return pl.rules;
+
+      // very old keys
+      return state?.CRONOS_RULES || state?.cronos_rules || [];
     }
+
+    function loadFieldRulesForDoc(state) {
+      // workspace (authoritative during editing)
+      if (Array.isArray(state?.fieldRules)) return state.fieldRules;
+
+      // payload mirrors (support both nested + flat mirrors)
+      const pl = state?.payload?.CRONOS_PAYLOAD
+              || state?.CRONOS_PAYLOAD
+              || state?.cronos_payload
+              || state?.payload;
+
+      if (Array.isArray(pl?.fieldRules)) return pl.fieldRules;
+
+      // very old keys
+      return state?.CRONOS_FIELD_RULES || state?.cronos_field_rules || [];
+    }
+
 
     function ruleMatchesValue(op, expected, actual) {
       const a = actual;
@@ -2335,6 +2377,19 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       return false;
     }
 
+    // Small helper: accept targets like  "12"  OR  "12|Heading title"
+    function parseTargetIdx(t) {
+      const raw = t?.key ?? t?.idx ?? t?.id;
+      if (raw == null) return NaN;
+      if (typeof raw === 'number') return raw;
+      const s = String(raw);
+      const head = s.split('|', 1)[0]; // "12|..." → "12"
+      const n = Number(head);
+      return Number.isFinite(n) ? n : NaN;
+    }
+
+    // Keep your existing ruleMatchesValue(...) helper
+
     function evaluateRulesToVisibility(schema, values, rules) {
       const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
@@ -2342,8 +2397,16 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const cleanVals = sanitizeValues(schema, values || {});
       const getVal = (fid) => cleanVals[fid];
 
+      const toSlug = (s) => String(s||'')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+
       for (const r of rules) {
         if (!r) continue;
+
         const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
                     : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
                     : null;
@@ -2354,25 +2417,23 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
 
+        // --- match condition ---
         let match = false;
+
+        // option-sourced boolean (e.g., "services__opt__cleaning")
         if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
           const [baseId, slug] = fieldId.split('__opt__');
-          const raw = getVal(baseId);
-          const arr = Array.isArray(raw) ? raw.map(String) : [];
-          const toSlug = (s) => String(s||'')
-            .normalize('NFKD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-zA-Z0-9]+/g, '_')
-            .replace(/^_+|_+$/g, '')
-            .toLowerCase();
-          const selected = arr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
+          const actualArr = Array.isArray(getVal(baseId)) ? getVal(baseId).map(String) : [];
+          const selected = actualArr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
           const expect = Array.isArray(exp) ? exp[0] : exp;
           const expectBool = (String(expect) === 'true');
           if (op === 'equals') match = (selected === expectBool);
         } else {
+          // normal field comparison
           const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
           const t = String(fld?.type||'').toLowerCase();
           const actual = getVal(fieldId);
+
           if (t === 'date') {
             const expStr = Array.isArray(exp) ? String(exp[0]||'') : String(exp||'');
             const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
@@ -2380,11 +2441,11 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
             const b = toDay(expStr);
             if (Number.isNaN(a) || Number.isNaN(b)) match = false;
             else if (op === 'before') match = a < b;
-            else if (op === 'after') match = a > b;
-            else if (op === 'equals') match = a == b;
+            else if (op === 'after')  match = a > b;
+            else if (op === 'equals') match = a === b;
           } else if (t === 'text' || t === 'number' || t === 'select') {
             const expVal = Array.isArray(exp) ? exp[0] : exp;
-            if (op === 'equals') match = String(actual) === String(expVal);
+            if (op === 'equals')    match = String(actual) === String(expVal);
             else if (op === 'notEquals') match = String(actual) !== String(expVal);
             else if (t === 'text' && op === 'contains') match = String(actual ?? '').toLowerCase().includes(String(expVal ?? '').toLowerCase());
           } else if (t === 'multichoice') {
@@ -2393,12 +2454,12 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
             match = ruleMatchesValue(op, exp, actual);
           }
         }
+
         if (!match) continue;
 
+        // --- apply effect to heading indices ---
         for (const t of targets) {
-          const key = t?.key ?? t?.idx ?? t?.id;
-          if (key == null) continue;
-          const idx = Number(key);
+          const idx = parseTargetIdx(t);
           if (!Number.isFinite(idx)) continue;
           const prev = out[idx];
           if (action === 'SHOW') out[idx] = 'SHOW';
@@ -2426,8 +2487,16 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const cleanVals = sanitizeValues(schema, values || {});
       const getVal = (fid) => cleanVals[fid];
 
+      const toSlug = (s) => String(s||'')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+
       for (const r of rules) {
         if (!r) continue;
+
         const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
                     : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
                     : null;
@@ -2437,21 +2506,15 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const op      = r.op || r.operator || 'equals';
         const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
-        const effect = (String(r.hideMode||'hide').toLowerCase() === 'disable') ? 'DISABLE' : 'HIDE';
+        const effect  = (String(r.hideMode||'hide').toLowerCase() === 'disable') ? 'DISABLE' : 'HIDE';
 
+        // --- match condition ---
         let match = false;
+
         if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
           const [baseId, slug] = fieldId.split('__opt__');
-          const base = baseId;
-          const raw = getVal(base);
-          const arr = Array.isArray(raw) ? raw.map(String) : [];
-          const toSlug = (s) => String(s||'')
-            .normalize('NFKD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-zA-Z0-9]+/g, '_')
-            .replace(/^_+|_+$/g, '')
-            .toLowerCase();
-          const selected = arr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
+          const actualArr = Array.isArray(getVal(baseId)) ? getVal(baseId).map(String) : [];
+          const selected = actualArr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
           const expect = Array.isArray(exp) ? exp[0] : exp;
           const expectBool = (String(expect) === 'true');
           if (op === 'equals') match = (selected === expectBool);
@@ -2459,42 +2522,41 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
           const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
           const t = String(fld?.type||'').toLowerCase();
           const actual = getVal(fieldId);
+
           if (t === 'date') {
             const expStr = Array.isArray(exp) ? String(exp[0]||'') : String(exp||'');
             const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
             const a = toDay(actual);
             const b = toDay(expStr);
-            if (Number.isNaN(a) || Number.isNaN(b)) match = false; // <-- fixed (was "False")
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false;
             else if (op === 'before') match = a < b;
-            else if (op === 'after') match = a > b;
-            else if (op === 'equals') match = a == b;
-          } else if (t === 'text' || t === 'number') {
+            else if (op === 'after')  match = a > b;
+            else if (op === 'equals') match = a === b;
+          } else if (t === 'text' || t === 'number' || t === 'select') {
             const expVal = Array.isArray(exp) ? exp[0] : exp;
-            if (op === 'equals') match = String(actual) === String(expVal);
+            if (op === 'equals')    match = String(actual) === String(expVal);
             else if (op === 'notEquals') match = String(actual) !== String(expVal);
-          } else if (t === 'select') {
-            const expVal = Array.isArray(exp) ? exp[0] : exp;
-            if (op === 'equals') match = String(actual) === String(expVal);
-            else if (op === 'notEquals') match = String(actual) !== String(expVal);
+            else if (t === 'text' && op === 'contains') match = String(actual ?? '').toLowerCase().includes(String(expVal ?? '').toLowerCase());
           } else if (t === 'multichoice') {
             match = ruleMatchesValue(op, exp, actual);
           } else {
             match = ruleMatchesValue(op, exp, actual);
           }
         }
+
         if (!match) continue;
 
+        // --- apply to field/option targets ---
         for (const t of targets) {
-          const id = String(t?.id ?? t?.fieldId ?? '');
+          // field rules target either a field id or a multichoice option id ("field__opt__slug")
+          const id = String(t?.id ?? t?.fieldId ?? t?.key ?? '');
           if (!id) continue;
           const prev = out[id];
           if (action === 'SHOW') out[id] = 'SHOW';
-          else if (action === 'HIDE' && prev !== 'SHOW') {
-            if (prev === 'HIDE') out[id] = 'HIDE';
-            else out[id] = effect;
-          }
+          else if (action === 'HIDE' && prev !== 'SHOW') out[id] = effect; // DISABLE or HIDE
         }
       }
+
       return out;
     }
 
@@ -2511,12 +2573,18 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
         document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
 
-        const esc = (window.CSS && CSS.escape) ? CSS.escape : (s => String(s)
-          .replace(/\\/g,'\\\\')
-          .replace(/"/g,'\\"')
-          .replace(/\]/g,'\\]')
-          .replace(/\[/g,'\\[')
-        );
+        const esc = (window.CSS && CSS.escape)
+          ? CSS.escape
+          : (s => String(s)
+              .replace(/\\/g,'\\\\')
+              .replace(/"/g,'\\"')
+              .replace(/\]/g,'\\]')
+              .replace(/\[/g,'\\[')
+              .replace(/\(/g,'\\(')
+              .replace(/\)/g,'\\)')
+              .replace(/\./g,'\\.')
+            );
+
 
         const deselectMcItem = (mcEl) => {
           const cb = mcEl.querySelector('input[type="checkbox"][data-mc="1"]');

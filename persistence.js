@@ -7,6 +7,12 @@
    • Persist per-doc state (schema/values/tagMap/rules/…) in localStorage
    • Provide safe, atomic helpers (locks + coalescers) used by pages
    • Broadcast payload patches across tabs + snapshot/rehydration
+
+   IMPORTANT (Oct 2025):
+   • Rules are now handled like values/tagMap:
+     - Patch into workspace state
+     - Mirror into payload.CRONOS_PAYLOAD
+     - No immediate DOCX embedding during edit (export handles it)
 */
 
 (() => {
@@ -15,7 +21,7 @@
     CANON_ACTIVE: 'FS_ACTIVE_DOC_META', // { docId, name }  <- canonical
     LEGACY_ACTIVE: 'FS_CURRENT_DOC_META', // legacy mirror
     INTERNAL_ACTIVE: 'FS_active_doc_v1',  // older internal
-    STATE_PREFIX: 'FS_state_',            // per docId -> { schema, values, ... }
+    STATE_PREFIX: 'FS_state_',            // per docId -> { schema, values, tagMap, rules, fieldRules, payload, ... }
   };
   const ACTIVE_KEYS_READ_ORDER = [
     LS_KEYS.CANON_ACTIVE,
@@ -24,25 +30,27 @@
   ];
 
   const BC = {
-    CANON: 'fs-active-doc',   // {active:set|active:updated|active:clear}
-    LEGACY: 'form-suite-doc', // {doc-switched|doc-updated|doc-cleared}
-    PAYLOAD: 'fs-payload-v1', // {t:'payload'|'request-snapshot'|'snapshot', ...}
+    CANON:  'fs-active-doc',   // {active:set|active:updated|active:clear}
+    LEGACY: 'form-suite-doc',  // {doc-switched|doc-updated|doc-cleared}
+    PAYLOAD:'fs-payload-v1',   // {t:'payload'|'request-snapshot'|'snapshot', ...}
   };
 
   const DB_NAME = 'formsuite_v1';
   const DB_STORE_HANDLES = 'handles';
+  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
 
   // ===== Utils =====
   const uuid = () =>
     (crypto?.randomUUID?.() || ('doc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)));
-
   const readJSON = (k) => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch { return null; } };
   const writeJSON = (k, v) => { try { (v == null) ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch {} };
-
   const isPlainObject = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+  const _safeArr = (v) => Array.isArray(v) ? v.slice() : (v == null ? [] : [v]);
+  const _nowIso = () => { try { return new Date().toISOString(); } catch { return ''; } };
+  const debounce = (fn, ms) => { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; };
 
   function deepMerge(a, b) {
-    if (Array.isArray(b)) return b.slice();
+    if (Array.isArray(b)) return b.slice(); // arrays REPLACE (by design)
     if (!isPlainObject(b)) return (b === undefined) ? a : b;
     const out = isPlainObject(a) ? { ...a } : {};
     for (const [k, v] of Object.entries(b)) {
@@ -50,14 +58,11 @@
     }
     return out;
   }
-
   function isEmptyState(st) {
     if (!st || typeof st !== 'object') return true;
     const keys = Object.keys(st).filter(k => !k.startsWith('__'));
     return keys.length === 0;
   }
-
-  const debounce = (fn, ms) => { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; };
 
   // ===== IndexedDB for FileSystemFileHandle =====
   function openDB() {
@@ -73,7 +78,6 @@
       req.onerror = () => reject(req.error);
     });
   }
-
   async function idbPutHandle(docId, handle) {
     try {
       const db = await openDB();
@@ -104,13 +108,10 @@
         const tx = db.transaction(DB_STORE_HANDLES, 'readonly');
         const store = tx.objectStore(DB_STORE_HANDLES);
         const req = store.openCursor();
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (cursor) { items.push(cursor.value); cursor.continue(); }
-        };
-        req.onerror = () => rej(req.error);
-        tx.oncomplete = () => res(items);
-        tx.onerror = () => rej(tx.error);
+        req.onsuccess = () => { const c = req.result; if (c) { items.push(c.value); c.continue(); } };
+        req.onerror  = () => rej(req.error);
+        tx.oncomplete= () => res(items);
+        tx.onerror   = () => rej(tx.error);
       });
     } catch { rows = []; }
     for (const { docId, handle } of rows) {
@@ -119,9 +120,7 @@
   }
 
   // ===== OPFS working copy =====
-  async function opfsRoot() {
-    try { return await navigator.storage.getDirectory(); } catch { return null; }
-  }
+  async function opfsRoot()         { try { return await navigator.storage.getDirectory(); } catch { return null; } }
   async function opfsPut(docId, bytes) {
     try {
       const root = await opfsRoot(); if (!root) return false;
@@ -153,14 +152,37 @@
     payload: new Set(), // fn({docId, patch, v, from})
   };
   function subscribe(kind, fn) { listeners[kind]?.add(fn); return () => listeners[kind]?.delete(fn); }
-  function emit(kind, data) { listeners[kind]?.forEach(fn => { try { fn(data); } catch {} }); }
+  function emit(kind, data)    { listeners[kind]?.forEach(fn => { try { fn(data); } catch {} }); }
 
   // ===== State (schema/values/etc.) =====
-  function keyFor(docId) { return LS_KEYS.STATE_PREFIX + docId; }
+  function keyFor(docId)    { return LS_KEYS.STATE_PREFIX + docId; }
+  function getState(docId)  { if (!docId) return {}; return readJSON(keyFor(docId)) || {}; }
 
-  function getState(docId) {
-    if (!docId) return {};
-    return readJSON(keyFor(docId)) || {};
+  // ---- payload builder + mirror ----
+  function buildPayloadFromState(state) {
+    const schema  = state?.schema || {};
+    const fields  = Array.isArray(schema.fields) ? schema.fields : [];
+    const values  = state?.values || {};
+    const tagMap  = state?.tagMap || {};
+    const rules   = _safeArr(state?.rules);
+    const fRules  = _safeArr(state?.fieldRules);
+    return {
+      title: schema?.title || 'Form',
+      fields,
+      values,
+      tagMap,
+      rules,
+      fieldRules: fRules,
+      updatedAt: _nowIso(),
+    };
+  }
+  function mirrorPayloadOnState(state) {
+    const payload = buildPayloadFromState(state);
+    if (!state.payload) state.payload = {};
+    state.payload[PAYLOAD_KEY] = payload;   // canonical nested
+    state[PAYLOAD_KEY]        = payload;    // flat mirror (old code paths)
+    state.cronos_payload      = payload;    // another flat mirror (BWC)
+    return state;
   }
 
   // Save & broadcast a partial patch to the per-doc state
@@ -168,39 +190,28 @@
     if (!docId || !patch || typeof patch !== 'object') return getState(docId);
     const prev = getState(docId);
 
-    // Special-case: top-level arrays that should not be clobbered by empty arrays
-    const arrayKeys = ['rules', 'fieldRules'];
+    // Normalize rule arrays if present (empty arrays are allowed for deletions)
     const normalizedPatch = { ...patch };
-    for (const k of arrayKeys) {
-      if (k in normalizedPatch && Array.isArray(normalizedPatch[k])) {
-        const inc = normalizedPatch[k];
-        if (!inc.length && Array.isArray(prev[k]) && prev[k].length) {
-          // keep previous non-empty array
-          delete normalizedPatch[k];
-        }
-      }
-    }
+    if ('rules' in normalizedPatch)      normalizedPatch.rules = _safeArr(normalizedPatch.rules);
+    if ('fieldRules' in normalizedPatch) normalizedPatch.fieldRules = _safeArr(normalizedPatch.fieldRules);
 
-    // NEW: do the same for payload mirrors (payload.CRONOS_PAYLOAD.rules/fieldRules)
-    const prevPL = prev?.payload?.CRONOS_PAYLOAD || {};
-    const nextPL = normalizedPatch?.payload?.CRONOS_PAYLOAD;
-    if (nextPL && typeof nextPL === 'object') {
-      ['rules', 'fieldRules'].forEach(k => {
-        if (Array.isArray(nextPL[k]) && nextPL[k].length === 0 &&
-            Array.isArray(prevPL[k]) && prevPL[k].length > 0) {
-          // keep previous non-empty array
-          delete normalizedPatch.payload.CRONOS_PAYLOAD[k];
-        }
-      });
-    }
-
+    // Merge shallowly then ensure mirrors
     const next = deepMerge(prev, normalizedPatch);
-    next.__v = (prev.__v|0) + 1;
+
+    // Ensure structural defaults
+    if (!isPlainObject(next.schema))     next.schema = {};
+    if (!isPlainObject(next.values))     next.values = {};
+    if (!isPlainObject(next.tagMap))     next.tagMap = {};
+    if (!Array.isArray(next.rules))      next.rules = [];
+    if (!Array.isArray(next.fieldRules)) next.fieldRules = [];
+
+    mirrorPayloadOnState(next);
+
+    next.__v = (next.__v|0) + 1;
     writeJSON(keyFor(docId), next);
 
-    // Broadcast to peers
+    // Broadcast to peers & same-tab listeners
     try { bcPayload?.postMessage({ t: 'payload', docId, patch: normalizedPatch, v: next.__v, from: TAB }); } catch {}
-    // In-tab listeners
     emit('payload', { docId, patch: normalizedPatch, v: next.__v, from: TAB });
 
     return next;
@@ -208,12 +219,8 @@
 
   // Back-compat alias with the previous signature (async)
   async function saveState(docId, obj) { return setState(docId, obj); }
-  async function loadState(docId) { return getState(docId); }
-
-  function getLastKnownValues(docId) {
-    try { return (getState(docId) || {}).values || {}; }
-    catch { return {}; }
-  }
+  async function loadState(docId)      { return getState(docId); }
+  function getLastKnownValues(docId)   { try { return (getState(docId) || {}).values || {}; } catch { return {}; } }
 
   // ===== Permissions =====
   async function ensurePermission(handle, mode = 'readwrite') {
@@ -225,7 +232,6 @@
       return q || 'denied';
     } catch { return 'denied'; }
   }
-
   async function regrantAll() {
     let ok = 0, fail = 0;
     await idbEachHandle(async (_docId, h) => {
@@ -237,7 +243,6 @@
 
   // ===== Active doc single-source-of-truth (BC + LS) =====
   let _active = null; // { docId, name }
-
   function dbg(where, data) { try { console.log('%c[Persist]', 'color:#2563eb;font-weight:600', where, data || ''); } catch {} }
 
   function readActiveFromStorage() {
@@ -247,20 +252,17 @@
     }
     return null;
   }
-
   function writeActiveToStorage(metaOrNull) {
     writeJSON(LS_KEYS.CANON_ACTIVE,  metaOrNull);
     writeJSON(LS_KEYS.LEGACY_ACTIVE, metaOrNull);
     writeJSON(LS_KEYS.INTERNAL_ACTIVE, metaOrNull);
   }
-
   function getActiveDocMeta() {
     if (_active?.docId) return _active;
     const ls = readActiveFromStorage();
     if (ls?.docId) _active = ls;
     return _active;
   }
-
   async function setActiveDoc(metaOrNull) {
     if (!metaOrNull || !metaOrNull.docId) {
       _active = null;
@@ -279,7 +281,6 @@
     emit('active', next);
     return next;
   }
-
   function broadcastDocUpdated(docId, name) {
     const payload = { docId, name, ts: Date.now() };
     try { bcCanon?.postMessage({ type: 'active:updated', ...payload }); } catch {}
@@ -335,13 +336,11 @@
     }
     return null;
   }
-
   async function getCurrentDocBytes() {
     const meta = getActiveDocMeta();
     if (!meta?.docId) return null;
     return await getBytes(meta.docId);
   }
-
   async function putBytes(docId, bytes, { broadcast = true } = {}) {
     if (!docId) return false;
     const ok = await opfsPut(docId, bytes);
@@ -350,6 +349,117 @@
       broadcastDocUpdated(docId, meta?.name);
     }
     return ok;
+  }
+
+  // ===== JSZip helpers for DOCX payload IO (used by Export/Save flows) =====
+  async function ensureJSZip(){
+    if (window.JSZip) return;
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+      s.onload = res; s.onerror = rej; document.head.appendChild(s);
+    });
+  }
+  async function readPayloadFromDocx(bytes){
+    try {
+      await ensureJSZip();
+      const zip = await window.JSZip.loadAsync(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+      // Try word/settings.xml (docVars)
+      const settings = zip.file('word/settings.xml');
+      if (settings) {
+        const xmlText = await settings.async('string');
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlText, 'application/xml');
+        const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
+        if (docVars) {
+          const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
+          for (let i = 0; i < vars.length; i++) {
+            const dv = vars[i];
+            const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
+            if (name === PAYLOAD_KEY) {
+              const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
+              if (val) return val;
+            }
+          }
+        }
+      }
+      // Fallback: docProps/custom.xml custom property
+      const custom = zip.file('docProps/custom.xml');
+      if (custom) {
+        const xmlText = await custom.async('string');
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlText, 'application/xml');
+        const props = xml.getElementsByTagName('property');
+        for (let i = 0; i < props.length; i++) {
+          const p = props[i];
+          const nm = p.getAttribute('name');
+          if (nm === PAYLOAD_KEY) {
+            const child = p.firstElementChild;
+            return child && child.textContent ? child.textContent : null;
+          }
+        }
+      }
+    } catch (e) { dbg('readPayloadFromDocx error', e); }
+    return null;
+  }
+  async function writeDocVarSettings(bytes, key, jsonValue) {
+    // NOTE: kept for Export flows. We do NOT auto-embed while editing rules anymore.
+    await ensureJSZip();
+    const u8  = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
+    const zip = await window.JSZip.loadAsync(u8);
+
+    // Ensure word/settings.xml exists
+    let settings = zip.file('word/settings.xml');
+    let xmlText  = settings ? await settings.async('string') : null;
+    if (!xmlText) {
+      xmlText = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+            xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            mc:Ignorable="w14 w15 w16se w16cid w16">
+  <w:docVars/>
+</w:settings>`;
+    }
+    const parser = new DOMParser();
+    const xml    = parser.parseFromString(xmlText, 'application/xml');
+    const W_NS   = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+    let settingsEl = xml.getElementsByTagNameNS(W_NS, 'settings')[0];
+    if (!settingsEl) {
+      const se = xml.createElementNS(W_NS, 'w:settings');
+      xml.appendChild(se);
+      settingsEl = se;
+    }
+    let docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
+    if (!docVars) {
+      docVars = xml.createElementNS(W_NS, 'w:docVars');
+      settingsEl.appendChild(docVars);
+    }
+
+    // Find or create the docVar
+    let found = null;
+    const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
+    for (let i = 0; i < vars.length; i++) {
+      const dv = vars[i];
+      const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
+      if (name === key) { found = dv; break; }
+    }
+    if (!found) {
+      found = xml.createElementNS(W_NS, 'w:docVar');
+      found.setAttributeNS(W_NS, 'w:name', key);
+      docVars.appendChild(found);
+    }
+    found.setAttributeNS(W_NS, 'w:name', key);
+    found.setAttributeNS(W_NS, 'w:val', jsonValue);
+    found.setAttribute('name', key);
+    found.setAttribute('val', jsonValue);
+
+    const serializer = new XMLSerializer();
+    const outXml     = serializer.serializeToString(xml);
+    zip.file('word/settings.xml', outXml);
+
+    const newBuf = await zip.generateAsync({ type: 'uint8array' });
+    return newBuf.buffer;
   }
 
   // ===== High-level “set current” APIs =====
@@ -379,16 +489,16 @@
     }
 
     const docId = (reusePrev && prev?.docId) ? prev.docId : uuid();
-    const meta = { docId, name: (name || prev?.name || 'document').replace(/\.docx$/i,'') };
+    const meta  = { docId, name: (name || prev?.name || 'document').replace(/\.docx$/i,'') };
 
     // Persist handle & bytes (best-effort)
     if (handle) await idbPutHandle(docId, handle);
     if (bytes)  await opfsPut(docId, bytes);
 
-    // Ensure there is at least an empty state container and store fingerprint
+    // Ensure minimal state and fingerprint
     const existing = await loadState(docId);
-    if (!existing) {
-      await saveState(docId, { schema: null, values: {}, fingerprint: newFp || null });
+    if (!existing || isEmptyState(existing)) {
+      await saveState(docId, { schema: null, values: {}, rules: [], fieldRules: [], fingerprint: newFp || null });
     } else if (newFp && existing.fingerprint !== newFp) {
       await saveState(docId, { fingerprint: newFp });
     }
@@ -397,109 +507,11 @@
     try { await hydrateFromDocxIfEmpty(docId); } catch {}
     return meta;
   }
-
   async function setCurrentDocFromBytes(bytes, meta = {}) {
     return await setCurrentDoc({ bytes, handle: meta.handle, name: meta.name });
   }
 
-  // ===== Auto-hydration + cross-tab sync helpers =====
-  function ensureHydrated(optionalHydrator) {
-    const meta = getActiveDocMeta(); if (!meta?.docId) return;
-    const st = getState(meta.docId);
-    if (isEmptyState(st)) {
-      // Ask siblings for a snapshot
-      try { bcPayload?.postMessage({ t:'request-snapshot', docId: meta.docId, from:TAB }); } catch {}
-      // Optional: let a page (Extractor) try to hydrate from DOCX
-      if (typeof optionalHydrator === 'function') {
-        Promise.resolve(optionalHydrator(meta)).catch(()=>{});
-      }
-    }
-  }
-
-  function connectAutoSave({ readLocal, applyRemote, debounceMs = 150 } = {}) {
-    const meta = getActiveDocMeta(); if (!meta?.docId) return { save: ()=>{}, dispose: ()=>{} };
-    let skip = false;
-    const dispose = subscribe('payload', ({ docId, patch, from }) => {
-      if (docId !== meta.docId || from === TAB) return;
-      if (!patch || !applyRemote) return;
-      skip = true;
-      try { applyRemote(patch); } finally { skip = false; }
-    });
-    const save = debounce(() => {
-      if (skip) return;
-      const partial = readLocal ? readLocal() : null;
-      if (partial && Object.keys(partial).length) setState(meta.docId, partial);
-    }, debounceMs);
-    return { save, dispose };
-  }
-
-  // ===== Cross-tab payload channel =====
-  bcPayload && (bcPayload.onmessage = (ev) => {
-    const msg = ev.data || {};
-    if (msg.from === TAB) return;
-    if (msg.t === 'payload') {
-      emit('payload', msg);
-    } else if (msg.t === 'request-snapshot') {
-      const st = getState(msg.docId);
-      if (!isEmptyState(st)) {
-        try { bcPayload.postMessage({ t:'snapshot', docId: msg.docId, state: st, from:TAB }); } catch {}
-      }
-    } else if (msg.t === 'snapshot') {
-      const cur = getState(msg.docId);
-      if (isEmptyState(cur)) {
-        writeJSON(keyFor(msg.docId), msg.state);
-        emit('payload', { docId: msg.docId, patch: msg.state, v: (msg.state.__v|0), from:'remote-snapshot' });
-      }
-    }
-  });
-
-  // ===== Public API surface =====
-  const api = {
-    // canonical storage key (pages listen for it)
-    ACTIVE_DOC_KEY: LS_KEYS.CANON_ACTIVE,
-
-    // Active doc (single source of truth)
-    getActiveDocMeta,
-    setActiveDoc,
-    clearActiveDoc: async () => setActiveDoc(null),
-
-    // Back-compat (names some pages call)
-    getCurrentDocMeta: getActiveDocMeta,
-    getActiveDoc: async () => getActiveDocMeta(),
-    getState,
-    loadState,
-    getActiveDocMetaSync: getActiveDocMeta,
-
-    // Meta/bytes
-    setCurrentDoc,
-    setCurrentDocFromBytes,
-    getHandle: idbGetHandle,
-    getBytes,
-    putBytes,
-    getCurrentDocBytes,
-
-    // State
-    saveState,
-    setState,
-    getLastKnownValues,
-
-    // Permissions
-    ensurePermission,
-    regrantAll,
-
-    // Concurrency helpers
-    withDocLock,
-    coalesce,
-
-    // Sync helpers
-    ensureHydrated,
-    connectAutoSave,
-
-    // Restore from DOCX if empty
-    hydrateFromDocxIfEmpty,
-  };
-
-  // Utils bundle (optional)
+  // ===== Utils bundle used by pages (values/tagMap cleaning) =====
   const utils = (function(){
     function sanitizeValues(schema, vals) {
       const out = {};
@@ -576,9 +588,9 @@
         }
 
         if (f.type === 'table') {
-          const cols = Array.isArray(f.columns) ? f.columns : [];
+          const cols   = Array.isArray(f.columns) ? f.columns : [];
           const colIds = cols.map(c => c.id);
-          const arr = Array.isArray(v) ? v : [];
+          const arr    = Array.isArray(v) ? v : [];
           const cleaned = arr.map(row => {
             const o = {};
             for (const cid of colIds) { let cell = row?.[cid]; if (cell == null) cell = ''; o[cid] = String(cell); }
@@ -609,61 +621,6 @@
   })();
 
   // ===== Payload hydration (centralized) =====
-  async function ensureJSZip(){
-    if (window.JSZip) return;
-    await new Promise((res, rej) => {
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
-      s.onload = res; s.onerror = rej; document.head.appendChild(s);
-    });
-  }
-
-  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
-
-  async function readPayloadFromDocx(bytes){
-    try {
-      await ensureJSZip();
-      const zip = await window.JSZip.loadAsync(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
-      // Try word/settings.xml (docVars)
-      const settings = zip.file('word/settings.xml');
-      if (settings) {
-        const xmlText = await settings.async('string');
-        const parser = new DOMParser();
-        const xml = parser.parseFromString(xmlText, 'application/xml');
-        const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-        const docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
-        if (docVars) {
-          const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
-          for (let i = 0; i < vars.length; i++) {
-            const dv = vars[i];
-            const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
-            if (name === PAYLOAD_KEY) {
-              const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
-              if (val) return val;
-            }
-          }
-        }
-      }
-      // Fallback: docProps/custom.xml custom property
-      const custom = zip.file('docProps/custom.xml');
-      if (custom) {
-        const xmlText = await custom.async('string');
-        const parser = new DOMParser();
-        const xml = parser.parseFromString(xmlText, 'application/xml');
-        const props = xml.getElementsByTagName('property');
-        for (let i = 0; i < props.length; i++) {
-          const p = props[i];
-          const nm = p.getAttribute('name');
-          if (nm === PAYLOAD_KEY) {
-            const child = p.firstElementChild;
-            return child && child.textContent ? child.textContent : null;
-          }
-        }
-      }
-    } catch (e) { dbg('readPayloadFromDocx error', e); }
-    return null;
-  }
-
   let __hydrating = false;
   async function hydrateFromDocxIfEmpty(docId) {
     if (!docId || __hydrating) return false;
@@ -686,17 +643,14 @@
         dbg('hydrate:invalid', { docId }); return false;
       }
 
-      const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
+      const nextSchema  = { title: payload.title || 'Form', fields: payload.fields };
       const cleanValues = (window.formSuiteUtils?.sanitizeValues
         ? window.formSuiteUtils.sanitizeValues(nextSchema, payload.values || {})
         : (payload.values || {}));
-      const tagMap = payload.tagMap || {};
-
-      // ✅ Normalize rules arrays (include fieldRules)
-      const rules = Array.isArray(payload.rules) ? payload.rules : [];
+      const tagMap     = payload.tagMap || {};
+      const rules      = Array.isArray(payload.rules) ? payload.rules : [];
       const fieldRules = Array.isArray(payload.fieldRules) ? payload.fieldRules : [];
 
-      // Canonical mirrored payload so readers can find it anywhere
       const canonical = {
         title: nextSchema.title,
         fields: nextSchema.fields,
@@ -713,14 +667,12 @@
         tagMap,
         rules,
         fieldRules,
-        // mirror into common keys
-        payload: { CRONOS_PAYLOAD: canonical },
-        CRONOS_PAYLOAD: canonical,
+        payload: { [PAYLOAD_KEY]: canonical },
+        [PAYLOAD_KEY]: canonical,
         cronos_payload: canonical,
         schemaUpdatedAt: new Date().toISOString()
       });
 
-      // Notify other tabs/pages
       try { bcCanon?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
       try { bcLegacy?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
       try { const meta = getActiveDocMeta(); broadcastDocUpdated(docId, meta?.name); } catch {}
@@ -741,15 +693,163 @@
       if (m.type === 'active:clear') emit('active', null);
     });
   } catch {}
-
   window.addEventListener('focus', () => {
     const meta = getActiveDocMeta();
     if (meta?.docId) coalesce('hydrate:'+meta.docId, () => hydrateFromDocxIfEmpty(meta.docId));
   });
 
+  // ===== Cross-tab payload channel =====
+  bcPayload && (bcPayload.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.from === TAB) return;
+    if (msg.t === 'payload') {
+      emit('payload', msg);
+    } else if (msg.t === 'request-snapshot') {
+      const st = getState(msg.docId);
+      if (!isEmptyState(st)) {
+        try { bcPayload.postMessage({ t:'snapshot', docId: msg.docId, state: st, from:TAB }); } catch {}
+      }
+    } else if (msg.t === 'snapshot') {
+      const cur = getState(msg.docId);
+      if (isEmptyState(cur)) {
+        writeJSON(keyFor(msg.docId), msg.state);
+        emit('payload', { docId: msg.docId, patch: msg.state, v: (msg.state.__v|0), from:'remote-snapshot' });
+      }
+    }
+  });
+
+  // ===== RULES helpers (PATCH & OVERWRITE) — no embed here =====
+  function _dedupeByJSON(arr) {
+    const seen = new Set(); const out = [];
+    for (const x of (Array.isArray(arr) ? arr : [])) {
+      const k = JSON.stringify(x ?? null);
+      if (!seen.has(k)) { seen.add(k); out.push(x); }
+    }
+    return out;
+  }
+  function patchRules(docId, { headingRules, fieldRules }, { replace = false } = {}) {
+    const st = getState(docId);
+    const wsHeading = Array.isArray(st.rules) ? st.rules : [];
+    const wsField   = Array.isArray(st.fieldRules) ? st.fieldRules : [];
+    const inHeading = _safeArr(headingRules);
+    const inField   = _safeArr(fieldRules);
+
+    const nextHeading = replace ? inHeading : _dedupeByJSON(wsHeading.concat(inHeading));
+    const nextField   = replace ? inField   : _dedupeByJSON(wsField.concat(inField));
+
+    return setState(docId, { rules: nextHeading, fieldRules: nextField });
+  }
+
+  // In-window implementation (no self-recursion on window.formSuitePersist.*)
+  async function overwriteRules(docId, patch) {
+    const nextRules      = Array.isArray(patch?.rules) ? patch.rules : [];
+    const nextFieldRules = Array.isArray(patch?.fieldRules) ? patch.fieldRules : [];
+
+    const cur = (await loadState(docId)) || {};
+    const basePayload =
+        (cur?.payload?.CRONOS_PAYLOAD)
+    || (cur?.CRONOS_PAYLOAD)
+    || (cur?.cronos_payload)
+    || {};
+
+    const canonical = {
+      ...basePayload,
+      rules: nextRules,
+      fieldRules: nextFieldRules,
+      updatedAt: new Date().toISOString()
+    };
+
+    const next = {
+      rules: nextRules,
+      fieldRules: nextFieldRules,
+      payload: { CRONOS_PAYLOAD: canonical },
+      CRONOS_PAYLOAD: canonical,
+      cronos_payload: canonical
+    };
+
+    // Prefer setState to retain broadcast semantics
+    await setState(docId, next);
+
+    // Nudge active channels (some listeners only react to active:* messages)
+    try { new BroadcastChannel('fs-active-doc').postMessage({ type: 'rules-updated', docId, ts: Date.now(), from: 'persist' }); } catch {}
+  }
+
+  function getRules(docId) {
+    const st = getState(docId);
+    return { rules: Array.isArray(st.rules) ? st.rules : [], fieldRules: Array.isArray(st.fieldRules) ? st.fieldRules : [] };
+  }
+
+  // (Legacy) persistRules signature kept for callers but it ONLY writes to workspace + mirrors now.
+  async function persistRules(docId, rules, fieldRules /*, { embed } */) {
+    if (!docId) throw new Error('persistRules: missing docId');
+    return saveState(docId, { rules: _safeArr(rules), fieldRules: _safeArr(fieldRules) });
+  }
+
+  // ---- Hydration helper hook used by some pages (noop-safe) ----
+  async function ensureHydrated() {
+    // Best-effort: if there's an active doc with no schema, try to hydrate from DOCX
+    const meta = getActiveDocMeta();
+    if (meta?.docId) { try { await hydrateFromDocxIfEmpty(meta.docId); } catch {} }
+    return true;
+  }
+
+  // ===== Public API surface =====
+  const api = {
+    // canonical storage key (pages listen for it)
+    ACTIVE_DOC_KEY: LS_KEYS.CANON_ACTIVE,
+    PAYLOAD_KEY,
+
+    // Active doc (single source of truth)
+    getActiveDocMeta,
+    setActiveDoc,
+    clearActiveDoc: async () => setActiveDoc(null),
+
+    // Back-compat aliases
+    getCurrentDocMeta: getActiveDocMeta,
+    getActiveDoc: async () => getActiveDocMeta(),
+    getActiveDocMetaSync: getActiveDocMeta,
+
+    // State
+    getState,
+    loadState,
+    saveState,
+    setState,
+    getLastKnownValues,
+
+    // Rules API (new)
+    patchRules,
+    overwriteRules,
+    getRules,
+    persistRules, // legacy-friendly: writes to state only (no embed)
+
+    // DOCX bytes/handles
+    setCurrentDoc,
+    setCurrentDocFromBytes,
+    getHandle: idbGetHandle,
+    getBytes,
+    putBytes,
+    getCurrentDocBytes,
+
+    // Permissions
+    ensurePermission,
+    regrantAll,
+
+    // Concurrency helpers
+    withDocLock,
+    coalesce,
+
+    // DOCX payload helpers (used by Export/Save flows)
+    hydrateFromDocxIfEmpty,
+    readPayloadFromDocx,
+    writeDocVarSettings,
+
+    // Optional init hook used by some pages
+    ensureHydrated,
+  };
+
   // Expose
   window.formSuitePersist = Object.freeze(api);
-  window.formSuiteUtils = Object.freeze(utils);
+  window.formSuiteUtils   = Object.freeze(utils);
 })();
 
 /* --------------------------------------------------------------------------
@@ -760,20 +860,13 @@
  * -------------------------------------------------------------------------- */
 (function () {
   const ACTIVE_LS_KEY = 'FS_ACTIVE_DOC_META';
-  const hasFSAccess = typeof window.showOpenFilePicker === 'function'; // feature detection
-  const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-  const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+  const hasFSAccess   = typeof window.showOpenFilePicker === 'function'; // feature detection
+  const bcLegacy      = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
+  const bcCanon       = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
 
-  // Minimal console tag
-  const tag = (m) => ["%c[DocGuard]", "color:#6b7280;font-weight:600", m];
+  const tag  = (m) => ["%c[DocGuard]", "color:#6b7280;font-weight:600", m];
+  const jget = (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
 
-  // Safe JSON parse
-  const jget = (k) => {
-    try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; }
-    catch { return null; }
-  };
-
-  // Broadcast helpers
   function broadcastActive(meta) {
     try { localStorage.setItem(ACTIVE_LS_KEY, JSON.stringify({ docId: meta?.docId || null, name: meta?.name || null })); } catch {}
     try { bcCanon?.postMessage({ type: 'active:set', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
@@ -786,10 +879,9 @@
   }
   function broadcastUpdated(meta) {
     try { bcCanon?.postMessage({ type: 'active:updated', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
-    try { bcLegacy?.postMessage({ type: 'doc-updated', docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
+    try { bcLegacy?.postMessage({ type: 'doc-updated',  docId: meta?.docId || null, name: meta?.name || null, ts: Date.now() }); } catch {}
   }
 
-  // Small DOM helper
   function el(tag, attrs = {}, children = []) {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
@@ -804,7 +896,6 @@
     return n;
   }
 
-  // Create the modal overlay once
   let overlay = null;
   let visible = false;
 
@@ -848,9 +939,7 @@
     overlay = el('div', { class: 'fs-docguard-overlay', style: { display: 'none' } }, [style, card]);
     document.documentElement.appendChild(overlay);
 
-    // ---- cross-browser DOCX picker ----
     async function pickDocxFile() {
-      // Preferred: File System Access API
       if (hasFSAccess) {
         const [handle] = await window.showOpenFilePicker({
           multiple: false,
@@ -864,8 +953,6 @@
         const bytes = new Uint8Array(await f.arrayBuffer());
         return { file: f, bytes, handle };
       }
-
-      // Fallback: classic file input (works on Safari/Firefox/iOS)
       return new Promise((resolve, reject) => {
         const input = document.createElement('input');
         input.type = 'file';
@@ -887,14 +974,11 @@
       });
     }
 
-    // Wire actions
     btnOpen.addEventListener('click', async () => {
       setStatus('Opening picker…');
       try {
         const { file, bytes, handle } = await pickDocxFile();
         const nameNoExt = (file?.name || 'document').replace(/\.docx$/i, '');
-
-        // Persist into our storage layer
         let meta;
         if (window.formSuitePersist?.setCurrentDoc) {
           meta = await window.formSuitePersist.setCurrentDoc({ bytes, handle, name: nameNoExt + '.docx' });
@@ -903,12 +987,9 @@
         } else {
           meta = { docId: 'inline-' + Date.now(), name: nameNoExt + '.docx' };
         }
-
-        // Seed bytes and broadcast so all tabs rehydrate
         try { await window.formSuitePersist?.putBytes?.(meta.docId, bytes); } catch {}
         broadcastActive(meta);
         broadcastUpdated(meta);
-
         hide();
       } catch (e) {
         const msg = (e && (e.name === 'AbortError' || e.code === e.ABORT_ERR)) ? 'Open canceled.' : 'Open failed.';
@@ -930,7 +1011,6 @@
 
     btnClear.addEventListener('click', async () => {
       try {
-        // Best-effort clear; pages will reset themselves
         const meta = jget(ACTIVE_LS_KEY);
         if (meta?.docId) {
           try { await window.formSuitePersist?.saveState?.(meta.docId, {}); } catch {}
@@ -967,22 +1047,18 @@
   }
   function setStatus(s) { ensureOverlay()._setStatus?.(s); }
 
-  // Access checker: returns true if we can read bytes (or will be able to imminently)
   async function checkAccess(tryHandleFallback = false) {
     const meta = jget(ACTIVE_LS_KEY);
     const docId = meta?.docId;
     if (!docId) return false;
 
     try {
-      // 1) Try OPFS bytes
       let bytes = await window.formSuitePersist?.getBytes?.(docId);
       if (bytes?.byteLength) return true;
 
-      // 2) Try currentDocBytes mirror
       bytes = await window.formSuitePersist?.getCurrentDocBytes?.();
       if (bytes?.byteLength) return true;
 
-      // 3) Optional: try handle→file path
       if (tryHandleFallback) {
         const h = await window.formSuitePersist?.getHandle?.(docId);
         if (h?.getFile) {
@@ -1004,63 +1080,48 @@
     return false;
   }
 
-  // Detection strategy
   async function evaluateAndMaybeShow(source) {
     const meta = jget(ACTIVE_LS_KEY);
     const hasDoc = !!meta?.docId;
     if (!hasDoc) {
       show('(no document)');
       setStatus('No active document.');
-      console.log(...tag(`lost (no meta) via ${source}`));
       return;
     }
     const ok = await checkAccess(false);
     if (!ok) {
       show(meta?.name || '(no name)');
       setStatus('Lost access to current DOCX.');
-      console.log(...tag(`lost (no access) via ${source}`));
     } else if (visible) {
       hide();
     }
   }
 
-  // Broadcast listeners
   bcCanon?.addEventListener('message', (ev) => {
     const m = ev?.data || {};
-    if (m.type === 'active:clear') {
-      show('(cleared)'); setStatus('Workspace cleared.');
-    }
+    if (m.type === 'active:clear') { show('(cleared)'); setStatus('Workspace cleared.'); }
     if (m.type === 'active:set')      evaluateAndMaybeShow('bcCanon active:set');
     if (m.type === 'active:updated')  evaluateAndMaybeShow('bcCanon active:updated');
   });
   bcLegacy?.addEventListener('message', (ev) => {
     const m = ev?.data || {};
-    if (m.type === 'doc-cleared') {
-      show('(cleared)'); setStatus('Workspace cleared.');
-    }
+    if (m.type === 'doc-cleared') { show('(cleared)'); setStatus('Workspace cleared.'); }
     if (m.type === 'doc-switched' || m.type === 'doc-updated') {
       evaluateAndMaybeShow('bcLegacy ' + m.type);
     }
   });
 
-  // Storage listener (cross-tab)
   window.addEventListener('storage', (e) => {
     if (e.key === ACTIVE_LS_KEY) evaluateAndMaybeShow('storage');
   });
 
-  // Foreground triggers
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') evaluateAndMaybeShow('visibilitychange');
   });
   window.addEventListener('focus', () => evaluateAndMaybeShow('focus'));
-
-  // Light heartbeat (only if not visible)
   setInterval(() => { if (!visible) evaluateAndMaybeShow('heartbeat'); }, 25000);
-
-  // Initial mount
   window.addEventListener('DOMContentLoaded', () => { evaluateAndMaybeShow('DOMContentLoaded'); });
 
-  // Expose (optional) API
   window.fsDocGuard = {
     show, hide,
     ping: () => evaluateAndMaybeShow('manual'),
