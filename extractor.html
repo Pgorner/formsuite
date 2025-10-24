@@ -1377,16 +1377,17 @@
 
         // Persist both arrays so they remain available for export/save
         if (gDocId) {
-          await window.formSuitePersist.saveState(gDocId, {
+          const patch = {
             schema: gSchema,
             values: gValues,
             tagMap: prunedTagMap,
-            rules: prunedRules,
-            fieldRules: prunedFieldR,
             headings: headingsParsed.flat,
             headingsTree: headingsParsed.tree,
             headingsUpdatedAt: new Date().toISOString()
-          });
+          };
+          if (Array.isArray(prunedRules) && prunedRules.length)     patch.rules = prunedRules;
+          if (Array.isArray(prunedFieldR) && prunedFieldR.length)   patch.fieldRules = prunedFieldR;
+          await window.formSuitePersist.saveState(gDocId, patch);
         }
 
         buildForm(document.getElementById('formMount'), gSchema, gValues);
@@ -1676,15 +1677,30 @@
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
         if (restored?.schema) gSchema = restored.schema;
 
-        const domVals   = collectFormValues(gSchema);
-        const baseVals  = (restored && restored.values) ? restored.values : {};
-        const rawRules  = normalizeRules(restored?.rules);
-        const rules     = normalizeRulesForSchema(gSchema, rawRules);
+        // --- values ---
+        const domVals  = collectFormValues(gSchema);
+        const baseVals = (restored && restored.values) ? restored.values : {};
 
-        const rawField   = normalizeRules(restored?.fieldRules);
-        const fieldRules = normalizeRulesForSchema(gSchema, rawField);
-
+        // --- tag map ---
         const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
+
+        // --- RULE SOURCING: prefer workspace, fall back to payload mirrors (like Preview) ---
+        const pl = restored?.payload?.CRONOS_PAYLOAD
+                || restored?.CRONOS_PAYLOAD
+                || restored?.cronos_payload
+                || {};
+
+        const wsRules    = Array.isArray(restored?.rules)      ? restored.rules      : [];
+        const wsFieldR   = Array.isArray(restored?.fieldRules) ? restored.fieldRules : [];
+        const plRules    = Array.isArray(pl.rules)             ? pl.rules            : [];
+        const plFieldR   = Array.isArray(pl.fieldRules)        ? pl.fieldRules       : [];
+
+        const mergedRules  = wsRules.length  ? wsRules  : plRules;
+        const mergedFieldR = wsFieldR.length ? wsFieldR : plFieldR;
+
+        // --- Normalize / prune against current schema ---
+        const rules      = normalizeRulesForSchema(gSchema, mergedRules);
+        const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldR);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
@@ -1694,21 +1710,24 @@
 
         setStatus('Writing payload to DOCX (settings.xml)…');
 
-        const payload = JSON.stringify({
-          title:  gSchema.title || 'Form',
-          fields: gSchema.fields || [],
-          values: gValues || {},
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules,
+        // --- Build payload (always include arrays for symmetry) ---
+        const payloadObj = {
+          title:     gSchema.title || 'Form',
+          fields:    gSchema.fields || [],
+          values:    gValues || {},
+          tagMap:    prunedTagMap,
+          rules,          // always present
+          fieldRules,     // always present
           updatedAt: new Date().toISOString()
-        });
+        };
+        const payload = JSON.stringify(payloadObj);
 
-        // Normalize Pyodide output → compact Uint8Array, then update state/persistence
+        // Write into DOCX settings
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
         const updatedU8 = compactU8(toU8(updated));
         gArrayBuffer = updatedU8.slice().buffer;
 
+        // Persist workspace snapshot
         if (gDocId) await window.formSuitePersist.saveState(gDocId, {
           schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap
         });
@@ -1720,34 +1739,26 @@
 
         if (supportsFS) {
           const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-          if (handle?.createWritable) {
-            const perm = await ensureWritePermission(handle);
-            if (perm === 'granted') {
+          if (handle) {
+            const p = await ensurePermission(handle, 'readwrite');
+            tr.step('ensurePermission', p);
+            if (p === 'granted') {
               const stream = await handle.createWritable();
               await stream.write(updatedU8);
               await stream.close();
-              setStatus(`Saved back to "${handle.name || (gFileName + '.' + gFileExt)}".`);
-              gFileHandle = handle;
+              setStatus('Saved.');
               gDirty = false;
-              await updateWriteAccessBanner();
-              tr.end('wrote back'); return;
-            } else {
-              await updateWriteAccessBanner();
+              return;
             }
           }
         }
 
-        const mime = wordMimeFor(gFileExt);
-        const blob = new Blob([updatedU8], { type: mime });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `${gFileName}.${gFileExt}`;
-        document.body.appendChild(a); a.click(); a.remove();
-        setStatus('Saved: downloaded updated copy.');
+        setStatus('Saved in workspace (file system write not available).');
         gDirty = false;
-        tr.end('downloaded copy');
-      } catch (e) { tr.error('save failed', e); setStatus(`Error saving: ${e.message || e}`); }
-      finally { tr.end(); }
+      } catch (e) {
+        tr.error('save failed', e);
+        setStatus(`Error saving: ${e.message || e}`);
+      } finally { tr.end(); }
     }
 
     async function doExport() {
@@ -1758,15 +1769,30 @@
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
         if (restored?.schema) gSchema = restored.schema;
 
-        const domVals   = collectFormValues(gSchema);
-        const baseVals  = (restored && restored.values) ? restored.values : {};
-        const rawRules  = normalizeRules(restored?.rules);
-        const rules     = normalizeRulesForSchema(gSchema, rawRules);
+        // --- values ---
+        const domVals  = collectFormValues(gSchema);
+        const baseVals = (restored && restored.values) ? restored.values : {};
 
-        const rawField   = normalizeRules(restored?.fieldRules);
-        const fieldRules = normalizeRulesForSchema(gSchema, rawField);
-
+        // --- tag map ---
         const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
+
+        // --- RULE SOURCING (same logic as doSave/Preview) ---
+        const pl = restored?.payload?.CRONOS_PAYLOAD
+                || restored?.CRONOS_PAYLOAD
+                || restored?.cronos_payload
+                || {};
+
+        const wsRules    = Array.isArray(restored?.rules)      ? restored.rules      : [];
+        const wsFieldR   = Array.isArray(restored?.fieldRules) ? restored.fieldRules : [];
+        const plRules    = Array.isArray(pl.rules)             ? pl.rules            : [];
+        const plFieldR   = Array.isArray(pl.fieldRules)        ? pl.fieldRules       : [];
+
+        const mergedRules  = wsRules.length  ? wsRules  : plRules;
+        const mergedFieldR = wsFieldR.length ? wsFieldR : plFieldR;
+
+        // --- Normalize / prune against current schema ---
+        const rules      = normalizeRulesForSchema(gSchema, mergedRules);
+        const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldR);
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
@@ -1774,66 +1800,29 @@
         gValues = prunedValues;
         setStatus('Preparing export…');
 
-        // 1) write CRONOS_PAYLOAD
+        // 1) write CRONOS_PAYLOAD into the in-memory DOCX
         const payload = JSON.stringify({
-          title:  gSchema.title || 'Form',
-          fields: gSchema.fields || [],
-          values: gValues || {},
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules,
+          title:     gSchema.title || 'Form',
+          fields:    gSchema.fields || [],
+          values:    gValues || {},
+          tagMap:    prunedTagMap,
+          rules,          // always present
+          fieldRules,     // always present
           updatedAt: new Date().toISOString()
         });
         const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, payload);
         const updatedU8 = compactU8(toU8(updated));
 
-        // 2) replace SDTs using tagMap → values
-        const sdtMap = {};
-        for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
-          let v = gValues?.[fieldId];
-          if (v == null) v = '';
-          if (typeof v === 'object') {
-            // Prefer a clean line for address objects
-            v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
-          }
-          sdtMap[tag] = String(v);
-        }
-        let updated2 = await writeSDTs(updatedU8, sdtMap);
-        let updated2U8 = compactU8(toU8(updated2));
-        gArrayBuffer = updated2U8.slice().buffer;
-
-        // 3.5) evaluate rules → visibility map (SHOW supersedes HIDE)
-        const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, loadRulesForDoc(restored));
-
-        // 4) apply visibility (reset all fsHidden, then apply current HIDE ranges)
-        if (Object.keys(visibilityMap).length) {
-          const visU8 = await applyVisibilityByRules(updated2U8, visibilityMap);
-          const visU8Compact = compactU8(toU8(visU8));
-          updated2U8 = visU8Compact;
-          gArrayBuffer = visU8Compact.slice().buffer;
-        }
-
-        // 5) persist state + bytes in workspace
-        if (gDocId) await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap
-        });
-        if (gDocId) await window.formSuitePersist.putBytes(gDocId, updated2U8);
-        const metaObj = await persistCurrentDoc(updated2U8, gFileHandle, gFileName, gFileExt);
-        gDocId = metaObj.docId;
-        persistActiveMeta(metaObj);
-        announceDocUpdate();
-
-        // 6) Save As…
-        const suggested = `${gFileName} (export).${gFileExt}`;
-
-        if (supportsFS) {
+        // 2) save the updated bytes to the chosen file
+        const suggested = (gFileName?.replace(/\.docx$/i,'') || 'document') + '_export.' + gFileExt;
+        if (window.showSaveFilePicker) {
           try {
-            const handle = await showSaveFilePicker({
+            const handle = await window.showSaveFilePicker({
               suggestedName: suggested,
               types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
             });
             const stream = await handle.createWritable();
-            await stream.write(updated2U8);
+            await stream.write(updatedU8);
             await stream.close();
             setStatus(`Exported as “${handle.name || suggested}”.`);
             gDirty = false;
@@ -1845,19 +1834,16 @@
         }
 
         const mime = wordMimeFor(gFileExt);
-        const blob = new Blob([updated2U8], { type: mime });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = suggested;
-        document.body.appendChild(a); a.click(); a.remove();
-        setStatus('Exported: downloaded copy.');
+        const blob = new Blob([updatedU8], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = suggested; a.click();
+        URL.revokeObjectURL(url);
+        setStatus(`Exported as “${suggested}”.`);
         gDirty = false;
       } catch (e) {
         tr.error('export failed', e);
         setStatus(`Error exporting: ${e.message || e}`);
-      } finally {
-        tr.end();
-      }
+      } finally { tr.end(); }
     }
 
     // =========================

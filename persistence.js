@@ -181,6 +181,19 @@
       }
     }
 
+    // NEW: do the same for payload mirrors (payload.CRONOS_PAYLOAD.rules/fieldRules)
+    const prevPL = prev?.payload?.CRONOS_PAYLOAD || {};
+    const nextPL = normalizedPatch?.payload?.CRONOS_PAYLOAD;
+    if (nextPL && typeof nextPL === 'object') {
+      ['rules', 'fieldRules'].forEach(k => {
+        if (Array.isArray(nextPL[k]) && nextPL[k].length === 0 &&
+            Array.isArray(prevPL[k]) && prevPL[k].length > 0) {
+          // keep previous non-empty array
+          delete normalizedPatch.payload.CRONOS_PAYLOAD[k];
+        }
+      });
+    }
+
     const next = deepMerge(prev, normalizedPatch);
     next.__v = (prev.__v|0) + 1;
     writeJSON(keyFor(docId), next);
@@ -665,20 +678,53 @@
       if (!bytes) { dbg('hydrate:no-bytes', { docId }); return false; }
       const raw = await readPayloadFromDocx(bytes);
       if (!raw) { dbg('hydrate:no-payload', { docId }); return false; }
+
+      // Parse payload JSON from DOCX
       let payload = null;
       try { payload = JSON.parse(raw); } catch { payload = null; }
-      if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) { dbg('hydrate:invalid', { docId }); return false; }
+      if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) {
+        dbg('hydrate:invalid', { docId }); return false;
+      }
+
       const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
-      const cleanValues = (window.formSuiteUtils?.sanitizeValues ? window.formSuiteUtils.sanitizeValues(nextSchema, payload.values || {}) : (payload.values || {}));
+      const cleanValues = (window.formSuiteUtils?.sanitizeValues
+        ? window.formSuiteUtils.sanitizeValues(nextSchema, payload.values || {})
+        : (payload.values || {}));
       const tagMap = payload.tagMap || {};
-      // rules shape can be either array or object depending on previous builds; keep as-is
-      const rules  = payload.rules ?? {};
-      await saveState(docId, { schema: nextSchema, values: cleanValues, tagMap, rules, schemaUpdatedAt: new Date().toISOString() });
+
+      // ✅ Normalize rules arrays (include fieldRules)
+      const rules = Array.isArray(payload.rules) ? payload.rules : [];
+      const fieldRules = Array.isArray(payload.fieldRules) ? payload.fieldRules : [];
+
+      // Canonical mirrored payload so readers can find it anywhere
+      const canonical = {
+        title: nextSchema.title,
+        fields: nextSchema.fields,
+        values: cleanValues,
+        tagMap,
+        rules,
+        fieldRules,
+        updatedAt: new Date().toISOString()
+      };
+
+      await saveState(docId, {
+        schema: nextSchema,
+        values: cleanValues,
+        tagMap,
+        rules,
+        fieldRules,
+        // mirror into common keys
+        payload: { CRONOS_PAYLOAD: canonical },
+        CRONOS_PAYLOAD: canonical,
+        cronos_payload: canonical,
+        schemaUpdatedAt: new Date().toISOString()
+      });
+
       // Notify other tabs/pages
       try { bcCanon?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
       try { bcLegacy?.postMessage({ type: 'schema-updated', docId, ts: Date.now() }); } catch {}
       try { const meta = getActiveDocMeta(); broadcastDocUpdated(docId, meta?.name); } catch {}
-      dbg('hydrate:done', { docId, fields: nextSchema.fields.length });
+      dbg('hydrate:done', { docId, fields: nextSchema.fields.length, rules: rules.length, fieldRules: fieldRules.length });
       return true;
     } catch (e) { dbg('hydrate:error', e); return false; }
     finally { __hydrating = false; }
