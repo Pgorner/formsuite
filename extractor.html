@@ -129,6 +129,66 @@
     });
 
     // =========================
+    // 🧭 PAYLOAD CHANGE FORENSICS (WHY DID IT WRITE?)
+    // =========================
+    function __safeLen(x){ return Array.isArray(x) ? x.length : (x && typeof x==='object' ? Object.keys(x).length : 0); }
+    function __deepEqual(a,b){ try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; } }
+    function __diffObj(a, b, path = '') {
+      const diffs = [];
+      const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+      const keys = new Set([...Object.keys(a||{}), ...Object.keys(b||{})]);
+      for (const k of keys) {
+        const pa = path ? `${path}.${k}` : k;
+        const va = a?.[k], vb = b?.[k];
+        if (isObj(va) && isObj(vb)) { diffs.push(...__diffObj(va, vb, pa)); continue; }
+        if (Array.isArray(va) && Array.isArray(vb)) {
+          if (!__deepEqual(va, vb)) diffs.push({ path: pa, type:'array', from: va, to: vb });
+          continue;
+        }
+        if (JSON.stringify(va) !== JSON.stringify(vb)) diffs.push({ path: pa, type:'value', from: va, to: vb });
+      }
+      return diffs;
+    }
+    async function __snapshotCanonicalFromState(docId){
+      const st = docId ? (await window.formSuitePersist.loadState(docId) || {}) : {};
+      const p = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
+      return {
+        ws: {
+          rules: Array.isArray(st.rules) ? st.rules : [],
+          fieldRules: Array.isArray(st.fieldRules) ? st.fieldRules : [],
+          rulesVersion: st.rulesVersion,
+          schema: st.schema,
+          values: st.values,
+          tagMap: st.tagMap,
+        },
+        payload: p
+      };
+    }
+    async function debugLogExtractor(where, reasonFlags, beforeCanon, afterCanon){
+      const label = `[Extractor:payload][${where}]`;
+      try {
+        console.groupCollapsed(label);
+        console.log('docId:', gDocId, 'file:', `${gFileName || ''}.${gFileExt || ''}`);
+        console.log('reasonFlags:', reasonFlags);
+        const pre = beforeCanon || await __snapshotCanonicalFromState(gDocId);
+        console.log('BEFORE (workspace.rules, workspace.fieldRules):',
+          __safeLen(pre.ws.rules), __safeLen(pre.ws.fieldRules));
+        console.log('BEFORE (payload.rules, payload.fieldRules):',
+          __safeLen(pre.payload.rules), __safeLen(pre.payload.fieldRules));
+        console.log('BEFORE payload.updatedAt:', pre.payload?.updatedAt, 'rulesVersion:', pre.payload?.rulesVersion);
+        if (afterCanon) {
+          console.log('AFTER payload.rules:', __safeLen(afterCanon.rules), afterCanon.rules);
+          console.log('AFTER payload.fieldRules:', __safeLen(afterCanon.fieldRules), afterCanon.fieldRules);
+          console.log('AFTER payload.updatedAt:', afterCanon.updatedAt, 'rulesVersion:', afterCanon.rulesVersion);
+          const diffs = __diffObj(pre.payload || {}, afterCanon || {});
+          if (diffs.length) console.warn('DIFF (payload changes):', diffs);
+          else console.log('DIFF: none (payload unchanged)');
+        }
+      } catch (e) { console.error(label + ' failed', e); }
+      finally { console.groupEnd(); }
+    }
+
+    // =========================
     // CONSTANTS & STATE
     // =========================
     const STORAGE_KEY  = 'FORM_SCHEMA_V1';
@@ -333,6 +393,7 @@
             gValues = { ...wsVals, ...domVals };
             buildForm(formMount, gSchema, gValues);
             await updatePreview(gValues);
+            await debugLogExtractor('bc:rules-updated', { function:'BC rules-updated', from: 'rules.html' });
             setStatus('Schema updated from Form Builder.');
           }
         }
@@ -506,29 +567,113 @@
     }
 
     function installRulesUpdatedListener() {
-      try {
-        bcCanon?.addEventListener?.('message', async (ev) => {
-          const tr = TRACE('bcCanon:rules-updated', ev?.data);
+      // attach once
+      if (window.__fsRulesBCInstalled) {
+        console.log('[Extractor][BC] listener already installed');
+        return;
+      }
+      window.__fsRulesBCInstalled = true;
+
+      console.log('[Extractor][BC] installing listeners', {
+        hasCanon: !!bcCanon, hasLegacy: !!bcLegacy, gDocIdAtInstall: gDocId
+      });
+
+      const pickActiveMeta = () => {
+        try {
+          const v = localStorage.getItem('FS_ACTIVE_DOC_META') || localStorage.getItem('FS_CURRENT_DOC_META');
+          return v ? JSON.parse(v) : null;
+        } catch { return null; }
+      };
+
+      const onMsg = async (label, ev) => {
+        const m = ev?.data || {};
+        if (!m || typeof m !== 'object') return;
+
+        // Always log incoming broadcasts for debugging
+        console.log(`[Extractor][BC:${label}]`, m, 'local gDocId=', gDocId);
+
+        if (m.type === 'rules-updated') {
+          // Accept the docId from the message if we're not bound yet
+          const targetId = m.docId || pickActiveMeta()?.docId || gDocId;
+          if (!targetId) { console.warn('[Extractor][BC] rules-updated but no targetId'); return; }
+
+          if (!gDocId) {
+            // late-bind this tab to the active doc so we don’t miss future changes
+            gDocId = targetId;
+            persistActiveMeta({ docId: gDocId, name: pickActiveMeta()?.name || gFileName || 'document' });
+            console.log('[Extractor][BC] late-bound to docId', gDocId);
+          }
+          if (gDocId !== targetId) {
+            console.log('[Extractor][BC] rules-updated for different doc; ignoring', { targetId, gDocId });
+            return;
+          }
+
           try {
-            const m = ev.data || {};
-            if (m.type !== 'rules-updated') return;
-            if (!m.docId || m.docId !== gDocId) return;
-
-            const st = await window.formSuitePersist.loadState(gDocId);
-            const wsCollected = extractRulesFromState(st || {});
-            const rules      = normalizeRulesForSchema(gSchema, wsCollected.rules);
-            const fieldRules = normalizeRulesForSchema(gSchema, wsCollected.fieldRules);
-
-            await window.formSuitePersist.saveState(gDocId, { rules, fieldRules });
             await updatePreview(collectFormValues(gSchema));
-            setStatus('Rules updated from Rules tab.');
+            await debugLogExtractor('bc:rules-updated', { function:'BC rules-updated', from: 'rules.html' });
+            setStatus('Rules updated from Rules tab (BC).');
           } catch (e) {
-            console.warn('rules-updated handler failed', e);
-          } finally { tr?.end?.(); }
-        });
-      } catch {}
+            console.warn('[Extractor][BC] updatePreview failed after rules-updated', e);
+          }
+        }
+
+        // (optional) react to generic state signal if your persistence emits it
+        if (m.type === 'state-updated') {
+          const active = pickActiveMeta();
+          if (!active?.docId) return;
+          if (!gDocId) gDocId = active.docId;
+          if (gDocId !== active.docId) return;
+          try {
+            await updatePreview(collectFormValues(gSchema));
+            await debugLogExtractor('bc:state-updated', { function:'BC state-updated' });
+            setStatus('State updated (BC).');
+          } catch (e) {
+            console.warn('[Extractor][BC] updatePreview failed after state-updated', e);
+          }
+        }
+      };
+
+      bcCanon?.addEventListener?.('message', onMsg.bind(null, 'fs-active-doc'));
+      bcLegacy?.addEventListener?.('message', onMsg.bind(null, 'form-suite-doc'));
+      console.log('[Extractor][BC] listeners attached');
     }
 
+    (async function setupRulesWatchdog(){
+      let lastRV = null;
+
+      async function tick() {
+        try {
+          if (!gDocId) {
+            const meta = readActiveMeta();
+            if (meta?.docId) {
+              gDocId = meta.docId;
+              console.log('[Extractor][Watchdog] late-bound gDocId from active meta', gDocId);
+            } else {
+              return; // still nothing to watch
+            }
+          }
+          const st = await window.formSuitePersist.loadState(gDocId);
+          const rv = st?.rulesVersion
+            ?? st?.payload?.CRONOS_PAYLOAD?.rulesVersion
+            ?? st?.CRONOS_PAYLOAD?.rulesVersion
+            ?? st?.cronos_payload?.rulesVersion
+            ?? null;
+
+          if (rv !== lastRV) {
+            console.log('[Extractor][Watchdog] rulesVersion changed:', { prev: lastRV, next: rv });
+            lastRV = rv;
+            await updatePreview(collectFormValues(gSchema));
+            await debugLogExtractor('watchdog:rulesVersion', { function:'Watchdog', prev: (lastRV ?? null), next: rv });
+            setStatus('Rules updated (poll).');
+          }
+        } catch (e) {
+          console.warn('[Extractor][Watchdog] tick failed', e);
+        }
+      }
+
+      setInterval(tick, 1500);
+      console.log('[Extractor][Watchdog] installed');
+    })();
 
     // =========================
     // TAG MAP / PREVIEW HELPERS
@@ -539,53 +684,54 @@
       return new Set((schema?.fields || []).map(f => String(f.id)));
     }
 
-
     // Collect rules from workspace state regardless of where the Rules tab put them
     function extractRulesFromState(state) {
       const out = { rules: [], fieldRules: [] };
+      const safeArr = (x) => Array.isArray(x) ? x : [];
+      const ids = (arr) => safeArr(arr).map(r => r?.id).filter(Boolean);
+
       if (!state || typeof state !== 'object') return out;
 
-      // Workspace (authoritative while editing)
-      if (Array.isArray(state.rules))      out.rules.push(...state.rules);
-      if (Array.isArray(state.fieldRules)) out.fieldRules.push(...state.fieldRules);
+      const ws_rules      = safeArr(state.rules);
+      const ws_fieldRules = safeArr(state.fieldRules);
+      out.rules.push(...ws_rules);
+      out.fieldRules.push(...ws_fieldRules);
 
-      // Payload mirrors (support nested + flat + legacy)
       const payload =
-          state?.payload?.CRONOS_PAYLOAD
-      || state?.CRONOS_PAYLOAD
-      || state?.cronos_payload
-      || state?.payload
-      || {};
+            state?.payload?.CRONOS_PAYLOAD ? state.payload.CRONOS_PAYLOAD
+          : state?.CRONOS_PAYLOAD         ? state.CRONOS_PAYLOAD
+          : state?.cronos_payload         ? state.cronos_payload
+          : state?.payload                ? state.payload
+          : {};
 
-      if (Array.isArray(payload.rules))      out.rules.push(...payload.rules);
-      if (Array.isArray(payload.fieldRules)) out.fieldRules.push(...payload.fieldRules);
+      const pl_rules      = safeArr(payload?.rules);
+      const pl_fieldRules = safeArr(payload?.fieldRules);
+      out.rules.push(...pl_rules);
+      out.fieldRules.push(...pl_fieldRules);
 
-      // Ultra-legacy keys (very old)
-      if (Array.isArray(state.CRONOS_RULES))       out.rules.push(...state.CRONOS_RULES);
-      if (Array.isArray(state.cronos_rules))       out.rules.push(...state.cronos_rules);
-      if (Array.isArray(state.CRONOS_FIELD_RULES)) out.fieldRules.push(...state.CRONOS_FIELD_RULES);
-      if (Array.isArray(state.cronos_field_rules)) out.fieldRules.push(...state.cronos_field_rules);
+      const ul_rules_1 = safeArr(state.CRONOS_RULES);
+      const ul_rules_2 = safeArr(state.cronos_rules);
+      const ul_fr_1    = safeArr(state.CRONOS_FIELD_RULES);
+      const ul_fr_2    = safeArr(state.cronos_field_rules);
 
-      // Deduplicate by JSON shape
+      out.rules.push(...ul_rules_1, ...ul_rules_2);
+      out.fieldRules.push(...ul_fr_1, ...ul_fr_2);
+
+      // Dedup by shape
       const dedupe = (arr) => {
         const seen = new Set(); const res = [];
         for (const r of (arr || [])) {
-          const k = JSON.stringify(r || {});
+          const shallow = (r && typeof r === 'object') ? { ...r } : r;
+          delete shallow?.version; delete shallow?.ts;
+          const k = JSON.stringify(shallow ?? {});
           if (!seen.has(k)) { seen.add(k); res.push(r); }
         }
         return res;
       };
-
       return { rules: dedupe(out.rules), fieldRules: dedupe(out.fieldRules) };
     }
 
-
-    /**
-     * Keep only rules whose `fieldId` exists in the schema.
-     * Also prune condition references to non-existing fields.
-     * Targets (heading indices) are kept if they look numeric.
-     */
-    // --- helper: map label → id, and option label → parent field id
+    // --- schema indexers / normalizers for rules ---
     function __buildSchemaIndex(schema) {
       const idx = { byId: new Map(), byLabel: new Map(), optionToField: new Map() };
       for (const f of (schema?.fields || [])) {
@@ -617,7 +763,7 @@
       const s = String(raw).trim();
       const idx = __buildSchemaIndex(schema);
 
-      // Option synthetic ids like "fieldId__opt__option_slug" → base field
+      // option synth ids like "fieldId__opt__slug"
       if (s.includes('__opt__')) {
         const baseId = s.split('__opt__')[0];
         if (idx.byId.has(baseId)) return idx.byId.get(baseId);
@@ -649,7 +795,6 @@
     }
 
     function __coerceRuleForMultichoiceOption(schema, rule, field) {
-      // Turn “option equals true” into multichoice anyOf
       const out = JSON.parse(JSON.stringify(rule));
       const idx = __buildSchemaIndex(schema);
       const looksLikeOption = !idx.byId.has(String(out.fieldId || out.field || out.whenField));
@@ -664,7 +809,6 @@
       return out;
     }
 
-    // Normalize + prune against schema
     function normalizeRulesForSchema(schema, rulesIn) {
       const rules = Array.isArray(rulesIn) ? rulesIn : [];
       const out = [];
@@ -702,29 +846,18 @@
       return out;
     }
 
-
-    function normalizeRules(rules){
-      return Array.isArray(rules) ? rules : [];
-    }
-
     function normalizeForSchema(schema, values, tagMap) {
       const fieldIds = new Set((schema?.fields || []).map(f => String(f.id)));
-
-      // Keep only values whose keys exist in schema
       const prunedValues = {};
       for (const [k, v] of Object.entries(values || {})) {
         if (fieldIds.has(String(k))) prunedValues[k] = v;
       }
-
-      // Keep only tag mappings that point to existing field ids
       const prunedTagMap = {};
       for (const [tag, fieldId] of Object.entries(tagMap || {})) {
         if (fieldIds.has(String(fieldId))) prunedTagMap[tag] = fieldId;
       }
-
       return { values: prunedValues, tagMap: prunedTagMap };
     }
-
 
     async function getTagMapFor(docId) {
       try {
@@ -740,15 +873,13 @@
       }
     }
 
-
     function loadSchemaFromLocalStorage() {
       const tr = TRACE('loadSchemaFromLocalStorage');
       try { const s = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); tr.end({ has:s?.fields?.length }); return s; }
       catch (e) { tr.error('parse fail', e); tr.end(); return null; }
     }
 
-    // Collect values from the live form.
-    // NEW: returns structured address objects from __addressValues.
+    // Collect values from the live form (address values are structured)
     function collectFormValues(schema) {
       const form = document.getElementById('liveForm');
       const out = {};
@@ -760,7 +891,7 @@
           continue;
         }
         if (f.type === 'address') {
-          out[f.id] = __addressValues[f.id] ?? null; // structured
+          out[f.id] = __addressValues[f.id] ?? null;
           continue;
         }
         const el = form.elements[f.id];
@@ -768,43 +899,64 @@
       }
       return out;
     }
-
-
+    // =========================
+    // (REPLACE) updatePreview(values)
+    // =========================
     async function updatePreview(values) {
       if (!payloadEl) return;
 
       const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
 
-      // Gather rules from wherever they are (workspace preferred; else mirrors)
-      const wsCollected = extractRulesFromState(wsState || {});
-      const plObj = wsState?.payload?.CRONOS_PAYLOAD
-                || wsState?.CRONOS_PAYLOAD
-                || wsState?.cronos_payload
-                || {};
-      const plCollected = extractRulesFromState(plObj || {});
+      // Prefer workspace rules if the arrays exist (even if empty).
+      const wsOnly = extractWorkspaceRulesOnly(wsState || {});
+      const plObj  = wsState?.payload?.CRONOS_PAYLOAD
+                  || wsState?.CRONOS_PAYLOAD
+                  || wsState?.cronos_payload
+                  || {};
+      const plOnly = extractRulesFromPayloadObject(plObj);
 
-      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
-      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
+      const useWsRules      = Array.isArray(wsState?.rules);
+      const useWsFieldRules = Array.isArray(wsState?.fieldRules);
+
+      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+
+      // DEBUG: why these sources?
+      const usedSourceForRules =
+        (useWsRules || useWsFieldRules) ? 'workspace' : 'payloadMirror';
+
+      await debugLogExtractor('updatePreview:merge', {
+        function: 'updatePreview',
+        usedSourceForRules,
+        wsRules: (wsState?.rules || []).length,
+        plRules: (plObj?.rules || []).length,
+        wsFieldRules: (wsState?.fieldRules || []).length,
+        plFieldRules: (plObj?.fieldRules || []).length
+      });
 
       // Normalize against current schema
       const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
       const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
 
       const tagMapRaw = await getTagMapFor(gDocId);
-
       const { values: prunedValues, tagMap: prunedTagMap } =
         normalizeForSchema(gSchema, values || {}, tagMapRaw);
 
-      payloadEl.value = JSON.stringify({
+      const previewObj = {
         title:  gSchema?.title || 'Form',
         fields: gSchema?.fields || [],
         values: prunedValues,
         tagMap: prunedTagMap,
         rules,
         fieldRules
-      }, null, 2);
-    }
+      };
+      payloadEl.value = JSON.stringify(previewObj, null, 2);
 
+      await debugLogExtractor('updatePreview:previewBuilt', {
+        function:'updatePreview',
+        previewLen: (payloadEl?.value || '').length
+      });
+    }
 
     let previewTimer = null;
     function schedulePreviewUpdate() {
@@ -891,19 +1043,16 @@
           } else if (f.type === 'date') {
             input = document.createElement('input'); input.type = 'text'; input.dataset.type = 'date'; input.dataset.format = f.dateFormat || 'Y-m-d';
 
-          // NEW: Address field mounts AddressAuto and stores structured value in __addressValues
           } else if (f.type === 'address') {
             const mountDiv = document.createElement('div');
             mountDiv.className = 'address-field';
             wrap.appendChild(mountDiv);
 
-            // Initial structured value (or upgrade from legacy string)
             const initial =
               typeof values?.[f.id] === 'string'
                 ? { formatted: values[f.id] }
                 : (values?.[f.id] || null);
 
-            // seed local state for collectFormValues()
             __addressValues[f.id] = initial || null;
 
             try {
@@ -912,13 +1061,9 @@
                 label: f.label || 'Address',
                 required: !!f.required,
                 value: initial || null,
-                onChange: (val) => {
-                  __addressValues[f.id] = val;     // keep full object
-                  schedulePreviewUpdate();          // reflect in preview + persistence
-                }
+                onChange: (val) => { __addressValues[f.id] = val; schedulePreviewUpdate(); }
               });
             } catch (err) {
-              // Fallback: plain text input if AddressAuto is unavailable
               const fallback = document.createElement('input');
               fallback.type = 'text';
               fallback.id = f.id;
@@ -1030,7 +1175,7 @@
       } catch (e) { tr.error('failed', e); tr.end(); return { sdts: [], scan: [], total: 0 }; }
     }
 
-    // =========================
+        // =========================
     // PYODIDE (payload/SDT writes)
     // =========================
     let pyodideReady = (async () => {
@@ -1361,6 +1506,22 @@
       } catch (e) { tr.error('bootstrap failed', e); tr.end(); throw e; }
     })();
 
+    // ---------- NEW: workspace-only / payload-only rule extractors ----------
+    function extractWorkspaceRulesOnly(state) {
+      return {
+        rules: Array.isArray(state?.rules) ? state.rules : [],
+        fieldRules: Array.isArray(state?.fieldRules) ? state.fieldRules : [],
+      };
+    }
+
+    function extractRulesFromPayloadObject(obj) {
+      return {
+        rules: Array.isArray(obj?.rules) ? obj.rules : [],
+        fieldRules: Array.isArray(obj?.fieldRules) ? obj.fieldRules : [],
+      };
+    }
+
+    
     async function readDocVarSettings(arrayBufferOrBytes, name) {
       const tr = TRACE('readDocVarSettings', { name });
       try {
@@ -1441,7 +1602,7 @@
     }
 
     // =========================
-    // RENDER FROM CURRENT BYTES
+    // (REPLACE) renderFromCurrentBytes(prefix = '')
     // =========================
     async function renderFromCurrentBytes(prefix = '') {
       setStatus((prefix || '') + 'Parsing…');
@@ -1482,15 +1643,19 @@
         chosenSchema = loadSchemaFromLocalStorage() || { title: 'Form', fields: [] };
       }
 
-      // Merge values/tagMap
+      // Merge values/tagMap (workspace overrides payload)
       const mergedValues = Object.assign({}, payload?.values || {}, wsState?.values || {});
       const mergedTagMap = Object.assign({}, payload?.tagMap || {}, wsState?.tagMap || {});
 
-      // Merge rules (workspace preferred; else payload)
-      const wsCollected = extractRulesFromState(wsState || {});
-      const plCollected = extractRulesFromState(payload || {});
-      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
-      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
+      // ---------- RULES: prefer workspace arrays if they exist; else fall back to payload ----------
+      const wsOnly = extractWorkspaceRulesOnly(wsState || {});
+      const plOnly = extractRulesFromPayloadObject(payload || {});
+
+      const useWsRules      = Array.isArray(wsState?.rules);
+      const useWsFieldRules = Array.isArray(wsState?.fieldRules);
+
+      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
       // Normalize everything to chosen schema
       const rules      = normalizeRulesForSchema(chosenSchema, mergedRulesRaw);
@@ -1498,7 +1663,7 @@
       const { values: prunedValues, tagMap: prunedTagMap } =
         normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
 
-      // Adopt & persist mirrors so Save/Export see the same view
+      // Adopt & persist mirrors so Save/Export see the same view (this is app-state only; not DOCX)
       gSchema = chosenSchema;
       gValues = prunedValues;
 
@@ -1530,7 +1695,6 @@
       await updatePreview(gValues);
       setStatus('Ready.');
     }
-
 
 
     function renderSDTsView(parsed) {
@@ -1795,17 +1959,21 @@
 
       const domVals  = collectFormValues(gSchema);
       const baseVals = (restored && restored.values) ? restored.values : {};
-
       const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-      const wsCollected = extractRulesFromState(restored || {});
-      const plObj = restored?.payload?.CRONOS_PAYLOAD
-                || restored?.CRONOS_PAYLOAD
-                || restored?.cronos_payload
-                || {};
-      const plCollected = extractRulesFromState(plObj || {});
-      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
-      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
+      // --- RULES: prefer workspace arrays if they exist (even if empty); else fall back to payload ---
+      const wsOnly = extractWorkspaceRulesOnly(restored || {});
+      const plObj  = restored?.payload?.CRONOS_PAYLOAD
+                  || restored?.CRONOS_PAYLOAD
+                  || restored?.cronos_payload
+                  || {};
+      const plOnly = extractRulesFromPayloadObject(plObj);
+
+      const useWsRules      = Array.isArray(restored?.rules);
+      const useWsFieldRules = Array.isArray(restored?.fieldRules);
+
+      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
       const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
       const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
@@ -1832,15 +2000,22 @@
       gArrayBuffer = updatedU8.slice().buffer;
 
       if (gDocId) {
+        const stamp = Date.now();
         await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema, values: gValues, rules, fieldRules, tagMap: prunedTagMap,
+          schema: gSchema,
+          values: gValues,
+          rules,                // workspace arrays (maybe empty) are authoritative
+          fieldRules,
+          tagMap: prunedTagMap,
           payload: { CRONOS_PAYLOAD: payloadObj },
           CRONOS_PAYLOAD: payloadObj,
           cronos_payload: payloadObj,
+          rulesVersion: stamp,
           schemaUpdatedAt: new Date().toISOString()
         });
         await window.formSuitePersist.putBytes(gDocId, updatedU8);
       }
+
       const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
       gDocId = metaObj.docId;
       persistActiveMeta(metaObj);
@@ -1861,7 +2036,6 @@
       gDirty = false;
     }
 
-
     async function doExport() {
       if (!gArrayBuffer) return;
 
@@ -1872,14 +2046,19 @@
       const baseVals = (restored && restored.values) ? restored.values : {};
       const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-      const wsCollected = extractRulesFromState(restored || {});
-      const plObj = restored?.payload?.CRONOS_PAYLOAD
-                || restored?.CRONOS_PAYLOAD
-                || restored?.cronos_payload
-                || {};
-      const plCollected = extractRulesFromState(plObj || {});
-      const mergedRulesRaw  = wsCollected.rules.length      ? wsCollected.rules      : plCollected.rules;
-      const mergedFieldRaw  = wsCollected.fieldRules.length ? wsCollected.fieldRules : plCollected.fieldRules;
+      // --- RULES: prefer workspace arrays if they exist (even if empty); else fall back to payload ---
+      const wsOnly = extractWorkspaceRulesOnly(restored || {});
+      const plObj  = restored?.payload?.CRONOS_PAYLOAD
+                  || restored?.CRONOS_PAYLOAD
+                  || restored?.cronos_payload
+                  || {};
+      const plOnly = extractRulesFromPayloadObject(plObj);
+
+      const useWsRules      = Array.isArray(restored?.rules);
+      const useWsFieldRules = Array.isArray(restored?.fieldRules);
+
+      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
       const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
       const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
@@ -1889,7 +2068,7 @@
 
       gValues = prunedValues;
 
-      // 1) embed payload
+      // 1) embed payload (workspace-authoritative rules)
       const payloadObj = {
         title:  gSchema.title || 'Form',
         fields: gSchema.fields || [],
@@ -1906,7 +2085,8 @@
       for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
         let v = gValues?.[fieldId];
         if (v == null) v = '';
-        if (typeof v === 'object') v = v.formatted ?? (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
+        if (typeof v === 'object')
+          v = v.formatted ?? (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
         sdtMap[tag] = String(v);
       }
       updated = await writeSDTs(updated, sdtMap);

@@ -6,7 +6,6 @@
   <link rel="icon" href="favicon.ico" type="image/gif" sizes="32x32">
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <!-- Optional (for date condition picker) -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/material_blue.css">
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <link rel="stylesheet" href="style.css">
@@ -32,7 +31,7 @@
     <div class="row" style="justify-content:space-between; align-items:center">
       <h2 style="margin:0">Rules</h2>
       <div id="rulesTabs" class="row" style="margin-left:8px; gap:6px;">
-        <button id="tabHeadings" class="btn btn-ghost" aria-pressed="true">Headings</button>
+        <button id="tabHeadings" class="btn btn-secondary" aria-pressed="true">Headings</button>
         <button id="tabFields" class="btn btn-ghost" aria-pressed="false">Fields</button>
       </div>
       <div class="row">
@@ -58,94 +57,79 @@
 </main>
 
 <script>
-/* ============================ Debug printing ============================ */
+/* ------------------------------------------------------------------ *
+ * Bulletproof Rules editor
+ *  - Authoritative store: state.rules / state.fieldRules
+ *  - Mirrors into payload.CRONOS_PAYLOAD / CRONOS_PAYLOAD / cronos_payload
+ *  - Broadcasts 'rules-updated' (both channels) + bumps LS stamp
+ *  - Logs read-back verification after each persist
+ *  - F9 dumps quick diagnostics
+ * ------------------------------------------------------------------ */
+
 const nowt = () => new Date().toISOString().slice(11,23);
-function asTextRule(rule, mode) {
-  const id = rule?.id ?? null;
-  const action = rule?.action ?? null;
-  const fieldId = (rule?.fieldId ?? '');
-  const op = (rule?.op ?? null);
-  const values = Array.isArray(rule?.values) ? rule.values : [];
-  const targets = Array.isArray(rule?.targets) ? rule.targets : [];
-  const tCompact = (mode === 'headings')
-    ? targets.map(t => String((typeof t==='string')? t : (t?.key ?? '')))
-    : targets.map(t => String((typeof t==='string')? t : (t?.id ?? '')));
-  const hideMode = (mode === 'fields') ? (rule?.hideMode || 'hide') : undefined;
-  const ordered = (hideMode !== undefined)
-    ? { id, action, fieldId, op, values, targets: tCompact, hideMode }
-    : { id, action, fieldId, op, values, targets: tCompact };
-  return JSON.stringify(ordered);
-}
-function printRuleArray(title, rules, mode){
-  console.log(`[${nowt()}] ${title}: count=${(rules||[]).length}`);
-  (rules||[]).forEach((r, i) => console.log(`  #${i+1}: ${asTextRule(r, mode)}`));
-}
-function printPayloadSnapshot(st){
-  const pl = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || null;
-  if (!pl) { console.log(`[${nowt()}] STATE payload: (none)`); return; }
-  const rBoth = Array.isArray(pl.rules) ? pl.rules
-               : (Array.isArray(pl.headingRules) ? pl.headingRules : []);
-  const f = Array.isArray(pl.fieldRules) ? pl.fieldRules : [];
-  console.log(`[${nowt()}] STATE payload present`);
-  if (Array.isArray(pl.rules)) printRuleArray('STATE payload.rules', pl.rules, 'headings');
-  if (Array.isArray(pl.headingRules)) printRuleArray('STATE payload.headingRules', pl.headingRules, 'headings');
-  printRuleArray('STATE payload (effective: headings)', rBoth, 'headings');
-  printRuleArray('STATE payload.fieldRules', f, 'fields');
-}
-
-/* =============================== Globals ================================ */
 const ACTIVE_LS_KEY= "FS_ACTIVE_DOC_META";
-const statusEl   = document.getElementById("status");
-const btnAddRule = document.getElementById("btnAddRule");
-const editorMount= document.getElementById("editorMount");
-const rulesList  = document.getElementById("rulesList");
-const tabHeadings= document.getElementById("tabHeadings");
-const tabFields  = document.getElementById("tabFields");
-const rulesHint  = document.getElementById("rulesHint") || document.querySelector("section.panel .muted-note");
 
-const bcLegacy  = ("BroadcastChannel" in window) ? new BroadcastChannel("form-suite-doc")  : null;
+const els = {
+  status: document.getElementById("status"),
+  btnAddRule: document.getElementById("btnAddRule"),
+  editorMount: document.getElementById("editorMount"),
+  rulesList: document.getElementById("rulesList"),
+  tabHeadings: document.getElementById("tabHeadings"),
+  tabFields: document.getElementById("tabFields"),
+  rulesHint: document.getElementById("rulesHint"),
+};
+
 const bcCanon   = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-active-doc")   : null;
-const bcPayload = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-payload-v1")   : null;
+const bcLegacy  = ("BroadcastChannel" in window) ? new BroadcastChannel("form-suite-doc")  : null;
 
+// ---- DEBUG: pretty payload logger ----
+async function debugLogPayload(where) {
+  try {
+    const st = await window.formSuitePersist.loadState(gDocId) || {};
+    const payload = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
+    const wsRules      = Array.isArray(st.rules) ? st.rules : [];
+    const wsFieldRules = Array.isArray(st.fieldRules) ? st.fieldRules : [];
+
+    console.groupCollapsed(`[rules][${where}] docId=${gDocId}`);
+    console.log('workspace.rules        (%d):', wsRules.length, wsRules);
+    console.log('workspace.fieldRules   (%d):', wsFieldRules.length, wsFieldRules);
+    console.log('workspace.rulesVersion :', st.rulesVersion);
+    console.log('payload.rules          (%d):', Array.isArray(payload.rules) ? payload.rules.length : 0, payload.rules || []);
+    console.log('payload.fieldRules     (%d):', Array.isArray(payload.fieldRules) ? payload.fieldRules.length : 0, payload.fieldRules || []);
+    console.log('payload.rulesVersion   :', payload.rulesVersion);
+    console.log('payload.updatedAt      :', payload.updatedAt);
+    try {
+      const lsScoped = localStorage.getItem(`CRONOS_PAYLOAD:${gDocId}`);
+      const lsParsed = lsScoped ? JSON.parse(lsScoped) : null;
+      console.log('localStorage(scoped)   :', !!lsScoped, lsParsed?.rules?.length ?? 0, lsParsed?.fieldRules?.length ?? 0, lsParsed?.rulesVersion ?? null);
+    } catch (e) {
+      console.warn('localStorage parse fail:', e);
+    }
+    console.groupEnd();
+  } catch (e) {
+    console.error('[rules][debugLogPayload] failed', e);
+  }
+}
+
+
+// app state
 let gDocId   = null;
 let gSchema  = { title:"Form", fields:[] };
 let gHeadingsTree = [];
 let gMode    = 'headings'; // 'headings' | 'fields'
-let gRules   = [];         // rules currently shown/edited in the view
-let gRulesHeadings = [];   // backing store (headings rules)
-let gRulesFields   = [];   // backing store (field rules)
-let gEditingId = null;     // currently edited rule id
-let gDraft   = null;       // unsaved draft
+let gRulesHeadings = [];   // persisted
+let gRulesFields   = [];   // persisted
+let gRules   = [];         // current list in view
+let gEditingId = null;     // current editor
+let gDraft   = null;
 
-/* ========================= Utility + Builders =========================== */
-function setStatus(t){ if (statusEl) statusEl.textContent = t || ""; }
-function readActiveMeta(){
-  try { const v = localStorage.getItem(ACTIVE_LS_KEY); return v ? JSON.parse(v) : null; }
-  catch { return null; }
-}
-function slugify(s){
-  return String(s||"")
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .toLowerCase();
-}
+// UI helpers
+const setStatus = (s) => { try { els.status.textContent = s || ""; } catch {} };
+const slugify = (s)=> String(s||"").normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-zA-Z0-9]+/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
+const ACTIONS = new Set(["SHOW","HIDE"]);
 const debounce = (fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
 
-const ACTIONS = new Set(["SHOW","HIDE"]);
-
-/* ============================ Schema helpers ============================ */
-function printSchemaDebug(schema){
-  const fields = Array.isArray(schema?.fields) ? schema.fields : [];
-  console.log(`[${nowt()}] SCHEMA fields: count=${fields.length}`);
-  fields.forEach((f,i)=>{
-    const base = { idx:i+1, id:f.id, type:f.type, label:f.label||'', name:f.name||'', slug:f.slug||'' };
-    console.log(`[${nowt()}]   #${i+1}: ${JSON.stringify(base)}`);
-    const opts = normOptions(f);
-    if (opts.length) console.log(`[${nowt()}]      options: ${opts.map(o=>o.label+"="+o.value).join(', ')}`);
-  });
-}
+// schema/headings helpers
 function normOptions(field){
   const raw = field && field.options || [];
   return raw.map(o => {
@@ -161,11 +145,6 @@ function getFieldLabelById(id){
   const f = (gSchema.fields||[]).find(x => String(x.id)===String(id));
   return f?.label || f?.name || f?.id || String(id);
 }
-function fieldTypeOf(id){
-  return String((gSchema.fields||[]).find(x=>String(x.id)===String(id))?.type || '').toLowerCase();
-}
-
-/* ============================ Headings helpers ========================== */
 function flattenWithNumbers(tree){
   const out=[], counters=[];
   function walk(nodes, depth){
@@ -175,10 +154,10 @@ function flattenWithNumbers(tree){
       const number = counters.slice(0, depth+1).join(".");
       const label = (n.label?.trim?.() ? n.label : n.text) || "";
       out.push({
-        key: String(n.idx ?? number),        // raw key (might be numeric-only)
-        label: number + " " + label,         // "3.1 Title"
-        titleOnly: label,                    // "Title"
-        number,                              // "3.1"
+        key: String(n.idx ?? number),
+        label: number + " " + label,
+        titleOnly: label,
+        number,
         level: n.level || (depth+1)
       });
       if (n.children?.length) walk(n.children, depth+1);
@@ -200,592 +179,201 @@ function getHeadingLabelFromKey(key){
   const hit = flat.find(h => h.number === key);
   return hit?.titleOnly || key;
 }
-function printHeadingsDebug(headingsTree){
-  const flat = flattenWithNumbers(headingsTree);
-  console.log(`[${nowt()}] HEADINGS flat: count=${flat.length}`);
-  flat.forEach(h=>{
-    const comp = toCompositeKeyFromFlat(h);
-    console.log(`[${nowt()}]   ${h.number} | ${h.titleOnly}  => key="${comp}"  label="${h.label}"`);
-  });
-}
 
-/* ====================== Target normalization (universal) ================ */
-// Headings: accept string ("3" or "3|Title") or {key,label}
-function normalizeHeadingsRuleTargetsInPlace(rule, flatHeads){
-  if (!rule || !Array.isArray(rule.targets)) return { changed:false };
-  let changed = false;
-  const byNumber = new Map();   // "3.1" -> composite
-  const byComp   = new Map();   // "3.1|Title" -> label
-  flatHeads.forEach(h => {
-    const comp = toCompositeKeyFromFlat(h);
-    byNumber.set(h.number, comp);
-    byComp.set(comp, h.label);
-  });
-  rule.targets = rule.targets.map(t => {
-    let compKey = '';
-    if (typeof t === 'string') {
-      compKey = t.includes('|') ? t : (byNumber.get(t) || t);
-    } else if (t && typeof t === 'object') {
-      const k = String(t.key ?? '');
-      compKey = k ? (k.includes('|') ? k : (byNumber.get(k) || k)) : '';
-    }
-    if (!compKey) return (typeof t === 'object' ? t : { key: t });
+// target normalization
+function normalizeHeadingsRuleTargetsInPlace(rule){
+  if (!rule || !Array.isArray(rule.targets)) return {changed:false};
+  const flat = flattenWithNumbers(gHeadingsTree);
+  const byNumber = new Map(); const byComp=new Map();
+  flat.forEach(h=>{ const comp=toCompositeKeyFromFlat(h); byNumber.set(h.number,comp); byComp.set(comp,h.label);});
+  let changed=false;
+  rule.targets = rule.targets.map(t=>{
+    let compKey='';
+    if (typeof t === 'string'){ compKey = t.includes('|')? t : (byNumber.get(t)||t); }
+    else if (t && typeof t==='object'){ const k=String(t.key||''); compKey = k? (k.includes('|')? k : (byNumber.get(k)||k)) : ''; }
+    if (!compKey) return t;
     const label = byComp.get(compKey) || compKey.split('|').slice(1).join('|') || compKey;
-    const normalized = { key: compKey, label };
-    if (typeof t === 'string' || String((t.key ?? '')) !== compKey || !t.label) changed = true;
+    const normalized = { key:compKey, label };
+    if (typeof t==='string' || !t.label || String(t.key)!==compKey) changed=true;
     return normalized;
   });
-  return { changed };
+  return {changed};
 }
-function normalizeAllHeadingsRulesInPlace(rules, flatHeads){
-  let c = 0;
-  (rules||[]).forEach(r=>{
-    const { changed } = normalizeHeadingsRuleTargetsInPlace(r, flatHeads);
-    if (changed) c++;
-  });
-  if (c>0) console.log(`[${nowt()}] NORMALIZED headings target keys -> composite for ${c} rule(s)`);
-  return c;
-}
-
-// Fields: accept string id or {id,label}
-function normalizeFieldTargetsInPlace(rule, schema){
-  if (!rule || !Array.isArray(rule.targets)) return { changed:false };
-  const fields = Array.isArray(schema?.fields) ? schema.fields : [];
-  const labelById = new Map(fields.map(f => [String(f.id), (f.label || f.name || f.id)]));
+function normalizeFieldTargetsInPlace(rule){
+  if (!rule || !Array.isArray(rule.targets)) return {changed:false};
+  const lbl = new Map((gSchema.fields||[]).map(f=>[String(f.id), f.label||f.name||f.id]));
   let changed=false;
-  rule.targets = rule.targets.map(t => {
-    if (typeof t === 'string') {
-      changed = true;
-      return { id: t, label: labelById.get(String(t)) || String(t) };
-    } else if (t && typeof t === 'object') {
-      const id = String(t.id ?? '');
-      const want = labelById.get(id);
-      if (id && (!t.label || t.label !== want)) {
-        changed = true;
-        return { id, label: want || (t.label||id) };
-      }
-      return t;
-    } else {
+  rule.targets = rule.targets.map(t=>{
+    if (typeof t==='string'){ changed=true; return { id:t, label: lbl.get(String(t)) || String(t)}; }
+    if (t && typeof t==='object'){
+      const id=String(t.id||''); const want = lbl.get(id);
+      if (id && (!t.label || t.label!==want)){ changed=true; return { id, label: want || (t.label||id)}; }
       return t;
     }
+    return t;
   });
-  return { changed };
+  return {changed};
 }
-function normalizeAllFieldRulesInPlace(rules, schema){
-  let c = 0;
-  (rules||[]).forEach(r=>{
-    const { changed } = normalizeFieldTargetsInPlace(r, schema);
-    if (changed) c++;
-  });
-  if (c>0) console.log(`[${nowt()}] NORMALIZED field rule targets -> labeled for ${c} rule(s)`);
-  return c;
+function normalizeAllTargets(){
+  let cH=0, cF=0;
+  (gRulesHeadings||[]).forEach(r=>{ if (normalizeHeadingsRuleTargetsInPlace(r).changed) cH++; });
+  (gRulesFields||[]).forEach(r=>{ if (normalizeFieldTargetsInPlace(r).changed) cF++; });
+  if (cH) console.log(`[${nowt()}] normalized ${cH} heading rule(s)`);
+  if (cF) console.log(`[${nowt()}] normalized ${cF} field rule(s)`);
 }
 
-/* ================== Condition Sources (UNIVERSAL) ======================= */
-/**
- * Produces a universal list of sources (id, label, type) that rules can use in the "When..." part.
- * Supported types:
- *  - boolean (checkbox/switch; multichoice base; multichoice per-option booleans)
- *  - date
- *  - number (including "datediff")
- *  - text
- *  - select (single choice)
- * Unknown types fall back to text.
- */
+// condition sources + validation
 function buildConditionSources(schema){
-  const out = [];
-  const seen = new Set();
-  const fields = Array.isArray(schema?.fields) ? schema.fields : [];
-
-  for (const f of fields){
-    const t = String(f.type||'').toLowerCase();
-    const id = String(f.id);
-    const label = f.label || f.id;
-
-    // boolean-like fields in your schema (add aliases if you have them)
-    if (t === 'boolean' || t === 'checkbox' || t === 'switch') {
-      if (!seen.has(id)) { seen.add(id); out.push({ id, label, type:'boolean' }); }
-      continue;
-    }
-
-    // multichoice: base boolean + per-option booleans
-    if (t === 'multichoice'){
-      if (!seen.has(id)) { seen.add(id); out.push({ id, label, type:'boolean', meta:{ anySelected:true } }); }
-      const items = [];
-      if (Array.isArray(f.options)) items.push(...f.options);
-      if (f.mc && Array.isArray(f.mc.groups)){
-        for (const g of f.mc.groups){ (g.items||[]).forEach(it => items.push(it)); }
-      }
-      items.forEach(it => {
-        const rawVal = it && typeof it === 'object' ? (it.value ?? it.label ?? it.text ?? it.name ?? '') : it;
-        const rawLbl = it && typeof it === 'object' ? (it.label ?? it.text ?? it.name ?? rawVal) : rawVal;
-        const valStr = String(rawVal || '').trim();
-        const lblStr = String(rawLbl || '').trim();
-        const slug = slugify(valStr);
-        if (!valStr || !slug) return;
-        const optId = `${id}__opt__${slug}`;
-        if (seen.has(optId)) return;
-        seen.add(optId);
-        out.push({ id: optId, label: `${label}: ${lblStr}`, type: 'boolean' });
+  const out=[]; const seen=new Set();
+  for (const f of (schema?.fields||[])){
+    const t=String(f.type||'').toLowerCase(); const id=String(f.id); const label=f.label||f.id;
+    if (t==='boolean'||t==='checkbox'||t==='switch'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'boolean'});} continue; }
+    if (t==='multichoice'){
+      if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'boolean',meta:{anySelected:true}}); }
+      const items=[]; if (Array.isArray(f.options)) items.push(...f.options);
+      if (f.mc?.groups) (f.mc.groups||[]).forEach(g=> (g.items||[]).forEach(it=>items.push(it)));
+      items.forEach(it=>{
+        const rawV = it && typeof it==='object' ? (it.value ?? it.label ?? it.text ?? it.name ?? '') : it;
+        const rawL = it && typeof it==='object' ? (it.label ?? it.text ?? it.name ?? rawV) : rawV;
+        const v=String(rawV||'').trim(); const l=String(rawL||'').trim(); const slug=slugify(v);
+        if (!v||!slug) return; const optId = `${id}__opt__${slug}`; if (seen.has(optId)) return;
+        seen.add(optId); out.push({id:optId, label:`${label}: ${l}`, type:'boolean'});
       });
       continue;
     }
-
-    // date / datediff / number / text / select (single choice)
-    if (t === 'date') {
-      if (!seen.has(id)) { seen.add(id); out.push({ id, label, type:'date' }); }
+    if (t==='date'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'date'});} continue; }
+    if (t==='datediff'||t==='duration'||t==='number'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'number'});} continue; }
+    if (t==='select'||t==='dropdown'||t==='singlechoice'||t==='choice'||t==='single'||t==='combobox'||t==='list'){
+      if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'select', options:(f.options||[]).map(o=> (o&&typeof o==='object')? String(o.value??o.label??o) : String(o))});}
       continue;
     }
-    if (t === 'datediff' || t === 'duration' || t === 'number') {
-      if (!seen.has(id)) { seen.add(id); out.push({ id, label, type:'number' }); }
-      continue;
-    }
-    if (t === 'select' || t === 'dropdown' || t === 'singlechoice' || t === 'choice' || t === 'single' || t === 'combobox' || t === 'list'){
-      if (!seen.has(id)) {
-        seen.add(id);
-        const options = (f.options||[]).map(o => (o && typeof o === 'object') ? String(o.value ?? o.label ?? o) : String(o));
-        out.push({ id, label, type:'select', options });
-      }
-      continue;
-    }
-    if (t === 'text' || t === 'string' || t === 'textarea') {
-      if (!seen.has(id)) { seen.add(id); out.push({ id, label, type:'text' }); }
-      continue;
-    }
-
-    // Fallback: treat unknowns as text so they still work
-    if (!seen.has(id)) { seen.add(id); out.push({ id, label, type:'text' }); }
+    if (t==='text'||t==='string'||t==='textarea'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'text'});} continue; }
+    if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'text'}); }
   }
-
   return out;
 }
-
-/* ============================== Validation ============================== */
-function isRuleValid(rule, schema = gSchema, headingsTree = gHeadingsTree, mode = gMode){
+function isRuleValid(rule){
   if (!rule || !ACTIONS.has(rule.action)) return false;
-
-  const haveSchema = Array.isArray(schema?.fields) && schema.fields.length > 0;
-  const haveHeads  = Array.isArray(headingsTree) && headingsTree.length > 0;
-
-  if (!haveSchema) return !!(rule.fieldId && rule.op && Array.isArray(rule.values));
-
-  const sources = buildConditionSources(schema);
-  const src = sources.find(s => String(s.id) === String(rule.fieldId));
+  const srcs = buildConditionSources(gSchema);
+  const src = srcs.find(s=>String(s.id)===String(rule.fieldId));
   if (!src) return false;
-
-  const allowedOps = (src.type==='boolean') ? ['equals']
-                  : (src.type==='date')    ? ['before','equals','after']
-                  : (src.type==='text')    ? ['equals','notEquals','contains']
-                  : (src.type==='number')  ? ['equals','notEquals']
-                  : (src.type==='select')  ? ['equals','notEquals']
-                  : ['equals'];
-  if (!allowedOps.includes(rule.op)) return false;
-
+  const allowed = (src.type==='boolean')?['equals']
+                : (src.type==='date')?['before','equals','after']
+                : (src.type==='text')?['equals','notEquals','contains']
+                : (src.type==='number')?['equals','notEquals']
+                : (src.type==='select')?['equals','notEquals']
+                : ['equals'];
+  if (!allowed.includes(rule.op)) return false;
   if (!Array.isArray(rule.values)) return false;
-  if (src.type==='boolean') {
-    if (rule.values.length!==1) return false;
-    const v = rule.values[0];
-    if (!(v === true || v === false || v === 'true' || v === 'false')) return false;
-  } else if (src.type==='date') {
-    if (rule.values.length!==1 || !String(rule.values[0])) return false;
-  } else if (src.type==='text') {
-    if (rule.values.length!==1) return false;
-  } else if (src.type==='number') {
-    if (rule.values.length!==1 || (rule.values[0]!=='' && isNaN(Number(rule.values[0])))) return false;
-  } else if (src.type==='select') {
-    if (rule.values.length!==1) return false;
-    const opts = new Set((src.options||[]).map(String));
-    if (!opts.has(String(rule.values[0]))) return false;
-  }
-
-  if (mode === 'headings') {
-    if (!haveHeads) return true;
-    const flat = flattenWithNumbers(headingsTree);
-    const allowedHeads = new Set(flat.map(toCompositeKeyFromFlat));
-    return Array.isArray(rule.targets) && rule.targets.length>0 && rule.targets.every(t => {
-      const key = String((typeof t==='string')? t : (t.key ?? ''));
-      const k = key.includes('|') ? key : key;
-      return allowedHeads.has(k) || allowedHeads.has(k.split('|')[0]);
-    });
-  } else {
-    const allowedTargetIds = new Set((schema.fields||[]).map(s=>String(s.id)));
-    return Array.isArray(rule.targets) && rule.targets.length>0 && rule.targets.every(t => {
-      const id = String((typeof t==='string')? t : (t.id ?? ''));
-      return allowedTargetIds.has(id);
-    });
-  }
-}
-
-/* ============================ Persistence glue ========================== */
-function cloneRulesArray(rules){
-  if (!Array.isArray(rules)) return [];
-  if (typeof structuredClone === 'function'){ try { return structuredClone(rules); } catch {} }
-  return JSON.parse(JSON.stringify(rules));
-}
-async function _ensureSchemaFromPayload(st) {
-  if (st?.schema?.fields?.length) return st;
-  const pl = (st?.payload?.CRONOS_PAYLOAD) || st?.CRONOS_PAYLOAD || st?.cronos_payload;
-  if (Array.isArray(pl?.fields) && pl.fields.length) {
-    const derivedSchema = { title: pl.title || 'Form', fields: pl.fields };
-    await window.formSuitePersist.saveState(gDocId, {
-      schema: derivedSchema,
-      schemaUpdatedAt: new Date().toISOString()
-    });
-    return await window.formSuitePersist.loadState?.(gDocId);
-  }
-  return st;
-}
-function _deepEqual(a, b) {
-  if (a === b) return true;
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) return false;
-  }
+  if (!Array.isArray(rule.targets) || rule.targets.length===0) return false;
   return true;
 }
-async function persistRulesNow(reason = 'manual') {
+
+// ----------------------------- PERSISTENCE ------------------------------
+// hard-write to workspace + mirror to payload, mirror to localStorage, verify, broadcast
+async function persistRules(reason) {
   if (!gDocId) return;
 
-  const st = await window.formSuitePersist?.loadState?.(gDocId) || {};
-  const wsHeadings = Array.isArray(st.rules) ? st.rules
-                     : (Array.isArray(st.headingRules) ? st.headingRules : []);
-  const wsFields   = Array.isArray(st.fieldRules) ? st.fieldRules : [];
-  const wantHeadings = Array.isArray(gRulesHeadings) ? gRulesHeadings : [];
-  const wantFields   = Array.isArray(gRulesFields)   ? gRulesFields   : [];
-  const isViewChange = /^tab-switch/.test(reason) || /^view-change/.test(reason) || /^normalize:/.test(reason);
-  const patch = {};
+  // Normalize targets before writing (keeps labels in sync)
+  normalizeAllTargets();
 
-  if (wantHeadings.length === 0 && wsHeadings.length > 0 && isViewChange) {
-    // skip empty wipe
-  } else if (!_deepEqual(wantHeadings, wsHeadings)) {
-    patch.rules = wantHeadings.slice();
-  }
-  if (wantFields.length === 0 && wsFields.length > 0 && isViewChange) {
-    // skip empty wipe
-  } else if (!_deepEqual(wantFields, wsFields)) {
-    patch.fieldRules = wantFields.slice();
-  }
+  // Snapshot arrays (de-ref any reactive objects)
+  const rules      = (gRulesHeadings || []).map(x => JSON.parse(JSON.stringify(x)));
+  const fieldRules = (gRulesFields   || []).map(x => JSON.parse(JSON.stringify(x)));
+  const stamp = Date.now();
 
-  if (Object.keys(patch).length === 0) return;
+  console.log(`[${nowt()}] WRITE (${reason}) rules=${rules.length}, fieldRules=${fieldRules.length}`);
 
-  console.log(`[${nowt()}] WRITE reason=${JSON.stringify(reason)} (workspace patch)`);
-  if (patch.rules) console.log(`[${nowt()}] WRITE patch.rules: count=${patch.rules.length}`);
-  if (patch.fieldRules) console.log(`[${nowt()}] WRITE patch.fieldRules: count=${patch.fieldRules.length}`);
+  // --- Build a canonical payload object by patching whatever exists ----
+  const st0 = await window.formSuitePersist.loadState(gDocId) || {};
+  const basePayload =
+      (st0?.payload?.CRONOS_PAYLOAD)
+   || (st0?.CRONOS_PAYLOAD)
+   || (st0?.cronos_payload)
+   || {};
 
-  await window.formSuitePersist.saveState(gDocId, patch);
+  const canonical = {
+    ...basePayload,
+    rules,
+    fieldRules,
+    rulesVersion: stamp,
+    updatedAt: new Date(stamp).toISOString()
+  };
 
-  // Mirror into payload
-  const st2 = await window.formSuitePersist?.loadState?.(gDocId) || {};
-  const payloadBox =
-    (st2.payload && st2.payload.CRONOS_PAYLOAD) ? { kind: 'nested', obj: st2.payload.CRONOS_PAYLOAD } :
-    (st2.CRONOS_PAYLOAD)                        ? { kind: 'top',    obj: st2.CRONOS_PAYLOAD } :
-    (st2.cronos_payload)                        ? { kind: 'alt',    obj: st2.cronos_payload } :
-                                                  null;
-  if (payloadBox) {
-    if ('rules' in patch) payloadBox.obj.rules = patch.rules;
-    if ('fieldRules' in patch) payloadBox.obj.fieldRules = patch.fieldRules;
-
-    if (payloadBox.kind === 'nested') {
-      await window.formSuitePersist.saveState(gDocId, { payload: { ...(st2.payload || {}), CRONOS_PAYLOAD: payloadBox.obj } });
-    } else if (payloadBox.kind === 'top') {
-      await window.formSuitePersist.saveState(gDocId, { CRONOS_PAYLOAD: payloadBox.obj });
+  // ---- Preferred path: setState (if available) ----
+  try {
+    if (window.formSuitePersist?.setState) {
+      await window.formSuitePersist.setState(gDocId, {
+        rules, fieldRules, rulesVersion: stamp,
+        payload:        { CRONOS_PAYLOAD: canonical },
+        CRONOS_PAYLOAD:  canonical,
+        cronos_payload:  canonical
+      });
     } else {
-      await window.formSuitePersist.saveState(gDocId, { cronos_payload: payloadBox.obj });
+      await window.formSuitePersist.saveState(gDocId, {
+        rules, fieldRules, rulesVersion: stamp,
+        payload:        { ...(st0.payload || {}), CRONOS_PAYLOAD: canonical },
+        CRONOS_PAYLOAD:  canonical,
+        cronos_payload:  canonical
+      });
     }
-
-    if ('rules' in patch)      console.log(`[${nowt()}] LIVE payload patch -> rules: count=${payloadBox.obj.rules?.length || 0}`);
-    if ('fieldRules' in patch) console.log(`[${nowt()}] LIVE payload patch -> fieldRules: count=${payloadBox.obj.fieldRules?.length || 0}`);
+  } catch (e) {
+    console.error('[rules] persistRules: write failed', e);
+    throw e;
   }
 
-  const stAfter = await window.formSuitePersist?.loadState?.(gDocId) || {};
-  console.log(`[${nowt()}] AFTER state snapshot`);
-  console.log(`[${nowt()}] AFTER workspace.rules: count=${Array.isArray(stAfter.rules) ? stAfter.rules.length : 0}`);
-  console.log(`[${nowt()}] AFTER workspace.fieldRules: count=${Array.isArray(stAfter.fieldRules) ? stAfter.fieldRules.length : 0}`);
+  // ---- Mirror to localStorage (plain + scoped) + bump a stamp ----
+  try {
+    localStorage.setItem('CRONOS_PAYLOAD', JSON.stringify(canonical));
+    localStorage.setItem(`CRONOS_PAYLOAD:${gDocId}`, JSON.stringify(canonical));
+    localStorage.setItem(`FS_RULES_STAMP:${gDocId}`, String(stamp));
+  } catch (e) {
+    console.warn('[rules] localStorage mirror failed', e);
+  }
+
+  // ---- Read-back verification (counts + stamp) ----
+  try {
+    const st1 = await window.formSuitePersist.loadState(gDocId) || {};
+    const p1  = st1?.payload?.CRONOS_PAYLOAD || st1?.CRONOS_PAYLOAD || st1?.cronos_payload || {};
+    const ok  = Array.isArray(st1.rules) && Array.isArray(st1.fieldRules)
+             && JSON.stringify(p1.rules||[]) === JSON.stringify(rules)
+             && JSON.stringify(p1.fieldRules||[]) === JSON.stringify(fieldRules)
+             && (p1.rulesVersion === stamp || st1.rulesVersion === stamp);
+
+    console.log(
+      `[${nowt()}] VERIFY after persist → ` +
+      `workspace: r=${(st1.rules||[]).length}/${rules.length}, fr=${(st1.fieldRules||[]).length}/${fieldRules.length}; ` +
+      `payload: r=${(p1.rules||[]).length}/${rules.length}, fr=${(p1.fieldRules||[]).length}/${fieldRules.length}; ` +
+      `stamp=${stamp} ok=${ok}`
+    );
+  } catch (e) {
+    console.warn('[rules] read-back verification failed', e);
+  }
+
+  // ---- Broadcast everywhere ----
+  try { bcCanon?.postMessage({  type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+  try { bcLegacy?.postMessage({ type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+  try { bcCanon?.postMessage({  type: 'active:updated', docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+  try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+
+  console.log(`[${nowt()}] AFTER persist → workspace + all payload mirrors + LS updated; broadcast sent`);
+  await debugLogPayload(`persist:${reason}`);
 }
 
-/* =============================== UI: editor ============================== */
-function currentEditorRule(){ if (gDraft) return gDraft; if (gEditingId) return gRules.find(r=>r.id===gEditingId) || null; return null; }
-
-function renderEditor(){
-  editorMount.innerHTML = "";
-  const rule = currentEditorRule();
-  if (!rule){
-    editorMount.innerHTML = '<div class="empty">No rules yet — click “Add rule”.</div>';
-    return;
-  }
-
-  const flatHeads = flattenWithNumbers(gHeadingsTree);
-  const isDraft = !!gDraft;
-
-  // Normalize current rule in memory
-  if (gMode==='headings') normalizeHeadingsRuleTargetsInPlace(rule, flatHeads);
-  else normalizeFieldTargetsInPlace(rule, gSchema);
-
-  const card = document.createElement("div");
-  card.className = "rule-card";
-  card.dataset.id = rule.id || "draft";
-
-  // Row 0: Save/Cancel (for draft)
-  if (isDraft){
-    const top = document.createElement("div"); top.className="row"; top.style.justifyContent="flex-end"; top.style.gap="8px";
-    const btnCancel = document.createElement("button"); btnCancel.className="btn btn-ghost"; btnCancel.textContent="Cancel";
-    btnCancel.addEventListener("click", ()=>{ gDraft=null; renderEditor(); });
-    const btnSave = document.createElement("button"); btnSave.className="btn btn-primary"; btnSave.textContent="Save rule";
-    btnSave.disabled = !isRuleValid(rule, gSchema, gHeadingsTree, gMode);
-    btnSave.addEventListener("click", ()=>{
-      if (!isRuleValid(rule, gSchema, gHeadingsTree, gMode)){ alert("Please complete the rule."); return; }
-      rule.id = "r_"+Math.random().toString(36).slice(2,8);
-      gRules.push(rule);
-      gDraft=null;
-      console.log(`[${nowt()}] CREATE ${asTextRule(rule, gMode)}`);
-      persistRulesNow('create'); renderEditor(); renderList();
-    });
-    const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule(), gSchema, gHeadingsTree, gMode); };
-    card.dataset._updateSaveState = "1";
-    card.appendChild(top);
-    top.appendChild(btnCancel);
-    top.appendChild(btnSave);
-    card._updateSave = updateSaveState;
-  }
-
-  // Row 1: Action + Effect + When
-  const row1 = document.createElement("div"); row1.className="rule-row";
-
-  // Action
-  const pAction = document.createElement("div"); pAction.className="pair";
-  const lblA = document.createElement("label"); lblA.textContent="Action";
-  const selA = document.createElement("select");
-  const defAct = document.createElement("option"); defAct.value=""; defAct.textContent="Select…";
-  if (isDraft && !rule.action) selA.appendChild(defAct);
-  ["SHOW","HIDE"].forEach(a => { const o=document.createElement("option"); o.value=a; o.textContent=a; if(rule.action===a) o.selected=true; selA.appendChild(o); });
-  selA.addEventListener("change", () => {
-    rule.action = selA.value || null;
-    console.log(`[${nowt()}] EDIT action -> ${asTextRule(rule, gMode)}`);
-    if (!isDraft){ persistRulesNow("change:action"); renderList(); }
-    card._updateSave?.();
-  });
-  pAction.appendChild(lblA); pAction.appendChild(selA);
-  row1.appendChild(pAction);
-
-  // Effect (fields mode only)
-  const pEffect = document.createElement('div'); pEffect.className = 'pair';
-  const lblE = document.createElement('label'); lblE.textContent = 'Effect';
-  const selE = document.createElement('select');
-  const addOpt = (v,t) => { const o=document.createElement('option'); o.value=v; o.textContent=t; if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o); };
-  addOpt('hide','hide (remove)'); addOpt('disable','disable (greyed)');
-  selE.addEventListener('change', ()=>{ rule.hideMode = selE.value || 'hide'; console.log(`[${nowt()}] EDIT hideMode -> ${asTextRule(rule, gMode)}`); if(!isDraft){ persistRulesNow("change:hideMode"); renderList(); } });
-  if (gMode==='fields') { pEffect.appendChild(lblE); pEffect.appendChild(selE); row1.appendChild(pEffect); }
-
-  // When (source field)
-  const pField = document.createElement("div"); pField.className="pair";
-  const lblF = document.createElement("label"); lblF.textContent="When";
-  const selF = document.createElement("select");
-  const defF = document.createElement("option"); defF.value=""; defF.textContent="Select source…";
-  const __sources = buildConditionSources(gSchema);
-  if (isDraft && !rule.fieldId) selF.appendChild(defF);
-  if (!__sources.length){
-    const o=document.createElement("option"); o.value=""; o.textContent="(no fields)"; selF.appendChild(o);
-  } else {
-    __sources.forEach(s=>{
-      const o=document.createElement("option");
-      o.value=s.id; o.textContent=s.label; if(String(rule.fieldId)===String(s.id)) o.selected=true; selF.appendChild(o);
-    });
-  }
-  selF.addEventListener("change", () => {
-    rule.fieldId = selF.value || "";
-    if (!rule.fieldId){ rule.values=[]; rule.op=null; }
-    else {
-      const src = __sources.find(x=>String(x.id)===String(rule.fieldId));
-      if (src){
-        if (src.type==='boolean') { rule.op='equals'; rule.values=[true]; }
-        else if (src.type==='date') { rule.op='equals'; rule.values=['']; }
-        else if (src.type==='text') { rule.op='equals'; rule.values=['']; }
-        else if (src.type==='number') { rule.op='equals'; rule.values=[0]; }
-        else if (src.type==='select') { rule.op='equals'; rule.values=['']; }
-        else { rule.op='equals'; rule.values=['']; }
-      } else { rule.op=null; rule.values=[]; }
-    }
-    console.log(`[${nowt()}] EDIT source -> ${asTextRule(rule, gMode)}`);
-    if (!isDraft){ persistRulesNow("change:fieldId"); renderEditor(); renderList(); }
-    else { renderEditor(); }
-  });
-  pField.appendChild(lblF); pField.appendChild(selF);
-  row1.appendChild(pField);
-
-  card.appendChild(row1);
-
-  // Row 2: Condition editor (universal)
-  const chosenSource = buildConditionSources(gSchema).find(s=>String(s.id)===String(rule.fieldId));
-  if (chosenSource){
-    const row2 = document.createElement("div"); row2.className="rule-row";
-    const pCond = document.createElement("div"); pCond.className="pair";
-    const lblC = document.createElement("label"); lblC.textContent="Condition";
-    pCond.appendChild(lblC);
-
-    const src = chosenSource;
-    if (!Array.isArray(rule.values)) rule.values = [];
-    const schedulePersist = debounce(() => persistRulesNow("typing"), 150);
-
-    // Operators
-    if (src?.type !== 'boolean'){
-      const opSel = document.createElement('select');
-      const ops = (src?.type==='date') ? [{v:'before',l:'before'},{v:'equals',l:'equals'},{v:'after',l:'after'}]
-                : (src?.type==='text') ? [{v:'equals',l:'equals'},{v:'notEquals',l:'not equals'},{v:'contains',l:'contains'}]
-                : (src?.type==='number') ? [{v:'equals',l:'equals'},{v:'notEquals',l:'not equals'}]
-                : (src?.type==='select') ? [{v:'equals',l:'equals'},{v:'notEquals',l:'not equals'}]
-                : [{v:'equals',l:'equals'}];
-      ops.forEach(({v,l})=>{ const o=document.createElement('option'); o.value=v; o.textContent=l; if(rule.op===v) o.selected=true; opSel.appendChild(o); });
-      opSel.addEventListener('change', ()=>{ rule.op = opSel.value; console.log(`[${nowt()}] EDIT op -> ${asTextRule(rule, gMode)}`); if(!isDraft){ persistRulesNow("change:op"); renderList(); } card._updateSave?.(); });
-      pCond.appendChild(opSel);
-    } else {
-      const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='is'; pCond.appendChild(spanIs);
-      rule.op = 'equals';
-    }
-
-    // Value controls
-    if (src?.type==='boolean'){
-      const sel = document.createElement('select');
-      ;[{v:true,l:'true'},{v:false,l:'false'}].forEach(({v,l})=>{ const o=document.createElement('option'); o.value=String(v); o.textContent=l; if(String(rule.values?.[0])===String(v)) o.selected=true; sel.appendChild(o); });
-      sel.addEventListener('change', ()=>{ rule.values=[sel.value==='true']; console.log(`[${nowt()}] EDIT value -> ${asTextRule(rule, gMode)}`); if(!isDraft){ persistRulesNow("change:value"); renderList(); } card._updateSave?.(); });
-      pCond.appendChild(sel);
-    } else if (src?.type==='date'){
-      const inp = document.createElement('input'); inp.type='text'; inp.placeholder='YYYY-MM-DD'; inp.style.minWidth='140px';
-      inp.value = String(rule.values?.[0]||'');
-      setTimeout(()=>{ try{ flatpickr(inp,{ allowInput:true, dateFormat:'Y-m-d', onChange:()=>{ rule.values=[inp.value]; console.log(`[${nowt()}] EDIT value -> ${asTextRule(rule, gMode)}`); if(!isDraft){ persistRulesNow("change:value"); renderList(); } card._updateSave?.(); } }); }catch{} },0);
-      inp.addEventListener('input', ()=>{ rule.values=[inp.value]; console.log(`[${nowt()}] EDIT value -> ${asTextRule(rule, gMode)}`); schedulePersist(); card._updateSave?.(); });
-      pCond.appendChild(inp);
-    } else if (src?.type==='text'){
-      const inp = document.createElement('input'); inp.type='text'; inp.value=String(rule.values?.[0]||'');
-      inp.addEventListener('input', ()=>{ rule.values=[inp.value]; console.log(`[${nowt()}] EDIT value -> ${asTextRule(rule, gMode)}`); schedulePersist(); card._updateSave?.(); });
-      pCond.appendChild(inp);
-    } else if (src?.type==='number'){
-      const inp = document.createElement('input'); inp.type='number'; inp.value=String(rule.values?.[0]??'');
-      inp.addEventListener('input', ()=>{ const v=inp.value; rule.values=[v===''? '': Number(v)]; console.log(`[${nowt()}] EDIT value -> ${asTextRule(rule, gMode)}`); schedulePersist(); card._updateSave?.(); });
-      pCond.appendChild(inp);
-    } else if (src?.type==='select'){
-      const sel = document.createElement('select');
-      const def=document.createElement('option'); def.value=''; def.textContent='Select value…'; sel.appendChild(def);
-      const base = (gSchema.fields||[]).find(ff => String(ff.id)===String(src.id));
-      const opts = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
-      opts.forEach(opt=>{ const o=document.createElement('option'); o.value=String(opt.value); o.textContent=String(opt.label); if(String(rule.values?.[0])===String(opt.value)) o.selected=true; sel.appendChild(o); });
-      sel.addEventListener('change', ()=>{ rule.values = sel.value ? [sel.value] : ['']; console.log(`[${nowt()}] EDIT value -> ${asTextRule(rule, gMode)}`); if(!isDraft){ persistRulesNow("change:value"); renderList(); } card._updateSave?.(); });
-      pCond.appendChild(sel);
-    } else {
-      // Fallback text
-      const inp = document.createElement('input'); inp.type='text'; inp.value=String(rule.values?.[0]||'');
-      inp.addEventListener('input', ()=>{ rule.values=[inp.value]; console.log(`[${nowt()}] EDIT value(fallback) -> ${asTextRule(rule, gMode)}`); schedulePersist(); card._updateSave?.(); });
-      pCond.appendChild(inp);
-    }
-
-    row2.appendChild(pCond);
-    card.appendChild(row2);
-  }
-
-  // Row 3: Targets selector
-  if (gMode === 'headings') {
-    const flatHeads = flattenWithNumbers(gHeadingsTree);
-    if (flatHeads.length){
-      const row3 = document.createElement("div"); row3.className="rule-row";
-      const pHead = document.createElement("div"); pHead.className="pair";
-      const lblH = document.createElement("label"); lblH.textContent="Add heading";
-      const chosenKeys = new Set((rule.targets||[]).map(t=> (typeof t==='string') ? t : t.key));
-      const selH = document.createElement("select");
-      const defH = document.createElement("option"); defH.value=""; defH.textContent="Select…"; selH.appendChild(defH);
-
-      const options = flatHeads.map(h=>{
-        const compKey = toCompositeKeyFromFlat(h);
-        return { value: compKey, label: h.label };
-      }).filter(h => !chosenKeys.has(h.value));
-
-      options.forEach(h=>{
-        const o=document.createElement("option"); o.value=h.value; o.textContent=h.label; selH.appendChild(o);
-      });
-
-      selH.addEventListener("change", ()=>{
-        const compKey = selH.value; if (!compKey) return;
-        const label = (options.find(x=>x.value===compKey)?.label) || compKey;
-        rule.targets = rule.targets || [];
-        rule.targets.push({ key: compKey, label });
-        console.log(`[${nowt()}] EDIT addTarget -> ${asTextRule(rule, gMode)}`);
-        persistRulesNow("change:addHeading"); renderEditor(); renderList();
-      });
-
-      pHead.appendChild(lblH); pHead.appendChild(selH);
-      row3.appendChild(pHead);
-      card.appendChild(row3);
-    }
-  } else {
-    const sourcesT = (gSchema.fields||[]).map(f => ({ id:String(f.id), label: f.label||f.id }));
-    if (sourcesT.length){
-      const row3 = document.createElement("div"); row3.className="rule-row";
-      const pFld = document.createElement("div"); pFld.className="pair";
-      const lblF = document.createElement("label"); lblF.textContent="Add field";
-      const chosenIds = new Set((rule.targets||[]).map(t=> String((typeof t==='string')? t : t.id) ));
-      const selF = document.createElement("select");
-      const defF = document.createElement("option"); defF.value=""; defF.textContent="Select…"; selF.appendChild(defF);
-      sourcesT.forEach(s=>{ if (!chosenIds.has(String(s.id))) { const o=document.createElement("option"); o.value=s.id; o.textContent=s.label; selF.appendChild(o); } });
-      selF.addEventListener("change", ()=>{
-        const id = selF.value; if (!id) return;
-        const s = sourcesT.find(x=>String(x.id)===String(id));
-        if (!s) return;
-        rule.targets = rule.targets || [];
-        rule.targets.push({ id:s.id, label:s.label });
-        console.log(`[${nowt()}] EDIT addTarget -> ${asTextRule(rule, gMode)}`);
-        persistRulesNow("change:addField"); renderEditor(); renderList();
-      });
-      pFld.appendChild(lblF); pFld.appendChild(selF);
-      row3.appendChild(pFld);
-      card.appendChild(row3);
-    }
-  }
-
-  // Row 4: Selected target pills
-  const row4 = document.createElement("div"); row4.className="rule-row";
-  const lblSel = document.createElement("div"); lblSel.className="muted"; lblSel.textContent = (gMode==='headings' ? "Selected headings:" : "Selected fields:");
-  const hpills = document.createElement("div"); hpills.className="pills";
-  (rule.targets||[]).forEach(t=>{
-    const isHead = (gMode==='headings');
-    const idOrKey = isHead ? (typeof t==='string'? t : t.key) : (typeof t==='string'? t : t.id);
-    const label = isHead ? ( (typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(String(idOrKey)) )
-                         : ( (typeof t==='object' && t.label) ? t.label : getFieldLabelById(String(idOrKey)) );
-    const pill = document.createElement("span"); pill.className="pill"; pill.title=String(idOrKey);
-    const txt = document.createElement("span"); txt.textContent=label || String(idOrKey);
-    const x = document.createElement("button"); x.setAttribute("aria-label","Remove"); x.textContent="×";
-    x.addEventListener("click", ()=>{
-      if (isHead) rule.targets = (rule.targets||[]).filter(z=> String((typeof z==='string'? z : z.key)) !== String(idOrKey) );
-      else rule.targets = (rule.targets||[]).filter(z=> String((typeof z==='string'? z : z.id)) !== String(idOrKey) );
-      console.log(`[${nowt()}] EDIT removeTarget -> ${asTextRule(rule, gMode)}`);
-      persistRulesNow("change:removeTarget"); renderEditor(); renderList();
-    });
-    pill.appendChild(txt); pill.appendChild(x);
-    hpills.appendChild(pill);
-  });
-  if (!hpills.children.length){
-    const none=document.createElement("span"); none.className="empty"; none.textContent="(none)";
-    hpills.appendChild(none);
-  }
-  row4.appendChild(lblSel); row4.appendChild(hpills);
-  card.appendChild(row4);
-
-  editorMount.appendChild(card);
-  if (isDraft) card._updateSave?.();
-}
-
-/* ================================ List UI =============================== */
+// ------------------------------- RENDERING ------------------------------
 function summarizeCondition(rule){
-  const sources = buildConditionSources(gSchema);
-  let src = sources.find(s=>String(s.id)===String(rule.fieldId));
-  const fallbackLabel = getFieldLabelById(rule.fieldId);
-  const srcLabel = src?.label || fallbackLabel || String(rule.fieldId);
+  const srcs = buildConditionSources(gSchema);
+  let src = srcs.find(s=>String(s.id)===String(rule.fieldId));
+  const srcLabel = src?.label || getFieldLabelById(rule.fieldId) || String(rule.fieldId);
   const op = rule.op || 'equals';
   const v0 = Array.isArray(rule.values) ? rule.values[0] : rule.values;
 
   if (!src) return `when ${srcLabel} ${op} ${JSON.stringify(v0)}`;
-  if (src.type === 'boolean') return `when ${srcLabel} ${op} ${String(v0)}`;
-  if (src.type === 'date')    return `when ${srcLabel} ${op} ${String(v0||'')}`;
-  if (src.type === 'text')    return `when ${srcLabel} ${op} "${String(v0||'')}"`;
-  if (src.type === 'number')  return `when ${srcLabel} ${op} ${String(v0)}`;
-  if (src.type === 'select') {
+  if (src.type==='boolean') return `when ${srcLabel} ${op} ${String(v0)}`;
+  if (src.type==='date')    return `when ${srcLabel} ${op} ${String(v0||'')}`;
+  if (src.type==='text')    return `when ${srcLabel} ${op} "${String(v0||'')}"`;
+  if (src.type==='number')  return `when ${srcLabel} ${op} ${String(v0)}`;
+  if (src.type==='select') {
     const base = (gSchema.fields||[]).find(ff => String(ff.id)===String(src.id));
     const options = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
     const label = options.find(o=>String(o.value)===String(v0))?.label ?? String(v0||'');
@@ -793,230 +381,350 @@ function summarizeCondition(rule){
   }
   return `when ${srcLabel} ${op}`;
 }
+
 function renderList(){
-  rulesList.innerHTML = "";
-  if (!gRules.length){
-    rulesList.innerHTML = '<div class="empty">None.</div>';
-    return;
-  }
+  els.rulesList.innerHTML = "";
+  const list = gRules || [];
+  if (!list.length){ els.rulesList.innerHTML = '<div class="empty">None.</div>'; return; }
 
-  gRules.forEach(r=>{
-    const div=document.createElement("div"); div.className="item";
-    const left=document.createElement("div");
+  list.forEach(r=>{
+    const row = document.createElement('div'); row.className='item';
+    const left = document.createElement('div');
 
-    let targetsText = '';
-    if (gMode==='headings') {
-      const labels = (r.targets||[]).map(t=>{
-        const k = String((typeof t==='string')? t : (t.key ?? ''));
-        const lbl = (typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(k);
-        return lbl || k;
-      }).filter(Boolean);
-      targetsText = labels.join(', ') || '(no headings selected)';
-    } else {
-      const labels = (r.targets||[]).map(t=>{
-        const id = String((typeof t==='string')? t : (t.id ?? ''));
-        return (typeof t==='object' && t.label) ? t.label : getFieldLabelById(id);
-      }).filter(Boolean);
-      targetsText = labels.join(', ') || '(no fields selected)';
-    }
+    const labels = (gMode==='headings')
+      ? (r.targets||[]).map(t=> (typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(String((typeof t==='string')? t : (t.key||''))) ).filter(Boolean)
+      : (r.targets||[]).map(t=> (typeof t==='object' && t.label) ? t.label : getFieldLabelById(String((typeof t==='string')? t : (t.id||'')))).filter(Boolean);
 
-    left.innerHTML = `<strong>${r.action}</strong> — <em>${targetsText}</em> <span class="muted"> ${summarizeCondition(r)}</span>`;
-    const right=document.createElement("div"); right.style.display='flex'; right.style.gap='8px';
+    left.innerHTML = `<strong>${r.action}</strong> — <em>${labels.join(', ') || '(no targets selected)'}</em> <span class="muted">${summarizeCondition(r)}</span>`;
 
-    const edit=document.createElement("button"); edit.className="btn btn-ghost"; edit.textContent="Edit";
-    edit.addEventListener("click", ()=>{
-      gDraft = null;
-      gEditingId = r.id;
-      renderEditor();
-      editorMount.scrollIntoView({behavior:"smooth", block:"start"});
-    });
+    const right = document.createElement('div'); right.style.display='flex'; right.style.gap='8px';
 
-    const del=document.createElement("button"); del.className="btn btn-danger"; del.textContent="Delete";
-    del.addEventListener("click", ()=>{
-      if (!confirm("Delete this rule?")) return;
-      const idx = gRules.findIndex(x=>x.id===r.id);
-      if (idx >= 0) gRules.splice(idx,1);
+    const edit = document.createElement('button'); edit.className='btn btn-ghost'; edit.textContent='Edit';
+    edit.addEventListener('click', ()=>{ gDraft=null; gEditingId=r.id; renderEditor(); });
+
+    const del = document.createElement('button'); del.className='btn btn-danger'; del.textContent='Delete';
+    del.addEventListener('click', async ()=>{
+      if (!confirm('Delete this rule?')) return;
+      const arr = (gMode==='headings') ? gRulesHeadings : gRulesFields;
+      const idx = arr.findIndex(x=>x.id===r.id);
+      if (idx>=0) arr.splice(idx,1);
+      if (gMode==='headings') gRules = gRulesHeadings.slice(); else gRules = gRulesFields.slice();
       if (gEditingId === r.id) gEditingId = null;
       console.log(`[${nowt()}] DELETE id=${r.id}`);
-      persistRulesNow('delete'); renderEditor(); renderList();
+      await persistRules('delete');
+      renderEditor(); renderList();
     });
 
-    right.appendChild(edit);
-    right.appendChild(del);
-    div.appendChild(left); div.appendChild(right);
-    rulesList.appendChild(div);
+    right.appendChild(edit); right.appendChild(del);
+    row.appendChild(left); row.appendChild(right);
+    els.rulesList.appendChild(row);
   });
 }
 
-/* ============================== Reload / Sync =========================== */
-async function reloadState(reason){
-  try {
-    if (!gDocId) { return; }
+function currentEditorRule(){ if (gDraft) return gDraft; if (gEditingId) return (gRules||[]).find(r=>r.id===gEditingId) || null; return null; }
 
-    let st = await window.formSuitePersist?.loadState?.(gDocId);
-    st = await _ensureSchemaFromPayload(st);
-    if (!st) { return; }
-    if (st?.schema) gSchema = st.schema;
-    if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
+function renderEditor(){
+  const mount = els.editorMount;
+  mount.innerHTML = "";
+  const rule = currentEditorRule();
+  if (!rule){ mount.innerHTML = '<div class="empty">No rules yet — click “Add rule”.</div>'; return; }
 
-    // Debug: print schema + headings early
-    printSchemaDebug(gSchema);
-    printHeadingsDebug(gHeadingsTree);
+  // Normalize targets for display
+  if (gMode==='headings') normalizeHeadingsRuleTargetsInPlace(rule);
+  else normalizeFieldTargetsInPlace(rule);
 
-    // Pull payload mirrors
-    const plObj = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
+  const card = document.createElement('div'); card.className='rule-card'; card.dataset.id = rule.id || 'draft';
 
-    // Workspace (support both shapes)
-    const wsHeadings = Array.isArray(st.rules) ? st.rules
-                      : (Array.isArray(st.headingRules) ? st.headingRules : []);
-    const wsFields   = Array.isArray(st.fieldRules) ? st.fieldRules : [];
+  // Save/Cancel for draft
+  if (gDraft){
+    const top = document.createElement('div'); top.className='row'; top.style.justifyContent='flex-end'; top.style.gap='8px';
+    const btnCancel = document.createElement('button'); btnCancel.className='btn btn-ghost'; btnCancel.textContent='Cancel';
+    btnCancel.addEventListener('click', ()=>{ gDraft=null; renderEditor(); });
 
-    // Payload (support both shapes)
-    const plHeadings = Array.isArray(plObj.rules) ? plObj.rules
-                      : (Array.isArray(plObj.headingRules) ? plObj.headingRules : []);
-    const plFields   = Array.isArray(plObj.fieldRules) ? plObj.fieldRules : [];
+    const btnSave = document.createElement('button'); btnSave.className='btn btn-primary'; btnSave.textContent='Save rule';
+    btnSave.disabled = !isRuleValid(rule);
+    btnSave.addEventListener('click', async ()=>{
+      if (!isRuleValid(rule)){ alert('Please complete the rule.'); return; }
+      rule.id = "r_"+Math.random().toString(36).slice(2,8);
+      if (gMode==='headings') gRulesHeadings.push(rule); else gRulesFields.push(rule);
+      gDraft=null; gRules = (gMode==='headings')? gRulesHeadings.slice() : gRulesFields.slice();
+      console.log(`[${nowt()}] CREATE ${JSON.stringify(rule)}`);
+      await persistRules('create');
+      renderEditor(); renderList();
+    });
 
-    printPayloadSnapshot(st);
-    if (Array.isArray(st.headingRules)) printRuleArray('STATE workspace.headingRules', st.headingRules, 'headings');
-    printRuleArray('STATE workspace.rules', Array.isArray(st.rules)?st.rules:[], 'headings');
-    printRuleArray('STATE workspace.fieldRules', wsFields, 'fields');
+    const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule()); };
+    card._updateSave = updateSaveState;
 
-    // Prefer workspace; fall back to payload; else keep existing
-    const nextHeadings = wsHeadings.length ? cloneRulesArray(wsHeadings)
-                        : (plHeadings.length ? cloneRulesArray(plHeadings) : cloneRulesArray(gRulesHeadings));
-    const nextFields   = wsFields.length   ? cloneRulesArray(wsFields)
-                        : (plFields.length ? cloneRulesArray(plFields)   : cloneRulesArray(gRulesFields));
+    top.appendChild(btnCancel); top.appendChild(btnSave); card.appendChild(top);
+  }
 
-    // Update in-memory stores
-    gRulesHeadings = nextHeadings;
-    gRulesFields   = nextFields;
+  // Row 1: Action + Effect + When
+  const row1 = document.createElement('div'); row1.className='rule-row';
 
-    // Normalize targets + labels
-    const flatHeads = flattenWithNumbers(gHeadingsTree);
-    const normH = normalizeAllHeadingsRulesInPlace(gRulesHeadings, flatHeads);
-    const normF = normalizeAllFieldRulesInPlace(gRulesFields, gSchema);
-    if (normH>0) console.log(`[${nowt()}] NORMALIZE persist queued (headings targets)`);
-    if (normF>0) console.log(`[${nowt()}] NORMALIZE persist queued (field targets)`);
+  // Action
+  const pAction = document.createElement('div'); pAction.className='pair';
+  const lblA = document.createElement('label'); lblA.textContent='Action';
+  const selA = document.createElement('select');
+  const defAct = document.createElement('option'); defAct.value=''; defAct.textContent='Select…';
+  if (gDraft && !rule.action) selA.appendChild(defAct);
+  ['SHOW','HIDE'].forEach(a=>{ const o=document.createElement('option'); o.value=a; o.textContent=a; if(rule.action===a) o.selected=true; selA.appendChild(o);});
+  selA.addEventListener('change', async ()=>{
+    rule.action = selA.value || null;
+    if (!gDraft){ await persistRules('change:action'); renderList(); }
+    card._updateSave?.();
+  });
+  pAction.appendChild(lblA); pAction.appendChild(selA);
+  row1.appendChild(pAction);
 
-    // Reflect what's chosen
-    printRuleArray('CHOSEN rules (headings)', gRulesHeadings, 'headings');
-    printRuleArray('CHOSEN fieldRules (fields)', gRulesFields, 'fields');
+  // Effect (fields only)
+  const pEffect = document.createElement('div'); pEffect.className='pair';
+  const lblE = document.createElement('label'); lblE.textContent='Effect';
+  const selE = document.createElement('select');
+  ;[{v:'hide',t:'hide (remove)'},{v:'disable',t:'disable (greyed)'}].forEach(({v,t})=>{
+    const o=document.createElement('option'); o.value=v; o.textContent=t; if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o);
+  });
+  selE.addEventListener('change', async ()=>{
+    rule.hideMode = selE.value || 'hide';
+    if (!gDraft){ await persistRules('change:hideMode'); renderList(); }
+  });
+  if (gMode==='fields'){ pEffect.appendChild(lblE); pEffect.appendChild(selE); row1.appendChild(pEffect); }
 
-    gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
-    if (!gRules.find(r=>r?.id===gEditingId)) gEditingId = null;
+  // When (source)
+  const pField = document.createElement('div'); pField.className='pair';
+  const lblF = document.createElement('label'); lblF.textContent='When';
+  const selF = document.createElement('select');
+  const srcs = buildConditionSources(gSchema);
+  const defF = document.createElement('option'); defF.value=''; defF.textContent='Select source…';
+  if (gDraft && !rule.fieldId) selF.appendChild(defF);
+  if (!srcs.length){ const o=document.createElement('option'); o.value=''; o.textContent='(no fields)'; selF.appendChild(o); }
+  else srcs.forEach(s=>{ const o=document.createElement('option'); o.value=s.id; o.textContent=s.label; if(String(rule.fieldId)===String(s.id)) o.selected=true; selF.appendChild(o); });
+  selF.addEventListener('change', async ()=>{
+    rule.fieldId = selF.value || '';
+    if (!rule.fieldId){ rule.op=null; rule.values=[]; }
+    else{
+      const src = srcs.find(x=>String(x.id)===String(rule.fieldId));
+      if (src){
+        if (src.type==='boolean'){ rule.op='equals'; rule.values=[true]; }
+        else if (src.type==='date'){ rule.op='equals'; rule.values=['']; }
+        else if (src.type==='text'){ rule.op='equals'; rule.values=['']; }
+        else if (src.type==='number'){ rule.op='equals'; rule.values=[0]; }
+        else if (src.type==='select'){ rule.op='equals'; rule.values=['']; }
+        else { rule.op='equals'; rule.values=['']; }
+      }
+    }
+    if (!gDraft){ await persistRules('change:fieldId'); renderEditor(); renderList(); }
+    else { renderEditor(); }
+  });
+  pField.appendChild(lblF); pField.appendChild(selF);
+  row1.appendChild(pField);
 
-    if (normH>0 || normF>0) await persistRulesNow('normalize:headKeys');
+  card.appendChild(row1);
 
-    setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
+  // Row 2: condition controls
+  const chosenSource = buildConditionSources(gSchema).find(s=>String(s.id)===String(rule.fieldId));
+  if (chosenSource){
+    const row2 = document.createElement('div'); row2.className='rule-row';
+    const pCond = document.createElement('div'); pCond.className='pair';
+    const lblC = document.createElement('label'); lblC.textContent='Condition'; pCond.appendChild(lblC);
 
-    renderEditor(); renderList();
-  } catch(e){ console.error("reloadState failed:", e); }
+    const src = chosenSource; if (!Array.isArray(rule.values)) rule.values = [];
+    const schedulePersist = debounce(()=>persistRules('typing:value'), 150);
+
+    if (src.type!=='boolean'){
+      const opSel = document.createElement('select');
+      const ops = (src.type==='date')? ['before','equals','after']
+                : (src.type==='text')? ['equals','notEquals','contains']
+                : (src.type==='number'||src.type==='select')? ['equals','notEquals']
+                : ['equals'];
+      ops.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; if(rule.op===v) o.selected=true; opSel.appendChild(o); });
+      opSel.addEventListener('change', async ()=>{ rule.op = opSel.value; if(!gDraft){ await persistRules('change:op'); renderList(); } card._updateSave?.(); });
+      pCond.appendChild(opSel);
+    } else {
+      const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='is'; pCond.appendChild(spanIs);
+      rule.op = 'equals';
+    }
+
+    if (src.type==='boolean'){
+      const sel=document.createElement('select');
+      ;[{v:true,l:'true'},{v:false,l:'false'}].forEach(({v,l})=>{ const o=document.createElement('option'); o.value=String(v); o.textContent=l; if(String(rule.values?.[0])===String(v)) o.selected=true; sel.appendChild(o); });
+      sel.addEventListener('change', async ()=>{ rule.values=[sel.value==='true']; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); });
+      pCond.appendChild(sel);
+    } else if (src.type==='date'){
+      const inp=document.createElement('input'); inp.type='text'; inp.placeholder='YYYY-MM-DD'; inp.style.minWidth='140px'; inp.value=String(rule.values?.[0]||'');
+      setTimeout(()=>{ try{ flatpickr(inp,{ allowInput:true, dateFormat:'Y-m-d', onChange:async()=>{ rule.values=[inp.value]; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); } }); }catch{} },0);
+      inp.addEventListener('input', ()=>{ rule.values=[inp.value]; schedulePersist(); card._updateSave?.(); });
+      pCond.appendChild(inp);
+    } else if (src.type==='text'){
+      const inp=document.createElement('input'); inp.type='text'; inp.value=String(rule.values?.[0]||'');
+      inp.addEventListener('input', ()=>{ rule.values=[inp.value]; schedulePersist(); card._updateSave?.(); });
+      pCond.appendChild(inp);
+    } else if (src.type==='number'){
+      const inp=document.createElement('input'); inp.type='number'; inp.value=String(rule.values?.[0]??'');
+      inp.addEventListener('input', ()=>{ const v=inp.value; rule.values=[v===''? '': Number(v)]; schedulePersist(); card._updateSave?.(); });
+      pCond.appendChild(inp);
+    } else if (src.type==='select'){
+      const sel=document.createElement('select');
+      const def=document.createElement('option'); def.value=''; def.textContent='Select value…'; sel.appendChild(def);
+      const base=(gSchema.fields||[]).find(ff=>String(ff.id)===String(src.id));
+      const opts = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
+      opts.forEach(opt=>{ const o=document.createElement('option'); o.value=String(opt.value); o.textContent=String(opt.label); if(String(rule.values?.[0])===String(opt.value)) o.selected=true; sel.appendChild(o); });
+      sel.addEventListener('change', async ()=>{ rule.values = sel.value ? [sel.value] : ['']; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); });
+      pCond.appendChild(sel);
+    } else {
+      const inp=document.createElement('input'); inp.type='text'; inp.value=String(rule.values?.[0]||'');
+      inp.addEventListener('input', ()=>{ rule.values=[inp.value]; schedulePersist(); card._updateSave?.(); });
+      pCond.appendChild(inp);
+    }
+
+    row2.appendChild(pCond);
+    card.appendChild(row2);
+  }
+
+  // Row 3: targets
+  if (gMode==='headings'){
+    const flat = flattenWithNumbers(gHeadingsTree);
+    if (flat.length){
+      const row3=document.createElement('div'); row3.className='rule-row';
+      const pair=document.createElement('div'); pair.className='pair';
+      const lbl=document.createElement('label'); lbl.textContent='Add heading';
+      const sel=document.createElement('select'); const def=document.createElement('option'); def.value=''; def.textContent='Select…'; sel.appendChild(def);
+      const chosen = new Set((rule.targets||[]).map(t=> (typeof t==='string')? t : t.key));
+      flat.forEach(h=>{ const comp = toCompositeKeyFromFlat(h); if (chosen.has(comp)) return; const o=document.createElement('option'); o.value=comp; o.textContent=h.label; sel.appendChild(o); });
+      sel.addEventListener('change', async ()=>{
+        const comp=sel.value; if (!comp) return;
+        const label = (flat.find(h=>toCompositeKeyFromFlat(h)===comp)?.label)||comp;
+        rule.targets = rule.targets || []; rule.targets.push({ key:comp, label });
+        await persistRules('change:addHeading'); renderEditor(); renderList();
+      });
+      pair.appendChild(lbl); pair.appendChild(sel); row3.appendChild(pair); card.appendChild(row3);
+    }
+  } else {
+    const all = (gSchema.fields||[]).map(f=>({id:String(f.id), label:f.label||f.id}));
+    const row3=document.createElement('div'); row3.className='rule-row';
+    const pair=document.createElement('div'); pair.className='pair';
+    const lbl=document.createElement('label'); lbl.textContent='Add field';
+    const sel=document.createElement('select'); const def=document.createElement('option'); def.value=''; def.textContent='Select…'; sel.appendChild(def);
+    const chosen = new Set((rule.targets||[]).map(t=> String((typeof t==='string')? t : t.id)));
+    all.forEach(s=>{ if(!chosen.has(String(s.id))){ const o=document.createElement('option'); o.value=s.id; o.textContent=s.label; sel.appendChild(o);} });
+    sel.addEventListener('change', async ()=>{
+      const id=sel.value; if (!id) return;
+      const s = all.find(x=>String(x.id)===String(id)); if (!s) return;
+      rule.targets = rule.targets || []; rule.targets.push({ id:s.id, label:s.label });
+      await persistRules('change:addField'); renderEditor(); renderList();
+    });
+    pair.appendChild(lbl); pair.appendChild(sel); row3.appendChild(pair); card.appendChild(row3);
+  }
+
+  // Row 4: selected target pills
+  const row4=document.createElement('div'); row4.className='rule-row';
+  const lblSel=document.createElement('div'); lblSel.className='muted'; lblSel.textContent=(gMode==='headings'?'Selected headings:':'Selected fields:');
+  const pills=document.createElement('div'); pills.className='pills';
+  (rule.targets||[]).forEach(t=>{
+    const isHead = (gMode==='headings');
+    const idOrKey = isHead ? (typeof t==='string'? t : t.key) : (typeof t==='string'? t : t.id);
+    const label = isHead ? ((typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(String(idOrKey)))
+                         : ((typeof t==='object' && t.label) ? t.label : getFieldLabelById(String(idOrKey)));
+    const pill=document.createElement('span'); pill.className='pill'; pill.title=String(idOrKey);
+    const txt=document.createElement('span'); txt.textContent=label || String(idOrKey);
+    const x=document.createElement('button'); x.setAttribute('aria-label','Remove'); x.textContent='×';
+    x.addEventListener('click', async ()=>{
+      if (isHead) rule.targets=(rule.targets||[]).filter(z=> String((typeof z==='string'? z : z.key)) !== String(idOrKey));
+      else rule.targets=(rule.targets||[]).filter(z=> String((typeof z==='string'? z : z.id)) !== String(idOrKey));
+      await persistRules('change:removeTarget'); renderEditor(); renderList();
+    });
+    pill.appendChild(txt); pill.appendChild(x); pills.appendChild(pill);
+  });
+  if (!pills.children.length){ const none=document.createElement('span'); none.className='empty'; none.textContent='(none)'; pills.appendChild(none); }
+  row4.appendChild(lblSel); row4.appendChild(pills); card.appendChild(row4);
+
+  mount.appendChild(card);
+  if (gDraft) card._updateSave?.();
 }
 
-/* ============================== Sync wiring ============================= */
-function hookSync(){
-  bcLegacy?.addEventListener("message",(ev)=>{
-    const m = ev?.data || {};
-    if (m.type==="schema-updated"   && m.docId===gDocId) reloadState("schema-updated");
-    if (m.type==="headings-updated" && m.docId===gDocId) reloadState("headings-updated");
-    if (m.type==="doc-updated"      && m.docId===gDocId) reloadState("doc-updated");
-    if (m.type==="doc-switched"     && m.docId && m.docId!==gDocId){ gDocId=m.docId; reloadState("doc-switched"); }
-    if (m.type==="doc-cleared"){ gDocId=null; setStatus("Cleared."); editorMount.innerHTML='<div class="empty">No rules yet — click “Add rule”.</div>'; rulesList.innerHTML='<div class="empty">None.</div>'; }
-  });
-  bcCanon?.addEventListener("message",(ev)=>{
-    const m = ev?.data || {};
-    if (m.type==="active:set"){ if (m.docId && m.docId!==gDocId){ gDocId=m.docId; reloadState("active:set"); } }
-    if (m.type==="active:updated"){ if (m.docId===gDocId) reloadState("active:updated"); }
-    if (m.type==="active:clear"){ gDocId=null; setStatus("Cleared."); }
-  });
-
-  // Payload patch channel (instant)
-  bcPayload?.addEventListener("message", (ev) => {
-    const msg = ev?.data || {};
-    if (msg?.t !== 'payload' || !msg.docId || msg.docId !== gDocId) return;
-    const patch = msg.patch || {};
-    let changed = false;
-
-    if (Array.isArray(patch.rules)) {
-      const flatHeads = flattenWithNumbers(gHeadingsTree);
-      normalizeAllHeadingsRulesInPlace(patch.rules, flatHeads);
-      gRulesHeadings = cloneRulesArray(patch.rules);
-      if (gMode==='headings') { gRules = gRulesHeadings.slice(); changed = true; }
-      printRuleArray('LIVE payload patch -> rules', patch.rules, 'headings');
-    }
-    if (Array.isArray(patch.fieldRules)) {
-      normalizeAllFieldRulesInPlace(patch.fieldRules, gSchema);
-      gRulesFields = cloneRulesArray(patch.fieldRules);
-      if (gMode==='fields') { gRules = gRulesFields.slice(); changed = true; }
-      printRuleArray('LIVE payload patch -> fieldRules', patch.fieldRules, 'fields');
-    }
-    if (patch.schema) { gSchema = patch.schema; changed = true; }
-    if (Array.isArray(patch.headingsTree)) { gHeadingsTree = patch.headingsTree; changed = true; }
-
-    if (changed) { renderEditor(); renderList(); setStatus("Live-updated from another tab."); }
-  });
-
-  // Storage switch
-  window.addEventListener("storage", (e)=>{
-    if (e.key===ACTIVE_LS_KEY && e.newValue){
-      const meta = JSON.parse(e.newValue||"null");
-      if (meta?.docId && meta.docId!==gDocId){ gDocId=meta.docId; reloadState("storage switch"); }
-    }
-  });
-}
-
-/* ============================== Tabs + Boot ============================= */
+// ------------------------------ RELOAD/SYNC -----------------------------
 function applyTabUI(){
-  const isHead = gMode==='headings';
-  if (tabHeadings) {
-    tabHeadings.setAttribute('aria-pressed', String(isHead));
-    tabHeadings.className = 'btn ' + (isHead ? 'btn-secondary' : 'btn-ghost');
-  }
-  if (tabFields) {
-    tabFields.setAttribute('aria-pressed', String(!isHead));
-    tabFields.className   = 'btn ' + (!isHead ? 'btn-secondary' : 'btn-ghost');
-  }
-  if (rulesHint) {
-    rulesHint.textContent = isHead
-      ? 'SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).'
-      : 'SHOW or HIDE specific form fields based on another field’s selected value(s).';
-  }
+  const isHead=gMode==='headings';
+  els.tabHeadings.setAttribute('aria-pressed', String(isHead));
+  els.tabHeadings.className = 'btn ' + (isHead ? 'btn-secondary' : 'btn-ghost');
+  els.tabFields.setAttribute('aria-pressed', String(!isHead));
+  els.tabFields.className   = 'btn ' + (!isHead ? 'btn-secondary' : 'btn-ghost');
+  els.rulesHint.textContent = isHead
+    ? 'SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).'
+    : 'SHOW or HIDE specific form fields based on another field’s selected value(s).';
 }
-tabHeadings?.addEventListener('click', async ()=>{
+
+// NOTE: we never import rules from payload here; workspace is authoritative.
+async function reloadState(reason){
+  if (!gDocId) return;
+  const st = await window.formSuitePersist.loadState(gDocId) || {};
+  if (st.schema) gSchema = st.schema;
+  if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
+
+  gRulesHeadings = Array.isArray(st.rules) ? st.rules.slice() : [];
+  gRulesFields   = Array.isArray(st.fieldRules) ? st.fieldRules.slice() : [];
+
+  normalizeAllTargets();
+
+  gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
+  if (!gRules.find(r=>r?.id===gEditingId)) gEditingId = null;
+
+  setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
+  renderEditor(); renderList();
+
+  // DEBUG: print payload after any load/reload
+  await debugLogPayload(`reload:${reason}`);
+}
+
+// tab switches
+els.tabHeadings?.addEventListener('click', async ()=>{
   if (gMode==='headings') return;
-  gMode='headings';
-  gDraft = null; gEditingId = null;
-  gRules = gRulesHeadings.slice();
-  applyTabUI();
-  await reloadState('tab:headings');
+  gMode='headings'; gDraft=null; gEditingId=null; applyTabUI(); await reloadState('tab:headings');
 });
-tabFields?.addEventListener('click', async ()=>{
+els.tabFields?.addEventListener('click', async ()=>{
   if (gMode==='fields') return;
-  gMode='fields';
-  gDraft = null; gEditingId = null;
-  gRules = gRulesFields.slice();
-  applyTabUI();
-  await reloadState('tab:fields');
+  gMode='fields'; gDraft=null; gEditingId=null; applyTabUI(); await reloadState('tab:fields');
 });
 
-/* ================================= Boot ================================= */
-btnAddRule.addEventListener("click", ()=>{
+// add rule
+els.btnAddRule.addEventListener("click", ()=>{
   gEditingId = null;
-  gDraft = { id:null, action:null, fieldId:"", op:null, values:[], targets:[] };
-  console.log(`[${nowt()}] DRAFT ${asTextRule(gDraft, gMode)}`);
+  gDraft = { id:null, action:null, fieldId:"", op:null, values:[], targets:[], ...(gMode==='fields'? {hideMode:'hide'} : {}) };
   renderEditor();
-  editorMount.scrollIntoView({behavior:"smooth", block:"start"});
+  els.editorMount.scrollIntoView({behavior:"smooth", block:"start"});
 });
 
-(async function boot(){
+// quick diagnostics (F9)
+window.addEventListener('keydown', async (e) => {
+  if (e.key === 'F9') {
+    const st = await window.formSuitePersist.loadState(gDocId) || {};
+    const p  = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
+    console.log('[rules][F9] dump', {
+      docId: gDocId,
+      ws_rules: st.rules?.length || 0,
+      ws_fieldRules: st.fieldRules?.length || 0,
+      ws_rulesVersion: st.rulesVersion || null,
+      pl_rules: p.rules?.length || 0,
+      pl_fieldRules: p.fieldRules?.length || 0,
+      pl_rulesVersion: p.rulesVersion || null,
+      ls_has_plain: !!localStorage.getItem('CRONOS_PAYLOAD'),
+      ls_has_scoped: !!localStorage.getItem(`CRONOS_PAYLOAD:${gDocId}`),
+      ls_stamp: localStorage.getItem(`FS_RULES_STAMP:${gDocId}`)
+    });
+  }
+});
+
+// boot
+(function boot(){
   try{
-    hookSync();
     try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
-    let meta = window.formSuitePersist?.getActiveDocMeta?.() || window.formSuitePersist?.getCurrentDocMeta?.() || readActiveMeta();
+    const meta = window.formSuitePersist?.getActiveDoc?.sync?.()
+              || window.formSuitePersist?.getCurrentDocMeta?.()
+              || (function(){ try{ const v=localStorage.getItem(ACTIVE_LS_KEY); return v? JSON.parse(v):null; } catch { return null; } })();
     if (!meta?.docId){ setStatus("No active document. Open one first."); return; }
     gDocId = meta.docId;
     applyTabUI();
-    await reloadState("boot");
+    reloadState("boot");
   } catch(e){ console.error("boot failed:", e); setStatus("Failed to load state."); }
 })();
 </script>
