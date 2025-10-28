@@ -739,18 +739,61 @@
       return new Set((schema?.fields || []).map(f => String(f.id)));
     }
 
+    function normalizeRuleCollection(raw) {
+      if (raw == null) return [];
+      if (Array.isArray(raw)) {
+        const acc = [];
+        for (const item of raw) acc.push(...normalizeRuleCollection(item));
+        return acc;
+      }
+      if (raw instanceof Set) return normalizeRuleCollection([...raw]);
+      if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        if (!trimmed) return [];
+        try {
+          const parsed = JSON.parse(trimmed);
+          return normalizeRuleCollection(parsed);
+        } catch {
+          return [];
+        }
+      }
+      if (typeof raw === 'object') {
+        const maybeRule = raw;
+        if (maybeRule && (maybeRule.action || maybeRule.fieldId || maybeRule.whenField || maybeRule.targets)) {
+          return [maybeRule];
+        }
+        const vals = [];
+        for (const value of Object.values(maybeRule)) {
+          vals.push(...normalizeRuleCollection(value));
+        }
+        return vals;
+      }
+      return [];
+    }
+
+    function dedupeRules(arr) {
+      const seen = new Set();
+      const res = [];
+      for (const r of (arr || [])) {
+        if (!r) continue;
+        const shallow = (r && typeof r === 'object') ? { ...r } : r;
+        if (shallow && typeof shallow === 'object') {
+          delete shallow.version;
+          delete shallow.ts;
+        }
+        const key = JSON.stringify(shallow ?? {});
+        if (!seen.has(key)) {
+          seen.add(key);
+          res.push(r);
+        }
+      }
+      return res;
+    }
+
     // Collect rules from workspace state regardless of where the Rules tab put them
     function extractRulesFromState(state) {
-      const out = { rules: [], fieldRules: [] };
-      const safeArr = (x) => Array.isArray(x) ? x : [];
-      const ids = (arr) => safeArr(arr).map(r => r?.id).filter(Boolean);
-
+      const out = { rules: [], fieldRules: [], meta: { rulesSources: [], fieldRuleSources: [] } };
       if (!state || typeof state !== 'object') return out;
-
-      const ws_rules      = safeArr(state.rules);
-      const ws_fieldRules = safeArr(state.fieldRules);
-      out.rules.push(...ws_rules);
-      out.fieldRules.push(...ws_fieldRules);
 
       const payload =
             state?.payload?.CRONOS_PAYLOAD ? state.payload.CRONOS_PAYLOAD
@@ -759,31 +802,57 @@
           : state?.payload                ? state.payload
           : {};
 
-      const pl_rules      = safeArr(payload?.rules);
-      const pl_fieldRules = safeArr(payload?.fieldRules);
-      out.rules.push(...pl_rules);
-      out.fieldRules.push(...pl_fieldRules);
+      const ruleSources = [
+        ['workspace.rules', normalizeRuleCollection(state?.rules)],
+        ['payload.CRONOS_PAYLOAD.rules', normalizeRuleCollection(payload?.rules)],
+        ['payload.rules', normalizeRuleCollection(state?.payload?.rules)],
+        ['CRONOS_RULES', normalizeRuleCollection(state?.CRONOS_RULES)],
+        ['cronos_rules', normalizeRuleCollection(state?.cronos_rules)],
+      ];
 
-      const ul_rules_1 = safeArr(state.CRONOS_RULES);
-      const ul_rules_2 = safeArr(state.cronos_rules);
-      const ul_fr_1    = safeArr(state.CRONOS_FIELD_RULES);
-      const ul_fr_2    = safeArr(state.cronos_field_rules);
+      const fieldRuleSources = [
+        ['workspace.fieldRules', normalizeRuleCollection(state?.fieldRules)],
+        ['payload.CRONOS_PAYLOAD.fieldRules', normalizeRuleCollection(payload?.fieldRules)],
+        ['payload.fieldRules', normalizeRuleCollection(state?.payload?.fieldRules)],
+        ['CRONOS_FIELD_RULES', normalizeRuleCollection(state?.CRONOS_FIELD_RULES)],
+        ['cronos_field_rules', normalizeRuleCollection(state?.cronos_field_rules)],
+      ];
 
-      out.rules.push(...ul_rules_1, ...ul_rules_2);
-      out.fieldRules.push(...ul_fr_1, ...ul_fr_2);
+      out.rules = dedupeRules(ruleSources.flatMap(([, arr]) => arr));
+      out.fieldRules = dedupeRules(fieldRuleSources.flatMap(([, arr]) => arr));
+      out.meta.rulesSources = ruleSources.filter(([, arr]) => arr.length > 0).map(([name]) => name);
+      out.meta.fieldRuleSources = fieldRuleSources.filter(([, arr]) => arr.length > 0).map(([name]) => name);
 
-      // Dedup by shape
-      const dedupe = (arr) => {
-        const seen = new Set(); const res = [];
-        for (const r of (arr || [])) {
-          const shallow = (r && typeof r === 'object') ? { ...r } : r;
-          delete shallow?.version; delete shallow?.ts;
-          const k = JSON.stringify(shallow ?? {});
-          if (!seen.has(k)) { seen.add(k); res.push(r); }
-        }
-        return res;
+      return out;
+    }
+
+    function hasOwn(obj, key) {
+      return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+    }
+
+    function resolveRulesForState(state, payloadOverride = null) {
+      const view = state && typeof state === 'object' ? { ...state } : {};
+      if (payloadOverride) {
+        view.payload = { ...(state?.payload || {}), CRONOS_PAYLOAD: payloadOverride };
+        view.CRONOS_PAYLOAD = payloadOverride;
+        view.cronos_payload = payloadOverride;
+      }
+
+      const aggregated = extractRulesFromState(view);
+      const wsRulesRaw = hasOwn(view, 'rules') ? normalizeRuleCollection(view.rules) : [];
+      const wsFieldRulesRaw = hasOwn(view, 'fieldRules') ? normalizeRuleCollection(view.fieldRules) : [];
+
+      const rules = hasOwn(view, 'rules') ? dedupeRules(wsRulesRaw) : aggregated.rules;
+      const fieldRules = hasOwn(view, 'fieldRules') ? dedupeRules(wsFieldRulesRaw) : aggregated.fieldRules;
+
+      const source = {
+        rules: hasOwn(view, 'rules') ? 'workspace.rules' : (aggregated.meta?.rulesSources?.[0] || 'none'),
+        fieldRules: hasOwn(view, 'fieldRules') ? 'workspace.fieldRules' : (aggregated.meta?.fieldRuleSources?.[0] || 'none'),
+        contributingRules: aggregated.meta?.rulesSources || [],
+        contributingFieldRules: aggregated.meta?.fieldRuleSources || []
       };
-      return { rules: dedupe(out.rules), fieldRules: dedupe(out.fieldRules) };
+
+      return { rules, fieldRules, source };
     }
 
     // --- schema indexers / normalizers for rules ---
@@ -891,12 +960,25 @@
         if (Array.isArray(r0.targets)) {
           r0.targets = r0.targets
             .map(t => {
+              if (t == null) return null;
               let key = t?.key ?? t?.idx ?? t?.id;
               if (key == null) return null;
+
               const rawKey = String(key);
               const head = rawKey.includes('|') ? rawKey.split('|')[0] : rawKey;
               const n = Number(head);
-              return Number.isFinite(n) && n > 0 ? { key: n } : null;
+
+              if (Number.isFinite(n) && n >= 0) {
+                return { key: n };
+              }
+
+              if (typeof t === 'object') {
+                const copy = { ...t };
+                if (copy.key == null) copy.key = rawKey;
+                return copy;
+              }
+
+              return { key: rawKey };
             })
             .filter(Boolean);
         }
@@ -1190,28 +1272,24 @@
         if (!payloadEl) return;
 
         const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        const payloadObj = wsState?.payload?.CRONOS_PAYLOAD
+                        || wsState?.CRONOS_PAYLOAD
+                        || wsState?.cronos_payload
+                        || {};
 
-        // Prefer workspace rules if the arrays exist (even if empty).
-        const wsOnly = extractWorkspaceRulesOnly(wsState || {});
-        const plObj  = wsState?.payload?.CRONOS_PAYLOAD
-                    || wsState?.CRONOS_PAYLOAD
-                    || wsState?.cronos_payload
-                    || {};
-        const plOnly = extractRulesFromPayloadObject(plObj);
-
-        const useWsRules      = Array.isArray(wsState?.rules);
-        const useWsFieldRules = Array.isArray(wsState?.fieldRules);
-
-        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
+          resolveRulesForState(wsState || {}, payloadObj);
 
         await debugLogExtractor('updatePreview:merge', {
           function: 'updatePreview',
-          usedSourceForRules: (useWsRules || useWsFieldRules) ? 'workspace' : 'payloadMirror',
-          wsRules: (wsState?.rules || []).length,
-          plRules: (plObj?.rules || []).length,
-          wsFieldRules: (wsState?.fieldRules || []).length,
-          plFieldRules: (plObj?.fieldRules || []).length
+          chosenRulesSource: ruleSourceMeta.rules,
+          chosenFieldRulesSource: ruleSourceMeta.fieldRules,
+          contributingRulesSources: ruleSourceMeta.contributingRules,
+          contributingFieldRulesSources: ruleSourceMeta.contributingFieldRules,
+          wsRules: normalizeRuleCollection(wsState?.rules).length,
+          plRules: normalizeRuleCollection(payloadObj?.rules).length,
+          wsFieldRules: normalizeRuleCollection(wsState?.fieldRules).length,
+          plFieldRules: normalizeRuleCollection(payloadObj?.fieldRules).length
         });
 
         // Normalize against **current** gSchema (already set by renderFromCurrentBytes)
@@ -1797,22 +1875,6 @@
       } catch (e) { tr.error('bootstrap failed', e); tr.end(); throw e; }
     })();
 
-    // ---------- NEW: workspace-only / payload-only rule extractors ----------
-    function extractWorkspaceRulesOnly(state) {
-      return {
-        rules: Array.isArray(state?.rules) ? state.rules : [],
-        fieldRules: Array.isArray(state?.fieldRules) ? state.fieldRules : [],
-      };
-    }
-
-    function extractRulesFromPayloadObject(obj) {
-      return {
-        rules: Array.isArray(obj?.rules) ? obj.rules : [],
-        fieldRules: Array.isArray(obj?.fieldRules) ? obj.fieldRules : [],
-      };
-    }
-
-    
     async function readDocVarSettings(arrayBufferOrBytes, name) {
       const tr = TRACE('readDocVarSettings', { name });
       try {
@@ -1937,19 +1999,14 @@
         const mergedTagMap = Object.assign({}, payload?.tagMap || {}, wsState?.tagMap || {});
 
         // ---------- RULES: prefer workspace arrays if they exist; else fall back to payload ----------
-        const wsOnly = extractWorkspaceRulesOnly(wsState || {});
-        const plOnly = extractRulesFromPayloadObject(payload || {});
-
-        const useWsRules      = Array.isArray(wsState?.rules);
-        const useWsFieldRules = Array.isArray(wsState?.fieldRules);
-
-        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
+          resolveRulesForState(wsState || {}, payload || {});
 
         // 🔎 DEBUG pre-normalization
         console.log('[Rules][pre-normalize]', {
-          src: { rules: useWsRules ? 'workspace' : 'payload', fieldRules: useWsFieldRules ? 'workspace' : 'payload' },
-          counts: { rules: (mergedRulesRaw||[]).length, fieldRules: (mergedFieldRaw||[]).length }
+          src: { rules: ruleSourceMeta.rules, fieldRules: ruleSourceMeta.fieldRules },
+          counts: { rules: (mergedRulesRaw||[]).length, fieldRules: (mergedFieldRaw||[]).length },
+          contributing: ruleSourceMeta
         });
 
         // ✅ Normalize EVERYTHING against the **chosen** schema (NOT gSchema yet!)
@@ -2273,23 +2330,30 @@
         const baseVals = (restored && restored.values) ? restored.values : {};
         const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-        const wsOnly = extractWorkspaceRulesOnly(restored || {});
-        const plObj  = restored?.payload?.CRONOS_PAYLOAD
-                    || restored?.CRONOS_PAYLOAD
-                    || restored?.cronos_payload
-                    || {};
-        const plOnly = extractRulesFromPayloadObject(plObj);
+        const payloadSnapshot = restored?.payload?.CRONOS_PAYLOAD
+                              || restored?.CRONOS_PAYLOAD
+                              || restored?.cronos_payload
+                              || {};
 
-        const useWsRules      = Array.isArray(restored?.rules);
-        const useWsFieldRules = Array.isArray(restored?.fieldRules);
-
-        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
+          resolveRulesForState(restored || {}, payloadSnapshot);
 
         const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
         const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
-        console.log('[doSave][normalized]', { rules: rules.length, fieldRules: fieldRules.length });
+        console.log('[doSave][rulesSource]', {
+          source: ruleSourceMeta,
+          wsRules: normalizeRuleCollection(restored?.rules).length,
+          plRules: normalizeRuleCollection(payloadSnapshot?.rules).length
+        });
+
+        console.log('[doSave][normalized]', {
+          rules: rules.length,
+          fieldRules: fieldRules.length,
+          source: ruleSourceMeta,
+          wsRules: normalizeRuleCollection(restored?.rules).length,
+          plRules: normalizeRuleCollection(payloadSnapshot?.rules).length
+        });
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
@@ -2367,21 +2431,22 @@
         const baseVals = (restored && restored.values) ? restored.values : {};
         const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-        const wsOnly = extractWorkspaceRulesOnly(restored || {});
-        const plObj  = restored?.payload?.CRONOS_PAYLOAD
-                    || restored?.CRONOS_PAYLOAD
-                    || restored?.cronos_payload
-                    || {};
-        const plOnly = extractRulesFromPayloadObject(plObj);
+        const payloadSnapshot = restored?.payload?.CRONOS_PAYLOAD
+                              || restored?.CRONOS_PAYLOAD
+                              || restored?.cronos_payload
+                              || {};
 
-        const useWsRules      = Array.isArray(restored?.rules);
-        const useWsFieldRules = Array.isArray(restored?.fieldRules);
-
-        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
+          resolveRulesForState(restored || {}, payloadSnapshot);
 
         const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
         const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
+
+        console.log('[doExport][rulesSource]', {
+          source: ruleSourceMeta,
+          wsRules: normalizeRuleCollection(restored?.rules).length,
+          plRules: normalizeRuleCollection(payloadSnapshot?.rules).length
+        });
 
         const { values: prunedValues, tagMap: prunedTagMap } =
           normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
