@@ -59,11 +59,6 @@
 <script>
 /* ------------------------------------------------------------------ *
  * Bulletproof Rules editor
- *  - Authoritative store: state.rules / state.fieldRules
- *  - Mirrors into payload.CRONOS_PAYLOAD / CRONOS_PAYLOAD / cronos_payload
- *  - Broadcasts 'rules-updated' (both channels) + bumps LS stamp
- *  - Logs read-back verification after each persist
- *  - F9 dumps quick diagnostics
  * ------------------------------------------------------------------ */
 
 const nowt = () => new Date().toISOString().slice(11,23);
@@ -128,6 +123,12 @@ const setStatus = (s) => { try { els.status.textContent = s || ""; } catch {} };
 const slugify = (s)=> String(s||"").normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-zA-Z0-9]+/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
 const ACTIONS = new Set(["SHOW","HIDE"]);
 const debounce = (fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+const valueToSlug = (v)=> slugify(String(v));
+
+// ---- unified type helpers ----
+const isMultiOption = (t) => ['multichoice','multiselect'].includes(t);
+const isSelectLike  = (t) => ['select','dropdown','singlechoice','choice','single','combobox','list'].includes(t);
+const isNumericLike = (t) => ['datediff','duration','number'].includes(t);
 
 // schema/headings helpers
 function normOptions(field){
@@ -199,19 +200,38 @@ function normalizeHeadingsRuleTargetsInPlace(rule){
   });
   return {changed};
 }
+
+// keep option labels for child targets
 function normalizeFieldTargetsInPlace(rule){
   if (!rule || !Array.isArray(rule.targets)) return {changed:false};
-  const lbl = new Map((gSchema.fields||[]).map(f=>[String(f.id), f.label||f.name||f.id]));
+  const fieldLabel = new Map((gSchema.fields||[]).map(f=>[String(f.id), f.label||f.name||f.id]));
   let changed=false;
+
   rule.targets = rule.targets.map(t=>{
-    if (typeof t==='string'){ changed=true; return { id:t, label: lbl.get(String(t)) || String(t)}; }
-    if (t && typeof t==='object'){
-      const id=String(t.id||''); const want = lbl.get(id);
-      if (id && (!t.label || t.label!==want)){ changed=true; return { id, label: want || (t.label||id)}; }
-      return t;
+    if (!t) return t;
+
+    if (typeof t==='string'){
+      changed=true;
+      return { id:t, label: fieldLabel.get(String(t)) || String(t) };
     }
-    return t;
+
+    const id = String(t.id||'');
+    const parentLabel = fieldLabel.get(id) || id;
+
+    if ('optionValue' in t){
+      const optionValue = String(t.optionValue ?? '');
+      const optionLabel = String(t.optionLabel ?? '');
+      const composed = t.label || `${parentLabel}: ${optionLabel || optionValue}`;
+      const out = { id, optionValue, optionLabel, label: composed };
+      if (t.id!==id || t.optionValue!==optionValue || t.optionLabel!==optionLabel || t.label!==composed) changed=true;
+      return out;
+    }
+
+    const out = { id, label: parentLabel };
+    if (t.label!==out.label) changed=true;
+    return out;
   });
+
   return {changed};
 }
 function normalizeAllTargets(){
@@ -227,23 +247,30 @@ function buildConditionSources(schema){
   const out=[]; const seen=new Set();
   for (const f of (schema?.fields||[])){
     const t=String(f.type||'').toLowerCase(); const id=String(f.id); const label=f.label||f.id;
-    if (t==='boolean'||t==='checkbox'||t==='switch'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'boolean'});} continue; }
-    if (t==='multichoice'){
+
+    if (t==='boolean'||t==='checkbox'||t==='switch'){
+      if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'boolean'}); }
+      continue;
+    }
+
+    if (isMultiOption(t)){
       if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'boolean',meta:{anySelected:true}}); }
-      const items=[]; if (Array.isArray(f.options)) items.push(...f.options);
+      const items=[];
+      if (Array.isArray(f.options)) items.push(...f.options);
       if (f.mc?.groups) (f.mc.groups||[]).forEach(g=> (g.items||[]).forEach(it=>items.push(it)));
       items.forEach(it=>{
         const rawV = it && typeof it==='object' ? (it.value ?? it.label ?? it.text ?? it.name ?? '') : it;
         const rawL = it && typeof it==='object' ? (it.label ?? it.text ?? it.name ?? rawV) : rawV;
-        const v=String(rawV||'').trim(); const l=String(rawL||'').trim(); const slug=slugify(v);
-        if (!v||!slug) return; const optId = `${id}__opt__${slug}`; if (seen.has(optId)) return;
+        const v=String(rawV||'').trim(); const l=String(rawL||'').trim(); const sl=slugify(v);
+        if (!v||!sl) return; const optId = `${id}__opt__${sl}`; if (seen.has(optId)) return;
         seen.add(optId); out.push({id:optId, label:`${label}: ${l}`, type:'boolean'});
       });
       continue;
     }
+
     if (t==='date'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'date'});} continue; }
-    if (t==='datediff'||t==='duration'||t==='number'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'number'});} continue; }
-    if (t==='select'||t==='dropdown'||t==='singlechoice'||t==='choice'||t==='single'||t==='combobox'||t==='list'){
+    if (isNumericLike(t)){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'number'});} continue; }
+    if (isSelectLike(t)){
       if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'select', options:(f.options||[]).map(o=> (o&&typeof o==='object')? String(o.value??o.label??o) : String(o))});}
       continue;
     }
@@ -252,6 +279,175 @@ function buildConditionSources(schema){
   }
   return out;
 }
+
+// ---------- TREE-/F STYLE LIST RENDERER (single-line ASCII, always expanded)
+function flattenTreeLines(nodes, prefixBag=[], out=[]){
+  nodes.forEach((node, idx) => {
+    const isLast = idx === nodes.length - 1;
+    const prefix = prefixBag.map(last => last ? '   ' : '│  ').join('') + (prefixBag.length ? (isLast ? '└─ ' : '├─ ') : '');
+    out.push({ id: String(node.id), text: prefix + (node.label || node.id), isLast });
+    if (node.children && node.children.length){
+      flattenTreeLines(node.children, [...prefixBag, isLast], out);
+    }
+  });
+  return out;
+}
+
+function renderTreeMenu(container, nodes, { currentId=null, onPick, disableIds=new Set() } = {}){
+  container.innerHTML = '';
+  container.className = 'tree-menu';
+  container.style.maxHeight = '260px';
+  container.style.overflow = 'auto';
+  container.style.padding = '6px 0';
+  container.style.border = '1px solid var(--border)';
+  container.style.borderRadius = '6px';
+  container.style.background = 'var(--card)';
+  container.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+  container.style.fontSize = '12.5px';
+
+  const list = document.createElement('div');
+  list.setAttribute('role','listbox');
+
+  const lines = flattenTreeLines(nodes);
+  lines.forEach(({id, text})=>{
+    const row = document.createElement('div');
+    row.setAttribute('role','option');
+    row.dataset.id = id;
+    row.textContent = text;
+    row.style.whiteSpace = 'pre';
+    row.style.padding = '2px 10px';
+    row.style.cursor = disableIds.has(id) ? 'not-allowed' : 'pointer';
+    row.style.userSelect = 'none';
+
+    if (String(currentId) === String(id)){
+      row.style.background = 'var(--primary-ghost, rgba(0,0,0,0.06))';
+      row.style.fontWeight = '600';
+    }
+    if (disableIds.has(id)){
+      row.classList.add('muted');
+      row.style.opacity = '0.55';
+      row.style.pointerEvents = 'none';
+    }
+
+    row.addEventListener('mouseenter', ()=>{ if (!disableIds.has(id)) row.style.background='rgba(0,0,0,0.05)'; });
+    row.addEventListener('mouseleave', ()=>{ if (String(currentId) !== String(id)) row.style.background='transparent'; });
+
+    if (!disableIds.has(id)){
+      row.addEventListener('click', ()=> onPick && onPick(id));
+    }
+
+    list.appendChild(row);
+  });
+
+  container.appendChild(list);
+}
+
+// ---- Build trees for pickers
+function buildConditionTree(schema){
+  const flat = buildConditionSources(schema) || [];
+  const byId = new Map();
+  const roots = [];
+  for (const f of (schema?.fields || [])) {
+    const id = String(f.id);
+    const label = f.label || f.id;
+    const type = String(f.type || '').toLowerCase();
+    const node = { id, label, type, children: [] };
+    byId.set(id, node);
+    roots.push(node);
+  }
+  for (const src of flat) {
+    const sid = String(src.id || '');
+    if (!sid.includes('__opt__')) continue;
+    const parentId = sid.split('__opt__')[0];
+    const parent = byId.get(parentId);
+    if (!parent) continue;
+    parent.children.push({ id: sid, label: src.label, type: src.type || 'boolean', children: [] });
+  }
+  return roots;
+}
+
+// Headings tree with numbering in labels
+function buildHeadingsTreeNodes(){
+  function walk(nodes, depth, counters){
+    const out = [];
+    counters[depth] = 0;
+    (nodes || []).forEach(n => {
+      counters[depth]++;
+      const number = counters.slice(0, depth + 1).join('.');
+      const title  = (n.label?.trim?.() ? n.label : n.text) || '';
+      out.push({
+        id: `${number}|${title}`,
+        label: `${number} ${title}`,
+        children: walk(n.children || [], depth + 1, counters.slice())
+      });
+    });
+    return out;
+  }
+  return walk(gHeadingsTree || [], 0, []);
+}
+
+// Field targets tree — parent = field, children = options (selectable)
+function buildFieldTargetsTree(){
+  const nodes=[];
+  for (const f of (gSchema.fields||[])){
+    const id = String(f.id);
+    const type = String(f.type||'').toLowerCase();
+    const node = { id, label: f.label || f.id, children: [] };
+
+    if (isMultiOption(type) || isSelectLike(type)){
+      const opts = normOptions(f);
+      node.children = opts.map(o => ({ id: `${id}__opt__${valueToSlug(o.value)}`, value:String(o.value), label: String(o.label), children: [] }));
+    }
+    nodes.push(node);
+  }
+  return nodes;
+}
+
+// ---------- helper: selection logic for Fields targets ----------
+function hasParentTarget(rule, fieldId){
+  return (rule.targets||[]).some(t => t && typeof t==='object' && String(t.id)===String(fieldId) && !('optionValue' in t));
+}
+function hasOptionTarget(rule, fieldId, optionValue){
+  return (rule.targets||[]).some(t => t && typeof t==='object'
+    && String(t.id)===String(fieldId)
+    && String(t.optionValue)===String(optionValue));
+}
+function addParentWithAllOptions(rule, fieldId){
+  const f = (gSchema.fields||[]).find(x=> String(x.id)===String(fieldId));
+  if (!f) return;
+  const fieldLabel = f.label || f.id;
+  const type = String(f.type||'').toLowerCase();
+  if (!hasParentTarget(rule, fieldId)){
+    rule.targets = rule.targets || [];
+    rule.targets.push({ id:String(fieldId), label: fieldLabel });
+  }
+  if (isMultiOption(type) || isSelectLike(type)){
+    const opts = normOptions(f);
+    opts.forEach(o => {
+      if (!hasOptionTarget(rule, fieldId, o.value)){
+        rule.targets.push({
+          id: String(fieldId),
+          optionValue: String(o.value),
+          optionLabel: String(o.label),
+          label: `${fieldLabel}: ${o.label}`
+        });
+      }
+    });
+  }
+}
+function removeParent(rule, fieldId){
+  rule.targets = (rule.targets||[]).filter(t => !(t && typeof t==='object' && String(t.id)===String(fieldId) && !('optionValue' in t)));
+}
+function removeAllChildren(rule, fieldId){
+  rule.targets = (rule.targets||[]).filter(t => !(t && typeof t==='object' && String(t.id)===String(fieldId) && ('optionValue' in t)));
+}
+function removeOneChildAndParent(rule, fieldId, optionValue){
+  rule.targets = (rule.targets||[]).filter(t => !(t && typeof t==='object'
+    && String(t.id)===String(fieldId)
+    && String(t.optionValue)===String(optionValue)));
+  removeParent(rule, fieldId);
+}
+
 function isRuleValid(rule){
   if (!rule || !ACTIONS.has(rule.action)) return false;
   const srcs = buildConditionSources(gSchema);
@@ -270,21 +466,16 @@ function isRuleValid(rule){
 }
 
 // ----------------------------- PERSISTENCE ------------------------------
-// hard-write to workspace + mirror to payload, mirror to localStorage, verify, broadcast
 async function persistRules(reason) {
   if (!gDocId) return;
-
-  // Normalize targets before writing (keeps labels in sync)
   normalizeAllTargets();
 
-  // Snapshot arrays (de-ref any reactive objects)
   const rules      = (gRulesHeadings || []).map(x => JSON.parse(JSON.stringify(x)));
   const fieldRules = (gRulesFields   || []).map(x => JSON.parse(JSON.stringify(x)));
   const stamp = Date.now();
 
   console.log(`[${nowt()}] WRITE (${reason}) rules=${rules.length}, fieldRules=${fieldRules.length}`);
 
-  // --- Build a canonical payload object by patching whatever exists ----
   const st0 = await window.formSuitePersist.loadState(gDocId) || {};
   const basePayload =
       (st0?.payload?.CRONOS_PAYLOAD)
@@ -300,7 +491,6 @@ async function persistRules(reason) {
     updatedAt: new Date(stamp).toISOString()
   };
 
-  // ---- Preferred path: setState (if available) ----
   try {
     if (window.formSuitePersist?.setState) {
       await window.formSuitePersist.setState(gDocId, {
@@ -322,7 +512,6 @@ async function persistRules(reason) {
     throw e;
   }
 
-  // ---- Mirror to localStorage (plain + scoped) + bump a stamp ----
   try {
     localStorage.setItem('CRONOS_PAYLOAD', JSON.stringify(canonical));
     localStorage.setItem(`CRONOS_PAYLOAD:${gDocId}`, JSON.stringify(canonical));
@@ -331,7 +520,6 @@ async function persistRules(reason) {
     console.warn('[rules] localStorage mirror failed', e);
   }
 
-  // ---- Read-back verification (counts + stamp) ----
   try {
     const st1 = await window.formSuitePersist.loadState(gDocId) || {};
     const p1  = st1?.payload?.CRONOS_PAYLOAD || st1?.CRONOS_PAYLOAD || st1?.cronos_payload || {};
@@ -350,7 +538,6 @@ async function persistRules(reason) {
     console.warn('[rules] read-back verification failed', e);
   }
 
-  // ---- Broadcast everywhere ----
   try { bcCanon?.postMessage({  type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
   try { bcLegacy?.postMessage({ type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
   try { bcCanon?.postMessage({  type: 'active:updated', docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
@@ -393,7 +580,13 @@ function renderList(){
 
     const labels = (gMode==='headings')
       ? (r.targets||[]).map(t=> (typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(String((typeof t==='string')? t : (t.key||''))) ).filter(Boolean)
-      : (r.targets||[]).map(t=> (typeof t==='object' && t.label) ? t.label : getFieldLabelById(String((typeof t==='string')? t : (t.id||'')))).filter(Boolean);
+      : (r.targets||[]).map(t=>{
+          if (typeof t==='object'){
+            if (t.optionLabel!=null) return t.label || `${getFieldLabelById(String(t.id))}: ${t.optionLabel}`;
+            return t.label || getFieldLabelById(String(t.id));
+          }
+          return getFieldLabelById(String(t));
+        }).filter(Boolean);
 
     left.innerHTML = `<strong>${r.action}</strong> — <em>${labels.join(', ') || '(no targets selected)'}</em> <span class="muted">${summarizeCondition(r)}</span>`;
 
@@ -490,21 +683,45 @@ function renderEditor(){
   });
   if (gMode==='fields'){ pEffect.appendChild(lblE); pEffect.appendChild(selE); row1.appendChild(pEffect); }
 
-  // When (source)
+  // When (source) — TREE/F SINGLE-LINE PICKER
   const pField = document.createElement('div'); pField.className='pair';
   const lblF = document.createElement('label'); lblF.textContent='When';
-  const selF = document.createElement('select');
-  const srcs = buildConditionSources(gSchema);
-  const defF = document.createElement('option'); defF.value=''; defF.textContent='Select source…';
-  if (gDraft && !rule.fieldId) selF.appendChild(defF);
-  if (!srcs.length){ const o=document.createElement('option'); o.value=''; o.textContent='(no fields)'; selF.appendChild(o); }
-  else srcs.forEach(s=>{ const o=document.createElement('option'); o.value=s.id; o.textContent=s.label; if(String(rule.fieldId)===String(s.id)) o.selected=true; selF.appendChild(o); });
-  selF.addEventListener('change', async ()=>{
-    rule.fieldId = selF.value || '';
-    if (!rule.fieldId){ rule.op=null; rule.values=[]; }
-    else{
-      const src = srcs.find(x=>String(x.id)===String(rule.fieldId));
-      if (src){
+
+  const pickWrap = document.createElement('div');
+  pickWrap.style.position = 'relative';
+  pickWrap.style.display = 'inline-block';
+
+  const btnPick = document.createElement('button');
+  btnPick.type = 'button';
+  btnPick.className = 'btn';
+  btnPick.textContent = (function(){
+    const srcsFlat = buildConditionSources(gSchema);
+    const cur = srcsFlat.find(s => String(s.id) === String(rule.fieldId));
+    return cur ? cur.label : 'Select source…';
+  })();
+  pickWrap.appendChild(btnPick);
+
+  const pop = document.createElement('div');
+  pop.style.position = 'absolute';
+  pop.style.top = '110%';
+  pop.style.left = '0';
+  pop.style.zIndex = '10';
+  pop.style.display = 'none';
+  pop.style.minWidth = '320px';
+  pickWrap.appendChild(pop);
+
+  function closePop(){ pop.style.display='none'; document.removeEventListener('click', outsideClose); }
+  function outsideClose(e){ if (!pickWrap.contains(e.target)) closePop(); }
+
+  const tree = buildConditionTree(gSchema);
+  renderTreeMenu(pop, tree, {
+    currentId: rule.fieldId,
+    onPick: async (pickedId) => {
+      rule.fieldId = pickedId || '';
+      const srcs = buildConditionSources(gSchema);
+      const src = srcs.find(x => String(x.id) === String(rule.fieldId));
+      if (!rule.fieldId){ rule.op=null; rule.values=[]; }
+      else if (src){
         if (src.type==='boolean'){ rule.op='equals'; rule.values=[true]; }
         else if (src.type==='date'){ rule.op='equals'; rule.values=['']; }
         else if (src.type==='text'){ rule.op='equals'; rule.values=['']; }
@@ -512,11 +729,46 @@ function renderEditor(){
         else if (src.type==='select'){ rule.op='equals'; rule.values=['']; }
         else { rule.op='equals'; rule.values=['']; }
       }
+      btnPick.textContent = src ? src.label : 'Select source…';
+      if (!gDraft){ await persistRules('change:fieldId'); renderEditor(); renderList(); }
+      else { renderEditor(); }
+      closePop();
     }
-    if (!gDraft){ await persistRules('change:fieldId'); renderEditor(); renderList(); }
-    else { renderEditor(); }
   });
-  pField.appendChild(lblF); pField.appendChild(selF);
+
+  btnPick.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (pop.style.display === 'none') {
+      renderTreeMenu(pop, buildConditionTree(gSchema), {
+        currentId: rule.fieldId,
+        onPick: async (pickedId)=>{
+          rule.fieldId = pickedId || '';
+          const srcs = buildConditionSources(gSchema);
+          const src = srcs.find(x => String(x.id) === String(rule.fieldId));
+          if (!rule.fieldId){ rule.op=null; rule.values=[]; }
+          else if (src){
+            if (src.type==='boolean'){ rule.op='equals'; rule.values=[true]; }
+            else if (src.type==='date'){ rule.op='equals'; rule.values=['']; }
+            else if (src.type==='text'){ rule.op='equals'; rule.values=['']; }
+            else if (src.type==='number'){ rule.op='equals'; rule.values=[0]; }
+            else if (src.type==='select'){ rule.op='equals'; rule.values=['']; }
+            else { rule.op='equals'; rule.values=['']; }
+          }
+          btnPick.textContent = src ? src.label : 'Select source…';
+          if (!gDraft){ await persistRules('change:fieldId'); renderEditor(); renderList(); }
+          else { renderEditor(); }
+          closePop();
+        }
+      });
+      pop.style.display = 'block';
+      setTimeout(() => document.addEventListener('click', outsideClose), 0);
+    } else {
+      closePop();
+    }
+  });
+
+  pField.appendChild(lblF);
+  pField.appendChild(pickWrap);
   row1.appendChild(pField);
 
   card.appendChild(row1);
@@ -581,56 +833,158 @@ function renderEditor(){
     card.appendChild(row2);
   }
 
-  // Row 3: targets
+  // Row 3: targets — both modes use TREE/F PICKERS
   if (gMode==='headings'){
-    const flat = flattenWithNumbers(gHeadingsTree);
-    if (flat.length){
-      const row3=document.createElement('div'); row3.className='rule-row';
-      const pair=document.createElement('div'); pair.className='pair';
-      const lbl=document.createElement('label'); lbl.textContent='Add heading';
-      const sel=document.createElement('select'); const def=document.createElement('option'); def.value=''; def.textContent='Select…'; sel.appendChild(def);
-      const chosen = new Set((rule.targets||[]).map(t=> (typeof t==='string')? t : t.key));
-      flat.forEach(h=>{ const comp = toCompositeKeyFromFlat(h); if (chosen.has(comp)) return; const o=document.createElement('option'); o.value=comp; o.textContent=h.label; sel.appendChild(o); });
-      sel.addEventListener('change', async ()=>{
-        const comp=sel.value; if (!comp) return;
-        const label = (flat.find(h=>toCompositeKeyFromFlat(h)===comp)?.label)||comp;
-        rule.targets = rule.targets || []; rule.targets.push({ key:comp, label });
-        await persistRules('change:addHeading'); renderEditor(); renderList();
-      });
-      pair.appendChild(lbl); pair.appendChild(sel); row3.appendChild(pair); card.appendChild(row3);
-    }
+    const row3=document.createElement('div'); row3.className='rule-row';
+    const pair=document.createElement('div'); pair.className='pair';
+    const lbl=document.createElement('label'); lbl.textContent='Add heading';
+    const wrap=document.createElement('div'); wrap.style.position='relative'; wrap.style.display='inline-block';
+
+    const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Open headings…';
+    wrap.appendChild(btn);
+
+    const pop=document.createElement('div');
+    pop.style.position='absolute'; pop.style.top='110%'; pop.style.left='0'; pop.style.zIndex='10';
+    pop.style.display='none'; pop.style.minWidth='360px';
+    wrap.appendChild(pop);
+
+    function close(){ pop.style.display='none'; document.removeEventListener('click', outside); }
+    function outside(e){ if (!wrap.contains(e.target)) close(); }
+
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      if (pop.style.display==='none'){
+        const nodes = buildHeadingsTreeNodes();
+        renderTreeMenu(pop, nodes, {
+          onPick: async (id)=>{
+            const already = (rule.targets||[]).some(t=> String(typeof t==='string'? t : t.key)===String(id));
+            if (already) return;
+            const label = id.includes('|') ? id.split('|').slice(1).join('|') : getHeadingLabelFromKey(String(id));
+            rule.targets = rule.targets || []; rule.targets.push({ key:id, label });
+            await persistRules('change:addHeading'); renderEditor(); renderList();
+          }
+        });
+        pop.style.display='block';
+        setTimeout(()=>document.addEventListener('click', outside),0);
+      } else close();
+    });
+
+    pair.appendChild(lbl); pair.appendChild(wrap); row3.appendChild(pair); card.appendChild(row3);
+
   } else {
-    const all = (gSchema.fields||[]).map(f=>({id:String(f.id), label:f.label||f.id}));
+    // FIELDS PICKER (toggleable)
     const row3=document.createElement('div'); row3.className='rule-row';
     const pair=document.createElement('div'); pair.className='pair';
     const lbl=document.createElement('label'); lbl.textContent='Add field';
-    const sel=document.createElement('select'); const def=document.createElement('option'); def.value=''; def.textContent='Select…'; sel.appendChild(def);
-    const chosen = new Set((rule.targets||[]).map(t=> String((typeof t==='string')? t : t.id)));
-    all.forEach(s=>{ if(!chosen.has(String(s.id))){ const o=document.createElement('option'); o.value=s.id; o.textContent=s.label; sel.appendChild(o);} });
-    sel.addEventListener('change', async ()=>{
-      const id=sel.value; if (!id) return;
-      const s = all.find(x=>String(x.id)===String(id)); if (!s) return;
-      rule.targets = rule.targets || []; rule.targets.push({ id:s.id, label:s.label });
-      await persistRules('change:addField'); renderEditor(); renderList();
+    const wrap=document.createElement('div'); wrap.style.position='relative'; wrap.style.display='inline-block';
+
+    const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Open fields…';
+    wrap.appendChild(btn);
+
+    const pop=document.createElement('div');
+    pop.style.position='absolute'; pop.style.top='110%'; pop.style.left='0'; pop.style.zIndex='10';
+    pop.style.display='none'; pop.style.minWidth='360px';
+    wrap.appendChild(pop);
+
+    function close(){ pop.style.display='none'; document.removeEventListener('click', outside); }
+    function outside(e){ if (!wrap.contains(e.target)) close(); }
+
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      if (pop.style.display==='none'){
+        const nodes = buildFieldTargetsTree();
+
+        // No disabling: every row is clickable (we will toggle add/remove)
+        renderTreeMenu(pop, nodes, {
+          disableIds: new Set(),
+          onPick: async (pickedId)=>{
+            if (pickedId.includes('__opt__')){
+              // option node toggle
+              const [fieldId, , optSlug] = pickedId.split('__opt__');
+              const f = (gSchema.fields||[]).find(x=> String(x.id)===String(fieldId));
+              if (!f) return;
+              const hit = normOptions(f).find(o => valueToSlug(o.value)===optSlug);
+              if (!hit) return;
+
+              if (hasOptionTarget(rule, fieldId, hit.value)){
+                // remove child + parent
+                removeOneChildAndParent(rule, fieldId, String(hit.value));
+                await persistRules('toggle:removeFieldOption'); renderEditor(); renderList();
+              } else {
+                // add child
+                const fieldLabel = f.label || f.id;
+                rule.targets = rule.targets || [];
+                rule.targets.push({
+                  id: String(fieldId),
+                  optionValue: String(hit.value),
+                  optionLabel: String(hit.label),
+                  label: `${fieldLabel}: ${hit.label}`
+                });
+                await persistRules('toggle:addFieldOption'); renderEditor(); renderList();
+              }
+              return;
+            }
+
+            // parent node toggle
+            const fieldId = pickedId;
+            if (hasParentTarget(rule, fieldId)){
+              removeAllChildren(rule, fieldId);
+              removeParent(rule, fieldId);
+              await persistRules('toggle:removeFieldAll'); renderEditor(); renderList();
+            } else {
+              addParentWithAllOptions(rule, fieldId);
+              await persistRules('toggle:addFieldAll'); renderEditor(); renderList();
+            }
+          }
+        });
+        pop.style.display='block';
+        setTimeout(()=>document.addEventListener('click', outside),0);
+      } else close();
     });
-    pair.appendChild(lbl); pair.appendChild(sel); row3.appendChild(pair); card.appendChild(row3);
+
+    pair.appendChild(lbl); pair.appendChild(wrap); row3.appendChild(pair); card.appendChild(row3);
   }
 
-  // Row 4: selected target pills
+  // Row 4: selected target pills (with cascade remove rules)
   const row4=document.createElement('div'); row4.className='rule-row';
   const lblSel=document.createElement('div'); lblSel.className='muted'; lblSel.textContent=(gMode==='headings'?'Selected headings:':'Selected fields:');
   const pills=document.createElement('div'); pills.className='pills';
   (rule.targets||[]).forEach(t=>{
     const isHead = (gMode==='headings');
-    const idOrKey = isHead ? (typeof t==='string'? t : t.key) : (typeof t==='string'? t : t.id);
-    const label = isHead ? ((typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(String(idOrKey)))
-                         : ((typeof t==='object' && t.label) ? t.label : getFieldLabelById(String(idOrKey)));
-    const pill=document.createElement('span'); pill.className='pill'; pill.title=String(idOrKey);
-    const txt=document.createElement('span'); txt.textContent=label || String(idOrKey);
+    let uniqId, labelText, isParent=false, fieldId=null, optValue=null;
+
+    if (isHead){
+      const key = (typeof t==='string'? t : t.key);
+      uniqId = String(key);
+      labelText = (typeof t==='object' && t.label) ? t.label : getHeadingLabelFromKey(String(key));
+    } else {
+      fieldId = String(typeof t==='object' ? t.id : t);
+      if (typeof t==='object' && t.optionValue!=null){
+        optValue = String(t.optionValue);
+        uniqId = `${fieldId}__opt__${valueToSlug(optValue)}`;
+        labelText = t.label || `${getFieldLabelById(String(fieldId))}: ${t.optionLabel}`;
+      } else {
+        uniqId = String(fieldId);
+        labelText = (typeof t==='object' && t.label) ? t.label : getFieldLabelById(String(fieldId));
+        isParent = true;
+      }
+    }
+
+    const pill=document.createElement('span'); pill.className='pill'; pill.title=uniqId;
+    const txt=document.createElement('span'); txt.textContent=labelText || uniqId;
     const x=document.createElement('button'); x.setAttribute('aria-label','Remove'); x.textContent='×';
     x.addEventListener('click', async ()=>{
-      if (isHead) rule.targets=(rule.targets||[]).filter(z=> String((typeof z==='string'? z : z.key)) !== String(idOrKey));
-      else rule.targets=(rule.targets||[]).filter(z=> String((typeof z==='string'? z : z.id)) !== String(idOrKey));
+      if (isHead){
+        rule.targets=(rule.targets||[]).filter(z=>{
+          const zk = String((typeof z==='string'? z : z.key));
+          return zk !== uniqId;
+        });
+      } else if (isParent){
+        removeParent(rule, fieldId);
+        removeAllChildren(rule, fieldId);
+      } else {
+        removeOneChildAndParent(rule, fieldId, optValue);
+      }
       await persistRules('change:removeTarget'); renderEditor(); renderList();
     });
     pill.appendChild(txt); pill.appendChild(x); pills.appendChild(pill);
@@ -672,7 +1026,6 @@ async function reloadState(reason){
   setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
   renderEditor(); renderList();
 
-  // DEBUG: print payload after any load/reload
   await debugLogPayload(`reload:${reason}`);
 }
 
@@ -699,7 +1052,7 @@ window.addEventListener('keydown', async (e) => {
   if (e.key === 'F9') {
     const st = await window.formSuitePersist.loadState(gDocId) || {};
     const p  = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
-    console.log('[rules][F9] dump', {
+    console.log('[rules][F9] dump]', {
       docId: gDocId,
       ws_rules: st.rules?.length || 0,
       ws_fieldRules: st.fieldRules?.length || 0,
