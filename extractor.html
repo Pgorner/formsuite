@@ -104,22 +104,33 @@
     // =========================
     // 🔎 DEBUG / TRACE PRIMITIVES
     // =========================
-    const DEBUG = { on: true, seq: 0 };
-    const _t = () => new Date().toISOString().slice(11, 23);
-    const tag = (name) => `%c[Extractor ${_t()} #${++DEBUG.seq}] ${name}`;
-    const tagStyle = 'color:#6b7280;font-weight:600';
+      const DEBUG = { on: true, seq: 0 };
+      const _t = () => new Date().toISOString().slice(11, 23);
+      const tag = (name) => `%c[Extractor ${_t()} #${++DEBUG.seq}] ${name}`;
+      const tagStyle = 'color:#6b7280;font-weight:600';
 
-    function TRACE(name, details) {
-      const label = `${name} :: ${_t()} :: #${DEBUG.seq+1}`;
-      console.groupCollapsed(tag(name), tagStyle, details ?? '');
-      console.time(label);
-      return {
-        step: (msg, data) => console.log(tag(`  ↳ ${msg}`), tagStyle, data ?? ''),
-        warn: (msg, data) => console.warn(tag(`  ⚠ ${msg}`), tagStyle, data ?? ''),
-        error: (msg, err) => console.error(tag(`  ✖ ${msg}`), tagStyle, err),
-        end: (extra) => { if (extra) console.log(tag('done'), tagStyle, extra); console.timeEnd(label); console.groupEnd(); }
-      };
-    }
+      function TRACE(name, details) {
+        const label = `${name} :: ${_t()} :: #${DEBUG.seq+1}`;
+        let ended = false;
+        try {
+          console.groupCollapsed(tag(name), tagStyle, details ?? '');
+        } catch {}
+        try {
+          console.time(label);
+        } catch {}
+        return {
+          step: (msg, data) => console.log(tag(`  ↳ ${msg}`), tagStyle, data ?? ''),
+          warn: (msg, data) => console.warn(tag(`  ⚠ ${msg}`), tagStyle, data ?? ''),
+          error: (msg, err) => console.error(tag(`  ✖ ${msg}`), tagStyle, err),
+          end: (extra) => {
+            if (ended) return;
+            ended = true;
+            if (extra) console.log(tag('done'), tagStyle, extra);
+            try { console.timeEnd(label); } catch {}
+            try { console.groupEnd(); } catch {}
+          }
+        };
+      }
 
     window.addEventListener('error', (e) => {
       console.error(tag('window.error'), tagStyle, { message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno, error: e.error });
@@ -271,7 +282,7 @@
     (function ensurePersist() {
       const tr = TRACE('ensurePersist');
       try {
-        if (window.formSuitePersist) { tr.step('already present'); tr.end(); return; }
+        if (window.formSuitePersist) { tr.step('already present'); return; }
         tr.step('installing shim');
         let _meta = null;
         let _state = {};
@@ -287,8 +298,11 @@
           putBytes: async (_docId, _bytes) => { tr.step('shim.putBytes', { docId:_docId, len: _bytes?.byteLength }); },
           ensurePermission: async (_h, _mode) => { tr.step('shim.ensurePermission', { mode:_mode }); return 'granted'; }
         };
-      } finally { tr.end(); }
+      } finally {
+        tr.end();
+      }
     })();
+
 
     // =========================
     // CROSS-TAB + LOCALSTORAGE
@@ -679,6 +693,47 @@
     // TAG MAP / PREVIEW HELPERS
     // =========================
 
+        // ---------- Common helpers ----------
+    function __slug(s) {
+      return String(s ?? '')
+        .normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+        .replace(/[^a-z0-9]+/gi,'_')
+        .replace(/^_+|_+$/g,'')
+        .toLowerCase();
+    }
+
+    function __resolveFieldRef(schema, ref) {
+      if (!ref) return null;
+      const id = String(ref);
+      const fields = Array.isArray(schema?.fields) ? schema.fields : [];
+      // by exact id
+      let f = fields.find(x => String(x.id) === id);
+      if (f) return f;
+      // by label slug
+      const s = __slug(id);
+      f = fields.find(x => __slug(x.label || x.id) === s);
+      return f || null;
+    }
+
+    // If the "when" field is a multichoice/select and the author wrote:
+    //   when "Field: Option" equals true
+    // …we keep the rule untouched for persistence. This helper only
+    // ensures a consistent shape for in-memory evaluation (no pruning!).
+    function __coerceRuleForMultichoiceOption(schema, rule, whenField) {
+      if (!whenField) return rule;
+      const type = whenField.type;
+      if (!['multichoice','select'].includes(type)) return rule;
+
+      // keep authoring intact — just ensure "values" is an array
+      const r = { ...rule };
+      if (!Array.isArray(r.values)) r.values = [r.values];
+
+      // nothing else is coerced here; evaluation layer should interpret:
+      // if op==="equals" && values includes true => check option(s) in targets
+      return r;
+    }
+
+
     // ---------- Rules pruning against schema (NEW) ----------
     function getValidFieldIdSet(schema) {
       return new Set((schema?.fields || []).map(f => String(f.id)));
@@ -790,7 +845,10 @@
       const own = idx.optionToField.get(s.toLowerCase());
       if (own) return own;
 
-      console.warn('[resolveFieldRef] could not resolve field for:', s);
+      console.warn('[resolveFieldRef] could not resolve field for:', s, {
+        schemaFields: (schema?.fields || []).map(f => f.id),
+        sampleField: schema?.fields?.[0]
+      });
       return null;
     }
 
@@ -809,7 +867,7 @@
       return out;
     }
 
-    function normalizeRulesForSchema(schema, rulesIn) {
+    function normalizeHeadingsRulesForSchema(schema, rulesIn) {
       const rules = Array.isArray(rulesIn) ? rulesIn : [];
       const out = [];
       for (const raw of rules) {
@@ -820,6 +878,7 @@
 
         const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw, fieldId: got.id }, got);
 
+        // prune invalid condition field refs (if any)
         if (Array.isArray(r0.conditions)) {
           r0.conditions = r0.conditions.filter(c => {
             const ref = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
@@ -828,6 +887,7 @@
           });
         }
 
+        // HEADINGS: coerce targets to numeric keys only
         if (Array.isArray(r0.targets)) {
           r0.targets = r0.targets
             .map(t => {
@@ -845,6 +905,228 @@
       }
       return out;
     }
+
+    // ---------- Helpers for robust field target resolution ----------
+    function __slug(s) {
+      return String(s ?? '')
+        .normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+        .replace(/[^a-z0-9]+/gi,'_')
+        .replace(/^_+|_+$/g,'')
+        .toLowerCase();
+    }
+
+    // Build: fieldId -> { id, label, type, options: [{value,label,slug}] }
+    function __buildOptionIndex(schema) {
+      const byField = new Map();
+      for (const f of (schema?.fields || [])) {
+        const rec = { id: String(f.id), label: String(f.label || f.id), type: f.type, options: [] };
+
+        // (A) plain "options"
+        if (Array.isArray(f.options)) {
+          for (const opt of f.options) {
+            const value = String(opt?.value ?? opt?.id ?? opt);
+            const label = String(opt?.label ?? opt?.text ?? value);
+            rec.options.push({ value, label, slug: __slug(label) });
+          }
+        }
+
+        // (B) multi-choice groups
+        if (f?.mc?.groups) {
+          for (const g of f.mc.groups) {
+            for (const it of (g.items||[])) {
+              const value = String(it?.value ?? it?.id ?? it);
+              const label = String(it?.label ?? it?.text ?? value);
+              rec.options.push({ value, label, slug: __slug(label) });
+            }
+          }
+        }
+
+        byField.set(rec.id, rec);
+      }
+      return byField;
+    }
+
+    /**
+     * Normalize FIELD rules ONLY (preserve option targets). Accepts targets as:
+     *  - { id: "<fieldId>", optionValue, optionLabel, label? }
+     *  - "fieldId" (parent field target)
+     *  - "fieldId__opt__slug"
+     *  - "Field Label: Option Label" (the UI’s combined string)
+     *  - { id: "fieldId", label: "Field Label: Option Label" } (legacy)
+     */
+    function normalizeFieldRulesForSchema(schema, rulesIn) {
+      const rules = Array.isArray(rulesIn) ? rulesIn : [];
+      const out = [];
+      const optionIndex = __buildOptionIndex(schema);
+      const fieldIndex  = new Map((schema?.fields || []).map(f => [String(f.id), f]));
+
+      const dbg = []; // collect per-rule debug
+
+      for (const raw of rules) {
+        if (!raw) continue;
+
+        // Resolve "when" field
+        const resolvedField = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
+        if (!resolvedField) {
+          dbg.push({ id: raw.id, drop: 'unresolved whenField', raw });
+          continue;
+        }
+
+        // Coerce condition if "looks like option" on multichoice/select
+        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw, fieldId: resolvedField.id }, resolvedField);
+
+        // prune invalid condition refs
+        if (Array.isArray(r0.conditions)) {
+          r0.conditions = r0.conditions.filter(c => {
+            const ref = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
+            return !!__resolveFieldRef(schema, ref);
+          });
+        }
+
+        // === Robust TARGET normalization for FIELD rules ===
+        const normTargets = [];
+        const tIn = Array.isArray(r0.targets) ? r0.targets : [];
+        const pf  = optionIndex.get(resolvedField.id); // parent field option catalog (if any)
+
+        for (const t of tIn) {
+          // 1) Already structured option target
+          if (t && typeof t === 'object' && (t.optionValue != null || t.optionLabel != null)) {
+            const id = String(t.id ?? resolvedField.id);
+            const optVal = String(t.optionValue ?? '');
+            const optLab = String(t.optionLabel ?? optVal);
+            const parentLabel = fieldIndex.get(id)?.label || id;
+            normTargets.push({
+              id,
+              optionValue: optVal,
+              optionLabel: optLab,
+              label: t.label || `${parentLabel}: ${optLab || optVal}`
+            });
+            continue;
+          }
+
+          // 2) String format
+          if (typeof t === 'string') {
+            const s = t.trim();
+
+            // 2a) "fieldId__opt__slug"
+            if (s.includes('__opt__')) {
+              const [maybeId, slug] = s.split('__opt__');
+              const id = String(maybeId);
+              const cat = optionIndex.get(id) || pf;
+              if (cat && cat.options?.length) {
+                const hit = cat.options.find(o => o.slug === __slug(slug));
+                if (hit) {
+                  normTargets.push({
+                    id: cat.id,
+                    optionValue: hit.value,
+                    optionLabel: hit.label,
+                    label: `${cat.label}: ${hit.label}`
+                  });
+                  continue;
+                }
+              }
+            }
+
+            // 2b) "Field Label: Option Label" (with colon)
+            if (s.includes(':')) {
+              const [lhs, rhs] = s.split(':');
+              const fieldLike = lhs.trim();
+              const optLike   = rhs.trim();
+
+              // Try resolve field by id first, then by label
+              let cat = optionIndex.get(fieldLike);
+              if (!cat) {
+                // try label match
+                for (const [_id, rec] of optionIndex.entries()) {
+                  if (__slug(rec.label) === __slug(fieldLike)) { cat = rec; break; }
+                }
+              }
+              // Fall back to the parent field
+              if (!cat) cat = pf;
+
+              if (cat && cat.options?.length) {
+                const hit =
+                  cat.options.find(o => __slug(o.label) === __slug(optLike)) ||
+                  cat.options.find(o => __slug(o.value) === __slug(optLike));
+                if (hit) {
+                  normTargets.push({
+                    id: cat.id,
+                    optionValue: hit.value,
+                    optionLabel: hit.label,
+                    label: `${cat.label}: ${hit.label}`
+                  });
+                  continue;
+                }
+              }
+            }
+
+            // 2c) plain field id string (parent field target)
+            if (fieldIndex.has(s)) {
+              const parentLabel = fieldIndex.get(s)?.label || s;
+              normTargets.push({ id: s, label: parentLabel });
+              continue;
+            }
+
+            // 2d) plain option label string (implied current parent field)
+            if (pf && pf.options?.length) {
+              const hit =
+                pf.options.find(o => __slug(o.label) === __slug(s)) ||
+                pf.options.find(o => __slug(o.value) === __slug(s));
+              if (hit) {
+                normTargets.push({
+                  id: pf.id,
+                  optionValue: hit.value,
+                  optionLabel: hit.label,
+                  label: `${pf.label}: ${hit.label}`
+                });
+                continue;
+              }
+            }
+
+            // Couldn’t resolve — keep a readable fallback to avoid silent loss
+            normTargets.push({ id: resolvedField.id, label: s });
+            continue;
+          }
+
+          // 3) Object without optionValue — maybe {id,label}
+          if (t && typeof t === 'object') {
+            const id = String(t.id ?? resolvedField.id);
+            const label = String(t.label ?? fieldIndex.get(id)?.label ?? id);
+            normTargets.push({ id, label });
+            continue;
+          }
+
+          // 4) Unknown / null — skip
+        }
+
+        // Attach normalized targets
+        const rFinal = { ...r0, targets: normTargets };
+
+        // Debug per rule
+        dbg.push({
+          id: rFinal.id,
+          whenField: rFinal.fieldId,
+          action: rFinal.action,
+          op: rFinal.op,
+          values: rFinal.values,
+          inTargetsCount: tIn.length,
+          outTargetsCount: normTargets.length,
+          sampleOut: normTargets[0] || null
+        });
+
+        out.push(rFinal);
+      }
+
+      // One consolidated debug line (keeps console tidy)
+      console.log('[normalizeFieldRulesForSchema][summary]', {
+        rulesIn: rules.length,
+        rulesOut: out.length,
+        details: dbg
+      });
+
+      return out;
+    }
+
 
     function normalizeForSchema(schema, values, tagMap) {
       const fieldIds = new Set((schema?.fields || []).map(f => String(f.id)));
@@ -903,60 +1185,69 @@
     // (REPLACE) updatePreview(values)
     // =========================
     async function updatePreview(values) {
-      if (!payloadEl) return;
+      const tr = TRACE('updatePreview');
+      try {
+        if (!payloadEl) return;
 
-      const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
 
-      // Prefer workspace rules if the arrays exist (even if empty).
-      const wsOnly = extractWorkspaceRulesOnly(wsState || {});
-      const plObj  = wsState?.payload?.CRONOS_PAYLOAD
-                  || wsState?.CRONOS_PAYLOAD
-                  || wsState?.cronos_payload
-                  || {};
-      const plOnly = extractRulesFromPayloadObject(plObj);
+        // Prefer workspace rules if the arrays exist (even if empty).
+        const wsOnly = extractWorkspaceRulesOnly(wsState || {});
+        const plObj  = wsState?.payload?.CRONOS_PAYLOAD
+                    || wsState?.CRONOS_PAYLOAD
+                    || wsState?.cronos_payload
+                    || {};
+        const plOnly = extractRulesFromPayloadObject(plObj);
 
-      const useWsRules      = Array.isArray(wsState?.rules);
-      const useWsFieldRules = Array.isArray(wsState?.fieldRules);
+        const useWsRules      = Array.isArray(wsState?.rules);
+        const useWsFieldRules = Array.isArray(wsState?.fieldRules);
 
-      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
-      // DEBUG: why these sources?
-      const usedSourceForRules =
-        (useWsRules || useWsFieldRules) ? 'workspace' : 'payloadMirror';
+        await debugLogExtractor('updatePreview:merge', {
+          function: 'updatePreview',
+          usedSourceForRules: (useWsRules || useWsFieldRules) ? 'workspace' : 'payloadMirror',
+          wsRules: (wsState?.rules || []).length,
+          plRules: (plObj?.rules || []).length,
+          wsFieldRules: (wsState?.fieldRules || []).length,
+          plFieldRules: (plObj?.fieldRules || []).length
+        });
 
-      await debugLogExtractor('updatePreview:merge', {
-        function: 'updatePreview',
-        usedSourceForRules,
-        wsRules: (wsState?.rules || []).length,
-        plRules: (plObj?.rules || []).length,
-        wsFieldRules: (wsState?.fieldRules || []).length,
-        plFieldRules: (plObj?.fieldRules || []).length
-      });
+        // Normalize against **current** gSchema (already set by renderFromCurrentBytes)
+        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
+        const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
-      // Normalize against current schema
-      const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
-      const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
+        // Instrument target survival for fieldRules
+        console.log('[FieldRules][targets]', fieldRules.map(r => ({
+          id: r.id, action: r.action, when: r.fieldId, op: r.op, values: r.values,
+          targetsCount: Array.isArray(r.targets) ? r.targets.length : 0,
+          sampleTarget: Array.isArray(r.targets) ? r.targets[0] : null
+        })));
 
-      const tagMapRaw = await getTagMapFor(gDocId);
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, values || {}, tagMapRaw);
+        const tagMapRaw = await getTagMapFor(gDocId);
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(gSchema, values || {}, tagMapRaw);
 
-      const previewObj = {
-        title:  gSchema?.title || 'Form',
-        fields: gSchema?.fields || [],
-        values: prunedValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules
-      };
-      payloadEl.value = JSON.stringify(previewObj, null, 2);
+        const previewObj = {
+          title:  gSchema?.title || 'Form',
+          fields: gSchema?.fields || [],
+          values: prunedValues,
+          tagMap: prunedTagMap,
+          rules,
+          fieldRules
+        };
+        payloadEl.value = JSON.stringify(previewObj, null, 2);
 
-      await debugLogExtractor('updatePreview:previewBuilt', {
-        function:'updatePreview',
-        previewLen: (payloadEl?.value || '').length
-      });
+        await debugLogExtractor('updatePreview:previewBuilt', {
+          function:'updatePreview',
+          previewLen: (payloadEl?.value || '').length
+        });
+      } finally {
+        tr.end();
+      }
     }
+
 
     let previewTimer = null;
     function schedulePreviewUpdate() {
@@ -1605,95 +1896,114 @@
     // (REPLACE) renderFromCurrentBytes(prefix = '')
     // =========================
     async function renderFromCurrentBytes(prefix = '') {
-      setStatus((prefix || '') + 'Parsing…');
-
-      // 1) SDTs
-      const parsed = await parseSDTs_JS(gArrayBuffer);
-      gSDTs = parsed.sdts || [];
-      renderSDTsView(parsed);
-
-      // 2) Headings (best-effort)
-      let headingsParsed = { flat: [], tree: [], count: 0 };
+      const tr = TRACE('renderFromCurrentBytes', { prefix });
       try {
-        headingsParsed = await parseHeadings_JS(gArrayBuffer);
-        renderHeadingsTreeView(headingsParsed.tree);
-      } catch {
-        if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
-      }
+        setStatus((prefix || '') + 'Parsing…');
 
-      // 3) Payload from DOCX (settings/custom)
-      let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
-      if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
-      let payload = null; try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
+        // 1) SDTs
+        const parsed = await parseSDTs_JS(gArrayBuffer);
+        gSDTs = parsed.sdts || [];
+        renderSDTsView(parsed);
 
-      const wsState = await window.formSuitePersist.loadState(gDocId);
+        // 2) Headings (best-effort)
+        let headingsParsed = { flat: [], tree: [], count: 0 };
+        try {
+          headingsParsed = await parseHeadings_JS(gArrayBuffer);
+          renderHeadingsTreeView(headingsParsed.tree);
+        } catch {
+          if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
+        }
 
-      // Choose schema: newer wins (workspace vs payload)
-      const asTs = (x)=> { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
-      const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
-      const pUpdatedTs = asTs(payload?.updatedAt);
-      const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
+        // 3) Payload from DOCX (settings/custom)
+        let payloadRaw = await readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
+        if (payloadRaw == null) payloadRaw = await readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
+        let payload = null; try { payload = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payload = null; }
 
-      let chosenSchema;
-      if (wsState?.schema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) {
-        chosenSchema = wsState.schema;
-      } else if (pHasSchema) {
-        chosenSchema = { title: payload.title || 'Form', fields: payload.fields };
-      } else {
-        chosenSchema = loadSchemaFromLocalStorage() || { title: 'Form', fields: [] };
-      }
+        const wsState = await window.formSuitePersist.loadState(gDocId);
 
-      // Merge values/tagMap (workspace overrides payload)
-      const mergedValues = Object.assign({}, payload?.values || {}, wsState?.values || {});
-      const mergedTagMap = Object.assign({}, payload?.tagMap || {}, wsState?.tagMap || {});
+        // Choose schema: newer wins (workspace vs payload)
+        const asTs = (x)=> { const t = Date.parse(x || ''); return Number.isFinite(t) ? t : 0; };
+        const pHasSchema = Array.isArray(payload?.fields) && payload.fields.length > 0;
+        const pUpdatedTs = asTs(payload?.updatedAt);
+        const wsSchemaTs = asTs(wsState?.schemaUpdatedAt);
 
-      // ---------- RULES: prefer workspace arrays if they exist; else fall back to payload ----------
-      const wsOnly = extractWorkspaceRulesOnly(wsState || {});
-      const plOnly = extractRulesFromPayloadObject(payload || {});
+        const chosenSchema =
+          (wsState?.schema && (wsSchemaTs >= pUpdatedTs || !pHasSchema)) ? wsState.schema
+          : pHasSchema ? { title: payload.title || 'Form', fields: payload.fields }
+          : (loadSchemaFromLocalStorage() || { title: 'Form', fields: [] });
 
-      const useWsRules      = Array.isArray(wsState?.rules);
-      const useWsFieldRules = Array.isArray(wsState?.fieldRules);
+        // Merge values/tagMap (workspace overrides payload)
+        const mergedValues = Object.assign({}, payload?.values || {}, wsState?.values || {});
+        const mergedTagMap = Object.assign({}, payload?.tagMap || {}, wsState?.tagMap || {});
 
-      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        // ---------- RULES: prefer workspace arrays if they exist; else fall back to payload ----------
+        const wsOnly = extractWorkspaceRulesOnly(wsState || {});
+        const plOnly = extractRulesFromPayloadObject(payload || {});
 
-      // Normalize everything to chosen schema
-      const rules      = normalizeRulesForSchema(chosenSchema, mergedRulesRaw);
-      const fieldRules = normalizeRulesForSchema(chosenSchema, mergedFieldRaw);
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
+        const useWsRules      = Array.isArray(wsState?.rules);
+        const useWsFieldRules = Array.isArray(wsState?.fieldRules);
 
-      // Adopt & persist mirrors so Save/Export see the same view (this is app-state only; not DOCX)
-      gSchema = chosenSchema;
-      gValues = prunedValues;
+        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
-      if (gDocId) {
-        const canonical = {
-          title: gSchema.title,
-          fields: gSchema.fields,
-          values: gValues,
-          tagMap: prunedTagMap,
-          rules, fieldRules,
-          updatedAt: new Date().toISOString()
-        };
-        await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema,
-          values: gValues,
-          tagMap: prunedTagMap,
-          rules, fieldRules,
-          headings: headingsParsed.flat,
-          headingsTree: headingsParsed.tree,
-          headingsUpdatedAt: new Date().toISOString(),
-          payload: { CRONOS_PAYLOAD: canonical },
-          CRONOS_PAYLOAD: canonical,
-          cronos_payload: canonical,
-          schemaUpdatedAt: new Date().toISOString()
+        // 🔎 DEBUG pre-normalization
+        console.log('[Rules][pre-normalize]', {
+          src: { rules: useWsRules ? 'workspace' : 'payload', fieldRules: useWsFieldRules ? 'workspace' : 'payload' },
+          counts: { rules: (mergedRulesRaw||[]).length, fieldRules: (mergedFieldRaw||[]).length }
         });
-      }
 
-      buildForm(document.getElementById('formMount'), gSchema, gValues);
-      await updatePreview(gValues);
-      setStatus('Ready.');
+        // ✅ Normalize EVERYTHING against the **chosen** schema (NOT gSchema yet!)
+        const rules      = normalizeHeadingsRulesForSchema(chosenSchema, mergedRulesRaw);
+        const fieldRules = normalizeFieldRulesForSchema(chosenSchema, mergedFieldRaw);
+
+        // 🔎 DEBUG post-normalization
+        console.log('[Rules][post-normalize]', {
+          rulesCount: rules.length,
+          fieldRulesCount: fieldRules.length,
+          sampleRule: rules[0],
+          sampleFieldRule: fieldRules[0]
+        });
+
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
+
+        // Adopt & persist mirrors so Save/Export see the same view
+        gSchema = chosenSchema;
+        gValues = prunedValues;
+
+        if (gDocId) {
+          const canonical = {
+            title: gSchema.title,
+            fields: gSchema.fields,
+            values: gValues,
+            tagMap: prunedTagMap,
+            rules, fieldRules,
+            updatedAt: new Date().toISOString()
+          };
+          await window.formSuitePersist.saveState(gDocId, {
+            schema: gSchema,
+            values: gValues,
+            tagMap: prunedTagMap,
+            rules, fieldRules,
+            headings: headingsParsed.flat,
+            headingsTree: headingsParsed.tree,
+            headingsUpdatedAt: new Date().toISOString(),
+            payload: { CRONOS_PAYLOAD: canonical },
+            CRONOS_PAYLOAD: canonical,
+            cronos_payload: canonical,
+            schemaUpdatedAt: new Date().toISOString()
+          });
+        }
+
+        buildForm(document.getElementById('formMount'), gSchema, gValues);
+        await updatePreview(gValues);
+        setStatus('Ready.');
+      } catch (e) {
+        tr.error('failed', e);
+        setStatus('Error while parsing. See console.');
+      } finally {
+        tr.end();
+      }
     }
 
 
@@ -1952,170 +2262,186 @@
     }
 
     async function doSave() {
-      if (!gArrayBuffer) return;
+      const tr = TRACE('doSave');
+      try {
+        if (!gArrayBuffer) return;
 
-      const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-      if (restored?.schema) gSchema = restored.schema;
+        const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        if (restored?.schema) gSchema = restored.schema;
 
-      const domVals  = collectFormValues(gSchema);
-      const baseVals = (restored && restored.values) ? restored.values : {};
-      const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
+        const domVals  = collectFormValues(gSchema);
+        const baseVals = (restored && restored.values) ? restored.values : {};
+        const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-      // --- RULES: prefer workspace arrays if they exist (even if empty); else fall back to payload ---
-      const wsOnly = extractWorkspaceRulesOnly(restored || {});
-      const plObj  = restored?.payload?.CRONOS_PAYLOAD
-                  || restored?.CRONOS_PAYLOAD
-                  || restored?.cronos_payload
-                  || {};
-      const plOnly = extractRulesFromPayloadObject(plObj);
+        const wsOnly = extractWorkspaceRulesOnly(restored || {});
+        const plObj  = restored?.payload?.CRONOS_PAYLOAD
+                    || restored?.CRONOS_PAYLOAD
+                    || restored?.cronos_payload
+                    || {};
+        const plOnly = extractRulesFromPayloadObject(plObj);
 
-      const useWsRules      = Array.isArray(restored?.rules);
-      const useWsFieldRules = Array.isArray(restored?.fieldRules);
+        const useWsRules      = Array.isArray(restored?.rules);
+        const useWsFieldRules = Array.isArray(restored?.fieldRules);
 
-      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
-      const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
-      const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
+        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
+        const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
+        console.log('[doSave][normalized]', { rules: rules.length, fieldRules: fieldRules.length });
 
-      gValues = prunedValues;
-      await updatePreview(gValues);
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
 
-      const payloadObj = {
-        title:  gSchema.title || 'Form',
-        fields: gSchema.fields || [],
-        values: gValues || {},
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        updatedAt: new Date().toISOString()
-      };
+        gValues = prunedValues;
+        await updatePreview(gValues);
 
-      setStatus('Writing payload to DOCX…');
-      const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
-      const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
-      gArrayBuffer = updatedU8.slice().buffer;
-
-      if (gDocId) {
-        const stamp = Date.now();
-        await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema,
-          values: gValues,
-          rules,                // workspace arrays (maybe empty) are authoritative
-          fieldRules,
+        const payloadObj = {
+          title:  gSchema.title || 'Form',
+          fields: gSchema.fields || [],
+          values: gValues || {},
           tagMap: prunedTagMap,
-          payload: { CRONOS_PAYLOAD: payloadObj },
-          CRONOS_PAYLOAD: payloadObj,
-          cronos_payload: payloadObj,
-          rulesVersion: stamp,
-          schemaUpdatedAt: new Date().toISOString()
-        });
-        await window.formSuitePersist.putBytes(gDocId, updatedU8);
-      }
+          rules,
+          fieldRules,
+          updatedAt: new Date().toISOString()
+        };
 
-      const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
-      gDocId = metaObj.docId;
-      persistActiveMeta(metaObj);
-      announceDocUpdate();
+        setStatus('Writing payload to DOCX…');
+        const updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
+        const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
+        gArrayBuffer = updatedU8.slice().buffer;
 
-      if (window.showSaveFilePicker && gFileHandle) {
-        const p = await ensureWritePermission(gFileHandle, 'readwrite');
-        if (p === 'granted') {
-          const stream = await gFileHandle.createWritable();
-          await stream.write(updatedU8);
-          await stream.close();
-          setStatus('Saved.');
-          gDirty = false;
-          return;
+        if (gDocId) {
+          const stamp = Date.now();
+          await window.formSuitePersist.saveState(gDocId, {
+            schema: gSchema,
+            values: gValues,
+            rules,
+            fieldRules,
+            tagMap: prunedTagMap,
+            payload: { CRONOS_PAYLOAD: payloadObj },
+            CRONOS_PAYLOAD: payloadObj,
+            cronos_payload: payloadObj,
+            rulesVersion: stamp,
+            schemaUpdatedAt: new Date().toISOString()
+          });
+          await window.formSuitePersist.putBytes(gDocId, updatedU8);
         }
+
+        const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
+        gDocId = metaObj.docId;
+        persistActiveMeta(metaObj);
+        announceDocUpdate();
+
+        if (window.showSaveFilePicker && gFileHandle) {
+          const p = await ensureWritePermission(gFileHandle, 'readwrite');
+          if (p === 'granted') {
+            const stream = await gFileHandle.createWritable();
+            await stream.write(updatedU8);
+            await stream.close();
+            setStatus('Saved.');
+            gDirty = false;
+            return;
+          }
+        }
+        setStatus('Saved in workspace (file write not available).');
+        gDirty = false;
+      } catch (e) {
+        tr.error('failed', e);
+        setStatus('Save failed.');
+      } finally {
+        tr.end();
       }
-      setStatus('Saved in workspace (file write not available).');
-      gDirty = false;
     }
 
     async function doExport() {
-      if (!gArrayBuffer) return;
+      const tr = TRACE('doExport');
+      try {
+        if (!gArrayBuffer) return;
 
-      const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-      if (restored?.schema) gSchema = restored.schema;
+        const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        if (restored?.schema) gSchema = restored.schema;
 
-      const domVals  = collectFormValues(gSchema);
-      const baseVals = (restored && restored.values) ? restored.values : {};
-      const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
+        const domVals  = collectFormValues(gSchema);
+        const baseVals = (restored && restored.values) ? restored.values : {};
+        const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
 
-      // --- RULES: prefer workspace arrays if they exist (even if empty); else fall back to payload ---
-      const wsOnly = extractWorkspaceRulesOnly(restored || {});
-      const plObj  = restored?.payload?.CRONOS_PAYLOAD
-                  || restored?.CRONOS_PAYLOAD
-                  || restored?.cronos_payload
-                  || {};
-      const plOnly = extractRulesFromPayloadObject(plObj);
+        const wsOnly = extractWorkspaceRulesOnly(restored || {});
+        const plObj  = restored?.payload?.CRONOS_PAYLOAD
+                    || restored?.CRONOS_PAYLOAD
+                    || restored?.cronos_payload
+                    || {};
+        const plOnly = extractRulesFromPayloadObject(plObj);
 
-      const useWsRules      = Array.isArray(restored?.rules);
-      const useWsFieldRules = Array.isArray(restored?.fieldRules);
+        const useWsRules      = Array.isArray(restored?.rules);
+        const useWsFieldRules = Array.isArray(restored?.fieldRules);
 
-      const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
-      const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
+        const mergedRulesRaw  = useWsRules      ? wsOnly.rules      : plOnly.rules;
+        const mergedFieldRaw  = useWsFieldRules ? wsOnly.fieldRules : plOnly.fieldRules;
 
-      const rules      = normalizeRulesForSchema(gSchema, mergedRulesRaw);
-      const fieldRules = normalizeRulesForSchema(gSchema, mergedFieldRaw);
+        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
+        const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
 
-      gValues = prunedValues;
+        gValues = prunedValues;
 
-      // 1) embed payload (workspace-authoritative rules)
-      const payloadObj = {
-        title:  gSchema.title || 'Form',
-        fields: gSchema.fields || [],
-        values: gValues || {},
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        updatedAt: new Date().toISOString()
-      };
-      let updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
+        // 1) embed payload
+        const payloadObj = {
+          title:  gSchema.title || 'Form',
+          fields: gSchema.fields || [],
+          values: gValues || {},
+          tagMap: prunedTagMap,
+          rules,
+          fieldRules,
+          updatedAt: new Date().toISOString()
+        };
+        let updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
 
-      // 2) replace SDTs via tagMap
-      const sdtMap = {};
-      for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
-        let v = gValues?.[fieldId];
-        if (v == null) v = '';
-        if (typeof v === 'object')
-          v = v.formatted ?? (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
-        sdtMap[tag] = String(v);
-      }
-      updated = await writeSDTs(updated, sdtMap);
-      const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
-
-      // 3) download/save as a new file
-      const suggested = (gFileName?.replace(/\.(docx|docm|dotx|dotm)$/i,'') || 'document') + '_export.' + gFileExt;
-      if (window.showSaveFilePicker) {
-        try {
-          const handle = await window.showSaveFilePicker({
-            suggestedName: suggested,
-            types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
-          });
-          const stream = await handle.createWritable();
-          await stream.write(updatedU8);
-          await stream.close();
-          setStatus(`Exported as “${handle.name || suggested}”.`);
-          gDirty = false;
-          return;
-        } catch (e) {
-          if (e?.name === 'AbortError') { setStatus('Export canceled.'); return; }
+        // 2) replace SDTs via tagMap
+        const sdtMap = {};
+        for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
+          let v = gValues?.[fieldId];
+          if (v == null) v = '';
+          if (typeof v === 'object')
+            v = v.formatted ?? (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
+          sdtMap[tag] = String(v);
         }
+        updated = await writeSDTs(updated, sdtMap);
+        const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
+
+        // 3) download/save as a new file
+        const suggested = (gFileName?.replace(/\.(docx|docm|dotx|dotm)$/i,'') || 'document') + '_export.' + gFileExt;
+        if (window.showSaveFilePicker) {
+          try {
+            const handle = await window.showSaveFilePicker({
+              suggestedName: suggested,
+              types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
+            });
+            const stream = await handle.createWritable();
+            await stream.write(updatedU8);
+            await stream.close();
+            setStatus(`Exported as “${handle.name || suggested}”.`);
+            gDirty = false;
+            return;
+          } catch (e) {
+            if (e?.name === 'AbortError') { setStatus('Export canceled.'); return; }
+          }
+        }
+        const blob = new Blob([updatedU8], { type: wordMimeFor(gFileExt) });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = suggested; a.click();
+        URL.revokeObjectURL(url);
+        setStatus(`Exported as “${suggested}”.`);
+        gDirty = false;
+      } catch (e) {
+        tr.error('failed', e);
+        setStatus('Export failed.');
+      } finally {
+        tr.end();
       }
-      const blob = new Blob([updatedU8], { type: wordMimeFor(gFileExt) });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; a.download = suggested; a.click();
-      URL.revokeObjectURL(url);
-      setStatus(`Exported as “${suggested}”.`);
-      gDirty = false;
     }
 
     // =========================
@@ -2125,59 +2451,71 @@
     let __payloadEditBusy = false;
 
     async function applyPayloadObject(obj, { broadcast = true, save = true } = {}) {
-      if (!obj || typeof obj !== 'object') return;
+      const tr = TRACE('applyPayloadObject');
+      try {
+        if (!obj || typeof obj !== 'object') return;
 
-      const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
-      const rawValues  = (obj.values && typeof obj.values === 'object') ? obj.values : {};
-      const rawTagMap  = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
+        const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
+        const rawValues  = (obj.values && typeof obj.values === 'object') ? obj.values : {};
+        const rawTagMap  = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
 
-      const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
-      const rawFieldR  = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
+        const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
+        const rawFieldR  = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
 
-      const rules      = normalizeRulesForSchema(nextSchema, rawRules);
-      const fieldRules = normalizeRulesForSchema(nextSchema, rawFieldR);
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(nextSchema, rawValues, rawTagMap);
+        const rules      = normalizeHeadingsRulesForSchema(nextSchema, rawRules);
+        const fieldRules = normalizeFieldRulesForSchema(nextSchema, rawFieldR);
 
-      gSchema = nextSchema;
-      gValues = prunedValues;
+        console.log('[applyPayloadObject][normalized]', {
+          rules: rules.length,
+          fieldRules: fieldRules.length,
+          sampleFR: fieldRules[0]
+        });
 
-      const payloadObj = {
-        title: gSchema.title,
-        fields: gSchema.fields,
-        values: gValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        updatedAt: new Date().toISOString()
-      };
+        const { values: prunedValues, tagMap: prunedTagMap } =
+          normalizeForSchema(nextSchema, rawValues, rawTagMap);
 
-      if (gDocId && save) {
-        await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema,
+        gSchema = nextSchema;
+        gValues = prunedValues;
+
+        const payloadObj = {
+          title: gSchema.title,
+          fields: gSchema.fields,
           values: gValues,
           tagMap: prunedTagMap,
-          rules, fieldRules,
-          payload: { CRONOS_PAYLOAD: payloadObj },
-          CRONOS_PAYLOAD: payloadObj,
-          cronos_payload: payloadObj,
-          schemaUpdatedAt: new Date().toISOString()
-        });
-      } else {
-        try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields })); } catch {}
+          rules,
+          fieldRules,
+          updatedAt: new Date().toISOString()
+        };
+
+        if (gDocId && save) {
+          await window.formSuitePersist.saveState(gDocId, {
+            schema: gSchema,
+            values: gValues,
+            tagMap: prunedTagMap,
+            rules, fieldRules,
+            payload: { CRONOS_PAYLOAD: payloadObj },
+            CRONOS_PAYLOAD: payloadObj,
+            cronos_payload: payloadObj,
+            schemaUpdatedAt: new Date().toISOString()
+          });
+        } else {
+          try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields })); } catch {}
+        }
+
+        buildForm(document.getElementById('formMount'), gSchema, gValues);
+        await updatePreview(gValues);
+
+        if (broadcast) {
+          try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
+          try { bcCanon?.postMessage({ type: 'schema-updated',  docId: gDocId, ts: Date.now() }); } catch {}
+        }
+
+        gDirty = true;
+        setStatus('Payload applied (normalized). Not yet saved to DOCX.');
+        if (previewStatus) { previewStatus.textContent = 'Applied'; setTimeout(()=> previewStatus.textContent='', 900); }
+      } finally {
+        tr.end();
       }
-
-      buildForm(document.getElementById('formMount'), gSchema, gValues);
-      await updatePreview(gValues);
-
-      if (broadcast) {
-        try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
-        try { bcCanon?.postMessage({ type: 'schema-updated',  docId: gDocId, ts: Date.now() }); } catch {}
-      }
-
-      gDirty = true;
-      setStatus('Payload applied (normalized). Not yet saved to DOCX.');
-      if (previewStatus) { previewStatus.textContent = 'Applied'; setTimeout(()=> previewStatus.textContent='', 900); }
     }
 
 

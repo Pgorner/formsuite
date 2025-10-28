@@ -900,18 +900,19 @@ function renderEditor(){
           onPick: async (pickedId)=>{
             if (pickedId.includes('__opt__')){
               // option node toggle
-              const [fieldId, , optSlug] = pickedId.split('__opt__');
+              const [fieldId, optSlug] = pickedId.split('__opt__'); // <-- fixed destructuring
               const f = (gSchema.fields||[]).find(x=> String(x.id)===String(fieldId));
               if (!f) return;
-              const hit = normOptions(f).find(o => valueToSlug(o.value)===optSlug);
+
+              const hit = normOptions(f).find(o => valueToSlug(String(o.value)) === String(optSlug));
               if (!hit) return;
 
               if (hasOptionTarget(rule, fieldId, hit.value)){
-                // remove child + parent
+                // remove child + (also drop parent if it ends up orphaned)
                 removeOneChildAndParent(rule, fieldId, String(hit.value));
                 await persistRules('toggle:removeFieldOption'); renderEditor(); renderList();
               } else {
-                // add child
+                // add child (but don't force-add the parent—pill UI will still show nicely)
                 const fieldLabel = f.label || f.id;
                 rule.targets = rule.targets || [];
                 rule.targets.push({
