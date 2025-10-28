@@ -960,12 +960,25 @@
         if (Array.isArray(r0.targets)) {
           r0.targets = r0.targets
             .map(t => {
+              if (t == null) return null;
               let key = t?.key ?? t?.idx ?? t?.id;
               if (key == null) return null;
+
               const rawKey = String(key);
               const head = rawKey.includes('|') ? rawKey.split('|')[0] : rawKey;
               const n = Number(head);
-              return Number.isFinite(n) && n > 0 ? { key: n } : null;
+
+              if (Number.isFinite(n) && n >= 0) {
+                return { key: n };
+              }
+
+              if (typeof t === 'object') {
+                const copy = { ...t };
+                if (copy.key == null) copy.key = rawKey;
+                return copy;
+              }
+
+              return { key: rawKey };
             })
             .filter(Boolean);
         }
