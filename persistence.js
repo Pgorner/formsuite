@@ -9,7 +9,10 @@
    • Broadcast payload patches across tabs + snapshot/rehydration
 
    IMPORTANT (Oct 2025):
-   • Rules are now handled like values/tagMap:
+   • Content-addressed identity: docId = "<basename>#<sha256:12>"
+     - Different file contents → different docId (even if filename is identical)
+     - Everything is strictly keyed by docId
+   • Rules are handled like values/tagMap:
      - Patch into workspace state
      - Mirror into payload.CRONOS_PAYLOAD
      - No immediate DOCX embedding during edit (export handles it)
@@ -40,8 +43,6 @@
   const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
 
   // ===== Utils =====
-  const uuid = () =>
-    (crypto?.randomUUID?.() || ('doc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)));
   const readJSON = (k) => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch { return null; } };
   const writeJSON = (k, v) => { try { (v == null) ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch {} };
   const isPlainObject = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
@@ -62,6 +63,27 @@
     if (!st || typeof st !== 'object') return true;
     const keys = Object.keys(st).filter(k => !k.startsWith('__'));
     return keys.length === 0;
+  }
+
+  // --- Content-addressing helpers (stable doc identity) ---
+  async function sha256Hex(bytes) {
+    const ab = (bytes instanceof ArrayBuffer) ? bytes
+           : (bytes && bytes.buffer instanceof ArrayBuffer) ? bytes.buffer
+           : new Uint8Array(bytes || []).buffer;
+    const d = await crypto.subtle.digest('SHA-256', ab);
+    const u8 = new Uint8Array(d);
+    let out = '';
+    for (let i = 0; i < u8.length; i++) out += u8[i].toString(16).padStart(2, '0');
+    return out;
+  }
+  function splitNameAndExt(name) {
+    const m = /^(.*?)(\.(docx|docm|dotx|dotm))?$/i.exec(name || 'document.docx');
+    return { base: (m && m[1]) || 'document', ext: (m && m[2]) || '.docx' };
+  }
+  async function computeDocIdFromBytes(bytes, fileName) {
+    const hex = await sha256Hex(bytes);
+    const { base } = splitNameAndExt(fileName || 'document.docx');
+    return `${base}#${hex.slice(0,12)}`; // short, collision-resistant id
   }
 
   // ===== IndexedDB for FileSystemFileHandle =====
@@ -272,7 +294,7 @@
       emit('active', null);
       return null;
     }
-    const next = { docId: metaOrNull.docId, name: metaOrNull.name || 'document' };
+    const next = { docId: metaOrNull.docId, name: metaOrNull.name || 'document.docx' };
     _active = next;
     writeActiveToStorage(next);
     const payload = { docId: next.docId, name: next.name, ts: Date.now() };
@@ -462,53 +484,47 @@
     return newBuf.buffer;
   }
 
-  // ===== High-level “set current” APIs =====
+  // ===== High-level “set current” APIs (CONTENT-ADDRESSED) =====
+  /**
+   * Set the active document from bytes/handle/name.
+   * Always computes docId = "<basename>#<sha256:12>" from BYTES if available.
+   * If only a handle is provided, this attempts to read its bytes for hashing.
+   */
   async function setCurrentDoc({ bytes, handle, name }) {
-    const prev = readActiveFromStorage();
-
-    // Compute fingerprint if we have bytes
-    let newFp = null;
-    try {
-      if (bytes && (bytes.byteLength || (bytes.length|0) > 0)) {
-        const ab = (bytes instanceof ArrayBuffer) ? bytes
-                 : (bytes && bytes.buffer instanceof ArrayBuffer) ? bytes.buffer
-                 : new Uint8Array(bytes || []).buffer;
-        const d = await crypto.subtle.digest('SHA-256', ab);
-        newFp = Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2,'0')).join('');
-      }
-    } catch {}
-
-    // Decide whether to reuse previous docId
-    let reusePrev = false;
-    if (prev?.docId) {
-      try {
-        const prevState = await loadState(prev.docId);
-        const prevFp = prevState?.fingerprint || null;
-        if (prevFp && newFp && prevFp === newFp) reusePrev = true;
-      } catch {}
+    // 1) Normalize name and obtain bytes for hashing
+    const fileName = name || 'document.docx';
+    let theBytes = bytes;
+    if (!theBytes && handle?.getFile) {
+      try { const f = await handle.getFile(); theBytes = await f.arrayBuffer(); } catch {}
     }
+    if (!theBytes) throw new Error('setCurrentDoc: bytes or readable handle required to compute content id');
 
-    const docId = (reusePrev && prev?.docId) ? prev.docId : uuid();
-    const meta  = { docId, name: (name || prev?.name || 'document').replace(/\.docx$/i,'') };
+    // 2) Compute content-addressed docId
+    const docId = await computeDocIdFromBytes(theBytes, fileName);
+    const meta  = { docId, name: fileName };
 
-    // Persist handle & bytes (best-effort)
+    // 3) Persist handle & bytes (best-effort)
     if (handle) await idbPutHandle(docId, handle);
-    if (bytes)  await opfsPut(docId, bytes);
+    await opfsPut(docId, theBytes);
 
-    // Ensure minimal state and fingerprint
+    // 4) Ensure minimal state and content fingerprint
+    const fingerprint = await sha256Hex(theBytes);
     const existing = await loadState(docId);
     if (!existing || isEmptyState(existing)) {
-      await saveState(docId, { schema: null, values: {}, rules: [], fieldRules: [], fingerprint: newFp || null });
-    } else if (newFp && existing.fingerprint !== newFp) {
-      await saveState(docId, { fingerprint: newFp });
+      await saveState(docId, { schema: null, values: {}, rules: [], fieldRules: [], fingerprint });
+    } else if (existing.fingerprint !== fingerprint) {
+      await saveState(docId, { fingerprint });
     }
 
+    // 5) Flip active & try to hydrate schema/payload from DOCX if none present
     await setActiveDoc(meta); // BC + LS
     try { await hydrateFromDocxIfEmpty(docId); } catch {}
     return meta;
   }
   async function setCurrentDocFromBytes(bytes, meta = {}) {
-    return await setCurrentDoc({ bytes, handle: meta.handle, name: meta.name });
+    // Accept meta.name for basename, meta.handle optional
+    const fileName = meta?.name || 'document.docx';
+    return await setCurrentDoc({ bytes, handle: meta.handle, name: fileName });
   }
 
   // ===== Utils bundle used by pages (values/tagMap cleaning) =====
@@ -978,14 +994,20 @@
       setStatus('Opening picker…');
       try {
         const { file, bytes, handle } = await pickDocxFile();
-        const nameNoExt = (file?.name || 'document').replace(/\.docx$/i, '');
+        const name = file?.name || 'document.docx';
         let meta;
         if (window.formSuitePersist?.setCurrentDoc) {
-          meta = await window.formSuitePersist.setCurrentDoc({ bytes, handle, name: nameNoExt + '.docx' });
+          meta = await window.formSuitePersist.setCurrentDoc({ bytes, handle, name });
         } else if (window.formSuitePersist?.setCurrentDocFromBytes) {
-          meta = await window.formSuitePersist.setCurrentDocFromBytes(bytes, { name: nameNoExt + '.docx', handle });
+          meta = await window.formSuitePersist.setCurrentDocFromBytes(bytes, { name, handle });
         } else {
-          meta = { docId: 'inline-' + Date.now(), name: nameNoExt + '.docx' };
+          // last-ditch: content-address here (rare path)
+          const hex = await (async () => {
+            const d = await crypto.subtle.digest('SHA-256', bytes.buffer || bytes);
+            const u8 = new Uint8Array(d); let s=''; for (let i=0;i<u8.length;i++) s+=u8[i].toString(16).padStart(2,'0'); return s;
+          })();
+          const base = (name || 'document.docx').replace(/\.(docx|docm|dotx|dotm)$/i,'');
+          meta = { docId: `${base}#${hex.slice(0,12)}`, name };
         }
         try { await window.formSuitePersist?.putBytes?.(meta.docId, bytes); } catch {}
         broadcastActive(meta);

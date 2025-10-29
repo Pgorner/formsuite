@@ -2172,10 +2172,11 @@
     async function persistCurrentDoc(bytesU8, handle, nameNoExt, ext = 'docx') {
       const tr = TRACE('persistCurrentDoc', { hasBytes: !!bytesU8, handle: !!handle, nameNoExt, ext });
       try {
+        if (!bytesU8) throw new Error('persistCurrentDoc requires bytes');
         const safeExt = (ext || 'docx').toLowerCase();
-        const name = `${(nameNoExt || 'document').replace(/\.(docx|docm|dotx|dotm)$/i,'')}.${safeExt}`;
-        tr.step('computed name', name);
-        tr.step('hash', await sha256Hex(bytesU8));
+        const name    = `${(nameNoExt || 'document').replace(/\.(docx|docm|dotx|dotm)$/i,'')}.${safeExt}`;
+
+        // Always content-address via persistence.js
         if (window.formSuitePersist?.setCurrentDoc) {
           const meta = await window.formSuitePersist.setCurrentDoc({ bytes: bytesU8, handle, name });
           tr.end(meta); return meta;
@@ -2184,11 +2185,13 @@
           const meta = await window.formSuitePersist.setCurrentDocFromBytes(bytesU8, { name, handle });
           tr.end(meta); return meta;
         }
+
+        // Last-ditch fallback (shouldn’t normally hit)
         const meta = { docId: 'inline-' + Date.now(), name };
-        tr.end(meta);
-        return meta;
+        tr.end(meta); return meta;
       } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
+
 
     // ---------- Rules → Visibility map (SHOW supersedes HIDE) ----------
     function loadRulesForDoc(state) {
@@ -2263,47 +2266,54 @@
       try {
         clearUiForNewDoc('Opening…');
 
+        // 1) Let the user pick a DOCX (File System Access API)
         const [handle] = await showOpenFilePicker({
           multiple: false,
+          excludeAcceptAllOption: true,
           types: [{
             description: 'Word document',
-            accept: {
-              'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-              'application/vnd.ms-word.document.macroEnabled.12': ['.docm'],
-              'application/vnd.openxmlformats-officedocument.wordprocessingml.template': ['.dotx'],
-              'application/vnd.ms-word.template.macroEnabled.12': ['.dotm']
-            }
+            accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm'] }
           }]
         });
 
-        gFileHandle = handle;
-        const file = await handle.getFile();
-        const { base, ext } = splitNameAndExt(file.name || 'document.docx');
-        gFileName = base || 'document';
-        gFileExt  = ext;
-
+        // 2) Read bytes and compute content-addressed docId via persistence.js
+        const file  = await handle.getFile();
         const bytes = new Uint8Array(await file.arrayBuffer());
-        gArrayBuffer = bytes.buffer;
+        const { base, ext } = splitNameAndExt(file.name || 'document.docx');
+        gFileHandle = handle;
+        gFileName   = base || 'document';
+        gFileExt    = ext  || '.docx';
 
-        tr.step('opened', { name: `${gFileName}.${gFileExt}`, size: bytes.byteLength, sha: await sha256Hex(bytes) });
+        // IMPORTANT: this call computes docId = "<basename>#<sha256:12>" from BYTES
+        const metaObj = await window.formSuitePersist.setCurrentDoc({
+          bytes,
+          handle,
+          name: `${gFileName}${gFileExt}`
+        });
 
-        const metaObj = await persistCurrentDoc(bytes, gFileHandle, gFileName, gFileExt);
-        gDocId = metaObj.docId;
-        persistActiveMeta(metaObj);
+        // 3) Switch local context to the NEW docId (even if filename is identical)
+        gDocId        = metaObj.docId;
+        gArrayBuffer  = bytes.buffer;
+        persistActiveMeta(metaObj);     // keep existing cross-tab signals
         announceDocSwitch();
-        gPreferDocOnNextLoad = true;
-        await renderFromCurrentBytes();
 
+        // 4) Re-render and refresh permission banner
+        await renderFromCurrentBytes();
         await updateWriteAccessBanner({ tryPrompt: true });
 
-        btnSave.disabled = false; btnExport.disabled = false;
+        // 5) Enable actions
+        btnSave.disabled = false;
+        btnExport.disabled = false;
         if (btnSaveFromPreview) btnSaveFromPreview.disabled = false;
+
+        tr.step('opened', { name: `${gFileName}${gFileExt}`, size: bytes.byteLength, docId: gDocId });
       } catch (e) {
         if (e?.name === 'AbortError') { tr.step('user canceled'); return; }
         tr.error('open failed', e);
         setStatus(`Error opening file: ${e.message || e}`);
       } finally { tr.end(); }
     }
+
 
     async function ensureWritePermission(handle) {
       const tr = TRACE('ensureWritePermission', { haveHandle: !!handle });

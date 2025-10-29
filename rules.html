@@ -614,6 +614,15 @@ function renderList(){
   });
 }
 
+function getMultiOptionHeaderIdsForConditions(){
+  const ids = new Set();
+  for (const f of (gSchema?.fields || [])){
+    const t = String(f.type || '').toLowerCase();
+    if (isMultiOption(t)) ids.add(String(f.id));
+  }
+  return ids;
+}
+
 function currentEditorRule(){ if (gDraft) return gDraft; if (gEditingId) return (gRules||[]).find(r=>r.id===gEditingId) || null; return null; }
 
 function renderEditor(){
@@ -713,35 +722,17 @@ function renderEditor(){
   function closePop(){ pop.style.display='none'; document.removeEventListener('click', outsideClose); }
   function outsideClose(e){ if (!pickWrap.contains(e.target)) closePop(); }
 
-  const tree = buildConditionTree(gSchema);
-  renderTreeMenu(pop, tree, {
-    currentId: rule.fieldId,
-    onPick: async (pickedId) => {
-      rule.fieldId = pickedId || '';
-      const srcs = buildConditionSources(gSchema);
-      const src = srcs.find(x => String(x.id) === String(rule.fieldId));
-      if (!rule.fieldId){ rule.op=null; rule.values=[]; }
-      else if (src){
-        if (src.type==='boolean'){ rule.op='equals'; rule.values=[true]; }
-        else if (src.type==='date'){ rule.op='equals'; rule.values=['']; }
-        else if (src.type==='text'){ rule.op='equals'; rule.values=['']; }
-        else if (src.type==='number'){ rule.op='equals'; rule.values=[0]; }
-        else if (src.type==='select'){ rule.op='equals'; rule.values=['']; }
-        else { rule.op='equals'; rule.values=['']; }
-      }
-      btnPick.textContent = src ? src.label : 'Select source…';
-      if (!gDraft){ await persistRules('change:fieldId'); renderEditor(); renderList(); }
-      else { renderEditor(); }
-      closePop();
-    }
-  });
-
+  // Open the condition (source) picker — only here are some IDs disabled (multi-option parents)
   btnPick.addEventListener('click', (e) => {
     e.stopPropagation();
     if (pop.style.display === 'none') {
+      const disabledIds2 = getMultiOptionHeaderIdsForConditions(); // parents of multichoice/multiselect
       renderTreeMenu(pop, buildConditionTree(gSchema), {
         currentId: rule.fieldId,
+        disableIds: disabledIds2,
         onPick: async (pickedId)=>{
+          if (disabledIds2.has(String(pickedId))) return; // hard guard
+
           rule.fieldId = pickedId || '';
           const srcs = buildConditionSources(gSchema);
           const src = srcs.find(x => String(x.id) === String(rule.fieldId));
@@ -855,13 +846,17 @@ function renderEditor(){
       e.stopPropagation();
       if (pop.style.display==='none'){
         const nodes = buildHeadingsTreeNodes();
+        // No greying/disable here — all headings/selectable
         renderTreeMenu(pop, nodes, {
-          onPick: async (id)=>{
-            const already = (rule.targets||[]).some(t=> String(typeof t==='string'? t : t.key)===String(id));
+          disableIds: new Set(),
+          onPick: async (id) => {
+            const already = (rule.targets||[]).some(t=> String(typeof t==='string' ? t : t.key) === String(id));
             if (already) return;
             const label = id.includes('|') ? id.split('|').slice(1).join('|') : getHeadingLabelFromKey(String(id));
-            rule.targets = rule.targets || []; rule.targets.push({ key:id, label });
-            await persistRules('change:addHeading'); renderEditor(); renderList();
+            rule.targets = rule.targets || [];
+            rule.targets.push({ key:id, label });
+            await persistRules('change:addHeading');
+            renderEditor(); renderList();
           }
         });
         pop.style.display='block';
@@ -894,13 +889,13 @@ function renderEditor(){
       if (pop.style.display==='none'){
         const nodes = buildFieldTargetsTree();
 
-        // No disabling: every row is clickable (we will toggle add/remove)
+        // No disabling: every row is clickable (toggle add/remove)
         renderTreeMenu(pop, nodes, {
           disableIds: new Set(),
           onPick: async (pickedId)=>{
             if (pickedId.includes('__opt__')){
               // option node toggle
-              const [fieldId, optSlug] = pickedId.split('__opt__'); // <-- fixed destructuring
+              const [fieldId, optSlug] = pickedId.split('__opt__');
               const f = (gSchema.fields||[]).find(x=> String(x.id)===String(fieldId));
               if (!f) return;
 
@@ -908,11 +903,10 @@ function renderEditor(){
               if (!hit) return;
 
               if (hasOptionTarget(rule, fieldId, hit.value)){
-                // remove child + (also drop parent if it ends up orphaned)
+                // remove child + drop parent if ends up orphaned
                 removeOneChildAndParent(rule, fieldId, String(hit.value));
                 await persistRules('toggle:removeFieldOption'); renderEditor(); renderList();
               } else {
-                // add child (but don't force-add the parent—pill UI will still show nicely)
                 const fieldLabel = f.label || f.id;
                 rule.targets = rule.targets || [];
                 rule.targets.push({

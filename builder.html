@@ -191,7 +191,7 @@
         }
         // Active doc → reload workspace state (no LS fallback)
         const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        FORM_BUILDER.schema = st?.schema || loadLS() || { title: 'Untitled form', fields: [] };
+        FORM_BUILDER.schema = st?.schema || { title: 'Untitled form', fields: [] };
         els.formTitle.value = FORM_BUILDER.schema.title || '';
         renderAll({ persist:false });
         els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
