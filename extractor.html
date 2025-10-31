@@ -219,6 +219,7 @@
     let gLastSchemaPushTs = 0;
     let gPreferDocOnNextLoad = false;   // prefer DOCX payload only right after doOpen()
     let gFileExt = 'docx'; // 'docx' | 'docm' | 'dotx' | 'dotm'
+    let gHeadingBaseline = { flat: [], tree: [] };
 
     // NEW: hold structured address values while editing
     const __addressValues = Object.create(null);
@@ -350,6 +351,7 @@
       gSchema = { title: 'Form', fields: [] };
       gValues = {};
       gDirty = false;
+      adoptHeadingBaseline({ flat: [], tree: [] });
     }
 
     async function hardResetDocContext(reason = '') {
@@ -361,6 +363,7 @@
         }
       } catch (e) { tr.error('saveState failed', e); }
       gArrayBuffer = null; gFileHandle = null; gFileName = null; gDocId = null; gSDTs = [];
+      adoptHeadingBaseline({ flat: [], tree: [] });
       clearActiveMeta();
       try {
         tableBody.innerHTML = '<tr><td colspan="5" class="empty">No document loaded.</td></tr>';
@@ -400,6 +403,10 @@
         if (m.type === 'schema-updated' && m.docId && m.docId === gDocId) {
           gLastSchemaPushTs = m.ts || Date.now();
           const st = await window.formSuitePersist.loadState(gDocId);
+          adoptHeadingBaseline({
+            flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : Array.isArray(st?.headings) ? st.headings : [],
+            tree: Array.isArray(st?.headingsTree) ? st.headingsTree : []
+          });
           if (st?.schema) {
             const domVals = collectFormValues(st.schema);
             const wsVals  = st.values || {};
@@ -921,24 +928,280 @@
       return null;
     }
 
+    function adoptHeadingBaseline(baseline) {
+      const flat = baseline?.flat
+        ? Array.isArray(baseline.flat) ? baseline.flat.slice() : []
+        : Array.isArray(baseline) ? baseline.slice()
+        : Array.isArray(baseline?.headings) ? baseline.headings.slice()
+        : [];
+      const tree = baseline?.tree
+        ? (Array.isArray(baseline.tree) ? baseline.tree.slice() : [])
+        : Array.isArray(baseline?.headingsTree) ? baseline.headingsTree.slice()
+        : [];
+      gHeadingBaseline = { flat, tree };
+    }
+
+    function buildHeadingTargetIndex(baseline) {
+      const flat = Array.isArray(baseline?.flat)
+        ? baseline.flat
+        : Array.isArray(baseline) ? baseline
+        : Array.isArray(baseline?.headings) ? baseline.headings
+        : [];
+      const tree = Array.isArray(baseline?.tree)
+        ? baseline.tree
+        : Array.isArray(baseline?.headingsTree) ? baseline.headingsTree
+        : [];
+
+      const byIdx = new Map();
+      const byUid = new Map();
+      const byComposite = new Map();
+      const byNumber = new Map();
+
+      const normComposite = (entry) => {
+        const idx = Number(entry?.idx ?? entry?.key);
+        const text = entry?.text || entry?.title || entry?.label || '';
+        const num = entry?.number || entry?.num;
+        if (num) return `${String(num)}|${text}`.trim();
+        if (Number.isFinite(idx)) return `${idx}|${text}`.trim();
+        return text ? `|${text}` : '';
+      };
+
+      const add = (entry) => {
+        if (!entry) return;
+        const idx = Number(entry.idx ?? entry.key);
+        if (Number.isFinite(idx) && !byIdx.has(idx)) byIdx.set(idx, entry);
+        const uid = entry.uid || entry.id;
+        if (uid && !byUid.has(String(uid))) byUid.set(String(uid), entry);
+        const num = entry.number || entry.num;
+        if (num && !byNumber.has(String(num))) byNumber.set(String(num), entry);
+        const composite = entry.compositeKey || normComposite(entry);
+        if (composite) {
+          if (!byComposite.has(composite)) byComposite.set(composite, entry);
+          // also index by number-only portion for lookups like "1.2"
+          const head = composite.split('|', 1)[0];
+          if (head && !byNumber.has(head)) byNumber.set(head, entry);
+        }
+      };
+
+      flat.forEach(add);
+
+      const walk = (nodes) => {
+        if (!Array.isArray(nodes)) return;
+        nodes.forEach((n) => {
+          add(n);
+          if (Array.isArray(n.children) && n.children.length) walk(n.children);
+        });
+      };
+      walk(tree);
+
+      const parseLegacyIdx = (target) => {
+        const raw = (target && typeof target === 'object')
+          ? (target.key ?? target.idx ?? target.id ?? target.number ?? target.uid ?? null)
+          : target;
+        if (raw == null) return NaN;
+        if (typeof raw === 'number') return Number.isFinite(raw) ? raw : NaN;
+        const str = String(raw).trim();
+        if (!str) return NaN;
+        if (/^\d+$/.test(str)) return Number(str);
+        if (str.includes('|')) {
+          const head = str.split('|', 1)[0];
+          if (/^\d+$/.test(head)) return Number(head);
+        }
+        return NaN;
+      };
+
+      const resolve = (target) => {
+        if (target && typeof target === 'object') {
+          if (target.uid && byUid.has(String(target.uid))) return byUid.get(String(target.uid));
+          if (target.idx != null) {
+            const idx = Number(target.idx);
+            if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+          }
+          if (target.key != null) {
+            const idx = Number(target.key);
+            if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+            const keyStr = String(target.key);
+            if (byComposite.has(keyStr)) return byComposite.get(keyStr);
+          }
+          if (target.label) {
+            const lbl = String(target.label);
+            const head = lbl.split(' ')[0];
+            if (byNumber.has(head)) return byNumber.get(head);
+          }
+        }
+
+        const rawStr = String((target && typeof target === 'object')
+          ? (target.key ?? target.idx ?? target.id ?? target.uid ?? target.number ?? '')
+          : target ?? '').trim();
+
+        if (rawStr) {
+          if (byComposite.has(rawStr)) return byComposite.get(rawStr);
+          if (byUid.has(rawStr)) return byUid.get(rawStr);
+          if (byNumber.has(rawStr)) return byNumber.get(rawStr);
+          if (rawStr.includes('|')) {
+            const head = rawStr.split('|', 1)[0];
+            if (byNumber.has(head)) return byNumber.get(head);
+            const num = Number(head);
+            if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+          }
+          const num = Number(rawStr);
+          if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+        }
+        return null;
+      };
+
+      const resolveIdx = (target) => {
+        const entry = resolve(target);
+        if (entry && Number.isFinite(Number(entry.idx))) return Number(entry.idx);
+        const legacy = parseLegacyIdx(target);
+        if (Number.isFinite(legacy)) return legacy;
+        return NaN;
+      };
+
+      const buildLabel = (entry, fallback) => {
+        if (!entry) return fallback || '';
+        const text = entry.text || entry.title || entry.label || '';
+        const num = entry.number || entry.num;
+        if (num) return `${num} ${text}`.trim();
+        if (text) return text;
+        return fallback || '';
+      };
+
+      const normalizeTarget = (target) => {
+        const entry = resolve(target);
+        const idx = entry ? Number(entry.idx) : resolveIdx(target);
+        if (!Number.isFinite(idx)) return null;
+        const normalized = { key: idx, idx };
+        if (entry?.uid) normalized.uid = entry.uid;
+        else if (target && typeof target === 'object' && target.uid) normalized.uid = target.uid;
+        const fallbackLabel = (target && typeof target === 'object') ? target.label : null;
+        const label = buildLabel(entry, fallbackLabel) || `Heading ${idx}`;
+        normalized.label = label;
+        const number = entry?.number || entry?.num;
+        if (number) normalized.number = number;
+        return normalized;
+      };
+
+      return { resolve, resolveIdx, normalizeTarget, buildLabel };
+    }
+
     function __coerceRuleForMultichoiceOption(schema, rule, field) {
       const out = JSON.parse(JSON.stringify(rule));
-      const idx = __buildSchemaIndex(schema);
-      const looksLikeOption = !idx.byId.has(String(out.fieldId || out.field || out.whenField));
+      const type = String(field?.type || '').toLowerCase();
 
-      if ((field?.type === 'multichoice' || field?.type === 'select') && looksLikeOption) {
-        const raw = String(out.fieldId || out.field || out.whenField).split(':').pop().trim();
-        out.fieldId = field.id;
-        out.op = 'anyOf';
-        out.values = [raw];
-        delete out.value; delete out.expected;
+      const setFieldRef = (id) => {
+        if (!id) return;
+        out.fieldId = id;
+        if (out.field != null) out.field = id;
+        if (out.whenField != null) out.whenField = id;
+      };
+
+      const ensureBooleanValues = (fallbackBool) => {
+        const rawArr = Array.isArray(out.values)
+          ? out.values.slice()
+          : (out.values == null ? [] : [out.values]);
+        let bool = null;
+        if (rawArr.length) {
+          const first = rawArr[0];
+          if (typeof first === 'boolean') {
+            bool = first;
+          } else if (typeof first === 'string') {
+            const norm = first.trim().toLowerCase();
+            if (norm === 'true') bool = true;
+            else if (norm === 'false') bool = false;
+          }
+        }
+        if (bool == null) bool = fallbackBool;
+        out.values = [bool];
+        out.op = 'equals';
+      };
+
+      const optionCatalog = __buildOptionIndex(schema).get(String(field?.id || ''));
+      const matchOptionToken = (token) => {
+        if (!optionCatalog || !token) return null;
+        const normalized = __slug(token);
+        return optionCatalog.options.find(o => o.slug === normalized)
+            || optionCatalog.options.find(o => __slug(o.label) === normalized)
+            || optionCatalog.options.find(o => __slug(o.value) === normalized)
+            || null;
+      };
+
+      const rawRef = String(out.fieldId ?? out.field ?? out.whenField ?? '').trim();
+
+      if (!['multichoice', 'select'].includes(type)) {
+        if (!Array.isArray(out.values)) {
+          out.values = out.values == null ? [] : [out.values];
+        }
+        return out;
       }
+
+      if (rawRef.includes('__opt__')) {
+        setFieldRef(rawRef);
+        const defaultBool = (() => {
+          const arr = Array.isArray(out.values) ? out.values : (out.values == null ? [] : [out.values]);
+          if (arr.length) {
+            const first = arr[0];
+            if (typeof first === 'boolean') return first;
+            if (typeof first === 'string') {
+              const norm = first.trim().toLowerCase();
+              if (norm === 'true') return true;
+              if (norm === 'false') return false;
+            }
+          }
+          return true;
+        })();
+        ensureBooleanValues(defaultBool);
+        return out;
+      }
+
+      let optionMatch = null;
+      if (rawRef) {
+        if (rawRef.includes(':')) {
+          optionMatch = matchOptionToken(rawRef.split(':').pop());
+        }
+        if (!optionMatch) optionMatch = matchOptionToken(rawRef);
+      }
+
+      if (!optionMatch) {
+        const valueTokens = Array.isArray(out.values)
+          ? out.values.filter(v => typeof v === 'string' && v.trim())
+          : (typeof out.values === 'string' && out.values.trim() ? [out.values] : []);
+        if (valueTokens.length === 1) {
+          optionMatch = matchOptionToken(valueTokens[0]);
+        }
+      }
+
+      if (optionMatch) {
+        const nextId = `${String(field.id)}__opt__${optionMatch.slug}`;
+        setFieldRef(nextId);
+        const fallback = (() => {
+          const arr = Array.isArray(out.values) ? out.values : (out.values == null ? [] : [out.values]);
+          if (arr.length) {
+            const first = arr[0];
+            if (typeof first === 'boolean') return first;
+            if (typeof first === 'string') {
+              const norm = first.trim().toLowerCase();
+              if (norm === 'true') return true;
+              if (norm === 'false') return false;
+            }
+          }
+          return String(out.op || '').toLowerCase() === 'notequals' ? false : true;
+        })();
+        ensureBooleanValues(fallback);
+        return out;
+      }
+
+      if (!Array.isArray(out.values)) {
+        out.values = out.values == null ? [] : [out.values];
+      }
+      if (rawRef) setFieldRef(rawRef);
       return out;
     }
 
-    function normalizeHeadingsRulesForSchema(schema, rulesIn) {
+    function normalizeHeadingsRulesForSchema(schema, rulesIn, headingBaseline = gHeadingBaseline) {
       const rules = Array.isArray(rulesIn) ? rulesIn : [];
       const out = [];
+      const headingIndex = buildHeadingTargetIndex(headingBaseline);
       for (const raw of rules) {
         if (!raw) continue;
 
@@ -959,27 +1222,7 @@
         // HEADINGS: coerce targets to numeric keys only
         if (Array.isArray(r0.targets)) {
           r0.targets = r0.targets
-            .map(t => {
-              if (t == null) return null;
-              let key = t?.key ?? t?.idx ?? t?.id;
-              if (key == null) return null;
-
-              const rawKey = String(key);
-              const head = rawKey.includes('|') ? rawKey.split('|')[0] : rawKey;
-              const n = Number(head);
-
-              if (Number.isFinite(n) && n >= 0) {
-                return { key: n };
-              }
-
-              if (typeof t === 'object') {
-                const copy = { ...t };
-                if (copy.key == null) copy.key = rawKey;
-                return copy;
-              }
-
-              return { key: rawKey };
-            })
+            .map(t => headingIndex.normalizeTarget(t))
             .filter(Boolean);
         }
 
@@ -1272,6 +1515,12 @@
         if (!payloadEl) return;
 
         const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        if (wsState) {
+          adoptHeadingBaseline({
+            flat: Array.isArray(wsState.headingsFlat) ? wsState.headingsFlat : Array.isArray(wsState.headings) ? wsState.headings : [],
+            tree: Array.isArray(wsState.headingsTree) ? wsState.headingsTree : gHeadingBaseline.tree
+          });
+        }
         const payloadObj = wsState?.payload?.CRONOS_PAYLOAD
                         || wsState?.CRONOS_PAYLOAD
                         || wsState?.cronos_payload
@@ -1293,7 +1542,7 @@
         });
 
         // Normalize against **current** gSchema (already set by renderFromCurrentBytes)
-        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
+        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
         const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
         // Instrument target survival for fieldRules
@@ -1972,8 +2221,10 @@
         try {
           headingsParsed = await parseHeadings_JS(gArrayBuffer);
           renderHeadingsTreeView(headingsParsed.tree);
+          adoptHeadingBaseline(headingsParsed);
         } catch {
           if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
+          adoptHeadingBaseline({ flat: [], tree: [] });
         }
 
         // 3) Payload from DOCX (settings/custom)
@@ -2010,7 +2261,7 @@
         });
 
         // ✅ Normalize EVERYTHING against the **chosen** schema (NOT gSchema yet!)
-        const rules      = normalizeHeadingsRulesForSchema(chosenSchema, mergedRulesRaw);
+        const rules      = normalizeHeadingsRulesForSchema(chosenSchema, mergedRulesRaw, headingsParsed);
         const fieldRules = normalizeFieldRulesForSchema(chosenSchema, mergedFieldRaw);
 
         // 🔎 DEBUG post-normalization
@@ -2034,7 +2285,10 @@
             fields: gSchema.fields,
             values: gValues,
             tagMap: prunedTagMap,
-            rules, fieldRules,
+            rules,
+            fieldRules,
+            headingsFlat: headingsParsed.flat,
+            headingsTree: headingsParsed.tree,
             updatedAt: new Date().toISOString()
           };
           await window.formSuitePersist.saveState(gDocId, {
@@ -2042,6 +2296,7 @@
             values: gValues,
             tagMap: prunedTagMap,
             rules, fieldRules,
+            headingsFlat: headingsParsed.flat,
             headings: headingsParsed.flat,
             headingsTree: headingsParsed.tree,
             headingsUpdatedAt: new Date().toISOString(),
@@ -2334,6 +2589,12 @@
         if (!gArrayBuffer) return;
 
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        if (restored) {
+          adoptHeadingBaseline({
+            flat: Array.isArray(restored.headingsFlat) ? restored.headingsFlat : Array.isArray(restored.headings) ? restored.headings : [],
+            tree: Array.isArray(restored.headingsTree) ? restored.headingsTree : gHeadingBaseline.tree
+          });
+        }
         if (restored?.schema) gSchema = restored.schema;
 
         const domVals  = collectFormValues(gSchema);
@@ -2348,7 +2609,7 @@
         const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
           resolveRulesForState(restored || {}, payloadSnapshot);
 
-        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
+        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
         const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
         console.log('[doSave][rulesSource]', {
@@ -2435,6 +2696,12 @@
         if (!gArrayBuffer) return;
 
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+        if (restored) {
+          adoptHeadingBaseline({
+            flat: Array.isArray(restored.headingsFlat) ? restored.headingsFlat : Array.isArray(restored.headings) ? restored.headings : [],
+            tree: Array.isArray(restored.headingsTree) ? restored.headingsTree : gHeadingBaseline.tree
+          });
+        }
         if (restored?.schema) gSchema = restored.schema;
 
         const domVals  = collectFormValues(gSchema);
@@ -2449,7 +2716,7 @@
         const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
           resolveRulesForState(restored || {}, payloadSnapshot);
 
-        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw);
+        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
         const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
 
         console.log('[doExport][rulesSource]', {
@@ -2537,7 +2804,7 @@
         const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
         const rawFieldR  = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
 
-        const rules      = normalizeHeadingsRulesForSchema(nextSchema, rawRules);
+        const rules      = normalizeHeadingsRulesForSchema(nextSchema, rawRules, gHeadingBaseline);
         const fieldRules = normalizeFieldRulesForSchema(nextSchema, rawFieldR);
 
         console.log('[applyPayloadObject][normalized]', {
@@ -2820,40 +3087,72 @@
         tr.step('styleMap', { entries: Object.keys(styleMap || {}).length });
 
         const zip = await JSZip.loadAsync(arrayBuffer);
-        const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
-        const parser = new DOMParser();
-        const out = [];
-        let idx = 0;
+        const docPart = zip.file('word/document.xml');
+        if (!docPart) { tr.end({ count: 0, reason: 'no-document-xml' }); return { flat: [], tree: [], count: 0 }; }
 
-        for (const f of parts) {
-          const pf = TRACE('parseHeadings_JS:file', f.name);
-          const xmlTextContent = await f.async('string');
-          try {
-            const xml = parser.parseFromString(xmlTextContent, "application/xml");
-            const paras = xml.getElementsByTagNameNS(W_NS, 'p');
-            for (let i = 0; i < paras.length; i++) {
-              const p = paras[i];
-              const lvl = detectHeadingLevel(p, styleMap);
-              if (!lvl) continue;
-              const text = paraText(p);
-              if (!text) continue;
-              out.push({
-                idx: ++idx,
-                level: lvl,
-                text,
-                part: f.name.split('/').pop().replace('.xml','')
-              });
-            }
-            pf.end({ added: idx });
-          } catch (e) {
-            pf.warn('xml parse error', e);
-            pf.end({ added: 0, error: String(e?.message || e) });
-          }
+        const parser = new DOMParser();
+        const xmlTextContent = await docPart.async('string');
+        const xml = parser.parseFromString(xmlTextContent, "application/xml");
+        const paras = xml.getElementsByTagNameNS(W_NS, 'p');
+        const totalParas = paras.length;
+        const flat = [];
+
+        for (let i = 0; i < totalParas; i++) {
+          const p = paras[i];
+          const lvl = detectHeadingLevel(p, styleMap);
+          if (!lvl) continue;
+          const text = paraText(p);
+          if (!text) continue;
+          const idx = flat.length + 1;
+          const uid = `sec_${String(i).padStart(6, '0')}`;
+          flat.push({
+            idx,
+            level: lvl,
+            text,
+            part: 'document',
+            paraIndex: i,
+            start: i,
+            end: totalParas,
+            uid,
+            label: text
+          });
         }
 
-        const tree = buildHeadingTree(out);
-        tr.end({ count: out.length, rootChildren: tree.length });
-        return { flat: out, tree, count: out.length };
+        for (let i = 0; i < flat.length; i++) {
+          const cur = flat[i];
+          let end = totalParas;
+          for (let j = i + 1; j < flat.length; j++) {
+            if (flat[j].level <= cur.level) { end = flat[j].paraIndex; break; }
+          }
+          cur.end = end;
+        }
+
+        const tree = buildHeadingTree(flat);
+        numberHeadingsTree(tree);
+
+        const byIdx = new Map(flat.map(h => [Number(h.idx), h]));
+        const propagate = (nodes) => {
+          if (!Array.isArray(nodes)) return;
+          for (const n of nodes) {
+            if (byIdx.has(Number(n.idx))) {
+              const ref = byIdx.get(Number(n.idx));
+              if (n.num) {
+                ref.number = n.num;
+                ref.compositeKey = `${n.num}|${ref.text}`.trim();
+              }
+            }
+            if (Array.isArray(n.children) && n.children.length) propagate(n.children);
+          }
+        };
+        propagate(tree);
+
+        flat.forEach((h) => {
+          if (!h.number && h.idx != null) h.number = h.idx;
+          if (!h.compositeKey) h.compositeKey = `${h.number}|${h.text}`.trim();
+        });
+
+        tr.end({ count: flat.length, rootChildren: tree.length });
+        return { flat, tree, count: flat.length };
       } catch (e) {
         tr.error('failed', e); tr.end();
         return { flat: [], tree: [], count: 0 };
@@ -2863,8 +3162,19 @@
     function buildHeadingTree(list) {
       const root = [];
       const stack = [];
-      for (const h of list) {
-        const node = { level: h.level, text: h.text, part: h.part, idx: h.idx, children: [] };
+      for (const h of (list || [])) {
+        const node = {
+          level: h.level,
+          text: h.text,
+          part: h.part || 'document',
+          idx: h.idx,
+          uid: h.uid,
+          paraIndex: h.paraIndex,
+          start: h.start,
+          end: h.end,
+          label: h.label || h.text,
+          children: []
+        };
         while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
         if (!stack.length) {
           root.push(node);

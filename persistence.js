@@ -188,6 +188,11 @@
     const tagMap  = state?.tagMap || {};
     const rules   = _safeArr(state?.rules);
     const fRules  = _safeArr(state?.fieldRules);
+    const headingsFlat = Array.isArray(state?.headingsFlat)
+      ? state.headingsFlat
+      : Array.isArray(state?.headings) ? state.headings
+      : [];
+    const headingsTree = Array.isArray(state?.headingsTree) ? state.headingsTree : [];
     return {
       title: schema?.title || 'Form',
       fields,
@@ -195,6 +200,8 @@
       tagMap,
       rules,
       fieldRules: fRules,
+      headingsFlat,
+      headingsTree,
       updatedAt: _nowIso(),
     };
   }
