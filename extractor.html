@@ -1087,16 +1087,114 @@
 
     function __coerceRuleForMultichoiceOption(schema, rule, field) {
       const out = JSON.parse(JSON.stringify(rule));
-      const idx = __buildSchemaIndex(schema);
-      const looksLikeOption = !idx.byId.has(String(out.fieldId || out.field || out.whenField));
+      const type = String(field?.type || '').toLowerCase();
 
-      if ((field?.type === 'multichoice' || field?.type === 'select') && looksLikeOption) {
-        const raw = String(out.fieldId || out.field || out.whenField).split(':').pop().trim();
-        out.fieldId = field.id;
-        out.op = 'anyOf';
-        out.values = [raw];
-        delete out.value; delete out.expected;
+      const setFieldRef = (id) => {
+        if (!id) return;
+        out.fieldId = id;
+        if (out.field != null) out.field = id;
+        if (out.whenField != null) out.whenField = id;
+      };
+
+      const ensureBooleanValues = (fallbackBool) => {
+        const rawArr = Array.isArray(out.values)
+          ? out.values.slice()
+          : (out.values == null ? [] : [out.values]);
+        let bool = null;
+        if (rawArr.length) {
+          const first = rawArr[0];
+          if (typeof first === 'boolean') {
+            bool = first;
+          } else if (typeof first === 'string') {
+            const norm = first.trim().toLowerCase();
+            if (norm === 'true') bool = true;
+            else if (norm === 'false') bool = false;
+          }
+        }
+        if (bool == null) bool = fallbackBool;
+        out.values = [bool];
+        out.op = 'equals';
+      };
+
+      const optionCatalog = __buildOptionIndex(schema).get(String(field?.id || ''));
+      const matchOptionToken = (token) => {
+        if (!optionCatalog || !token) return null;
+        const normalized = __slug(token);
+        return optionCatalog.options.find(o => o.slug === normalized)
+            || optionCatalog.options.find(o => __slug(o.label) === normalized)
+            || optionCatalog.options.find(o => __slug(o.value) === normalized)
+            || null;
+      };
+
+      const rawRef = String(out.fieldId ?? out.field ?? out.whenField ?? '').trim();
+
+      if (!['multichoice', 'select'].includes(type)) {
+        if (!Array.isArray(out.values)) {
+          out.values = out.values == null ? [] : [out.values];
+        }
+        return out;
       }
+
+      if (rawRef.includes('__opt__')) {
+        setFieldRef(rawRef);
+        const defaultBool = (() => {
+          const arr = Array.isArray(out.values) ? out.values : (out.values == null ? [] : [out.values]);
+          if (arr.length) {
+            const first = arr[0];
+            if (typeof first === 'boolean') return first;
+            if (typeof first === 'string') {
+              const norm = first.trim().toLowerCase();
+              if (norm === 'true') return true;
+              if (norm === 'false') return false;
+            }
+          }
+          return true;
+        })();
+        ensureBooleanValues(defaultBool);
+        return out;
+      }
+
+      let optionMatch = null;
+      if (rawRef) {
+        if (rawRef.includes(':')) {
+          optionMatch = matchOptionToken(rawRef.split(':').pop());
+        }
+        if (!optionMatch) optionMatch = matchOptionToken(rawRef);
+      }
+
+      if (!optionMatch) {
+        const valueTokens = Array.isArray(out.values)
+          ? out.values.filter(v => typeof v === 'string' && v.trim())
+          : (typeof out.values === 'string' && out.values.trim() ? [out.values] : []);
+        if (valueTokens.length === 1) {
+          optionMatch = matchOptionToken(valueTokens[0]);
+        }
+      }
+
+      if (optionMatch) {
+        const nextId = `${String(field.id)}__opt__${optionMatch.slug}`;
+        setFieldRef(nextId);
+        const fallback = (() => {
+          const arr = Array.isArray(out.values) ? out.values : (out.values == null ? [] : [out.values]);
+          if (arr.length) {
+            const first = arr[0];
+            if (typeof first === 'boolean') return first;
+            if (typeof first === 'string') {
+              const norm = first.trim().toLowerCase();
+              if (norm === 'true') return true;
+              if (norm === 'false') return false;
+            }
+          }
+          return String(out.op || '').toLowerCase() === 'notequals' ? false : true;
+        })();
+        ensureBooleanValues(fallback);
+        return out;
+      }
+
+      if (!Array.isArray(out.values)) {
+        out.values = out.values == null ? [] : [out.values];
+      }
+      if (rawRef) setFieldRef(rawRef);
       return out;
     }
 
