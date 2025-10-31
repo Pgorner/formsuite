@@ -1088,6 +1088,7 @@
     function __coerceRuleForMultichoiceOption(schema, rule, field) {
       const out = JSON.parse(JSON.stringify(rule));
       const type = String(field?.type || '').toLowerCase();
+      const baseId = String(field?.id ?? '');
 
       const setFieldRef = (id) => {
         if (!id) return;
@@ -1116,7 +1117,24 @@
         out.op = 'equals';
       };
 
-      const optionCatalog = __buildOptionIndex(schema).get(String(field?.id || ''));
+      const optionCatalog = __buildOptionIndex(schema).get(baseId || '');
+      const normalizeOptRef = (rawOptRef) => {
+        if (!rawOptRef) return null;
+        const [rawFieldPart, rawSlugPart] = rawOptRef.split('__opt__');
+        const slugNorm = __slug(rawSlugPart || '');
+        const resolvedFieldId = baseId || String(rawFieldPart || '').trim();
+        if (!optionCatalog || !Array.isArray(optionCatalog.options) || !optionCatalog.options.length) {
+          if (slugNorm) return `${resolvedFieldId}__opt__${slugNorm}`;
+          return rawOptRef;
+        }
+        const hit = optionCatalog.options.find(o => o.slug === slugNorm)
+          || optionCatalog.options.find(o => __slug(o.label) === slugNorm)
+          || optionCatalog.options.find(o => __slug(o.value) === slugNorm);
+        if (hit) return `${optionCatalog.id}__opt__${hit.slug}`;
+        if (slugNorm) return `${optionCatalog.id}__opt__${slugNorm}`;
+        return `${optionCatalog.id}__opt__${__slug(rawSlugPart || '')}`;
+      };
+
       const matchOptionToken = (token) => {
         if (!optionCatalog || !token) return null;
         const normalized = __slug(token);
@@ -1132,11 +1150,14 @@
         if (!Array.isArray(out.values)) {
           out.values = out.values == null ? [] : [out.values];
         }
+        if (baseId) setFieldRef(baseId);
+        else if (rawRef) setFieldRef(rawRef);
         return out;
       }
 
       if (rawRef.includes('__opt__')) {
-        setFieldRef(rawRef);
+        const normalizedRef = normalizeOptRef(rawRef) || rawRef;
+        setFieldRef(normalizedRef);
         const defaultBool = (() => {
           const arr = Array.isArray(out.values) ? out.values : (out.values == null ? [] : [out.values]);
           if (arr.length) {
@@ -1172,7 +1193,7 @@
       }
 
       if (optionMatch) {
-        const nextId = `${String(field.id)}__opt__${optionMatch.slug}`;
+        const nextId = `${baseId}__opt__${optionMatch.slug}`;
         setFieldRef(nextId);
         const fallback = (() => {
           const arr = Array.isArray(out.values) ? out.values : (out.values == null ? [] : [out.values]);
@@ -1194,7 +1215,10 @@
       if (!Array.isArray(out.values)) {
         out.values = out.values == null ? [] : [out.values];
       }
-      if (rawRef) setFieldRef(rawRef);
+
+      if (baseId) setFieldRef(baseId);
+      else if (rawRef) setFieldRef(rawRef);
+
       return out;
     }
 
@@ -1208,7 +1232,17 @@
         const got = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
         if (!got) continue;
 
-        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw, fieldId: got.id }, got);
+        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, got);
+
+        const refAfterCoerce = r0?.fieldId ?? r0?.field ?? r0?.whenField;
+        if (!__resolveFieldRef(schema, refAfterCoerce)) {
+          const fallbackId = String(got.id);
+          if (fallbackId) {
+            r0.fieldId = fallbackId;
+            if (r0.field != null) r0.field = fallbackId;
+            if (r0.whenField != null) r0.whenField = fallbackId;
+          }
+        }
 
         // prune invalid condition field refs (if any)
         if (Array.isArray(r0.conditions)) {
@@ -1298,7 +1332,17 @@
         }
 
         // Coerce condition if "looks like option" on multichoice/select
-        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw, fieldId: resolvedField.id }, resolvedField);
+        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, resolvedField);
+
+        const refAfterCoerce = r0?.fieldId ?? r0?.field ?? r0?.whenField;
+        if (!__resolveFieldRef(schema, refAfterCoerce)) {
+          const fallbackId = String(resolvedField.id);
+          if (fallbackId) {
+            r0.fieldId = fallbackId;
+            if (r0.field != null) r0.field = fallbackId;
+            if (r0.whenField != null) r0.whenField = fallbackId;
+          }
+        }
 
         // prune invalid condition refs
         if (Array.isArray(r0.conditions)) {
