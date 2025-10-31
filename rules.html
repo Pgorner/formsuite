@@ -111,6 +111,7 @@ async function debugLogPayload(where) {
 let gDocId   = null;
 let gSchema  = { title:"Form", fields:[] };
 let gHeadingsTree = [];
+let gHeadingsFlat = [];
 let gMode    = 'headings'; // 'headings' | 'fields'
 let gRulesHeadings = [];   // persisted
 let gRulesFields   = [];   // persisted
@@ -167,6 +168,153 @@ function flattenWithNumbers(tree){
   walk(tree||[],0);
   return out;
 }
+
+function buildHeadingTargetIndex(baseline) {
+  const flat = Array.isArray(baseline?.flat)
+    ? baseline.flat
+    : Array.isArray(baseline) ? baseline
+    : Array.isArray(baseline?.headings) ? baseline.headings
+    : [];
+  const tree = Array.isArray(baseline?.tree)
+    ? baseline.tree
+    : Array.isArray(baseline?.headingsTree) ? baseline.headingsTree
+    : [];
+
+  const byIdx = new Map();
+  const byUid = new Map();
+  const byComposite = new Map();
+  const byNumber = new Map();
+
+  const normComposite = (entry) => {
+    const idx = Number(entry?.idx ?? entry?.key);
+    const text = entry?.text || entry?.title || entry?.label || '';
+    const num = entry?.number || entry?.num;
+    if (num) return `${String(num)}|${text}`.trim();
+    if (Number.isFinite(idx)) return `${idx}|${text}`.trim();
+    return text ? `|${text}` : '';
+  };
+
+  const add = (entry) => {
+    if (!entry) return;
+    const idx = Number(entry.idx ?? entry.key);
+    if (Number.isFinite(idx) && !byIdx.has(idx)) byIdx.set(idx, entry);
+    const uid = entry.uid || entry.id;
+    if (uid && !byUid.has(String(uid))) byUid.set(String(uid), entry);
+    const num = entry.number || entry.num;
+    if (num && !byNumber.has(String(num))) byNumber.set(String(num), entry);
+    const composite = entry.compositeKey || normComposite(entry);
+    if (composite) {
+      if (!byComposite.has(composite)) byComposite.set(composite, entry);
+      const head = composite.split('|', 1)[0];
+      if (head && !byNumber.has(head)) byNumber.set(head, entry);
+    }
+  };
+
+  flat.forEach(add);
+
+  const walk = (nodes) => {
+    if (!Array.isArray(nodes)) return;
+    nodes.forEach((n) => {
+      add(n);
+      if (Array.isArray(n.children) && n.children.length) walk(n.children);
+    });
+  };
+  walk(tree);
+
+  const parseLegacyIdx = (target) => {
+    const raw = (target && typeof target === 'object')
+      ? (target.key ?? target.idx ?? target.id ?? target.number ?? target.uid ?? null)
+      : target;
+    if (raw == null) return NaN;
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : NaN;
+    const str = String(raw).trim();
+    if (!str) return NaN;
+    if (/^\d+$/.test(str)) return Number(str);
+    if (str.includes('|')) {
+      const head = str.split('|', 1)[0];
+      if (/^\d+$/.test(head)) return Number(head);
+    }
+    return NaN;
+  };
+
+  const resolve = (target) => {
+    if (target && typeof target === 'object') {
+      if (target.uid && byUid.has(String(target.uid))) return byUid.get(String(target.uid));
+      if (target.idx != null) {
+        const idx = Number(target.idx);
+        if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+      }
+      if (target.key != null) {
+        const idx = Number(target.key);
+        if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+        const keyStr = String(target.key);
+        if (byComposite.has(keyStr)) return byComposite.get(keyStr);
+      }
+      if (target.label) {
+        const lbl = String(target.label);
+        const head = lbl.split(' ')[0];
+        if (byNumber.has(head)) return byNumber.get(head);
+      }
+    }
+
+    const rawStr = String((target && typeof target === 'object')
+      ? (target.key ?? target.idx ?? target.id ?? target.uid ?? target.number ?? '')
+      : target ?? '').trim();
+
+    if (rawStr) {
+      if (byComposite.has(rawStr)) return byComposite.get(rawStr);
+      if (byUid.has(rawStr)) return byUid.get(rawStr);
+      if (byNumber.has(rawStr)) return byNumber.get(rawStr);
+      if (rawStr.includes('|')) {
+        const head = rawStr.split('|', 1)[0];
+        if (byNumber.has(head)) return byNumber.get(head);
+        const num = Number(head);
+        if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+      }
+      const num = Number(rawStr);
+      if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+    }
+    return null;
+  };
+
+  const resolveIdx = (target) => {
+    const entry = resolve(target);
+    if (entry && Number.isFinite(Number(entry.idx))) return Number(entry.idx);
+    const legacy = parseLegacyIdx(target);
+    if (Number.isFinite(legacy)) return legacy;
+    return NaN;
+  };
+
+  const buildLabel = (entry, fallback) => {
+    if (!entry) return fallback || '';
+    const text = entry.text || entry.title || entry.label || '';
+    const num = entry.number || entry.num;
+    if (num) return `${num} ${text}`.trim();
+    if (text) return text;
+    return fallback || '';
+  };
+
+  const normalizeTarget = (target) => {
+    const entry = resolve(target);
+    const idx = entry ? Number(entry.idx) : resolveIdx(target);
+    if (!Number.isFinite(idx)) return null;
+    const normalized = { key: idx, idx };
+    if (entry?.uid) normalized.uid = entry.uid;
+    else if (target && typeof target === 'object' && target.uid) normalized.uid = target.uid;
+    const fallbackLabel = (target && typeof target === 'object') ? target.label : null;
+    const label = buildLabel(entry, fallbackLabel) || `Heading ${idx}`;
+    normalized.label = label;
+    const number = entry?.number || entry?.num;
+    if (number) normalized.number = number;
+    return normalized;
+  };
+
+  return { resolve, resolveIdx, normalizeTarget, buildLabel };
+}
+
+function currentHeadingIndex() {
+  return buildHeadingTargetIndex({ flat: gHeadingsFlat, tree: gHeadingsTree });
+}
 function toCompositeKeyFromFlat(h){
   if (!h) return '';
   const raw = String(h.key ?? '');
@@ -184,20 +332,20 @@ function getHeadingLabelFromKey(key){
 // target normalization
 function normalizeHeadingsRuleTargetsInPlace(rule){
   if (!rule || !Array.isArray(rule.targets)) return {changed:false};
-  const flat = flattenWithNumbers(gHeadingsTree);
-  const byNumber = new Map(); const byComp=new Map();
-  flat.forEach(h=>{ const comp=toCompositeKeyFromFlat(h); byNumber.set(h.number,comp); byComp.set(comp,h.label);});
+  const idx = currentHeadingIndex();
   let changed=false;
   rule.targets = rule.targets.map(t=>{
-    let compKey='';
-    if (typeof t === 'string'){ compKey = t.includes('|')? t : (byNumber.get(t)||t); }
-    else if (t && typeof t==='object'){ const k=String(t.key||''); compKey = k? (k.includes('|')? k : (byNumber.get(k)||k)) : ''; }
-    if (!compKey) return t;
-    const label = byComp.get(compKey) || compKey.split('|').slice(1).join('|') || compKey;
-    const normalized = { key:compKey, label };
-    if (typeof t==='string' || !t.label || String(t.key)!==compKey) changed=true;
+    if (t == null) return t;
+    const normalized = idx.normalizeTarget(t);
+    if (!normalized) return t;
+    const same = (typeof t === 'object')
+      ? (Number(t.key ?? t.idx) === normalized.idx
+         && t.label === normalized.label
+         && (t.uid ?? null) === (normalized.uid ?? null))
+      : false;
+    if (!same) changed = true;
     return normalized;
-  });
+  }).filter(Boolean);
   return {changed};
 }
 
@@ -1009,6 +1157,10 @@ async function reloadState(reason){
   const st = await window.formSuitePersist.loadState(gDocId) || {};
   if (st.schema) gSchema = st.schema;
   if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
+  else gHeadingsTree = Array.isArray(st.headings) ? [] : gHeadingsTree;
+  if (Array.isArray(st.headingsFlat)) gHeadingsFlat = st.headingsFlat;
+  else if (Array.isArray(st.headings)) gHeadingsFlat = st.headings.slice();
+  else gHeadingsFlat = Array.isArray(gHeadingsTree) ? flattenWithNumbers(gHeadingsTree) : [];
 
   gRulesHeadings = Array.isArray(st.rules) ? st.rules.slice() : [];
   gRulesFields   = Array.isArray(st.fieldRules) ? st.fieldRules.slice() : [];
