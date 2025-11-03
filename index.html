@@ -244,7 +244,7 @@
         py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/" });
 
         await py.runPythonAsync(`
-import io, zipfile, json
+import io, zipfile, json, re
 import xml.etree.ElementTree as ET
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -381,7 +381,103 @@ def write_sdts_by_tag(u8, tag_to_text_json):
     return outbuf.getvalue()
 
 # ---------- heading + block collectors ----------
-def _heading_level(p_el):
+_STYLE_HINT_PATTERNS = [
+    re.compile(r"heading\s*([1-9])", re.IGNORECASE),
+    re.compile(r"überschrift\s*([1-9])", re.IGNORECASE),
+    re.compile(r"titre\s*([1-9])", re.IGNORECASE),
+    re.compile(r"t[ií]tulo\s*([1-9])", re.IGNORECASE),
+    re.compile(r"encabezado\s*([1-9])", re.IGNORECASE),
+    re.compile(r"rubrik\s*([1-9])", re.IGNORECASE),
+    re.compile(r"zagolovok\s*([1-9])", re.IGNORECASE),
+    re.compile(r"заголовок\s*([1-9])", re.IGNORECASE),
+]
+
+def _level_from_style_hint(value):
+    if not value:
+        return 0
+    s = str(value).strip()
+    if not s:
+        return 0
+    for pattern in _STYLE_HINT_PATTERNS:
+        m = pattern.search(s)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 0
+    m2 = re.match(r"^heading([1-9])$", s, re.IGNORECASE)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except Exception:
+            return 0
+    return 0
+
+def _build_heading_style_map(zip_file):
+    try:
+        raw = zip_file.read("word/styles.xml")
+    except KeyError:
+        return {}
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return {}
+
+    by_id = {}
+    for style in root.findall("w:style", {"w": _W_NS}):
+        st_type = (style.get(_q("type")) or style.get("type") or "").strip().lower()
+        if st_type and st_type != "paragraph":
+            continue
+        style_id = style.get(_q("styleId")) or style.get("styleId") or ""
+        if not style_id:
+            continue
+        name_el = style.find(_q("name"))
+        name = ""
+        if name_el is not None:
+            name = name_el.get(_q("val")) or name_el.get("val") or ""
+        based_on_el = style.find(_q("basedOn"))
+        based_on = ""
+        if based_on_el is not None:
+            based_on = based_on_el.get(_q("val")) or based_on_el.get("val") or ""
+        lvl = 0
+        ppr = style.find(_q("pPr"))
+        if ppr is not None:
+            ol = ppr.find(_q("outlineLvl"))
+            if ol is not None:
+                val = ol.get(_q("val")) or ol.get("val")
+                if val not in (None, ""):
+                    try:
+                        num = int(val)
+                        if num >= 0:
+                            lvl = max(1, min(9, num + 1))
+                    except Exception:
+                        pass
+        if not lvl:
+            lvl = _level_from_style_hint(style_id) or _level_from_style_hint(name)
+        by_id[style_id] = {"basedOn": based_on or "", "rawLevel": int(lvl) if lvl else 0}
+
+    resolved = {}
+
+    def resolve(style_id, depth=0):
+        if not style_id or style_id not in by_id or depth > 12:
+            return 0
+        if style_id in resolved:
+            return resolved[style_id]
+        info = by_id[style_id]
+        lvl = info.get("rawLevel") or 0
+        if lvl:
+            resolved[style_id] = lvl
+            return lvl
+        parent = resolve(info.get("basedOn") or "", depth + 1)
+        resolved[style_id] = parent or 0
+        return resolved[style_id]
+
+    for style_id in list(by_id.keys()):
+        resolve(style_id)
+
+    return resolved
+
+def _heading_level(p_el, style_map=None):
     ppr = p_el.find(_q("pPr"))
     if ppr is not None:
         ol = ppr.find(_q("outlineLvl"))
@@ -389,39 +485,45 @@ def _heading_level(p_el):
             try: return int(ol.get(_q("val"))) + 1
             except: pass
         ps = ppr.find(_q("pStyle"))
-        if ps is not None and ps.get(_q("val")):
-            v = ps.get(_q("val")).lower()
-            if v.startswith("heading"):
-                try: return int(v.replace("heading","").strip())
-                except: return None
+        if ps is not None:
+            style_id = ps.get(_q("val")) or ps.get("val")
+            if style_id:
+                if style_map:
+                    lvl = style_map.get(style_id)
+                    if isinstance(lvl, int) and lvl > 0:
+                        return lvl
+                v = style_id.lower()
+                if v.startswith("heading"):
+                    try: return int(v.replace("heading","").strip())
+                    except: return None
     return None
 
-def _iter_blocks_within(container, top_level):
+def _iter_blocks_within(container, top_level, style_map=None):
     for node in list(container):
         if node.tag == _q("sdt"):
             inner = node.find(_q("sdtContent"))
             if inner is not None:
-                yield from _iter_blocks_within(inner, top_level)
+                yield from _iter_blocks_within(inner, top_level, style_map)
             else:
                 yield {"element": node, "type": "other", "level": None, "top": top_level}
         elif node.tag == _q("p"):
-            yield {"element": node, "type": "p", "level": _heading_level(node), "top": top_level}
+            yield {"element": node, "type": "p", "level": _heading_level(node, style_map), "top": top_level}
         elif node.tag == _q("tbl"):
             yield {"element": node, "type": "tbl", "level": None, "top": top_level}
         else:
             yield {"element": node, "type": "other", "level": None, "top": top_level}
 
-def _collect_body_blocks(body_el):
+def _collect_body_blocks(body_el, style_map=None):
     blocks = []
     for child in list(body_el):
         if child.tag == _q("sdt"):
             content = child.find(_q("sdtContent"))
             if content is not None:
-                blocks.extend(_iter_blocks_within(content, child))
+                blocks.extend(_iter_blocks_within(content, child, style_map))
             else:
                 blocks.append({"element": child, "type": "other", "level": None, "top": child})
         elif child.tag == _q("p"):
-            blocks.append({"element": child, "type": "p", "level": _heading_level(child), "top": child})
+            blocks.append({"element": child, "type": "p", "level": _heading_level(child, style_map), "top": child})
         elif child.tag == _q("tbl"):
             blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
         else:
@@ -532,6 +634,22 @@ def _ensure_backup_embedded(zfin, zfout, names, backup_path="customXml/originalD
         zfout.writestr(backup_path, orig)
     except KeyError:
         pass
+
+def restore_document_from_backup(u8, backup_path="customXml/originalDocument.xml"):
+    data = bytes(u8)
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin:
+        try:
+            original = zfin.read(backup_path)
+        except KeyError:
+            return data
+        outbuf = io.BytesIO()
+        with zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+            for name in zfin.namelist():
+                if name == "word/document.xml":
+                    continue
+                zfout.writestr(name, zfin.read(name))
+            zfout.writestr("word/document.xml", original)
+    return outbuf.getvalue()
 
 def _ensure_update_fields(zfin, zfout):
     try:
@@ -684,6 +802,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
         # Process primary document (you can extend to headers/footers if needed)
         doc_parts = [n for n in names if n == "word/document.xml"]
+        style_map = _build_heading_style_map(zfin)
 
         global_idx = 0
         for part in doc_parts:
@@ -697,7 +816,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
                 zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
                 continue
 
-            elems = _collect_body_blocks(body)
+            elems = _collect_body_blocks(body, style_map)
 
             heading_positions = []
             for i, blk in enumerate(elems):
@@ -2833,8 +2952,33 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       return u8;
     }
 
+    async function restoreDocxFromBackup(bytesU8, backupPath = 'customXml/originalDocument.xml') {
+      await ensurePy();
+      const fn = py.globals.get('restore_document_from_backup');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
+      const pyBytes = py.toPy(buf);
+      const pyPath = py.toPy(String(backupPath || 'customXml/originalDocument.xml'));
+      let pyOut;
+      try {
+        pyOut = fn(pyBytes, pyPath);
+      } finally {
+        try { fn.destroy(); } catch {}
+        try { pyBytes.destroy(); } catch {}
+        try { pyPath.destroy(); } catch {}
+      }
+      let u8;
+      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+      else u8 = new Uint8Array(buf);
+      try { pyOut?.destroy?.(); } catch {}
+      return u8;
+    }
+
     // Expose for cross-callbacks
-    try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
+    try {
+      window.applyFieldVisibility = applyFieldVisibility;
+      window.restoreDocxFromBackup = restoreDocxFromBackup;
+    } catch {}
 
     // ---------- Logo triple-click: focus mode ----------
     (function() {
