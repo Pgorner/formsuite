@@ -701,6 +701,147 @@ def inspect_export_removal_plan(u8, idx_to_action_json):
 
     return json.dumps(plan, ensure_ascii=False)
 
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
+
 # ---------- removal/backup/cleanup helpers ----------
 def _is_empty_para(p):
     if p.findall(".//w:fldSimple", {"w": _W_NS}): return False
@@ -2483,6 +2624,119 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     });
 
     // ---------- Export (Open Form) ----------
+    function summarizeForExportDebug(value) {
+      const seen = new WeakSet();
+
+      function helper(val, depth) {
+        if (val == null) return val;
+        const t = typeof val;
+        if (t === 'number' || t === 'boolean') return val;
+        if (t === 'string') {
+          if (val.length <= 2048) return val;
+          return {
+            type: 'string',
+            length: val.length,
+            head: val.slice(0, 1024),
+            tail: val.slice(-256)
+          };
+        }
+        if (typeof Date !== 'undefined' && val instanceof Date) {
+          return { type: 'Date', value: val.toISOString() };
+        }
+        if (typeof Blob !== 'undefined' && val instanceof Blob) {
+          return { type: 'Blob', size: val.size, mime: val.type || '' };
+        }
+        if (typeof File !== 'undefined' && val instanceof File) {
+          return { type: 'File', name: val.name, size: val.size, mime: val.type || '' };
+        }
+        if (val instanceof Uint8Array) {
+          const previewLength = Math.min(32, val.length);
+          const preview = Array.from(val.slice(0, previewLength));
+          const hexPreview = preview.map(b => b.toString(16).padStart(2, '0')).join(' ');
+          return {
+            type: 'Uint8Array',
+            length: val.length,
+            previewHex: hexPreview,
+          };
+        }
+        if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) {
+          return { type: 'ArrayBuffer', byteLength: val.byteLength };
+        }
+        if (val && typeof val.byteLength === 'number' && val.buffer instanceof ArrayBuffer) {
+          return { type: val.constructor?.name || 'TypedArray', byteLength: val.byteLength };
+        }
+        if (t === 'function') {
+          return `[Function ${val.name || 'anonymous'}]`;
+        }
+        if (seen.has(val)) {
+          return '[Circular]';
+        }
+        const nextDepth = depth + 1;
+        if (nextDepth > 2) {
+          if (Array.isArray(val)) {
+            return `[Array length=${val.length}]`;
+          }
+          const keys = Object.keys(val);
+          return `[Object keys=${keys.length}]`;
+        }
+        seen.add(val);
+        try {
+          if (Array.isArray(val)) {
+            const max = nextDepth === 1 ? 20 : 10;
+            const out = val.slice(0, max).map(item => helper(item, nextDepth));
+            if (val.length > max) {
+              out.push(`… ${val.length - max} more`);
+            }
+            return out;
+          }
+          if (val instanceof Map) {
+            const entries = Array.from(val.entries());
+            const max = nextDepth === 1 ? 20 : 10;
+            const mapped = entries.slice(0, max).map(([k, v]) => [helper(k, nextDepth), helper(v, nextDepth)]);
+            if (entries.length > max) {
+              mapped.push(["__truncated__", `… ${entries.length - max} more`]);
+            }
+            return mapped;
+          }
+          const entries = Object.entries(val);
+          const max = nextDepth === 1 ? 25 : 12;
+          const out = {};
+          for (let i = 0; i < entries.length && i < max; i++) {
+            const [k, v] = entries[i];
+            out[k] = helper(v, nextDepth);
+          }
+          if (entries.length > max) {
+            out.__truncated__ = `… ${entries.length - max} more keys`;
+          }
+          return out;
+        } finally {
+          seen.delete(val);
+        }
+      }
+
+      return helper(value, 0);
+    }
+
+    function buildExportDebugSnapshot(plan, context) {
+      return {
+        generatedAt: new Date().toISOString(),
+        plan,
+        context: summarizeForExportDebug(context || {}),
+      };
+    }
+
+    function stringifyExportDebugSnapshot(plan, context) {
+      try {
+        return JSON.stringify(buildExportDebugSnapshot(plan, context), null, 2);
+      } catch (err) {
+        console.warn('Failed to stringify export debug snapshot', err);
+        return JSON.stringify({
+          error: 'stringify-failed',
+          message: err?.message || String(err || 'unknown-error'),
+        }, null, 2);
+      }
+    }
+
     async function gatherExportArtifacts(preloadedBytes = null) {
       if (!currentDoc?.docId) return null;
 
@@ -2789,7 +3043,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       copyBtn.textContent = 'Copy JSON';
       copyBtn.addEventListener('click', async () => {
         try {
-          await navigator.clipboard.writeText(JSON.stringify({ plan, context }, null, 2));
+          const json = stringifyExportDebugSnapshot(plan, context);
+          await navigator.clipboard.writeText(json);
           copyBtn.textContent = 'Copied!';
           setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
         } catch (err) {
@@ -2806,7 +3061,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       downloadBtn.addEventListener('click', (ev) => {
         ev.preventDefault();
         try {
-          const blob = new Blob([JSON.stringify({ plan, context }, null, 2)], { type: 'application/json' });
+          const json = stringifyExportDebugSnapshot(plan, context);
+          const blob = new Blob([json], { type: 'application/json' });
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
@@ -2830,7 +3086,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const pre = document.createElement('pre');
       pre.style.whiteSpace = 'pre-wrap';
       pre.style.fontSize = '12px';
-      pre.textContent = JSON.stringify({ plan, context }, null, 2);
+      pre.textContent = stringifyExportDebugSnapshot(plan, context);
       details.appendChild(summaryEl);
       details.appendChild(pre);
       overlay.appendChild(details);
