@@ -59,6 +59,21 @@
 
     let currentDoc = null, schema = null, values = {}, fieldRules = [];
     let btnExportMain = null;
+    let btnExportDebug = null;
+    let lastExportDebug = null;
+    let exportDebugEscHandler = null;
+
+    function clearExportDebugPanel() {
+      if (exportDebugEscHandler) {
+        try { document.removeEventListener('keydown', exportDebugEscHandler); } catch {}
+        exportDebugEscHandler = null;
+      }
+      try {
+        const panel = document.getElementById('exportDebugPanel');
+        if (panel) panel.remove();
+      } catch {}
+      lastExportDebug = null;
+    }
 
     // ---------- Status + Hard Reset ----------
     function setStatus(s) { els.docStatus.innerHTML = s; }
@@ -68,7 +83,9 @@
       values = {};
       if (els.formMount) els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
       if (btnExportMain) btnExportMain.disabled = true;
+      if (btnExportDebug) btnExportDebug.disabled = true;
       els.permNote.style.display = 'none';
+      clearExportDebugPanel();
       if (reason) setStatus(`No active document (${reason}). Open one in the <a href="extractor.html">Extractor</a>.`);
       else setStatus(`No active document. Open one in the <a href="extractor.html">Extractor</a>.`);
     }
@@ -477,26 +494,39 @@ def _build_heading_style_map(zip_file):
 
     return resolved
 
-def _heading_level(p_el, style_map=None):
+def _heading_level_trace(p_el, style_map=None):
     ppr = p_el.find(_q("pPr"))
-    if ppr is not None:
-        ol = ppr.find(_q("outlineLvl"))
-        if ol is not None and ol.get(_q("val")) is not None:
-            try: return int(ol.get(_q("val"))) + 1
-            except: pass
-        ps = ppr.find(_q("pStyle"))
-        if ps is not None:
-            style_id = ps.get(_q("val")) or ps.get("val")
-            if style_id:
-                if style_map:
-                    lvl = style_map.get(style_id)
-                    if isinstance(lvl, int) and lvl > 0:
-                        return lvl
-                v = style_id.lower()
-                if v.startswith("heading"):
-                    try: return int(v.replace("heading","").strip())
-                    except: return None
-    return None
+    if ppr is None:
+        return (None, None)
+    ol = ppr.find(_q("outlineLvl"))
+    if ol is not None and ol.get(_q("val")) is not None:
+        try:
+            raw = int(ol.get(_q("val")))
+            lvl = max(1, min(9, raw + 1))
+            return (lvl, f"outlineLvl:{raw}")
+        except Exception:
+            pass
+    ps = ppr.find(_q("pStyle"))
+    if ps is not None:
+        style_id = ps.get(_q("val")) or ps.get("val")
+        if style_id:
+            if style_map:
+                lvl = style_map.get(style_id)
+                if isinstance(lvl, int) and lvl > 0:
+                    return (lvl, f"style:{style_id}")
+            v = style_id.lower()
+            if v.startswith("heading"):
+                try:
+                    lvl = int(v.replace("heading", "").strip())
+                    if lvl > 0:
+                        return (lvl, f"builtin:{style_id}")
+                except Exception:
+                    return (None, None)
+    return (None, None)
+
+def _heading_level(p_el, style_map=None):
+    lvl, _ = _heading_level_trace(p_el, style_map)
+    return lvl
 
 def _iter_blocks_within(container, top_level, style_map=None):
     for node in list(container):
@@ -529,6 +559,147 @@ def _collect_body_blocks(body_el, style_map=None):
         else:
             blocks.append({"element": child, "type": "other", "level": None, "top": child})
     return blocks
+
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
 
 # ---------- removal/backup/cleanup helpers ----------
 def _is_empty_para(p):
@@ -1376,6 +1547,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
         mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
         if (btnExportMain) btnExportMain.disabled = true;
+        if (btnExportDebug) btnExportDebug.disabled = true;
         return;
       }
 
@@ -1936,6 +2108,14 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       btnExportMain.disabled = !currentDoc;
       btnExportMain.addEventListener('click', onExportFromOpenForm);
       bar.appendChild(btnExportMain);
+
+      btnExportDebug = document.createElement('button');
+      btnExportDebug.type = 'button';
+      btnExportDebug.className = 'ghost';
+      btnExportDebug.textContent = 'Debug export…';
+      btnExportDebug.disabled = !currentDoc;
+      btnExportDebug.addEventListener('click', onExportDebugFromOpenForm);
+      bar.appendChild(btnExportDebug);
       form.appendChild(bar);
       form.addEventListener('change', () => { try { applyFieldVisibility(); } catch {} });
       mount.appendChild(form);
@@ -2303,6 +2483,391 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     });
 
     // ---------- Export (Open Form) ----------
+    async function gatherExportArtifacts(preloadedBytes = null) {
+      if (!currentDoc?.docId) return null;
+
+      let docBytes = preloadedBytes;
+      if (!docBytes) {
+        docBytes = await fetchWorkingDocBytes();
+      }
+      if (!docBytes) return null;
+
+      if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
+        throw new Error('Cannot export: no schema loaded for the current document.');
+      }
+
+      const originalBytes = docBytes instanceof Uint8Array ? new Uint8Array(docBytes) : new Uint8Array(docBytes);
+
+      const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
+                  || (state?.cronos_payload?.tagMap)
+                  || (state?.CRONOS_PAYLOAD?.tagMap)
+                  || (state?.tagMap)
+                  || {};
+      const validIds   = new Set((schema?.fields || []).map(f => f.id));
+      const safeValues = sanitizeValues(schema, values || {});
+      const cleanTagMap = sanitizeTagMap(tagMap, validIds);
+      const rules = loadRulesForDoc(state);
+      const fieldRulesForDoc = loadFieldRulesForDoc(state);
+
+      const headingResolver = buildHeadingTargetIndex({
+        flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
+        tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
+      });
+
+      const payload = JSON.stringify({
+        title: schema?.title || 'Form',
+        fields: schema?.fields || [],
+        values: safeValues,
+        tagMap: cleanTagMap,
+        rules,
+        fieldRules: fieldRulesForDoc
+      });
+
+      const updated = await writeDocVar(originalBytes, PAYLOAD_KEY, payload);
+
+      const sdtMap = {};
+      for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
+        let v = safeValues?.[fieldId];
+        if (v == null) v = '';
+        if (typeof v === 'object') {
+          v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
+        }
+        sdtMap[tag] = String(v);
+      }
+      const updated2 = await writeSDTs(updated, sdtMap);
+
+      const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
+
+      return {
+        originalBytes,
+        updatedBytes: updated2,
+        visibilityMap,
+        safeValues,
+        cleanTagMap,
+        rules,
+        fieldRulesForDoc,
+        headingResolver,
+        state,
+        payload,
+        rawTagMap: tagMap,
+      };
+    }
+
+    function renderExportDebugPanel(plan, context = {}) {
+      if (!plan || typeof plan !== 'object') {
+        console.warn('renderExportDebugPanel: invalid plan', plan);
+        return;
+      }
+      clearExportDebugPanel();
+      lastExportDebug = { plan, context };
+      try { window.lastExportDebug = lastExportDebug; } catch {}
+
+      const overlay = document.createElement('div');
+      overlay.id = 'exportDebugPanel';
+      overlay.tabIndex = -1;
+      overlay.style.position = 'fixed';
+      overlay.style.top = '72px';
+      overlay.style.right = '24px';
+      overlay.style.maxWidth = 'min(90vw, 520px)';
+      overlay.style.maxHeight = '70vh';
+      overlay.style.overflowY = 'auto';
+      overlay.style.background = '#ffffff';
+      overlay.style.border = '1px solid rgba(15,23,42,0.12)';
+      overlay.style.boxShadow = '0 18px 45px rgba(15,23,42,0.25)';
+      overlay.style.padding = '18px';
+      overlay.style.borderRadius = '12px';
+      overlay.style.zIndex = '4000';
+      overlay.style.fontSize = '14px';
+      overlay.style.lineHeight = '1.4';
+
+      const header = document.createElement('div');
+      header.style.display = 'flex';
+      header.style.gap = '12px';
+      header.style.alignItems = 'center';
+      header.style.marginBottom = '12px';
+
+      const title = document.createElement('h3');
+      title.textContent = 'Export removal debug';
+      title.style.margin = '0';
+      title.style.fontSize = '16px';
+      title.style.fontWeight = '600';
+
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'ghost';
+      closeBtn.textContent = 'Close';
+      closeBtn.style.marginLeft = 'auto';
+      closeBtn.addEventListener('click', (ev) => { ev.preventDefault(); clearExportDebugPanel(); });
+
+      header.appendChild(title);
+      header.appendChild(closeBtn);
+      overlay.appendChild(header);
+
+      const summary = document.createElement('div');
+      summary.style.marginBottom = '12px';
+
+      const headings = [];
+      (plan.parts || []).forEach(part => {
+        (part?.headings || []).forEach(h => {
+          headings.push({ ...h, part: part?.name || '' });
+        });
+      });
+      headings.sort((a, b) => a.idx - b.idx);
+
+      const unmatched = Array.isArray(plan.unmatchedActions) ? plan.unmatchedActions : [];
+
+      const summaryLines = [];
+      summaryLines.push(`<strong>${headings.length}</strong> headings detected.`);
+      summaryLines.push(`Style map entries: <strong>${plan.styleMapSize || 0}</strong> (${plan.hasStylesXml ? 'styles.xml present' : 'styles.xml missing'})`);
+      summaryLines.push(`Visibility actions: <strong>${Object.keys(context.visibilityMap || {}).length}</strong>.`);
+      if (unmatched.length) {
+        summaryLines.push(`Unmatched actions: ${unmatched.join(', ')}`);
+      }
+      summary.innerHTML = summaryLines.map(line => `<div>${line}</div>`).join('');
+      overlay.appendChild(summary);
+
+      const headingResolver = context?.headingResolver;
+      const labelForHeading = (idx) => {
+        let fallback = `Heading ${idx}`;
+        if (!headingResolver) return fallback;
+        let entry = null;
+        try { entry = headingResolver.resolve?.({ idx }); } catch {}
+        if (!entry) {
+          try { entry = headingResolver.resolve?.(idx); } catch {}
+        }
+        if (entry && headingResolver.buildLabel) {
+          return headingResolver.buildLabel(entry, fallback);
+        }
+        if (entry?.text) return entry.text;
+        if (headingResolver.buildLabel) {
+          return headingResolver.buildLabel(null, fallback);
+        }
+        return fallback;
+      };
+
+      const actionsEntries = Object.entries(context.visibilityMap || {}).map(([idx, action]) => {
+        const num = Number(idx);
+        return { idx: Number.isFinite(num) ? num : idx, action, label: labelForHeading(num) };
+      }).sort((a, b) => Number(a.idx) - Number(b.idx));
+
+      const makeTable = () => {
+        const table = document.createElement('table');
+        table.style.width = '100%';
+        table.style.borderCollapse = 'collapse';
+        table.style.marginBottom = '12px';
+        table.style.fontSize = '13px';
+        return table;
+      };
+
+      if (actionsEntries.length) {
+        const actionsWrap = document.createElement('div');
+        actionsWrap.style.marginBottom = '12px';
+        const heading = document.createElement('h4');
+        heading.textContent = 'Visibility map';
+        heading.style.margin = '0 0 6px';
+        heading.style.fontSize = '14px';
+        heading.style.fontWeight = '600';
+        actionsWrap.appendChild(heading);
+
+        const table = makeTable();
+        const thead = document.createElement('thead');
+        const tr = document.createElement('tr');
+        ['Idx', 'Action', 'Label'].forEach(text => {
+          const th = document.createElement('th');
+          th.textContent = text;
+          th.style.textAlign = 'left';
+          th.style.padding = '4px 6px';
+          th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
+          tr.appendChild(th);
+        });
+        thead.appendChild(tr);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        actionsEntries.forEach(entry => {
+          const row = document.createElement('tr');
+          row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
+          const cells = [
+            String(entry.idx),
+            String(entry.action || ''),
+            entry.label || ''
+          ];
+          cells.forEach((value, i) => {
+            const td = document.createElement('td');
+            td.textContent = value;
+            td.style.padding = '4px 6px';
+            if (i === 1) td.style.textTransform = 'uppercase';
+            row.appendChild(td);
+          });
+          tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        actionsWrap.appendChild(table);
+        overlay.appendChild(actionsWrap);
+      }
+
+      const headingsWrap = document.createElement('div');
+      const headingTitle = document.createElement('h4');
+      headingTitle.textContent = 'Detected headings';
+      headingTitle.style.margin = '0 0 6px';
+      headingTitle.style.fontSize = '14px';
+      headingTitle.style.fontWeight = '600';
+      headingsWrap.appendChild(headingTitle);
+
+      if (plan.error) {
+        const err = document.createElement('div');
+        err.textContent = `Unable to analyse document (${plan.error}).`;
+        err.style.color = '#b91c1c';
+        headingsWrap.appendChild(err);
+      }
+
+      if (headings.length) {
+        const table = makeTable();
+        const thead = document.createElement('thead');
+        const headerRow = document.createElement('tr');
+        ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
+          const th = document.createElement('th');
+          th.textContent = text;
+          th.style.textAlign = 'left';
+          th.style.padding = '4px 6px';
+          th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
+          headerRow.appendChild(th);
+        });
+        thead.appendChild(headerRow);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        headings.forEach(h => {
+          const row = document.createElement('tr');
+          row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
+          if (h.action === 'HIDE') row.style.background = 'rgba(239,68,68,0.08)';
+          else if (h.action === 'SHOW') row.style.background = 'rgba(34,197,94,0.1)';
+          const cells = [
+            String(h.idx),
+            String(h.level ?? ''),
+            String(h.action || ''),
+            h.detectedBy || '',
+            `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
+          ];
+          cells.forEach((value, i) => {
+            const td = document.createElement('td');
+            td.textContent = value;
+            td.style.padding = '4px 6px';
+            if (i === 2) td.style.textTransform = 'uppercase';
+            row.appendChild(td);
+          });
+          tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        headingsWrap.appendChild(table);
+      } else if (!plan.error) {
+        const empty = document.createElement('div');
+        empty.textContent = 'No headings were detected in the document.';
+        headingsWrap.appendChild(empty);
+      }
+
+      if (unmatched.length) {
+        const warn = document.createElement('div');
+        warn.textContent = `Indices without matching headings: ${unmatched.join(', ')}`;
+        warn.style.color = '#b45309';
+        warn.style.marginBottom = '8px';
+        headingsWrap.appendChild(warn);
+      }
+
+      overlay.appendChild(headingsWrap);
+
+      const controls = document.createElement('div');
+      controls.style.display = 'flex';
+      controls.style.flexWrap = 'wrap';
+      controls.style.gap = '8px';
+      controls.style.marginTop = '12px';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'ghost';
+      copyBtn.textContent = 'Copy JSON';
+      copyBtn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(JSON.stringify({ plan, context }, null, 2));
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+        } catch (err) {
+          copyBtn.textContent = 'Copy failed';
+          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+        }
+      });
+      controls.appendChild(copyBtn);
+
+      const downloadBtn = document.createElement('button');
+      downloadBtn.type = 'button';
+      downloadBtn.className = 'ghost';
+      downloadBtn.textContent = 'Download JSON';
+      downloadBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        try {
+          const blob = new Blob([JSON.stringify({ plan, context }, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = (currentDoc?.name || 'document') + ' - export-debug.json';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
+        } catch (err) {
+          console.warn('Download debug JSON failed:', err);
+        }
+      });
+      controls.appendChild(downloadBtn);
+
+      overlay.appendChild(controls);
+
+      const details = document.createElement('details');
+      details.style.marginTop = '10px';
+      const summaryEl = document.createElement('summary');
+      summaryEl.textContent = 'Raw debug payload';
+      summaryEl.style.cursor = 'pointer';
+      const pre = document.createElement('pre');
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.fontSize = '12px';
+      pre.textContent = JSON.stringify({ plan, context }, null, 2);
+      details.appendChild(summaryEl);
+      details.appendChild(pre);
+      overlay.appendChild(details);
+
+      document.body.appendChild(overlay);
+      try { overlay.focus({ preventScroll: true }); } catch {}
+      exportDebugEscHandler = (ev) => { if (ev.key === 'Escape') { clearExportDebugPanel(); } };
+      document.addEventListener('keydown', exportDebugEscHandler);
+    }
+
+    async function onExportDebugFromOpenForm() {
+      if (!currentDoc?.docId) {
+        alert('No active document. Open or pick a DOCX first.');
+        return;
+      }
+      try {
+        if (btnExportDebug) btnExportDebug.disabled = true;
+        await ensurePy();
+        const prepared = await gatherExportArtifacts();
+        if (!prepared) {
+          alert('Could not access the current DOCX bytes.');
+          return;
+        }
+        const plan = await inspectRemovalPlan(prepared.updatedBytes, prepared.visibilityMap);
+        console.groupCollapsed('Export removal debug');
+        console.log('Visibility map', prepared.visibilityMap);
+        console.log('Removal plan', plan);
+        console.groupEnd();
+        renderExportDebugPanel(plan, prepared);
+      } catch (e) {
+        console.error('Export debug failed:', e);
+        alert('Export debug failed: ' + (e?.message || e));
+      } finally {
+        if (btnExportDebug) btnExportDebug.disabled = !currentDoc;
+      }
+    }
+
     async function onExportFromOpenForm() {
       if (!currentDoc?.docId) {
         alert('No active document. Open or pick a DOCX first.');
@@ -2340,59 +2905,10 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const attempt = async () => {
         await ensurePy();
 
-        const docBytes = await fetchWorkingDocBytes();
-        if (!docBytes) return;
+        const prepared = await gatherExportArtifacts(canBytes);
+        if (!prepared) { await hardResetOpenForm('no bytes / no permission'); return; }
 
-        const originalBytes = (docBytes instanceof Uint8Array)
-          ? docBytes
-          : new Uint8Array(docBytes);
-
-        const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
-                    || (state?.cronos_payload?.tagMap)
-                    || (state?.CRONOS_PAYLOAD?.tagMap)
-                    || (state?.tagMap)
-                    || {};
-        const validIds   = new Set((schema?.fields || []).map(f => f.id));
-        const safeValues = sanitizeValues(schema, values || {});
-        const cleanTagMap = sanitizeTagMap(tagMap, validIds);
-        const rules = loadRulesForDoc(state);
-        const fieldRulesForDoc = loadFieldRulesForDoc(state);
-
-        const headingResolver = buildHeadingTargetIndex({
-          flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
-          tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
-        });
-
-        const payload = JSON.stringify({
-          title: schema?.title || 'Form',
-          fields: schema?.fields || [],
-          values: safeValues,
-          tagMap: cleanTagMap,
-          rules,
-          fieldRules: fieldRulesForDoc
-        });
-
-        // 1) write CRONOS_PAYLOAD → settings.xml
-        const updated = await writeDocVar(docBytes, PAYLOAD_KEY, payload);
-
-        // 2) fill SDTs
-        const sdtMap = {};
-        for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
-          let v = safeValues?.[fieldId];
-          if (v == null) v = '';
-          if (typeof v === 'object') {
-            v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
-          }
-          sdtMap[tag] = String(v);
-        }
-        let updated2 = await writeSDTs(updated, sdtMap);
-
-        // 3) evaluate rules → visibility map (SHOW overrides HIDE)
-        const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
-
-        // 4) REMOVE sections (if requested) + embed untouched original backup
-        const updated3 = await applyRemovalWithBackup(updated2, visibilityMap, originalBytes);
+        const updated3 = await applyRemovalWithBackup(prepared.updatedBytes, prepared.visibilityMap, prepared.originalBytes);
 
         await window.formSuitePersist.putBytes?.(currentDoc.docId, updated3);
 
@@ -2917,6 +3433,31 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     }
 
     // ---------- JS bridge to Python removal-with-backup ----------
+    async function inspectRemovalPlan(bytesU8, visibilityMap) {
+      await ensurePy();
+      const fn = py.globals.get('inspect_export_removal_plan');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
+      const pyBytes = py.toPy(buf);
+      const pyMap = py.toPy(JSON.stringify(visibilityMap || {}));
+      let pyOut;
+      try {
+        pyOut = fn(pyBytes, pyMap);
+      } finally {
+        try { fn.destroy(); } catch {}
+        try { pyBytes.destroy(); } catch {}
+        try { pyMap.destroy(); } catch {}
+      }
+      let out = null;
+      if (pyOut?.toJs) out = pyOut.toJs({ create_proxies:false });
+      else out = pyOut ?? null;
+      try { pyOut?.destroy?.(); } catch {}
+      if (typeof out === 'string') {
+        try { return JSON.parse(out); }
+        catch { return { error: 'parse-error', raw: out }; }
+      }
+      return out;
+    }
+
     async function applyRemovalWithBackup(bytesU8, visibilityMap, originalBytes) {
       await ensurePy();
       const fn = py.globals.get('apply_removal_with_backup');
@@ -2978,6 +3519,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     try {
       window.applyFieldVisibility = applyFieldVisibility;
       window.restoreDocxFromBackup = restoreDocxFromBackup;
+      window.inspectExportRemovalPlan = inspectRemovalPlan;
+      window.renderExportDebugPanel = renderExportDebugPanel;
     } catch {}
 
     // ---------- Logo triple-click: focus mode ----------
