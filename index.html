@@ -59,6 +59,21 @@
 
     let currentDoc = null, schema = null, values = {}, fieldRules = [];
     let btnExportMain = null;
+    let btnExportDebug = null;
+    let lastExportDebug = null;
+    let exportDebugEscHandler = null;
+
+    function clearExportDebugPanel() {
+      if (exportDebugEscHandler) {
+        try { document.removeEventListener('keydown', exportDebugEscHandler); } catch {}
+        exportDebugEscHandler = null;
+      }
+      try {
+        const panel = document.getElementById('exportDebugPanel');
+        if (panel) panel.remove();
+      } catch {}
+      lastExportDebug = null;
+    }
 
     // ---------- Status + Hard Reset ----------
     function setStatus(s) { els.docStatus.innerHTML = s; }
@@ -68,7 +83,9 @@
       values = {};
       if (els.formMount) els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
       if (btnExportMain) btnExportMain.disabled = true;
+      if (btnExportDebug) btnExportDebug.disabled = true;
       els.permNote.style.display = 'none';
+      clearExportDebugPanel();
       if (reason) setStatus(`No active document (${reason}). Open one in the <a href="extractor.html">Extractor</a>.`);
       else setStatus(`No active document. Open one in the <a href="extractor.html">Extractor</a>.`);
     }
@@ -244,7 +261,7 @@
         py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/" });
 
         await py.runPythonAsync(`
-import io, zipfile, json
+import io, zipfile, json, re
 import xml.etree.ElementTree as ET
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -381,52 +398,308 @@ def write_sdts_by_tag(u8, tag_to_text_json):
     return outbuf.getvalue()
 
 # ---------- heading + block collectors ----------
-def _heading_level(p_el):
-    ppr = p_el.find(_q("pPr"))
-    if ppr is not None:
-        ol = ppr.find(_q("outlineLvl"))
-        if ol is not None and ol.get(_q("val")) is not None:
-            try: return int(ol.get(_q("val"))) + 1
-            except: pass
-        ps = ppr.find(_q("pStyle"))
-        if ps is not None and ps.get(_q("val")):
-            v = ps.get(_q("val")).lower()
-            if v.startswith("heading"):
-                try: return int(v.replace("heading","").strip())
-                except: return None
-    return None
+_STYLE_HINT_PATTERNS = [
+    re.compile(r"heading\s*([1-9])", re.IGNORECASE),
+    re.compile(r"überschrift\s*([1-9])", re.IGNORECASE),
+    re.compile(r"titre\s*([1-9])", re.IGNORECASE),
+    re.compile(r"t[ií]tulo\s*([1-9])", re.IGNORECASE),
+    re.compile(r"encabezado\s*([1-9])", re.IGNORECASE),
+    re.compile(r"rubrik\s*([1-9])", re.IGNORECASE),
+    re.compile(r"zagolovok\s*([1-9])", re.IGNORECASE),
+    re.compile(r"заголовок\s*([1-9])", re.IGNORECASE),
+]
 
-def _iter_blocks_within(container, top_level):
+def _level_from_style_hint(value):
+    if not value:
+        return 0
+    s = str(value).strip()
+    if not s:
+        return 0
+    for pattern in _STYLE_HINT_PATTERNS:
+        m = pattern.search(s)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 0
+    m2 = re.match(r"^heading([1-9])$", s, re.IGNORECASE)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except Exception:
+            return 0
+    return 0
+
+def _build_heading_style_map(zip_file):
+    try:
+        raw = zip_file.read("word/styles.xml")
+    except KeyError:
+        return {}
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return {}
+
+    by_id = {}
+    for style in root.findall("w:style", {"w": _W_NS}):
+        st_type = (style.get(_q("type")) or style.get("type") or "").strip().lower()
+        if st_type and st_type != "paragraph":
+            continue
+        style_id = style.get(_q("styleId")) or style.get("styleId") or ""
+        if not style_id:
+            continue
+        name_el = style.find(_q("name"))
+        name = ""
+        if name_el is not None:
+            name = name_el.get(_q("val")) or name_el.get("val") or ""
+        based_on_el = style.find(_q("basedOn"))
+        based_on = ""
+        if based_on_el is not None:
+            based_on = based_on_el.get(_q("val")) or based_on_el.get("val") or ""
+        lvl = 0
+        ppr = style.find(_q("pPr"))
+        if ppr is not None:
+            ol = ppr.find(_q("outlineLvl"))
+            if ol is not None:
+                val = ol.get(_q("val")) or ol.get("val")
+                if val not in (None, ""):
+                    try:
+                        num = int(val)
+                        if num >= 0:
+                            lvl = max(1, min(9, num + 1))
+                    except Exception:
+                        pass
+        if not lvl:
+            lvl = _level_from_style_hint(style_id) or _level_from_style_hint(name)
+        by_id[style_id] = {"basedOn": based_on or "", "rawLevel": int(lvl) if lvl else 0}
+
+    resolved = {}
+
+    def resolve(style_id, depth=0):
+        if not style_id or style_id not in by_id or depth > 12:
+            return 0
+        if style_id in resolved:
+            return resolved[style_id]
+        info = by_id[style_id]
+        lvl = info.get("rawLevel") or 0
+        if lvl:
+            resolved[style_id] = lvl
+            return lvl
+        parent = resolve(info.get("basedOn") or "", depth + 1)
+        resolved[style_id] = parent or 0
+        return resolved[style_id]
+
+    for style_id in list(by_id.keys()):
+        resolve(style_id)
+
+    return resolved
+
+def _heading_level_trace(p_el, style_map=None):
+    ppr = p_el.find(_q("pPr"))
+    if ppr is None:
+        return (None, None)
+    ol = ppr.find(_q("outlineLvl"))
+    if ol is not None and ol.get(_q("val")) is not None:
+        try:
+            raw = int(ol.get(_q("val")))
+            lvl = max(1, min(9, raw + 1))
+            return (lvl, f"outlineLvl:{raw}")
+        except Exception:
+            pass
+    ps = ppr.find(_q("pStyle"))
+    if ps is not None:
+        style_id = ps.get(_q("val")) or ps.get("val")
+        if style_id:
+            if style_map:
+                lvl = style_map.get(style_id)
+                if isinstance(lvl, int) and lvl > 0:
+                    return (lvl, f"style:{style_id}")
+            v = style_id.lower()
+            if v.startswith("heading"):
+                try:
+                    lvl = int(v.replace("heading", "").strip())
+                    if lvl > 0:
+                        return (lvl, f"builtin:{style_id}")
+                except Exception:
+                    return (None, None)
+    return (None, None)
+
+def _heading_level(p_el, style_map=None):
+    lvl, _ = _heading_level_trace(p_el, style_map)
+    return lvl
+
+def _iter_blocks_within(container, top_level, style_map=None):
     for node in list(container):
         if node.tag == _q("sdt"):
             inner = node.find(_q("sdtContent"))
             if inner is not None:
-                yield from _iter_blocks_within(inner, top_level)
+                yield from _iter_blocks_within(inner, top_level, style_map)
             else:
                 yield {"element": node, "type": "other", "level": None, "top": top_level}
         elif node.tag == _q("p"):
-            yield {"element": node, "type": "p", "level": _heading_level(node), "top": top_level}
+            yield {"element": node, "type": "p", "level": _heading_level(node, style_map), "top": top_level}
         elif node.tag == _q("tbl"):
             yield {"element": node, "type": "tbl", "level": None, "top": top_level}
         else:
             yield {"element": node, "type": "other", "level": None, "top": top_level}
 
-def _collect_body_blocks(body_el):
+def _collect_body_blocks(body_el, style_map=None):
     blocks = []
     for child in list(body_el):
         if child.tag == _q("sdt"):
             content = child.find(_q("sdtContent"))
             if content is not None:
-                blocks.extend(_iter_blocks_within(content, child))
+                blocks.extend(_iter_blocks_within(content, child, style_map))
             else:
                 blocks.append({"element": child, "type": "other", "level": None, "top": child})
         elif child.tag == _q("p"):
-            blocks.append({"element": child, "type": "p", "level": _heading_level(child), "top": child})
+            blocks.append({"element": child, "type": "p", "level": _heading_level(child, style_map), "top": child})
         elif child.tag == _q("tbl"):
             blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
         else:
             blocks.append({"element": child, "type": "other", "level": None, "top": child})
     return blocks
+
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
 
 # ---------- removal/backup/cleanup helpers ----------
 def _is_empty_para(p):
@@ -532,6 +805,22 @@ def _ensure_backup_embedded(zfin, zfout, names, backup_path="customXml/originalD
         zfout.writestr(backup_path, orig)
     except KeyError:
         pass
+
+def restore_document_from_backup(u8, backup_path="customXml/originalDocument.xml"):
+    data = bytes(u8)
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin:
+        try:
+            original = zfin.read(backup_path)
+        except KeyError:
+            return data
+        outbuf = io.BytesIO()
+        with zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+            for name in zfin.namelist():
+                if name == "word/document.xml":
+                    continue
+                zfout.writestr(name, zfin.read(name))
+            zfout.writestr("word/document.xml", original)
+    return outbuf.getvalue()
 
 def _ensure_update_fields(zfin, zfout):
     try:
@@ -684,6 +973,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
         # Process primary document (you can extend to headers/footers if needed)
         doc_parts = [n for n in names if n == "word/document.xml"]
+        style_map = _build_heading_style_map(zfin)
 
         global_idx = 0
         for part in doc_parts:
@@ -697,7 +987,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
                 zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
                 continue
 
-            elems = _collect_body_blocks(body)
+            elems = _collect_body_blocks(body, style_map)
 
             heading_positions = []
             for i, blk in enumerate(elems):
@@ -1257,6 +1547,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
         mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
         if (btnExportMain) btnExportMain.disabled = true;
+        if (btnExportDebug) btnExportDebug.disabled = true;
         return;
       }
 
@@ -1817,6 +2108,14 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       btnExportMain.disabled = !currentDoc;
       btnExportMain.addEventListener('click', onExportFromOpenForm);
       bar.appendChild(btnExportMain);
+
+      btnExportDebug = document.createElement('button');
+      btnExportDebug.type = 'button';
+      btnExportDebug.className = 'ghost';
+      btnExportDebug.textContent = 'Debug export…';
+      btnExportDebug.disabled = !currentDoc;
+      btnExportDebug.addEventListener('click', onExportDebugFromOpenForm);
+      bar.appendChild(btnExportDebug);
       form.appendChild(bar);
       form.addEventListener('change', () => { try { applyFieldVisibility(); } catch {} });
       mount.appendChild(form);
@@ -2184,6 +2483,506 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     });
 
     // ---------- Export (Open Form) ----------
+    function summarizeForExportDebug(value) {
+      const seen = new WeakSet();
+
+      function helper(val, depth) {
+        if (val == null) return val;
+        const t = typeof val;
+        if (t === 'number' || t === 'boolean') return val;
+        if (t === 'string') {
+          if (val.length <= 2048) return val;
+          return {
+            type: 'string',
+            length: val.length,
+            head: val.slice(0, 1024),
+            tail: val.slice(-256)
+          };
+        }
+        if (typeof Date !== 'undefined' && val instanceof Date) {
+          return { type: 'Date', value: val.toISOString() };
+        }
+        if (typeof Blob !== 'undefined' && val instanceof Blob) {
+          return { type: 'Blob', size: val.size, mime: val.type || '' };
+        }
+        if (typeof File !== 'undefined' && val instanceof File) {
+          return { type: 'File', name: val.name, size: val.size, mime: val.type || '' };
+        }
+        if (val instanceof Uint8Array) {
+          const previewLength = Math.min(32, val.length);
+          const preview = Array.from(val.slice(0, previewLength));
+          const hexPreview = preview.map(b => b.toString(16).padStart(2, '0')).join(' ');
+          return {
+            type: 'Uint8Array',
+            length: val.length,
+            previewHex: hexPreview,
+          };
+        }
+        if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) {
+          return { type: 'ArrayBuffer', byteLength: val.byteLength };
+        }
+        if (val && typeof val.byteLength === 'number' && val.buffer instanceof ArrayBuffer) {
+          return { type: val.constructor?.name || 'TypedArray', byteLength: val.byteLength };
+        }
+        if (t === 'function') {
+          return `[Function ${val.name || 'anonymous'}]`;
+        }
+        if (seen.has(val)) {
+          return '[Circular]';
+        }
+        const nextDepth = depth + 1;
+        if (nextDepth > 2) {
+          if (Array.isArray(val)) {
+            return `[Array length=${val.length}]`;
+          }
+          const keys = Object.keys(val);
+          return `[Object keys=${keys.length}]`;
+        }
+        seen.add(val);
+        try {
+          if (Array.isArray(val)) {
+            const max = nextDepth === 1 ? 20 : 10;
+            const out = val.slice(0, max).map(item => helper(item, nextDepth));
+            if (val.length > max) {
+              out.push(`… ${val.length - max} more`);
+            }
+            return out;
+          }
+          if (val instanceof Map) {
+            const entries = Array.from(val.entries());
+            const max = nextDepth === 1 ? 20 : 10;
+            const mapped = entries.slice(0, max).map(([k, v]) => [helper(k, nextDepth), helper(v, nextDepth)]);
+            if (entries.length > max) {
+              mapped.push(["__truncated__", `… ${entries.length - max} more`]);
+            }
+            return mapped;
+          }
+          const entries = Object.entries(val);
+          const max = nextDepth === 1 ? 25 : 12;
+          const out = {};
+          for (let i = 0; i < entries.length && i < max; i++) {
+            const [k, v] = entries[i];
+            out[k] = helper(v, nextDepth);
+          }
+          if (entries.length > max) {
+            out.__truncated__ = `… ${entries.length - max} more keys`;
+          }
+          return out;
+        } finally {
+          seen.delete(val);
+        }
+      }
+
+      return helper(value, 0);
+    }
+
+    function buildExportDebugSnapshot(plan, context) {
+      return {
+        generatedAt: new Date().toISOString(),
+        plan,
+        context: summarizeForExportDebug(context || {}),
+      };
+    }
+
+    function stringifyExportDebugSnapshot(plan, context) {
+      try {
+        return JSON.stringify(buildExportDebugSnapshot(plan, context), null, 2);
+      } catch (err) {
+        console.warn('Failed to stringify export debug snapshot', err);
+        return JSON.stringify({
+          error: 'stringify-failed',
+          message: err?.message || String(err || 'unknown-error'),
+        }, null, 2);
+      }
+    }
+
+    async function gatherExportArtifacts(preloadedBytes = null) {
+      if (!currentDoc?.docId) return null;
+
+      let docBytes = preloadedBytes;
+      if (!docBytes) {
+        docBytes = await fetchWorkingDocBytes();
+      }
+      if (!docBytes) return null;
+
+      if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
+        throw new Error('Cannot export: no schema loaded for the current document.');
+      }
+
+      const originalBytes = docBytes instanceof Uint8Array ? new Uint8Array(docBytes) : new Uint8Array(docBytes);
+
+      const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
+                  || (state?.cronos_payload?.tagMap)
+                  || (state?.CRONOS_PAYLOAD?.tagMap)
+                  || (state?.tagMap)
+                  || {};
+      const validIds   = new Set((schema?.fields || []).map(f => f.id));
+      const safeValues = sanitizeValues(schema, values || {});
+      const cleanTagMap = sanitizeTagMap(tagMap, validIds);
+      const rules = loadRulesForDoc(state);
+      const fieldRulesForDoc = loadFieldRulesForDoc(state);
+
+      const headingResolver = buildHeadingTargetIndex({
+        flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
+        tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
+      });
+
+      const payload = JSON.stringify({
+        title: schema?.title || 'Form',
+        fields: schema?.fields || [],
+        values: safeValues,
+        tagMap: cleanTagMap,
+        rules,
+        fieldRules: fieldRulesForDoc
+      });
+
+      const updated = await writeDocVar(originalBytes, PAYLOAD_KEY, payload);
+
+      const sdtMap = {};
+      for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
+        let v = safeValues?.[fieldId];
+        if (v == null) v = '';
+        if (typeof v === 'object') {
+          v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
+        }
+        sdtMap[tag] = String(v);
+      }
+      const updated2 = await writeSDTs(updated, sdtMap);
+
+      const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
+
+      return {
+        originalBytes,
+        updatedBytes: updated2,
+        visibilityMap,
+        safeValues,
+        cleanTagMap,
+        rules,
+        fieldRulesForDoc,
+        headingResolver,
+        state,
+        payload,
+        rawTagMap: tagMap,
+      };
+    }
+
+    function renderExportDebugPanel(plan, context = {}) {
+      if (!plan || typeof plan !== 'object') {
+        console.warn('renderExportDebugPanel: invalid plan', plan);
+        return;
+      }
+      clearExportDebugPanel();
+      lastExportDebug = { plan, context };
+      try { window.lastExportDebug = lastExportDebug; } catch {}
+
+      const overlay = document.createElement('div');
+      overlay.id = 'exportDebugPanel';
+      overlay.tabIndex = -1;
+      overlay.style.position = 'fixed';
+      overlay.style.top = '72px';
+      overlay.style.right = '24px';
+      overlay.style.maxWidth = 'min(90vw, 520px)';
+      overlay.style.maxHeight = '70vh';
+      overlay.style.overflowY = 'auto';
+      overlay.style.background = '#ffffff';
+      overlay.style.border = '1px solid rgba(15,23,42,0.12)';
+      overlay.style.boxShadow = '0 18px 45px rgba(15,23,42,0.25)';
+      overlay.style.padding = '18px';
+      overlay.style.borderRadius = '12px';
+      overlay.style.zIndex = '4000';
+      overlay.style.fontSize = '14px';
+      overlay.style.lineHeight = '1.4';
+
+      const header = document.createElement('div');
+      header.style.display = 'flex';
+      header.style.gap = '12px';
+      header.style.alignItems = 'center';
+      header.style.marginBottom = '12px';
+
+      const title = document.createElement('h3');
+      title.textContent = 'Export removal debug';
+      title.style.margin = '0';
+      title.style.fontSize = '16px';
+      title.style.fontWeight = '600';
+
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'ghost';
+      closeBtn.textContent = 'Close';
+      closeBtn.style.marginLeft = 'auto';
+      closeBtn.addEventListener('click', (ev) => { ev.preventDefault(); clearExportDebugPanel(); });
+
+      header.appendChild(title);
+      header.appendChild(closeBtn);
+      overlay.appendChild(header);
+
+      const summary = document.createElement('div');
+      summary.style.marginBottom = '12px';
+
+      const headings = [];
+      (plan.parts || []).forEach(part => {
+        (part?.headings || []).forEach(h => {
+          headings.push({ ...h, part: part?.name || '' });
+        });
+      });
+      headings.sort((a, b) => a.idx - b.idx);
+
+      const unmatched = Array.isArray(plan.unmatchedActions) ? plan.unmatchedActions : [];
+
+      const summaryLines = [];
+      summaryLines.push(`<strong>${headings.length}</strong> headings detected.`);
+      summaryLines.push(`Style map entries: <strong>${plan.styleMapSize || 0}</strong> (${plan.hasStylesXml ? 'styles.xml present' : 'styles.xml missing'})`);
+      summaryLines.push(`Visibility actions: <strong>${Object.keys(context.visibilityMap || {}).length}</strong>.`);
+      if (unmatched.length) {
+        summaryLines.push(`Unmatched actions: ${unmatched.join(', ')}`);
+      }
+      summary.innerHTML = summaryLines.map(line => `<div>${line}</div>`).join('');
+      overlay.appendChild(summary);
+
+      const headingResolver = context?.headingResolver;
+      const labelForHeading = (idx) => {
+        let fallback = `Heading ${idx}`;
+        if (!headingResolver) return fallback;
+        let entry = null;
+        try { entry = headingResolver.resolve?.({ idx }); } catch {}
+        if (!entry) {
+          try { entry = headingResolver.resolve?.(idx); } catch {}
+        }
+        if (entry && headingResolver.buildLabel) {
+          return headingResolver.buildLabel(entry, fallback);
+        }
+        if (entry?.text) return entry.text;
+        if (headingResolver.buildLabel) {
+          return headingResolver.buildLabel(null, fallback);
+        }
+        return fallback;
+      };
+
+      const actionsEntries = Object.entries(context.visibilityMap || {}).map(([idx, action]) => {
+        const num = Number(idx);
+        return { idx: Number.isFinite(num) ? num : idx, action, label: labelForHeading(num) };
+      }).sort((a, b) => Number(a.idx) - Number(b.idx));
+
+      const makeTable = () => {
+        const table = document.createElement('table');
+        table.style.width = '100%';
+        table.style.borderCollapse = 'collapse';
+        table.style.marginBottom = '12px';
+        table.style.fontSize = '13px';
+        return table;
+      };
+
+      if (actionsEntries.length) {
+        const actionsWrap = document.createElement('div');
+        actionsWrap.style.marginBottom = '12px';
+        const heading = document.createElement('h4');
+        heading.textContent = 'Visibility map';
+        heading.style.margin = '0 0 6px';
+        heading.style.fontSize = '14px';
+        heading.style.fontWeight = '600';
+        actionsWrap.appendChild(heading);
+
+        const table = makeTable();
+        const thead = document.createElement('thead');
+        const tr = document.createElement('tr');
+        ['Idx', 'Action', 'Label'].forEach(text => {
+          const th = document.createElement('th');
+          th.textContent = text;
+          th.style.textAlign = 'left';
+          th.style.padding = '4px 6px';
+          th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
+          tr.appendChild(th);
+        });
+        thead.appendChild(tr);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        actionsEntries.forEach(entry => {
+          const row = document.createElement('tr');
+          row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
+          const cells = [
+            String(entry.idx),
+            String(entry.action || ''),
+            entry.label || ''
+          ];
+          cells.forEach((value, i) => {
+            const td = document.createElement('td');
+            td.textContent = value;
+            td.style.padding = '4px 6px';
+            if (i === 1) td.style.textTransform = 'uppercase';
+            row.appendChild(td);
+          });
+          tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        actionsWrap.appendChild(table);
+        overlay.appendChild(actionsWrap);
+      }
+
+      const headingsWrap = document.createElement('div');
+      const headingTitle = document.createElement('h4');
+      headingTitle.textContent = 'Detected headings';
+      headingTitle.style.margin = '0 0 6px';
+      headingTitle.style.fontSize = '14px';
+      headingTitle.style.fontWeight = '600';
+      headingsWrap.appendChild(headingTitle);
+
+      if (plan.error) {
+        const err = document.createElement('div');
+        err.textContent = `Unable to analyse document (${plan.error}).`;
+        err.style.color = '#b91c1c';
+        headingsWrap.appendChild(err);
+      }
+
+      if (headings.length) {
+        const table = makeTable();
+        const thead = document.createElement('thead');
+        const headerRow = document.createElement('tr');
+        ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
+          const th = document.createElement('th');
+          th.textContent = text;
+          th.style.textAlign = 'left';
+          th.style.padding = '4px 6px';
+          th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
+          headerRow.appendChild(th);
+        });
+        thead.appendChild(headerRow);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        headings.forEach(h => {
+          const row = document.createElement('tr');
+          row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
+          if (h.action === 'HIDE') row.style.background = 'rgba(239,68,68,0.08)';
+          else if (h.action === 'SHOW') row.style.background = 'rgba(34,197,94,0.1)';
+          const cells = [
+            String(h.idx),
+            String(h.level ?? ''),
+            String(h.action || ''),
+            h.detectedBy || '',
+            `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
+          ];
+          cells.forEach((value, i) => {
+            const td = document.createElement('td');
+            td.textContent = value;
+            td.style.padding = '4px 6px';
+            if (i === 2) td.style.textTransform = 'uppercase';
+            row.appendChild(td);
+          });
+          tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        headingsWrap.appendChild(table);
+      } else if (!plan.error) {
+        const empty = document.createElement('div');
+        empty.textContent = 'No headings were detected in the document.';
+        headingsWrap.appendChild(empty);
+      }
+
+      if (unmatched.length) {
+        const warn = document.createElement('div');
+        warn.textContent = `Indices without matching headings: ${unmatched.join(', ')}`;
+        warn.style.color = '#b45309';
+        warn.style.marginBottom = '8px';
+        headingsWrap.appendChild(warn);
+      }
+
+      overlay.appendChild(headingsWrap);
+
+      const controls = document.createElement('div');
+      controls.style.display = 'flex';
+      controls.style.flexWrap = 'wrap';
+      controls.style.gap = '8px';
+      controls.style.marginTop = '12px';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'ghost';
+      copyBtn.textContent = 'Copy JSON';
+      copyBtn.addEventListener('click', async () => {
+        try {
+          const json = stringifyExportDebugSnapshot(plan, context);
+          await navigator.clipboard.writeText(json);
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+        } catch (err) {
+          copyBtn.textContent = 'Copy failed';
+          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+        }
+      });
+      controls.appendChild(copyBtn);
+
+      const downloadBtn = document.createElement('button');
+      downloadBtn.type = 'button';
+      downloadBtn.className = 'ghost';
+      downloadBtn.textContent = 'Download JSON';
+      downloadBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        try {
+          const json = stringifyExportDebugSnapshot(plan, context);
+          const blob = new Blob([json], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = (currentDoc?.name || 'document') + ' - export-debug.json';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
+        } catch (err) {
+          console.warn('Download debug JSON failed:', err);
+        }
+      });
+      controls.appendChild(downloadBtn);
+
+      overlay.appendChild(controls);
+
+      const details = document.createElement('details');
+      details.style.marginTop = '10px';
+      const summaryEl = document.createElement('summary');
+      summaryEl.textContent = 'Raw debug payload';
+      summaryEl.style.cursor = 'pointer';
+      const pre = document.createElement('pre');
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.fontSize = '12px';
+      pre.textContent = stringifyExportDebugSnapshot(plan, context);
+      details.appendChild(summaryEl);
+      details.appendChild(pre);
+      overlay.appendChild(details);
+
+      document.body.appendChild(overlay);
+      try { overlay.focus({ preventScroll: true }); } catch {}
+      exportDebugEscHandler = (ev) => { if (ev.key === 'Escape') { clearExportDebugPanel(); } };
+      document.addEventListener('keydown', exportDebugEscHandler);
+    }
+
+    async function onExportDebugFromOpenForm() {
+      if (!currentDoc?.docId) {
+        alert('No active document. Open or pick a DOCX first.');
+        return;
+      }
+      try {
+        if (btnExportDebug) btnExportDebug.disabled = true;
+        await ensurePy();
+        const prepared = await gatherExportArtifacts();
+        if (!prepared) {
+          alert('Could not access the current DOCX bytes.');
+          return;
+        }
+        const plan = await inspectRemovalPlan(prepared.updatedBytes, prepared.visibilityMap);
+        console.groupCollapsed('Export removal debug');
+        console.log('Visibility map', prepared.visibilityMap);
+        console.log('Removal plan', plan);
+        console.groupEnd();
+        renderExportDebugPanel(plan, prepared);
+      } catch (e) {
+        console.error('Export debug failed:', e);
+        alert('Export debug failed: ' + (e?.message || e));
+      } finally {
+        if (btnExportDebug) btnExportDebug.disabled = !currentDoc;
+      }
+    }
+
     async function onExportFromOpenForm() {
       if (!currentDoc?.docId) {
         alert('No active document. Open or pick a DOCX first.');
@@ -2221,59 +3020,10 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const attempt = async () => {
         await ensurePy();
 
-        const docBytes = await fetchWorkingDocBytes();
-        if (!docBytes) return;
+        const prepared = await gatherExportArtifacts(canBytes);
+        if (!prepared) { await hardResetOpenForm('no bytes / no permission'); return; }
 
-        const originalBytes = (docBytes instanceof Uint8Array)
-          ? docBytes
-          : new Uint8Array(docBytes);
-
-        const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
-                    || (state?.cronos_payload?.tagMap)
-                    || (state?.CRONOS_PAYLOAD?.tagMap)
-                    || (state?.tagMap)
-                    || {};
-        const validIds   = new Set((schema?.fields || []).map(f => f.id));
-        const safeValues = sanitizeValues(schema, values || {});
-        const cleanTagMap = sanitizeTagMap(tagMap, validIds);
-        const rules = loadRulesForDoc(state);
-        const fieldRulesForDoc = loadFieldRulesForDoc(state);
-
-        const headingResolver = buildHeadingTargetIndex({
-          flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
-          tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
-        });
-
-        const payload = JSON.stringify({
-          title: schema?.title || 'Form',
-          fields: schema?.fields || [],
-          values: safeValues,
-          tagMap: cleanTagMap,
-          rules,
-          fieldRules: fieldRulesForDoc
-        });
-
-        // 1) write CRONOS_PAYLOAD → settings.xml
-        const updated = await writeDocVar(docBytes, PAYLOAD_KEY, payload);
-
-        // 2) fill SDTs
-        const sdtMap = {};
-        for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
-          let v = safeValues?.[fieldId];
-          if (v == null) v = '';
-          if (typeof v === 'object') {
-            v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
-          }
-          sdtMap[tag] = String(v);
-        }
-        let updated2 = await writeSDTs(updated, sdtMap);
-
-        // 3) evaluate rules → visibility map (SHOW overrides HIDE)
-        const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
-
-        // 4) REMOVE sections (if requested) + embed untouched original backup
-        const updated3 = await applyRemovalWithBackup(updated2, visibilityMap, originalBytes);
+        const updated3 = await applyRemovalWithBackup(prepared.updatedBytes, prepared.visibilityMap, prepared.originalBytes);
 
         await window.formSuitePersist.putBytes?.(currentDoc.docId, updated3);
 
@@ -2798,6 +3548,31 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     }
 
     // ---------- JS bridge to Python removal-with-backup ----------
+    async function inspectRemovalPlan(bytesU8, visibilityMap) {
+      await ensurePy();
+      const fn = py.globals.get('inspect_export_removal_plan');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
+      const pyBytes = py.toPy(buf);
+      const pyMap = py.toPy(JSON.stringify(visibilityMap || {}));
+      let pyOut;
+      try {
+        pyOut = fn(pyBytes, pyMap);
+      } finally {
+        try { fn.destroy(); } catch {}
+        try { pyBytes.destroy(); } catch {}
+        try { pyMap.destroy(); } catch {}
+      }
+      let out = null;
+      if (pyOut?.toJs) out = pyOut.toJs({ create_proxies:false });
+      else out = pyOut ?? null;
+      try { pyOut?.destroy?.(); } catch {}
+      if (typeof out === 'string') {
+        try { return JSON.parse(out); }
+        catch { return { error: 'parse-error', raw: out }; }
+      }
+      return out;
+    }
+
     async function applyRemovalWithBackup(bytesU8, visibilityMap, originalBytes) {
       await ensurePy();
       const fn = py.globals.get('apply_removal_with_backup');
@@ -2833,8 +3608,35 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       return u8;
     }
 
+    async function restoreDocxFromBackup(bytesU8, backupPath = 'customXml/originalDocument.xml') {
+      await ensurePy();
+      const fn = py.globals.get('restore_document_from_backup');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
+      const pyBytes = py.toPy(buf);
+      const pyPath = py.toPy(String(backupPath || 'customXml/originalDocument.xml'));
+      let pyOut;
+      try {
+        pyOut = fn(pyBytes, pyPath);
+      } finally {
+        try { fn.destroy(); } catch {}
+        try { pyBytes.destroy(); } catch {}
+        try { pyPath.destroy(); } catch {}
+      }
+      let u8;
+      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+      else u8 = new Uint8Array(buf);
+      try { pyOut?.destroy?.(); } catch {}
+      return u8;
+    }
+
     // Expose for cross-callbacks
-    try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
+    try {
+      window.applyFieldVisibility = applyFieldVisibility;
+      window.restoreDocxFromBackup = restoreDocxFromBackup;
+      window.inspectExportRemovalPlan = inspectRemovalPlan;
+      window.renderExportDebugPanel = renderExportDebugPanel;
+    } catch {}
 
     // ---------- Logo triple-click: focus mode ----------
     (function() {
