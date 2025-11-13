@@ -962,7 +962,7 @@
         const text = entry?.text || entry?.title || entry?.label || '';
         const num = entry?.number || entry?.num;
         if (num) return `${String(num)}|${text}`.trim();
-        if (Number.isFinite(idx)) return `${idx}|${text}`.trim();
+        if (Number.isFinite(idx)) return `${idx + 1}|${text}`.trim();
         return text ? `|${text}` : '';
       };
 
@@ -1015,13 +1015,28 @@
           if (target.uid && byUid.has(String(target.uid))) return byUid.get(String(target.uid));
           if (target.idx != null) {
             const idx = Number(target.idx);
-            if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+            if (Number.isFinite(idx)) {
+              if (byIdx.has(idx)) return byIdx.get(idx);
+              const legacy = idx - 1;
+              if (byIdx.has(legacy)) {
+                const maybe = byIdx.get(legacy);
+                if (maybe && idx === Number(maybe.idx) + 1) return maybe;
+              }
+            }
           }
           if (target.key != null) {
             const idx = Number(target.key);
-            if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+            if (Number.isFinite(idx)) {
+              if (byIdx.has(idx)) return byIdx.get(idx);
+              const legacy = idx - 1;
+              if (byIdx.has(legacy)) {
+                const maybe = byIdx.get(legacy);
+                if (maybe && idx === Number(maybe.idx) + 1) return maybe;
+              }
+            }
             const keyStr = String(target.key);
             if (byComposite.has(keyStr)) return byComposite.get(keyStr);
+            if (byNumber.has(keyStr)) return byNumber.get(keyStr);
           }
           if (target.label) {
             const lbl = String(target.label);
@@ -1042,10 +1057,24 @@
             const head = rawStr.split('|', 1)[0];
             if (byNumber.has(head)) return byNumber.get(head);
             const num = Number(head);
-            if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+            if (Number.isFinite(num)) {
+              if (byIdx.has(num)) return byIdx.get(num);
+              const legacy = num - 1;
+              if (byIdx.has(legacy)) {
+                const maybe = byIdx.get(legacy);
+                if (maybe && num === Number(maybe.idx) + 1) return maybe;
+              }
+            }
           }
           const num = Number(rawStr);
-          if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+          if (Number.isFinite(num)) {
+            if (byIdx.has(num)) return byIdx.get(num);
+            const legacy = num - 1;
+            if (byIdx.has(legacy)) {
+              const maybe = byIdx.get(legacy);
+              if (maybe && num === Number(maybe.idx) + 1) return maybe;
+            }
+          }
         }
         return null;
       };
@@ -1054,7 +1083,15 @@
         const entry = resolve(target);
         if (entry && Number.isFinite(Number(entry.idx))) return Number(entry.idx);
         const legacy = parseLegacyIdx(target);
-        if (Number.isFinite(legacy)) return legacy;
+        if (Number.isFinite(legacy)) {
+          if (byIdx.has(legacy)) return legacy;
+          const fallback = legacy - 1;
+          if (byIdx.has(fallback)) {
+            const maybe = byIdx.get(fallback);
+            if (maybe && legacy === Number(maybe.idx) + 1) return Number(maybe.idx);
+          }
+          return legacy;
+        }
         return NaN;
       };
 
@@ -1069,16 +1106,31 @@
 
       const normalizeTarget = (target) => {
         const entry = resolve(target);
-        const idx = entry ? Number(entry.idx) : resolveIdx(target);
+        let idx = entry ? Number(entry.idx) : resolveIdx(target);
         if (!Number.isFinite(idx)) return null;
+
+        if (!entry && target && typeof target === 'object') {
+          const rawIdx = Number(target.idx ?? target.key);
+          if (Number.isFinite(rawIdx)) {
+            const legacy = rawIdx - 1;
+            if (byIdx.has(legacy)) {
+              const maybe = byIdx.get(legacy);
+              if (maybe && rawIdx === Number(maybe.idx) + 1) {
+                idx = Number(maybe.idx);
+              }
+            }
+          }
+        }
+
         const normalized = { key: idx, idx };
         if (entry?.uid) normalized.uid = entry.uid;
         else if (target && typeof target === 'object' && target.uid) normalized.uid = target.uid;
         const fallbackLabel = (target && typeof target === 'object') ? target.label : null;
-        const label = buildLabel(entry, fallbackLabel) || `Heading ${idx}`;
+        const label = buildLabel(entry, fallbackLabel) || `Heading ${idx + 1}`;
         normalized.label = label;
         const number = entry?.number || entry?.num;
         if (number) normalized.number = number;
+        else normalized.number = String(idx + 1);
         return normalized;
       };
 
@@ -2522,7 +2574,7 @@
       return false;
     }
 
-    function evaluateRulesToVisibility(schema, values, rules) {
+    function evaluateRulesToVisibility(schema, values, rules, headingResolver) {
       const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
 
@@ -2545,9 +2597,29 @@
         if (!ruleMatchesValue(op, exp, actual)) continue;
 
         for (const t of targets) {
-          const key = t?.key ?? t?.idx ?? t?.id;
-          if (key == null) continue;
-          const idx = Number(key);
+          let idx = NaN;
+          if (headingResolver && typeof headingResolver.normalizeTarget === 'function') {
+            const normalized = headingResolver.normalizeTarget(t);
+            if (normalized && Number.isFinite(Number(normalized.idx))) {
+              idx = Number(normalized.idx);
+            }
+          }
+          if (!Number.isFinite(idx) && headingResolver && typeof headingResolver.resolveIdx === 'function') {
+            const resolved = headingResolver.resolveIdx(t);
+            if (Number.isFinite(resolved)) idx = resolved;
+          }
+          if (!Number.isFinite(idx)) {
+            const raw = t?.key ?? t?.idx ?? t?.id;
+            if (raw != null) {
+              if (typeof raw === 'number') idx = Number(raw);
+              else {
+                const s = String(raw);
+                const head = s.split('|', 1)[0];
+                const n = Number(head);
+                if (Number.isFinite(n)) idx = n;
+              }
+            }
+          }
           if (!Number.isFinite(idx)) continue;
           const prev = out[idx];
           if (action === 'SHOW') out[idx] = 'SHOW';
@@ -3147,7 +3219,7 @@
           if (!lvl) continue;
           const text = paraText(p);
           if (!text) continue;
-          const idx = flat.length + 1;
+          const idx = flat.length;
           const uid = `sec_${String(i).padStart(6, '0')}`;
           flat.push({
             idx,
@@ -3191,7 +3263,7 @@
         propagate(tree);
 
         flat.forEach((h) => {
-          if (!h.number && h.idx != null) h.number = h.idx;
+          if (!h.number && h.idx != null) h.number = String(h.idx + 1);
           if (!h.compositeKey) h.compositeKey = `${h.number}|${h.text}`.trim();
         });
 
