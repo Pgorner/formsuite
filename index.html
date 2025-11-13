@@ -651,6 +651,147 @@ def inspect_export_removal_plan(u8, idx_to_action_json):
                 lvl = blk.get("level")
                 if not isinstance(lvl, int) or lvl <= 0:
                     continue
+                global_idx += 1
+                idx = global_idx
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
+
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
                 idx = global_idx
                 global_idx += 1
                 trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
@@ -1278,8 +1419,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
                 lvl = blk.get("level")
                 if not isinstance(lvl, int) or lvl <= 0:
                     continue
-                idx = global_idx
                 global_idx += 1
+                idx = global_idx
                 heading_positions.append((i, lvl, idx))
 
             to_remove_top_nodes = set()
