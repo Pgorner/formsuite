@@ -3051,9 +3051,17 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const rules = loadRulesForDoc(state);
       const fieldRulesForDoc = loadFieldRulesForDoc(state);
 
+      const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
+        ? state.headingsFlat
+        : Array.isArray(state?.headings) ? state.headings
+        : [];
+      const baselineHeadingsTree = Array.isArray(state?.headingsTree)
+        ? state.headingsTree
+        : [];
+
       const fallbackHeadingResolver = buildHeadingTargetIndex({
-        flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
-        tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
+        flat: baselineHeadingsFlat,
+        tree: baselineHeadingsTree
       });
 
       const payload = JSON.stringify({
@@ -3078,7 +3086,11 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       }
       const updated2 = await writeSDTs(updated, sdtMap);
 
-      const headingResolver = await buildHeadingResolverFromDoc(updated2, fallbackHeadingResolver);
+      const headingResolver = await buildHeadingResolverFromDoc(updated2, {
+        fallbackResolver: fallbackHeadingResolver,
+        baselineFlat: baselineHeadingsFlat,
+        baselineTree: baselineHeadingsTree
+      });
 
       const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
 
@@ -3736,8 +3748,151 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       return { resolve, resolveIdx, normalizeTarget, buildLabel };
     }
 
-    async function buildHeadingResolverFromDoc(bytesU8, fallbackResolver = null) {
-      const fallback = fallbackResolver || null;
+    function mergeHeadingMetadataFromBaseline(liveFlat, baselineFlat) {
+      if (!Array.isArray(liveFlat) || !liveFlat.length) return;
+      if (!Array.isArray(baselineFlat) || !baselineFlat.length) return;
+
+      const normalizeText = (value) => {
+        if (!value && value !== 0) return '';
+        let out = String(value);
+        try { out = out.normalize('NFKD'); } catch {}
+        out = out.replace(/[\u0300-\u036f]/g, '');
+        return out.replace(/\s+/g, ' ').trim().toLowerCase();
+      };
+
+      const copyMetadata = (target, source) => {
+        if (!target || !source) return;
+        const copyIfMissing = (fromKey, toKey = fromKey) => {
+          const val = source[fromKey];
+          if (val == null || val === '') return;
+          if (target[toKey] == null || target[toKey] === '') target[toKey] = val;
+        };
+        copyIfMissing('uid');
+        copyIfMissing('compositeKey');
+        copyIfMissing('number');
+        copyIfMissing('num', 'number');
+        copyIfMissing('part');
+        const lbl = source.label || source.title;
+        if (lbl && (!target.label || target.label === target.text)) target.label = lbl;
+      };
+
+      const baselineMeta = baselineFlat.map((entry, order) => ({
+        entry,
+        order,
+        idx: Number(entry?.idx ?? entry?.key),
+        level: Number(entry?.level),
+        norm: normalizeText(entry?.label || entry?.text || entry?.title || ''),
+      })).filter(meta => meta.entry);
+      if (!baselineMeta.length) return;
+
+      const liveMeta = liveFlat.map((entry, order) => ({
+        entry,
+        order,
+        idx: Number(entry?.idx ?? entry?.key),
+        level: Number(entry?.level),
+        norm: normalizeText(entry?.text || entry?.label || ''),
+      }));
+
+      const baselineByIdx = new Map();
+      const baselineByLevelText = new Map();
+      const baselineByText = new Map();
+      const pushToMap = (map, key, value) => {
+        if (!key && key !== 0) return;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(value);
+      };
+
+      baselineMeta.forEach((meta) => {
+        if (Number.isFinite(meta.idx) && !baselineByIdx.has(meta.idx)) baselineByIdx.set(meta.idx, meta);
+        if (meta.norm) {
+          const lvlKey = `${Number.isFinite(meta.level) ? meta.level : 'x'}|${meta.norm}`;
+          pushToMap(baselineByLevelText, lvlKey, meta);
+          pushToMap(baselineByText, meta.norm, meta);
+        }
+      });
+
+      const takeMatch = (collection, key) => {
+        if (!collection) return null;
+        const arr = Array.isArray(collection) ? collection : collection.get?.(key);
+        if (!arr) return null;
+        while (arr.length) {
+          const cand = arr.shift();
+          if (cand && !cand._used) return cand;
+        }
+        return null;
+      };
+
+      const matchIdx = () => {
+        for (const live of liveMeta) {
+          if (!Number.isFinite(live.idx)) continue;
+          const cand = baselineByIdx.get(live.idx);
+          if (cand && !cand._used) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      const matchLevelAndText = () => {
+        for (const live of liveMeta) {
+          if (live._matched) continue;
+          if (!live.norm) continue;
+          const key = `${Number.isFinite(live.level) ? live.level : 'x'}|${live.norm}`;
+          const cand = takeMatch(baselineByLevelText, key);
+          if (cand) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      const matchTextOnly = () => {
+        for (const live of liveMeta) {
+          if (live._matched) continue;
+          if (!live.norm) continue;
+          const cand = takeMatch(baselineByText, live.norm);
+          if (cand) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      const matchByOrder = () => {
+        for (let i = 0; i < liveMeta.length; i++) {
+          const live = liveMeta[i];
+          if (live._matched) continue;
+          const cand = baselineMeta[i];
+          if (cand && !cand._used) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      matchIdx();
+      matchLevelAndText();
+      matchTextOnly();
+      if (liveMeta.length === baselineMeta.length) matchByOrder();
+    }
+
+    async function buildHeadingResolverFromDoc(bytesU8, options = null) {
+      let fallback = null;
+      let baselineFlat = [];
+      if (options && typeof options === 'object' && !Array.isArray(options)) {
+        if (typeof options.resolve === 'function' || typeof options.resolveIdx === 'function' || typeof options.normalizeTarget === 'function') {
+          fallback = options;
+        } else {
+          fallback = options.fallbackResolver || null;
+        }
+        if (Array.isArray(options.baselineFlat)) baselineFlat = options.baselineFlat;
+      } else {
+        fallback = options || null;
+      }
       let normalized = null;
       if (bytesU8 instanceof Uint8Array) normalized = bytesU8;
       else if (bytesU8) {
@@ -3777,6 +3932,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
         if (liveFlat.length) {
           liveFlat.sort((a, b) => a.idx - b.idx);
+          mergeHeadingMetadataFromBaseline(liveFlat, baselineFlat);
           return buildHeadingTargetIndex({ flat: liveFlat, tree: [] });
         }
       } catch (err) {
