@@ -651,8 +651,8 @@ def inspect_export_removal_plan(u8, idx_to_action_json):
                 lvl = blk.get("level")
                 if not isinstance(lvl, int) or lvl <= 0:
                     continue
-                global_idx += 1
                 idx = global_idx
+                global_idx += 1
                 trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
                 if isinstance(trace_lvl, int) and trace_lvl > 0:
                     lvl = trace_lvl
@@ -1419,8 +1419,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
                 lvl = blk.get("level")
                 if not isinstance(lvl, int) or lvl <= 0:
                     continue
-                global_idx += 1
                 idx = global_idx
+                global_idx += 1
                 heading_positions.append((i, lvl, idx))
 
             to_remove_top_nodes = set()
@@ -4040,7 +4040,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const remapped = {};
       for (const [key, value] of Object.entries(map || {})) {
         const num = Number(key);
-        if (Number.isFinite(num)) remapped[num + 1] = value;
+        if (Number.isFinite(num)) remapped[num] = value;
         else remapped[key] = value;
       }
       return JSON.stringify(remapped);
