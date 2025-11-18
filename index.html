@@ -3051,7 +3051,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const rules = loadRulesForDoc(state);
       const fieldRulesForDoc = loadFieldRulesForDoc(state);
 
-      const headingResolver = buildHeadingTargetIndex({
+      const fallbackHeadingResolver = buildHeadingTargetIndex({
         flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
         tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
       });
@@ -3077,6 +3077,8 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         sdtMap[tag] = String(v);
       }
       const updated2 = await writeSDTs(updated, sdtMap);
+
+      const headingResolver = await buildHeadingResolverFromDoc(updated2, fallbackHeadingResolver);
 
       const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
 
@@ -3732,6 +3734,56 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       };
 
       return { resolve, resolveIdx, normalizeTarget, buildLabel };
+    }
+
+    async function buildHeadingResolverFromDoc(bytesU8, fallbackResolver = null) {
+      const fallback = fallbackResolver || null;
+      let normalized = null;
+      if (bytesU8 instanceof Uint8Array) normalized = bytesU8;
+      else if (bytesU8) {
+        try { normalized = new Uint8Array(bytesU8); }
+        catch { normalized = null; }
+      }
+      if (!normalized || !normalized.length) return fallback;
+
+      try {
+        const plan = await inspectRemovalPlan(normalized, {});
+        const parts = Array.isArray(plan?.parts) ? plan.parts : [];
+        const seen = new Set();
+        const liveFlat = [];
+
+        for (const part of parts) {
+          const headings = Array.isArray(part?.headings) ? part.headings : [];
+          for (const heading of headings) {
+            const idx = Number(heading?.idx);
+            if (!Number.isFinite(idx) || seen.has(idx)) continue;
+            seen.add(idx);
+            const text = String(heading?.text || '').trim();
+            const lvl = Number(heading?.level);
+            const entry = {
+              idx,
+              key: idx,
+              id: idx,
+              text,
+              title: text,
+              label: text,
+            };
+            if (Number.isFinite(lvl)) entry.level = lvl;
+            const number = heading?.number ?? heading?.num;
+            if (number != null && number !== '') entry.number = String(number);
+            liveFlat.push(entry);
+          }
+        }
+
+        if (liveFlat.length) {
+          liveFlat.sort((a, b) => a.idx - b.idx);
+          return buildHeadingTargetIndex({ flat: liveFlat, tree: [] });
+        }
+      } catch (err) {
+        console.warn('Failed to rebuild heading resolver from DOCX before export', err);
+      }
+
+      return fallback;
     }
 
     function ruleMatchesValue(op, expected, actual) {
