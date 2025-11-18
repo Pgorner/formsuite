@@ -3170,7 +3170,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
       const headingResolver = context?.headingResolver;
       const labelForHeading = (idx) => {
-        let fallback = `Heading ${idx}`;
+        let fallback = `Heading ${idx + 1}`;
         if (!headingResolver) return fallback;
         let entry = null;
         try { entry = headingResolver.resolve?.({ idx }); } catch {}
@@ -3560,7 +3560,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const text = entry?.text || entry?.title || entry?.label || '';
         const num = entry?.number || entry?.num;
         if (num) return `${String(num)}|${text}`.trim();
-        if (Number.isFinite(idx)) return `${idx}|${text}`.trim();
+        if (Number.isFinite(idx)) return `${idx + 1}|${text}`.trim();
         return text ? `|${text}` : '';
       };
 
@@ -3612,13 +3612,28 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
           if (target.uid && byUid.has(String(target.uid))) return byUid.get(String(target.uid));
           if (target.idx != null) {
             const idx = Number(target.idx);
-            if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+            if (Number.isFinite(idx)) {
+              if (byIdx.has(idx)) return byIdx.get(idx);
+              const legacy = idx - 1;
+              if (byIdx.has(legacy)) {
+                const maybe = byIdx.get(legacy);
+                if (maybe && idx === Number(maybe.idx) + 1) return maybe;
+              }
+            }
           }
           if (target.key != null) {
             const idx = Number(target.key);
-            if (Number.isFinite(idx) && byIdx.has(idx)) return byIdx.get(idx);
+            if (Number.isFinite(idx)) {
+              if (byIdx.has(idx)) return byIdx.get(idx);
+              const legacy = idx - 1;
+              if (byIdx.has(legacy)) {
+                const maybe = byIdx.get(legacy);
+                if (maybe && idx === Number(maybe.idx) + 1) return maybe;
+              }
+            }
             const keyStr = String(target.key);
             if (byComposite.has(keyStr)) return byComposite.get(keyStr);
+            if (byNumber.has(keyStr)) return byNumber.get(keyStr);
           }
           if (target.label) {
             const lbl = String(target.label);
@@ -3639,10 +3654,24 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
             const head = rawStr.split('|', 1)[0];
             if (byNumber.has(head)) return byNumber.get(head);
             const num = Number(head);
-            if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+            if (Number.isFinite(num)) {
+              if (byIdx.has(num)) return byIdx.get(num);
+              const legacy = num - 1;
+              if (byIdx.has(legacy)) {
+                const maybe = byIdx.get(legacy);
+                if (maybe && num === Number(maybe.idx) + 1) return maybe;
+              }
+            }
           }
           const num = Number(rawStr);
-          if (Number.isFinite(num) && byIdx.has(num)) return byIdx.get(num);
+          if (Number.isFinite(num)) {
+            if (byIdx.has(num)) return byIdx.get(num);
+            const legacy = num - 1;
+            if (byIdx.has(legacy)) {
+              const maybe = byIdx.get(legacy);
+              if (maybe && num === Number(maybe.idx) + 1) return maybe;
+            }
+          }
         }
         return null;
       };
@@ -3651,7 +3680,15 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         const entry = resolve(target);
         if (entry && Number.isFinite(Number(entry.idx))) return Number(entry.idx);
         const legacy = parseLegacyIdx(target);
-        if (Number.isFinite(legacy)) return legacy;
+        if (Number.isFinite(legacy)) {
+          if (byIdx.has(legacy)) return legacy;
+          const fallback = legacy - 1;
+          if (byIdx.has(fallback)) {
+            const maybe = byIdx.get(fallback);
+            if (maybe && legacy === Number(maybe.idx) + 1) return Number(maybe.idx);
+          }
+          return legacy;
+        }
         return NaN;
       };
 
@@ -3666,16 +3703,31 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
       const normalizeTarget = (target) => {
         const entry = resolve(target);
-        const idx = entry ? Number(entry.idx) : resolveIdx(target);
+        let idx = entry ? Number(entry.idx) : resolveIdx(target);
         if (!Number.isFinite(idx)) return null;
+
+        if (!entry && target && typeof target === 'object') {
+          const rawIdx = Number(target.idx ?? target.key);
+          if (Number.isFinite(rawIdx)) {
+            const legacy = rawIdx - 1;
+            if (byIdx.has(legacy)) {
+              const maybe = byIdx.get(legacy);
+              if (maybe && rawIdx === Number(maybe.idx) + 1) {
+                idx = Number(maybe.idx);
+              }
+            }
+          }
+        }
+
         const normalized = { key: idx, idx };
         if (entry?.uid) normalized.uid = entry.uid;
         else if (target && typeof target === 'object' && target.uid) normalized.uid = target.uid;
         const fallbackLabel = (target && typeof target === 'object') ? target.label : null;
-        const label = buildLabel(entry, fallbackLabel) || `Heading ${idx}`;
+        const label = buildLabel(entry, fallbackLabel) || `Heading ${idx + 1}`;
         normalized.label = label;
         const number = entry?.number || entry?.num;
         if (number) normalized.number = number;
+        else normalized.number = String(idx + 1);
         return normalized;
       };
 
@@ -3705,15 +3757,23 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
     // Small helper: accept targets like  "12"  OR  "12|Heading title"
     function parseTargetIdx(t, headingResolver) {
-      if (headingResolver && typeof headingResolver.resolveIdx === 'function') {
-        const resolved = headingResolver.resolveIdx(t);
-        if (Number.isFinite(resolved)) return resolved;
+      if (headingResolver) {
+        if (typeof headingResolver.normalizeTarget === 'function') {
+          const normalized = headingResolver.normalizeTarget(t);
+          if (normalized && Number.isFinite(Number(normalized.idx))) {
+            return Number(normalized.idx);
+          }
+        }
+        if (typeof headingResolver.resolveIdx === 'function') {
+          const resolved = headingResolver.resolveIdx(t);
+          if (Number.isFinite(resolved)) return resolved;
+        }
       }
       const raw = t?.key ?? t?.idx ?? t?.id;
       if (raw == null) return NaN;
       if (typeof raw === 'number') return raw;
       const s = String(raw);
-      const head = s.split('|', 1)[0]; // "12|..." → "12"
+      const head = s.split('|', 1)[0];
       const n = Number(head);
       return Number.isFinite(n) ? n : NaN;
     }
@@ -3976,12 +4036,22 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
     }
 
     // ---------- JS bridge to Python removal-with-backup ----------
+    const serializeVisibilityMapForPython = (map) => {
+      const remapped = {};
+      for (const [key, value] of Object.entries(map || {})) {
+        const num = Number(key);
+        if (Number.isFinite(num)) remapped[num + 1] = value;
+        else remapped[key] = value;
+      }
+      return JSON.stringify(remapped);
+    };
+
     async function inspectRemovalPlan(bytesU8, visibilityMap) {
       await ensurePy();
       const fn = py.globals.get('inspect_export_removal_plan');
       const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
       const pyBytes = py.toPy(buf);
-      const pyMap = py.toPy(JSON.stringify(visibilityMap || {}));
+      const pyMap = py.toPy(serializeVisibilityMapForPython(visibilityMap));
       let pyOut;
       try {
         pyOut = fn(pyBytes, pyMap);
@@ -4006,7 +4076,7 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const fn = py.globals.get('apply_removal_with_backup');
       const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8);
       const pyBytes = py.toPy(buf);
-      const pyMap   = py.toPy(JSON.stringify(visibilityMap || {}));
+      const pyMap   = py.toPy(serializeVisibilityMapForPython(visibilityMap));
       const pyPath  = py.toPy('customXml/originalDocument.xml');
       const origBuf = (originalBytes instanceof Uint8Array)
         ? originalBytes
