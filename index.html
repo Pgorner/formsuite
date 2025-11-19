@@ -3024,6 +3024,40 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       }
     }
 
+    function normalizeDebugError(err) {
+      if (!err) return null;
+      if (typeof err === 'string') {
+        return { name: null, message: err, stack: null };
+      }
+      if (typeof err === 'object') {
+        return {
+          name: err?.name || err?.constructor?.name || null,
+          message: err?.message || String(err || ''),
+          stack: typeof err?.stack === 'string' ? err.stack : null,
+        };
+      }
+      return { name: null, message: String(err), stack: null };
+    }
+
+    function describeDebugError(err) {
+      if (!err) return '';
+      if (typeof err === 'string') return err;
+      if (typeof err === 'object') {
+        const parts = [];
+        if (err.name) parts.push(err.name);
+        if (err.message && (!parts.length || err.message !== parts[parts.length - 1])) {
+          parts.push(err.message);
+        }
+        if (!parts.length && err.stack) return err.stack;
+        if (!parts.length) {
+          try { return JSON.stringify(err); }
+          catch { return String(err); }
+        }
+        return parts.join(': ');
+      }
+      return String(err);
+    }
+
     async function gatherExportArtifacts(preloadedBytes = null) {
       if (!currentDoc?.docId) return null;
 
@@ -3051,9 +3085,17 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const rules = loadRulesForDoc(state);
       const fieldRulesForDoc = loadFieldRulesForDoc(state);
 
-      const headingResolver = buildHeadingTargetIndex({
-        flat: Array.isArray(state?.headingsFlat) ? state.headingsFlat : Array.isArray(state?.headings) ? state.headings : [],
-        tree: Array.isArray(state?.headingsTree) ? state.headingsTree : []
+      const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
+        ? state.headingsFlat
+        : Array.isArray(state?.headings) ? state.headings
+        : [];
+      const baselineHeadingsTree = Array.isArray(state?.headingsTree)
+        ? state.headingsTree
+        : [];
+
+      const fallbackHeadingResolver = buildHeadingTargetIndex({
+        flat: baselineHeadingsFlat,
+        tree: baselineHeadingsTree
       });
 
       const payload = JSON.stringify({
@@ -3077,6 +3119,12 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         sdtMap[tag] = String(v);
       }
       const updated2 = await writeSDTs(updated, sdtMap);
+
+      const headingResolver = await buildHeadingResolverFromDoc(updated2, {
+        fallbackResolver: fallbackHeadingResolver,
+        baselineFlat: baselineHeadingsFlat,
+        baselineTree: baselineHeadingsTree
+      });
 
       const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
 
@@ -3148,13 +3196,28 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const summary = document.createElement('div');
       summary.style.marginBottom = '12px';
 
-      const headings = [];
-      (plan.parts || []).forEach(part => {
-        (part?.headings || []).forEach(h => {
-          headings.push({ ...h, part: part?.name || '' });
+      const collectHeadingsFromPlan = (target, planLike) => {
+        if (!planLike) return;
+        (planLike.parts || []).forEach(part => {
+          (part?.headings || []).forEach(h => {
+            target.push({ ...h, part: part?.name || '' });
+          });
         });
-      });
+        if (!target.length && Array.isArray(planLike.headings)) {
+          planLike.headings.forEach(h => target.push({ ...h }));
+        }
+      };
+
+      const headings = [];
+      collectHeadingsFromPlan(headings, plan);
       headings.sort((a, b) => a.idx - b.idx);
+
+      const removalPreview = context?.removalPreview || null;
+      const removalPreviewHeadings = [];
+      if (removalPreview?.plan) {
+        collectHeadingsFromPlan(removalPreviewHeadings, removalPreview.plan);
+        removalPreviewHeadings.sort((a, b) => a.idx - b.idx);
+      }
 
       const unmatched = Array.isArray(plan.unmatchedActions) ? plan.unmatchedActions : [];
 
@@ -3162,8 +3225,21 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       summaryLines.push(`<strong>${headings.length}</strong> headings detected.`);
       summaryLines.push(`Style map entries: <strong>${plan.styleMapSize || 0}</strong> (${plan.hasStylesXml ? 'styles.xml present' : 'styles.xml missing'})`);
       summaryLines.push(`Visibility actions: <strong>${Object.keys(context.visibilityMap || {}).length}</strong>.`);
+      const hiddenTargets = headings.filter(h => (h.action || '').toUpperCase() === 'HIDE').length;
+      summaryLines.push(`Headings flagged for removal: <strong>${hiddenTargets}</strong>.`);
+      if (removalPreviewHeadings.length) {
+        summaryLines.push(`Headings after removal preview: <strong>${removalPreviewHeadings.length}</strong>.`);
+      }
+      if (removalPreview?.bytes instanceof Uint8Array) {
+        summaryLines.push(`Removal preview DOCX size: <strong>${removalPreview.bytes.length}</strong> bytes.`);
+      }
       if (unmatched.length) {
         summaryLines.push(`Unmatched actions: ${unmatched.join(', ')}`);
+      }
+      if (removalPreview?.error) {
+        summaryLines.push(`Removal preview failed: ${describeDebugError(removalPreview.error)}`);
+      } else if (removalPreview?.planError) {
+        summaryLines.push(`Removal preview inspection failed: ${describeDebugError(removalPreview.planError)}`);
       }
       summary.innerHTML = summaryLines.map(line => `<div>${line}</div>`).join('');
       overlay.appendChild(summary);
@@ -3318,11 +3394,121 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
 
       overlay.appendChild(headingsWrap);
 
+      if (removalPreview) {
+        const previewWrap = document.createElement('div');
+        previewWrap.style.marginTop = '12px';
+        const previewHeading = document.createElement('h4');
+        previewHeading.textContent = 'Removal preview result';
+        previewHeading.style.margin = '0 0 6px';
+        previewHeading.style.fontSize = '14px';
+        previewHeading.style.fontWeight = '600';
+        previewWrap.appendChild(previewHeading);
+
+        if (removalPreview?.error) {
+          const err = document.createElement('div');
+          err.textContent = `Removal preview failed: ${describeDebugError(removalPreview.error)}`;
+          err.style.color = '#b91c1c';
+          err.style.marginBottom = '6px';
+          previewWrap.appendChild(err);
+        } else if (removalPreview?.planError) {
+          const err = document.createElement('div');
+          err.textContent = `Removal preview inspection failed: ${describeDebugError(removalPreview.planError)}`;
+          err.style.color = '#b45309';
+          err.style.marginBottom = '6px';
+          previewWrap.appendChild(err);
+        }
+
+        if (removalPreviewHeadings.length) {
+          const table = makeTable();
+          const thead = document.createElement('thead');
+          const headerRow = document.createElement('tr');
+          ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
+            const th = document.createElement('th');
+            th.textContent = text;
+            th.style.textAlign = 'left';
+            th.style.padding = '4px 6px';
+            th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
+            headerRow.appendChild(th);
+          });
+          thead.appendChild(headerRow);
+          table.appendChild(thead);
+
+          const tbody = document.createElement('tbody');
+          removalPreviewHeadings.forEach(h => {
+            const row = document.createElement('tr');
+            row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
+            const cells = [
+              String(h.idx),
+              String(h.level ?? ''),
+              String(h.action || ''),
+              h.detectedBy || '',
+              `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
+            ];
+            cells.forEach((value, i) => {
+              const td = document.createElement('td');
+              td.textContent = value;
+              td.style.padding = '4px 6px';
+              if (i === 2) td.style.textTransform = 'uppercase';
+              row.appendChild(td);
+            });
+            tbody.appendChild(row);
+          });
+          table.appendChild(tbody);
+          previewWrap.appendChild(table);
+        } else if (!removalPreview?.error) {
+          const empty = document.createElement('div');
+          empty.textContent = 'No headings were detected after running the removal preview.';
+          previewWrap.appendChild(empty);
+        }
+
+        const previewUnmatched = Array.isArray(removalPreview?.plan?.unmatchedActions)
+          ? removalPreview.plan.unmatchedActions
+          : [];
+        if (previewUnmatched.length) {
+          const warn = document.createElement('div');
+          warn.textContent = `Post-removal unmatched indices: ${previewUnmatched.join(', ')}`;
+          warn.style.color = '#b45309';
+          previewWrap.appendChild(warn);
+        }
+
+        overlay.appendChild(previewWrap);
+      }
+
       const controls = document.createElement('div');
       controls.style.display = 'flex';
       controls.style.flexWrap = 'wrap';
       controls.style.gap = '8px';
       controls.style.marginTop = '12px';
+
+      const appendDocDownloadButton = (bytes, label, suffix) => {
+        if (!(bytes instanceof Uint8Array) || !bytes.length) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ghost';
+        btn.textContent = label;
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          try {
+            const blob = new Blob([bytes], {
+              type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            });
+            const safeSuffix = (suffix || '').replace(/[^a-z0-9\-_. ]+/gi, '-').trim();
+            const base = (currentDoc?.name || 'document').replace(/\.docx$/i, '').trim() || 'document';
+            const suffixPart = safeSuffix ? ` - ${safeSuffix}` : '';
+            const filename = `${base}${suffixPart}`.replace(/\s+/g, ' ').trim() + '.docx';
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 750);
+          } catch (err) {
+            console.warn('Failed to download DOCX snapshot', err);
+          }
+        });
+        controls.appendChild(btn);
+      };
 
       const copyBtn = document.createElement('button');
       copyBtn.type = 'button';
@@ -3363,6 +3549,10 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       });
       controls.appendChild(downloadBtn);
 
+      appendDocDownloadButton(context?.originalBytes, 'Download original DOCX snapshot', 'original-snapshot');
+      appendDocDownloadButton(context?.updatedBytes, 'Download DOCX before removal', 'pre-removal');
+      appendDocDownloadButton(removalPreview?.bytes, 'Download removal preview DOCX', 'post-removal-preview');
+
       overlay.appendChild(controls);
 
       const details = document.createElement('details');
@@ -3398,11 +3588,44 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
           return;
         }
         const plan = await inspectRemovalPlan(prepared.updatedBytes, prepared.visibilityMap);
+        let removalPreview = null;
+        try {
+          const removalBytes = await applyRemovalWithBackup(prepared.updatedBytes, prepared.visibilityMap, prepared.originalBytes);
+          let previewPlan = null;
+          let previewPlanError = null;
+          try {
+            previewPlan = await inspectRemovalPlan(removalBytes, {});
+          } catch (planErr) {
+            previewPlanError = normalizeDebugError(planErr);
+          }
+          removalPreview = {
+            bytes: removalBytes,
+            plan: previewPlan,
+            planError: previewPlanError || (previewPlan?.error || null),
+          };
+        } catch (removalErr) {
+          removalPreview = { error: normalizeDebugError(removalErr) };
+        }
+
+        const debugContext = { ...prepared, removalPreview };
+
         console.groupCollapsed('Export removal debug');
         console.log('Visibility map', prepared.visibilityMap);
-        console.log('Removal plan', plan);
+        console.log('Removal plan (before applying actions)', plan);
+        if (removalPreview) {
+          console.log('Removal preview bytes length', removalPreview?.bytes?.length || 0);
+          if (removalPreview?.plan) {
+            console.log('Removal preview plan (after applying actions)', removalPreview.plan);
+          }
+          if (removalPreview?.planError) {
+            console.log('Removal preview plan error', removalPreview.planError);
+          }
+          if (removalPreview?.error) {
+            console.log('Removal preview error', removalPreview.error);
+          }
+        }
         console.groupEnd();
-        renderExportDebugPanel(plan, prepared);
+        renderExportDebugPanel(plan, debugContext);
       } catch (e) {
         console.error('Export debug failed:', e);
         alert('Export debug failed: ' + (e?.message || e));
@@ -3732,6 +3955,200 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       };
 
       return { resolve, resolveIdx, normalizeTarget, buildLabel };
+    }
+
+    function mergeHeadingMetadataFromBaseline(liveFlat, baselineFlat) {
+      if (!Array.isArray(liveFlat) || !liveFlat.length) return;
+      if (!Array.isArray(baselineFlat) || !baselineFlat.length) return;
+
+      const normalizeText = (value) => {
+        if (!value && value !== 0) return '';
+        let out = String(value);
+        try { out = out.normalize('NFKD'); } catch {}
+        out = out.replace(/[\u0300-\u036f]/g, '');
+        return out.replace(/\s+/g, ' ').trim().toLowerCase();
+      };
+
+      const copyMetadata = (target, source) => {
+        if (!target || !source) return;
+        const copyIfMissing = (fromKey, toKey = fromKey) => {
+          const val = source[fromKey];
+          if (val == null || val === '') return;
+          if (target[toKey] == null || target[toKey] === '') target[toKey] = val;
+        };
+        copyIfMissing('uid');
+        copyIfMissing('compositeKey');
+        copyIfMissing('number');
+        copyIfMissing('num', 'number');
+        copyIfMissing('part');
+        const lbl = source.label || source.title;
+        if (lbl && (!target.label || target.label === target.text)) target.label = lbl;
+      };
+
+      const baselineMeta = baselineFlat.map((entry, order) => ({
+        entry,
+        order,
+        idx: Number(entry?.idx ?? entry?.key),
+        level: Number(entry?.level),
+        norm: normalizeText(entry?.label || entry?.text || entry?.title || ''),
+      })).filter(meta => meta.entry);
+      if (!baselineMeta.length) return;
+
+      const liveMeta = liveFlat.map((entry, order) => ({
+        entry,
+        order,
+        idx: Number(entry?.idx ?? entry?.key),
+        level: Number(entry?.level),
+        norm: normalizeText(entry?.text || entry?.label || ''),
+      }));
+
+      const baselineByIdx = new Map();
+      const baselineByLevelText = new Map();
+      const baselineByText = new Map();
+      const pushToMap = (map, key, value) => {
+        if (!key && key !== 0) return;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(value);
+      };
+
+      baselineMeta.forEach((meta) => {
+        if (Number.isFinite(meta.idx) && !baselineByIdx.has(meta.idx)) baselineByIdx.set(meta.idx, meta);
+        if (meta.norm) {
+          const lvlKey = `${Number.isFinite(meta.level) ? meta.level : 'x'}|${meta.norm}`;
+          pushToMap(baselineByLevelText, lvlKey, meta);
+          pushToMap(baselineByText, meta.norm, meta);
+        }
+      });
+
+      const takeMatch = (collection, key) => {
+        if (!collection) return null;
+        const arr = Array.isArray(collection) ? collection : collection.get?.(key);
+        if (!arr) return null;
+        while (arr.length) {
+          const cand = arr.shift();
+          if (cand && !cand._used) return cand;
+        }
+        return null;
+      };
+
+      const matchIdx = () => {
+        for (const live of liveMeta) {
+          if (!Number.isFinite(live.idx)) continue;
+          const cand = baselineByIdx.get(live.idx);
+          if (cand && !cand._used) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      const matchLevelAndText = () => {
+        for (const live of liveMeta) {
+          if (live._matched) continue;
+          if (!live.norm) continue;
+          const key = `${Number.isFinite(live.level) ? live.level : 'x'}|${live.norm}`;
+          const cand = takeMatch(baselineByLevelText, key);
+          if (cand) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      const matchTextOnly = () => {
+        for (const live of liveMeta) {
+          if (live._matched) continue;
+          if (!live.norm) continue;
+          const cand = takeMatch(baselineByText, live.norm);
+          if (cand) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      const matchByOrder = () => {
+        for (let i = 0; i < liveMeta.length; i++) {
+          const live = liveMeta[i];
+          if (live._matched) continue;
+          const cand = baselineMeta[i];
+          if (cand && !cand._used) {
+            cand._used = true;
+            live._matched = true;
+            copyMetadata(live.entry, cand.entry);
+          }
+        }
+      };
+
+      matchIdx();
+      matchLevelAndText();
+      matchTextOnly();
+      if (liveMeta.length === baselineMeta.length) matchByOrder();
+    }
+
+    async function buildHeadingResolverFromDoc(bytesU8, options = null) {
+      let fallback = null;
+      let baselineFlat = [];
+      if (options && typeof options === 'object' && !Array.isArray(options)) {
+        if (typeof options.resolve === 'function' || typeof options.resolveIdx === 'function' || typeof options.normalizeTarget === 'function') {
+          fallback = options;
+        } else {
+          fallback = options.fallbackResolver || null;
+        }
+        if (Array.isArray(options.baselineFlat)) baselineFlat = options.baselineFlat;
+      } else {
+        fallback = options || null;
+      }
+      let normalized = null;
+      if (bytesU8 instanceof Uint8Array) normalized = bytesU8;
+      else if (bytesU8) {
+        try { normalized = new Uint8Array(bytesU8); }
+        catch { normalized = null; }
+      }
+      if (!normalized || !normalized.length) return fallback;
+
+      try {
+        const plan = await inspectRemovalPlan(normalized, {});
+        const parts = Array.isArray(plan?.parts) ? plan.parts : [];
+        const seen = new Set();
+        const liveFlat = [];
+
+        for (const part of parts) {
+          const headings = Array.isArray(part?.headings) ? part.headings : [];
+          for (const heading of headings) {
+            const idx = Number(heading?.idx);
+            if (!Number.isFinite(idx) || seen.has(idx)) continue;
+            seen.add(idx);
+            const text = String(heading?.text || '').trim();
+            const lvl = Number(heading?.level);
+            const entry = {
+              idx,
+              key: idx,
+              id: idx,
+              text,
+              title: text,
+              label: text,
+            };
+            if (Number.isFinite(lvl)) entry.level = lvl;
+            const number = heading?.number ?? heading?.num;
+            if (number != null && number !== '') entry.number = String(number);
+            liveFlat.push(entry);
+          }
+        }
+
+        if (liveFlat.length) {
+          liveFlat.sort((a, b) => a.idx - b.idx);
+          mergeHeadingMetadataFromBaseline(liveFlat, baselineFlat);
+          return buildHeadingTargetIndex({ flat: liveFlat, tree: [] });
+        }
+      } catch (err) {
+        console.warn('Failed to rebuild heading resolver from DOCX before export', err);
+      }
+
+      return fallback;
     }
 
     function ruleMatchesValue(op, expected, actual) {
