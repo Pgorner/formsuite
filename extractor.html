@@ -1902,319 +1902,1213 @@
         const py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/" });
         tr.step('pyodide loaded');
         await py.runPythonAsync(`
-    import io, zipfile, json
-    import xml.etree.ElementTree as ET
-    _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    NS = {"w": _W_NS}
-    def _q(local): return f"{{{_W_NS}}}{local}"
+import io, zipfile, json, re
+import xml.etree.ElementTree as ET
 
-    def read_docvar_settings(doc_bytes: bytes, name: str) -> str | None:
-        f = io.BytesIO(doc_bytes)
-        with zipfile.ZipFile(f) as z:
-            try: data = z.read("word/settings.xml")
-            except KeyError: return None
-        try: root = ET.fromstring(data)
-        except ET.ParseError: return None
-        docVars = root.find("w:docVars", NS)
-        if docVars is None: return None
-        for dv in docVars.findall("w:docVar", NS):
-            if dv.attrib.get(_q("name")) == name:
-                return dv.attrib.get(_q("val"), "") or ""
-        return None
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+def _q(local): return "{%s}%s" % (_W_NS, local)
 
-    def write_docvar_settings(doc_bytes: bytes, name: str, value: str) -> bytes:
-        f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
-        with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
-            try: settings_xml = zin.read("word/settings.xml")
-            except KeyError:
-                settings_xml = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
-            for item in zin.infolist():
-                if item.filename != "word/settings.xml":
-                    zout.writestr(item, zin.read(item.filename))
-            root = ET.fromstring(settings_xml)
-            docVars = root.find("w:docVars", NS)
-            if docVars is None: 
-                docVars = ET.SubElement(root, _q("docVars"))
-            target = None
-            for dv in docVars.findall("w:docVar", NS):
-                if dv.attrib.get(_q("name")) == name: 
-                    target = dv; break
-            if target is None:
-                ET.SubElement(docVars, _q("docVar"), {_q("name"): name, _q("val"): value or ""})
+# ---------------------- existing helpers ----------------------
+def write_docvar(u8, var_name, value):
+    data = bytes(u8); outbuf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
+        try: names = set(zfin.namelist())
+        except: names = set()
+        if "word/settings.xml" in names:
+            try: root = ET.fromstring(zfin.read("word/settings.xml"))
+            except ET.ParseError: root = ET.Element(_q("settings"))
+        else:
+            root = ET.Element(_q("settings"))
+        doc_vars = root.find(_q("docVars"))
+        if doc_vars is None:
+            doc_vars = ET.SubElement(root, _q("docVars"))
+        target = None
+        for dv in doc_vars.findall(_q("docVar")):
+            if dv.get(_q("name")) == var_name:
+                target = dv; break
+        if target is None:
+            target = ET.SubElement(doc_vars, _q("docVar"), {_q("name"): var_name, _q("val"): value})
+        else:
+            target.set(_q("val"), value)
+        settings_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        for n in zfin.namelist():
+            if n == "word/settings.xml": continue
+            zfout.writestr(n, zfin.read(n))
+        zfout.writestr("word/settings.xml", settings_bytes)
+    return outbuf.getvalue()
+
+def read_docvar_settings(u8, var_name):
+    data = bytes(u8)
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        try:
+            xml = zf.read("word/settings.xml")
+        except KeyError:
+            return None
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return None
+        W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        def _q(local):
+            return "{%s}%s" % (W_NS, local)
+        doc_vars = root.find(_q("docVars"))
+        if doc_vars is None:
+            return None
+        for dv in doc_vars.findall(_q("docVar")):
+            if dv.get(_q("name")) == var_name:
+                return dv.get(_q("val"))
+    return None
+
+def read_docvar_custom(u8, var_name):
+    data = bytes(u8)
+    name = str(var_name or "")
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        try:
+            xml = zf.read("docProps/custom.xml")
+        except KeyError:
+            return None
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return None
+        ns = {
+            'cp': 'http://schemas.openxmlformats.org/officeDocument/2006/custom-properties',
+            'vt': 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
+        }
+        for prop in root.findall('cp:property', ns):
+            if prop.get('name') == name:
+                for child in list(prop):
+                    if child.text is not None:
+                        return child.text
+    return None
+
+def _set_sdt_text(content_el, value):
+    texts = content_el.findall(".//w:t", {"w": _W_NS})
+    if texts:
+        first = True
+        for t in texts:
+            if first:
+                t.text = value
+                first = False
             else:
-                target.set(_q("val"), value or "")
-            data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-            zout.writestr("word/settings.xml", data)
-        return out.getvalue()
+                t.text = ""
+        return
+    has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
+    for ch in list(content_el): content_el.remove(ch)
+    if has_block:
+        p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
+    else:
+        r = ET.SubElement(content_el, _q("r"))
+    t = ET.SubElement(r, _q("t")); t.text = value
+    if (value.strip() != value) or ("\\n" in value) or ("  " in value):
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
-    def read_docvar_custom(doc_bytes: bytes, name: str) -> str | None:
-        f = io.BytesIO(doc_bytes)
-        with zipfile.ZipFile(f) as z:
-            try: docprops = z.read("docProps/custom.xml")
-            except KeyError: return None
-        try: root = ET.fromstring(docprops)
-        except ET.ParseError: return None
-        for v in root:
-            if v.tag.endswith("property") and v.attrib.get("name") == name:
-                for c in v: return c.text or ""
-        return None
-
-    def _set_sdt_text(content_el, value):
-        texts = content_el.findall(".//w:t", {"w": _W_NS})
-        if texts:
-            first = True
-            for t in texts:
-                if first:
-                    t.text = value
-                    first = False
-                else:
-                    t.text = ""
-            return
-        has_block = (content_el.find(".//w:p", {"w": _W_NS}) is not None) or (content_el.find(".//w:tbl", {"w": _W_NS}) is not None)
-        for ch in list(content_el): content_el.remove(ch)
-        if has_block:
-            p = ET.SubElement(content_el, _q("p")); r = ET.SubElement(p, _q("r"))
-        else:
-            r = ET.SubElement(content_el, _q("r"))
-        t = ET.SubElement(r, _q("t")); t.text = value
-        if (value.strip() != value) or ("\\n" in value) or ("  " in value):
-            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-
-    def write_sdts_by_tag(doc_bytes: bytes, mapping_json: str) -> bytes:
-        try: mapping = json.loads(mapping_json or "{}")
-        except Exception: mapping = {}
-        f_in = io.BytesIO(doc_bytes); out = io.BytesIO()
-        with zipfile.ZipFile(f_in) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
-            def is_target(name):
-                if not (name.startswith("word/") and name.endswith(".xml")): return False
-                skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
-                return name not in skip and not name.startswith("word/_rels/")
-            for item in zin.infolist():
-                name = item.filename
-                data = zin.read(name)
-                if not is_target(name):
-                    zout.writestr(name, data); continue
-                try:
-                    root = ET.fromstring(data)
-                except ET.ParseError:
-                    zout.writestr(name, data); continue
-                changed = False
-                for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
-                    pr = sdt.find("w:sdtPr", {"w": _W_NS})
-                    if pr is None: continue
-                    tag_el = pr.find("w:tag", {"w": _W_NS})
-                    tag_val = (tag_el.get(_q("val")) if tag_el is not None else "") or ""
-                    if tag_val and tag_val in mapping:
-                        val = mapping.get(tag_val, "")
-                        if not isinstance(val, str):
-                            try: import json as _json; val = _json.dumps(val, ensure_ascii=False)
-                            except Exception: val = str(val)
-                        content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
-                        _set_sdt_text(content_el, val)
-                        changed = True
-                zout.writestr(name, ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else data)
-        return out.getvalue()
-
-    # ---------------------- NEW: visibility tooling ----------------------
-    def _ensure_fsHidden_style(zfin, names):
-        if "word/styles.xml" in names:
+def write_sdts_by_tag(u8, tag_to_text_json):
+    try: mapping = json.loads(tag_to_text_json or "{}")
+    except Exception: mapping = {}
+    if not mapping: return u8
+    data = bytes(u8); outbuf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf,"w",compression=zipfile.ZIP_DEFLATED) as zfout:
+        names = zfin.namelist()
+        def is_target(name):
+            if not (name.startswith("word/") and name.endswith(".xml")): return False
+            skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
+            return name not in skip and not name.startswith("word/_rels/")
+        for n in names:
+            if not is_target(n):
+                zfout.writestr(n, zfin.read(n)); continue
             try:
-                root = ET.fromstring(zfin.read("word/styles.xml"))
+                root = ET.fromstring(zfin.read(n))
             except ET.ParseError:
-                root = ET.Element(_q("styles"))
-        else:
-            root = ET.Element(_q("styles"))
+                zfout.writestr(n, zfin.read(n)); continue
+            changed = False
+            for sdt in root.findall(".//w:sdt", {"w": _W_NS}):
+                pr = sdt.find("w:sdtPr", {"w": _W_NS})
+                if pr is None: continue
+                tag_el = pr.find("w:tag", {"w": _W_NS})
+                tag_val = tag_el.get(_q("val")) if tag_el is not None else ""
+                if not tag_val or tag_val not in mapping: continue
+                content_el = sdt.find("w:sdtContent", {"w": _W_NS}) or sdt
+                val = mapping.get(tag_val, "")
+                if not isinstance(val, str):
+                    try: val = json.dumps(val, ensure_ascii=False)
+                    except Exception: val = str(val)
+                _set_sdt_text(content_el, val); changed = True
+            out_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True) if changed else zfin.read(n)
+            zfout.writestr(n, out_xml)
+    return outbuf.getvalue()
 
-        have = False
-        for st in root.findall(_q("style")):
-            if st.get(_q("type")) == "character" and st.get(_q("styleId")) == "fsHidden":
-                have = True
-                break
+# ---------- heading + block collectors ----------
+_STYLE_HINT_PATTERNS = [
+    re.compile(r"heading\s*([1-9])", re.IGNORECASE),
+    re.compile(r"überschrift\s*([1-9])", re.IGNORECASE),
+    re.compile(r"titre\s*([1-9])", re.IGNORECASE),
+    re.compile(r"t[ií]tulo\s*([1-9])", re.IGNORECASE),
+    re.compile(r"encabezado\s*([1-9])", re.IGNORECASE),
+    re.compile(r"rubrik\s*([1-9])", re.IGNORECASE),
+    re.compile(r"zagolovok\s*([1-9])", re.IGNORECASE),
+    re.compile(r"заголовок\s*([1-9])", re.IGNORECASE),
+]
 
-        if not have:
-            st = ET.Element(_q("style"), {_q("type"): "character", _q("styleId"): "fsHidden"})
-            ET.SubElement(st, _q("name"), {_q("val"): "fsHidden"})
-            rpr = ET.SubElement(st, _q("rPr"))
-            ET.SubElement(rpr, _q("vanish"))
-            root.append(st)
+def _level_from_style_hint(value):
+    if not value:
+        return 0
+    s = str(value).strip()
+    if not s:
+        return 0
+    for pattern in _STYLE_HINT_PATTERNS:
+        m = pattern.search(s)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 0
+    m2 = re.match(r"^heading([1-9])$", s, re.IGNORECASE)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except Exception:
+            return 0
+    return 0
 
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+def _build_heading_style_map(zip_file):
+    try:
+        raw = zip_file.read("word/styles.xml")
+    except KeyError:
+        return {}
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return {}
 
-
-
-    def _heading_level(p_el):
-        ppr = p_el.find(_q("pPr"))
+    by_id = {}
+    for style in root.findall("w:style", {"w": _W_NS}):
+        st_type = (style.get(_q("type")) or style.get("type") or "").strip().lower()
+        if st_type and st_type != "paragraph":
+            continue
+        style_id = style.get(_q("styleId")) or style.get("styleId") or ""
+        if not style_id:
+            continue
+        name_el = style.find(_q("name"))
+        name = ""
+        if name_el is not None:
+            name = name_el.get(_q("val")) or name_el.get("val") or ""
+        based_on_el = style.find(_q("basedOn"))
+        based_on = ""
+        if based_on_el is not None:
+            based_on = based_on_el.get(_q("val")) or based_on_el.get("val") or ""
+        lvl = 0
+        ppr = style.find(_q("pPr"))
         if ppr is not None:
             ol = ppr.find(_q("outlineLvl"))
-            if ol is not None and ol.get(_q("val")) is not None:
-                try: return int(ol.get(_q("val"))) + 1
-                except: pass
-            ps = ppr.find(_q("pStyle"))
-            if ps is not None and ps.get(_q("val")):
-                v = ps.get(_q("val")).lower()
-                if v.startswith("heading"):
-                    try: return int(v.replace("heading","").strip())
-                    except: return None
-        return None
+            if ol is not None:
+                val = ol.get(_q("val")) or ol.get("val")
+                if val not in (None, ""):
+                    try:
+                        num = int(val)
+                        if num >= 0:
+                            lvl = max(1, min(9, num + 1))
+                    except Exception:
+                        pass
+        if not lvl:
+            lvl = _level_from_style_hint(style_id) or _level_from_style_hint(name)
+        by_id[style_id] = {"basedOn": based_on or "", "rawLevel": int(lvl) if lvl else 0}
 
-    def _apply_rStyle_hidden_to_runs(el):
-        for r in el.findall(".//w:r", {"w": _W_NS}):
-            rpr = r.find(_q("rPr"))
-            if rpr is None:
-                rpr = ET.SubElement(r, _q("rPr"))
-            has = False
-            for rs in rpr.findall(_q("rStyle")):
-                if rs.get(_q("val")) == "fsHidden":
-                    has = True; break
-            if not has:
-                ET.SubElement(rpr, _q("rStyle"), {_q("val"): "fsHidden"})
+    resolved = {}
 
-    def _clear_table_hidden_markers(tbl_el):
-        tbl_pr = tbl_el.find(_q("tblPr"))
-        if tbl_pr is not None:
-            for node in list(tbl_pr.findall(_q("hidden"))):
-                tbl_pr.remove(node)
-        for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-            tr_pr = tr.find(_q("trPr"))
-            if tr_pr is None:
-                continue
-            for node in list(tr_pr.findall(_q("hidden"))):
-                tr_pr.remove(node)
+    def resolve(style_id, depth=0):
+        if not style_id or style_id not in by_id or depth > 12:
+            return 0
+        if style_id in resolved:
+            return resolved[style_id]
+        info = by_id[style_id]
+        lvl = info.get("rawLevel") or 0
+        if lvl:
+            resolved[style_id] = lvl
+            return lvl
+        parent = resolve(info.get("basedOn") or "", depth + 1)
+        resolved[style_id] = parent or 0
+        return resolved[style_id]
 
-    def _mark_table_hidden(tbl_el):
-        tbl_pr = tbl_el.find(_q("tblPr"))
-        if tbl_pr is None:
-            tbl_pr = ET.SubElement(tbl_el, _q("tblPr"))
-        hidden = tbl_pr.find(_q("hidden"))
-        if hidden is None:
-            ET.SubElement(tbl_pr, _q("hidden"), {_q("val"): "true"})
-        else:
-            hidden.set(_q("val"), "true")
-        for tr in tbl_el.findall(".//w:tr", {"w": _W_NS}):
-            tr_pr = tr.find(_q("trPr"))
-            if tr_pr is None:
-                tr_pr = ET.SubElement(tr, _q("trPr"))
-            hidden = tr_pr.find(_q("hidden"))
-            if hidden is None:
-                ET.SubElement(tr_pr, _q("hidden"), {_q("val"): "true"})
-            else:
-                hidden.set(_q("val"), "true")
+    for style_id in list(by_id.keys()):
+        resolve(style_id)
 
-    def _iter_blocks_within(container, top_level):
-        for node in list(container):
-            if node.tag == _q("sdt"):
-                inner = node.find(_q("sdtContent"))
-                if inner is not None:
-                    yield from _iter_blocks_within(inner, top_level)
-                else:
-                    yield {"element": node, "type": "other", "level": None, "top": top_level}
-            elif node.tag == _q("p"):
-                yield {"element": node, "type": "p", "level": _heading_level(node), "top": top_level}
-            elif node.tag == _q("tbl"):
-                yield {"element": node, "type": "tbl", "level": None, "top": top_level}
+    return resolved
+
+def _heading_level_trace(p_el, style_map=None):
+    ppr = p_el.find(_q("pPr"))
+    if ppr is None:
+        return (None, None)
+    ol = ppr.find(_q("outlineLvl"))
+    if ol is not None and ol.get(_q("val")) is not None:
+        try:
+            raw = int(ol.get(_q("val")))
+            lvl = max(1, min(9, raw + 1))
+            return (lvl, f"outlineLvl:{raw}")
+        except Exception:
+            pass
+    ps = ppr.find(_q("pStyle"))
+    if ps is not None:
+        style_id = ps.get(_q("val")) or ps.get("val")
+        if style_id:
+            if style_map:
+                lvl = style_map.get(style_id)
+                if isinstance(lvl, int) and lvl > 0:
+                    return (lvl, f"style:{style_id}")
+            v = style_id.lower()
+            if v.startswith("heading"):
+                try:
+                    lvl = int(v.replace("heading", "").strip())
+                    if lvl > 0:
+                        return (lvl, f"builtin:{style_id}")
+                except Exception:
+                    return (None, None)
+    return (None, None)
+
+def _heading_level(p_el, style_map=None):
+    lvl, _ = _heading_level_trace(p_el, style_map)
+    return lvl
+
+def _iter_blocks_within(container, top_level, style_map=None):
+    for node in list(container):
+        if node.tag == _q("sdt"):
+            inner = node.find(_q("sdtContent"))
+            if inner is not None:
+                yield from _iter_blocks_within(inner, top_level, style_map)
             else:
                 yield {"element": node, "type": "other", "level": None, "top": top_level}
+        elif node.tag == _q("p"):
+            yield {"element": node, "type": "p", "level": _heading_level(node, style_map), "top": top_level}
+        elif node.tag == _q("tbl"):
+            yield {"element": node, "type": "tbl", "level": None, "top": top_level}
+        else:
+            yield {"element": node, "type": "other", "level": None, "top": top_level}
 
-    def _collect_body_blocks(body_el):
-        blocks = []
-        for child in list(body_el):
-            if child.tag == _q("sdt"):
-                content = child.find(_q("sdtContent"))
-                if content is not None:
-                    blocks.extend(_iter_blocks_within(content, child))
-                else:
-                    blocks.append({"element": child, "type": "other", "level": None, "top": child})
-            elif child.tag == _q("p"):
-                blocks.append({"element": child, "type": "p", "level": _heading_level(child), "top": child})
-            elif child.tag == _q("tbl"):
-                blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
+def _collect_body_blocks(body_el, style_map=None):
+    blocks = []
+    for child in list(body_el):
+        if child.tag == _q("sdt"):
+            content = child.find(_q("sdtContent"))
+            if content is not None:
+                blocks.extend(_iter_blocks_within(content, child, style_map))
             else:
                 blocks.append({"element": child, "type": "other", "level": None, "top": child})
-        return blocks
+        elif child.tag == _q("p"):
+            blocks.append({"element": child, "type": "p", "level": _heading_level(child, style_map), "top": child})
+        elif child.tag == _q("tbl"):
+            blocks.append({"element": child, "type": "tbl", "level": None, "top": child})
+        else:
+            blocks.append({"element": child, "type": "other", "level": None, "top": child})
+    return blocks
 
-    def _mark_block_hidden(el):
-        if el is None:
-            return
-        _apply_rStyle_hidden_to_runs(el)
-        if el.tag == _q("tbl"):
-            _mark_table_hidden(el)
-        for tbl in el.findall(".//w:tbl", {"w": _W_NS}):
-            _apply_rStyle_hidden_to_runs(tbl)
-            _mark_table_hidden(tbl)
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
 
-    def apply_visibility(u8, idx_to_action_json):
-        try: idx_to_action = {int(k): v for (k,v) in json.loads(idx_to_action_json).items()}
-        except Exception: idx_to_action = {}
-        data = bytes(u8)
-        outbuf = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
-            names = zfin.namelist()
-            for n in names:
-                if n == "word/styles.xml": continue
-                zfout.writestr(n, zfin.read(n))
-            styles_bytes = _ensure_fsHidden_style(zfin, set(names))
-            zfout.writestr("word/styles.xml", styles_bytes)
-            def is_doc_part(n):
-                if not (n.startswith("word/") and n.endswith(".xml")): return False
-                skip = {"word/styles.xml","word/numbering.xml","word/theme/theme1.xml","word/fontTable.xml","word/settings.xml","word/webSettings.xml"}
-                return n not in skip and not n.startswith("word/_rels/")
-            parts_roots = {}
-            for n in names:
-                if not is_doc_part(n): continue
-                try: root = ET.fromstring(zfin.read(n))
-                except ET.ParseError:
-                    parts_roots[n] = None
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
                     continue
-                for r in root.findall(".//w:r", {"w": _W_NS}):
-                    rpr = r.find(_q("rPr"))
-                    if rpr is None: continue
-                    for rs in list(rpr.findall(_q("rStyle"))):
-                        if rs.get(_q("val")) == "fsHidden":
-                            rpr.remove(rs)
-                for tbl in root.findall(".//w:tbl", {"w": _W_NS}):
-                    _clear_table_hidden_markers(tbl)
-                parts_roots[n] = root
-            global_idx = 0
-            for n in names:
-                if not is_doc_part(n): continue
-                root = parts_roots.get(n)
-                if root is None: continue
-                body = root.find(_q("body"))
-                if body is None:
-                    zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True)); continue
-                elems = _collect_body_blocks(body)
-                heading_positions = []
-                for i, blk in enumerate(elems):
-                    if blk.get("type") == "p" and blk.get("level") is not None:
-                        global_idx += 1
-                        heading_positions.append((i, blk.get("level"), global_idx))
-                for h_i, (pos, lvl, idx) in enumerate(heading_positions):
-                    if idx_to_action.get(idx) != "HIDE":
-                        continue
-                    if h_i + 1 < len(heading_positions):
-                        end = len(elems)
-                        for j in range(h_i+1, len(heading_positions)):
-                            np, nl, _ = heading_positions[j]
-                            if nl <= lvl:
-                                end = np
-                                break
-                    else:
-                        end = len(elems)
-                    seen = set()
-                    for j in range(pos, end):
-                        blk = elems[j]
-                        top = blk.get("top")
-                        if top is None:
-                            continue
-                        key = id(top)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        if top.tag in {_q("p"), _q("tbl"), _q("sdt")}:
-                            _mark_block_hidden(top)
-                zfout.writestr(n, ET.tostring(root, encoding="utf-8", xml_declaration=True))
-        return outbuf.getvalue()
-        `);
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
+
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
+
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
+
+def _paragraph_plain_text(p_el):
+    if p_el is None:
+        return ""
+    parts = []
+    for t in p_el.findall(".//w:t", {"w": _W_NS}):
+        if t.text:
+            parts.append(t.text)
+    return "".join(parts)
+
+def inspect_export_removal_plan(u8, idx_to_action_json):
+    data = bytes(u8)
+    try:
+        raw_actions = json.loads(idx_to_action_json or "{}")
+        if not isinstance(raw_actions, dict):
+            raw_actions = {}
+    except Exception:
+        raw_actions = {}
+
+    normalized_actions = {}
+    for k, v in raw_actions.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        normalized_actions[idx] = str(v).upper()
+
+    plan = {
+        "styleMap": {},
+        "styleMapSize": 0,
+        "hasStylesXml": False,
+        "parts": [],
+        "idxToAction": normalized_actions,
+        "rawActions": raw_actions,
+        "unmatchedActions": [],
+        "totalHeadings": 0,
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data), "r")
+    except Exception as exc:
+        plan["error"] = f"zip-error:{exc}"
+        return json.dumps(plan, ensure_ascii=False)
+
+    with zf as zfin:
+        names = set(zfin.namelist())
+        plan["hasStylesXml"] = "word/styles.xml" in names
+        style_map = _build_heading_style_map(zfin)
+        plan["styleMap"] = style_map
+        plan["styleMapSize"] = len(style_map)
+
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        global_idx = 0
+        seen_indices = set()
+
+        for part in doc_parts:
+            info = {
+                "name": part,
+                "headings": [],
+                "removalRanges": [],
+                "blockCount": 0,
+                "errors": [],
+            }
+            try:
+                raw = zfin.read(part)
+            except KeyError:
+                info["errors"].append("missing-part")
+                plan["parts"].append(info)
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                info["errors"].append(f"parse-error:{exc}")
+                plan["parts"].append(info)
+                continue
+            body = root.find(_q("body"))
+            if body is None:
+                info["errors"].append("no-body")
+                plan["parts"].append(info)
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+            info["blockCount"] = len(elems)
+
+            heading_positions = []
+
+            for pos, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                trace_lvl, reason = _heading_level_trace(blk.get("element"), style_map)
+                if isinstance(trace_lvl, int) and trace_lvl > 0:
+                    lvl = trace_lvl
+                heading_positions.append((pos, lvl, idx))
+                heading_info = {
+                    "idx": idx,
+                    "level": lvl,
+                    "position": pos,
+                    "text": _paragraph_plain_text(blk.get("element")),
+                    "action": normalized_actions.get(idx),
+                    "detectedBy": reason or "",
+                }
+                info["headings"].append(heading_info)
+                seen_indices.add(idx)
+
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if normalized_actions.get(idx) != "HIDE":
+                    continue
+                end = len(elems)
+                for j in range(h_i + 1, len(heading_positions)):
+                    np, nl, _ = heading_positions[j]
+                    if nl <= lvl:
+                        end = np
+                        break
+                removal = {
+                    "idx": idx,
+                    "level": lvl,
+                    "startBlock": pos,
+                    "endBlock": end,
+                    "blockCount": max(0, end - pos),
+                }
+                for h in info["headings"]:
+                    if h.get("idx") == idx:
+                        removal["headingText"] = h.get("text")
+                        break
+                info["removalRanges"].append(removal)
+
+            plan["parts"].append(info)
+
+        plan["totalHeadings"] = global_idx
+        unmatched = []
+        for idx in sorted(normalized_actions.keys()):
+            if idx not in seen_indices:
+                unmatched.append(idx)
+        plan["unmatchedActions"] = unmatched
+
+    return json.dumps(plan, ensure_ascii=False)
+
+# ---------- removal/backup/cleanup helpers ----------
+def _is_empty_para(p):
+    if p.findall(".//w:fldSimple", {"w": _W_NS}): return False
+    if p.findall(".//w:drawing", {"w": _W_NS}): return False
+    if p.findall(".//w:object",  {"w": _W_NS}): return False
+    if p.findall(".//w:pict",    {"w": _W_NS}): return False
+    ts = p.findall(".//w:t", {"w": _W_NS})
+    return all(((t.text or "").strip() == "") for t in ts)
+
+def _has_page_break_run(p):
+    for br in p.findall(".//w:br", {"w": _W_NS}):
+        t = br.get(_q("type"))
+        if (t or "").lower() == "page":
+            return True
+    return False
+
+def _has_page_break_before(p):
+    pPr = p.find(_q("pPr"))
+    if pPr is None: return False
+    return pPr.find(_q("pageBreakBefore")) is not None
+
+def _compact_whitespace(root):
+    body = root.find(_q("body")) or root
+    # remove empty paragraphs unless they carry a page break
+    for node in list(body):
+        if node.tag == _q("p"):
+            keep_for_page = _has_page_break_run(node) or _has_page_break_before(node)
+            if (not keep_for_page) and _is_empty_para(node):
+                try: body.remove(node)
+                except: pass
+    # collapse duplicate page-break-only paras
+    def _is_pure_pb(p):
+        if p.tag != _q("p"): return False
+        if not _has_page_break_run(p): return False
+        ts = p.findall(".//w:t", {"w": _W_NS})
+        return all(((t.text or "").strip() == "") for t in ts)
+    prev_pb = False
+    for node in list(body):
+        if _is_pure_pb(node):
+            if prev_pb:
+                try: body.remove(node)
+                except: pass
+            else:
+                prev_pb = True
+        else:
+            prev_pb = False
+
+def _prune_empty_sdts(root):
+    # best-effort: remove SDTs whose content has only empty paragraphs (no tables)
+    for sdt in list(root.findall(".//w:sdt", {"w": _W_NS})):
+        content = sdt.find(_q("sdtContent"))
+        if content is None:
+            continue
+        if content.find(".//w:tbl", {"w": _W_NS}) is not None:
+            continue
+        keep = False
+        for p in content.findall(".//w:p", {"w": _W_NS}):
+            if not _is_empty_para(p):
+                keep = True
+                break
+        if not keep:
+            # remove sdt by scanning parent
+            removed = False
+            for cand in root.iter():
+                for ch in list(cand):
+                    if ch is sdt:
+                        try: cand.remove(ch); removed = True
+                        except: pass
+                        break
+                if removed: break
+
+def _prune_dead_tables(root):
+    for tbl in list(root.findall(".//w:tbl", {"w": _W_NS})):
+        trs = tbl.findall(".//w:tr", {"w": _W_NS})
+        has_cell = False
+        for tr in trs:
+            if tr.find(".//w:tc", {"w": _W_NS}) is not None:
+                has_cell = True; break
+        if not has_cell:
+            # remove this <w:tbl>
+            removed = False
+            for cand in root.iter():
+                for ch in list(cand):
+                    if ch is tbl:
+                        try: cand.remove(ch); removed = True
+                        except: pass
+                        break
+                if removed: break
+
+def _ensure_backup_embedded(zfin, zfout, names, backup_path="customXml/originalDocument.xml", override_bytes=None):
+    if backup_path in names:
+        # Already present → keep existing backup to preserve the untouched original
+        return
+    if override_bytes is not None:
+        try:
+            zfout.writestr(backup_path, override_bytes)
+        except Exception:
+            pass
+        return
+    try:
+        orig = zfin.read("word/document.xml")
+        zfout.writestr(backup_path, orig)
+    except KeyError:
+        pass
+
+def restore_document_from_backup(u8, backup_path="customXml/originalDocument.xml"):
+    data = bytes(u8)
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin:
+        try:
+            original = zfin.read(backup_path)
+        except KeyError:
+            return data
+        outbuf = io.BytesIO()
+        with zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+            for name in zfin.namelist():
+                if name == "word/document.xml":
+                    continue
+                zfout.writestr(name, zfin.read(name))
+            zfout.writestr("word/document.xml", original)
+    return outbuf.getvalue()
+
+def _ensure_update_fields(zfin, zfout):
+    try:
+        raw = zfin.read("word/settings.xml")
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            root = ET.Element(_q("settings"))
+    except KeyError:
+        root = ET.Element(_q("settings"))
+
+    upd = root.find(_q("updateFields"))
+    if upd is None:
+        upd = ET.SubElement(root, _q("updateFields"))
+    upd.set(_q("val"), "true")
+
+    zfout.writestr("word/settings.xml", ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+def _extract_part_from_bytes(data_like, part_name):
+    if data_like is None:
+        return None
+    try:
+        data = bytes(data_like)
+    except Exception:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+            return zf.read(part_name)
+    except Exception:
+        return None
+
+# ----- TOC minimal rebuild -----
+def _next_in_doc_order(node, root):
+    if node is None: return None
+    found = False
+    for el in root.iter():
+        if found: return el
+        if el is node: found = True
+    return None
+
+def _find_toc_ranges(root):
+    ranges = []
+    body = root.find(_q("body")) or root
+    fldChars = root.findall(".//w:fldChar", {"w": _W_NS})
+    for begin in fldChars:
+        if begin.get(_q("val")) != "begin":
+            continue
+        cur = begin
+        instr = ""
+        separate = None
+        end = None
+        while True:
+            cur = _next_in_doc_order(cur, body)
+            if cur is None: break
+            if cur.tag == _q("instrText"): instr += (cur.text or "")
+            if cur.tag == _q("fldChar"):
+                v = cur.get(_q("val"))
+                if v == "separate": separate = cur
+                if v == "end":
+                    end = cur
+                    break
+        u = (instr or "").strip().upper()
+        if u.startswith("TOC"):
+            if separate is not None and end is not None:
+                ranges.append((begin, separate, end, instr))
+    return ranges
+
+def _rebuild_toc(root): 
+    # Replace existing complex range with a minimal fldSimple paragraph
+    for (begin, separate, end, instr) in _find_toc_ranges(root):
+        switches = (instr.strip() if instr else r'TOC \\o "1-3" \\h \\z \\u')
+        # locate host paragraph of 'begin'
+        host_p = None
+        for par in root.findall(".//w:p", {"w": _W_NS}):
+            for el in par.iter():
+                if el is begin:
+                    host_p = par; break
+            if host_p is not None: break
+        if host_p is None: continue
+        # parent of host_p
+        parent = None
+        for cand in root.iter():
+            for ch in list(cand):
+                if ch is host_p:
+                    parent = cand; break
+            if parent is not None: break
+        if parent is None: continue
+
+        # new paragraph with simple TOC field
+        p = ET.Element(_q("p"))
+        fld = ET.SubElement(p, _q("fldSimple"), {_q("instr"): switches})
+        r = ET.SubElement(fld, _q("r")); ET.SubElement(r, _q("t")).text = ""
+
+        idx = list(parent).index(host_p)
+        parent.insert(idx, p)
+
+        # remove host_p and following siblings up to node that contains 'end'
+        # Simplest: rebuild parent's children excluding nodes that belong to the TOC range
+        new_children = []
+        skipping = False
+        end_reached = False
+        for ch in list(parent):
+            if not skipping and ch is host_p:
+                skipping = True
+                continue
+            if skipping:
+                hit_end = False
+                for el in ch.iter():
+                    if el is end:
+                        hit_end = True; break
+                if hit_end:
+                    skipping = False
+                    end_reached = True
+                    continue
+                else:
+                    continue
+            new_children.append(ch)
+        # replace
+        for ch in list(parent): parent.remove(ch)
+        for ch in new_children: parent.append(ch)
+
+# ---------- CORE: remove ranges & embed backup ----------
+def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/originalDocument.xml", original_bytes=None):
+    """
+    idx_to_action_json: {"12":"HIDE","13":"SHOW", ...}
+      - For headings where action == "HIDE": remove [heading .. next heading with <= level)
+      - Embed original as customXml/originalDocument.xml (if not already present)
+      - Cleanup empty SDTs, dead tables, whitespace
+      - Rebuild TOC (minimal fldSimple form)
+    """
+    try:
+        idx_to_action = {int(k): v for (k, v) in json.loads(idx_to_action_json).items()}
+    except Exception:
+        idx_to_action = {}
+
+    data = bytes(u8)
+    override_backup = _extract_part_from_bytes(original_bytes, "word/document.xml")
+    outbuf = io.BytesIO()
+
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zfin, \
+         zipfile.ZipFile(outbuf, "w", compression=zipfile.ZIP_DEFLATED) as zfout:
+
+        names = zfin.namelist()
+        # Copy everything first
+        for n in names:
+            zfout.writestr(n, zfin.read(n))
+
+        # Ensure embedded backup exists (using untouched original if provided)
+        _ensure_backup_embedded(zfin, zfout, names, backup_path=backup_path, override_bytes=override_backup)
+
+        # Process primary document (you can extend to headers/footers if needed)
+        doc_parts = [n for n in names if n == "word/document.xml"]
+        style_map = _build_heading_style_map(zfin)
+
+        global_idx = 0
+        for part in doc_parts:
+            try:
+                root = ET.fromstring(zfin.read(part))
+            except ET.ParseError:
+                continue
+
+            body = root.find(_q("body"))
+            if body is None:
+                zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+                continue
+
+            elems = _collect_body_blocks(body, style_map)
+
+            heading_positions = []
+            for i, blk in enumerate(elems):
+                if blk.get("type") != "p":
+                    continue
+                lvl = blk.get("level")
+                if not isinstance(lvl, int) or lvl <= 0:
+                    continue
+                idx = global_idx
+                global_idx += 1
+                heading_positions.append((i, lvl, idx))
+
+            to_remove_top_nodes = set()
+            for h_i, (pos, lvl, idx) in enumerate(heading_positions):
+                if idx_to_action.get(idx) != "HIDE":
+                    continue
+                # compute end boundary
+                if h_i + 1 < len(heading_positions):
+                    end = len(elems)
+                    for j in range(h_i + 1, len(heading_positions)):
+                        np, nl, _ = heading_positions[j]
+                        if nl <= lvl:
+                            end = np
+                            break
+                else:
+                    end = len(elems)
+                # gather distinct top nodes to remove (no duplicates)
+                seen = set()
+                for j in range(pos, end):
+                    top = elems[j].get("top")
+                    if top is None: continue
+                    k = id(top)
+                    if k in seen: continue
+                    seen.add(k)
+                    to_remove_top_nodes.add(top)
+
+            # Remove nodes by scanning parents (xml.etree has no getparent)
+            if to_remove_top_nodes:
+                for cand in root.iter():
+                    for ch in list(cand):
+                        if ch in to_remove_top_nodes:
+                            try: cand.remove(ch)
+                            except: pass
+
+            # Cleanup & TOC rebuild
+            _prune_empty_sdts(root)
+            _prune_dead_tables(root)
+            _compact_whitespace(root)
+            _rebuild_toc(root)
+
+            zfout.writestr(part, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+        # Align settings with Word expectations (updateFields must be true)
+        _ensure_update_fields(zfin, zfout)
+
+    return outbuf.getvalue()
+`);
         tr.end('pyodide ready');
         return py;
       } catch (e) { tr.error('bootstrap failed', e); tr.end(); throw e; }
@@ -2299,25 +3193,214 @@
       } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
 
-    async function applyVisibilityActions(arrayBufferOrBytes, visibilityMap) {
-      const tr = TRACE('applyVisibilityActions', { actions: Object.keys(visibilityMap || {}).length });
+    // ---------- Helpers: sanitize ----------
+    function sanitizeValues(schema, vals) {
+      const out = {};
+      const fields = Array.isArray(schema?.fields) ? schema.fields : [];
+
+      for (const f of fields) {
+        const id = f.id;
+        let v = vals?.[id];
+
+        if (f.type === 'datediff') {
+          const d = vals?.[id];
+          if (d && typeof d === 'object') {
+            const outObj = {
+              days: Number(d.days ?? 0),
+              months: Number(d.months ?? 0),
+              years: Number(d.years ?? 0),
+              formatted: String(d.formatted ?? '')
+            };
+            if (outObj.formatted) out[id] = outObj;
+          } else if (Number.isFinite(Number(d))) {
+            const n = Number(d);
+            out[id] = { days: n, months: 0, years: 0, formatted: `${n}-0-0 (${n})` };
+          }
+          continue;
+        }
+
+        if (f.type === 'address') {
+          const vv = vals?.[id];
+          if (typeof vv === 'string') {
+            const s = vv.trim();
+            if (s || f.required) out[id] = s ? { formatted: s } : { formatted: '' };
+          } else if (vv && typeof vv === 'object') {
+            const o = {
+              formatted: vv.formatted || '',
+              street: vv.street || '',
+              houseNumber: vv.houseNumber || '',
+              postcode: vv.postcode || '',
+              city: vv.city || '',
+              country: vv.country || '',
+              lat: (vv.lat ?? null),
+              lon: (vv.lon ?? null)
+            };
+            if (o.formatted || f.required) out[id] = o;
+          }
+          continue;
+        }
+
+        if (f.type === 'multichoice') {
+          const arr = Array.isArray(v) ? v.map(x => String(x || '')) : [];
+          const unique = [];
+          const seen = new Set();
+          for (const item of arr) {
+            if (seen.has(item)) continue;
+            seen.add(item);
+            unique.push(item);
+          }
+          if (unique.length) out[id] = unique;
+          else if (f.required) out[id] = [];
+          continue;
+        }
+
+        if (f.type === 'select') {
+          let s = Array.isArray(v) ? String(v[0] ?? '') : String(v ?? '');
+          if (Array.isArray(f.options) && f.options.length) {
+            const allowed = new Set(f.options.map(String));
+            if (!allowed.has(s)) s = '';
+          }
+          if (s === '') { if (f.required) out[id] = s; }
+          else out[id] = s;
+          continue;
+        }
+
+        if (f.type === 'number') {
+          if (v === '' || v == null) continue;
+          const num = (typeof v === 'number') ? v : Number(String(v).replace(',', '.'));
+          if (Number.isFinite(num)) out[id] = num;
+          continue;
+        }
+
+        if (f.type === 'date') { out[id] = String(v ?? ''); continue; }
+
+        if (f.type === 'table') {
+          const cols = Array.isArray(f.columns) ? f.columns : [];
+          const colIds = cols.map(c => c.id);
+          const arr = Array.isArray(v) ? v : [];
+          const cleaned = arr.map(row => {
+            const o = {};
+            for (const cid of colIds) {
+              let cell = row?.[cid];
+              if (cell == null) cell = '';
+              o[cid] = (typeof cell === 'string') ? cell : String(cell);
+            }
+            return o;
+          }).filter(r => Object.values(r).some(val => String(val).trim() !== ''));
+          const min = Math.max(0, parseInt(f.minRows || 0, 10));
+          while (cleaned.length < min) {
+            const empty = {}; colIds.forEach(cid => empty[cid] = '', cleaned.push(empty));
+          }
+          if (cleaned.length) out[id] = cleaned;
+          else if (f.required) out[id] = [];
+          continue;
+        }
+
+        const s = String(v ?? '');
+        if (s || f.required) out[id] = s;
+      }
+
+      return out;
+    }
+
+    function sanitizeTagMap(tagMap, validIds) {
+      const out = {};
+      for (const [tag, fid] of Object.entries(tagMap || {})) {
+        if (validIds.has(fid)) out[tag] = fid;
+      }
+      return out;
+    }
+
+    const serializeVisibilityMapForPython = (map) => {
+      const remapped = {};
+      for (const [key, value] of Object.entries(map || {})) {
+        const num = Number(key);
+        if (Number.isFinite(num)) remapped[num] = value;
+        else remapped[key] = value;
+      }
+      return JSON.stringify(remapped);
+    };
+
+    async function inspectRemovalPlan(bytesU8, visibilityMap) {
+      await ensurePy();
+      const fn = py.globals.get('inspect_export_removal_plan');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
+      const pyBytes = py.toPy(buf);
+      const pyMap = py.toPy(serializeVisibilityMapForPython(visibilityMap));
+      let pyOut;
       try {
-        const py = await pyodideReady;
-        const u8in = arrayBufferOrBytes instanceof Uint8Array ? arrayBufferOrBytes : new Uint8Array(arrayBufferOrBytes || []);
-        const fn = py.globals.get('apply_visibility');
-        const pyBytes = py.toPy(u8in);
-        const pyMap = py.toPy(JSON.stringify(visibilityMap || {}));
-        let pyOut;
-        try { pyOut = fn(pyBytes, pyMap); }
-        finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
-        let u8;
-        if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
-        else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
-        else u8 = new Uint8Array([]);
-        try { pyOut.destroy?.(); } catch {}
-        tr.end({ outLen: u8?.byteLength });
-        return u8;
-      } catch (e) { tr.error('failed', e); tr.end(); throw e; }
+        pyOut = fn(pyBytes, pyMap);
+      } finally {
+        try { fn.destroy(); } catch {}
+        try { pyBytes.destroy(); } catch {}
+        try { pyMap.destroy(); } catch {}
+      }
+      let out = null;
+      if (pyOut?.toJs) out = pyOut.toJs({ create_proxies:false });
+      else out = pyOut ?? null;
+      try { pyOut?.destroy?.(); } catch {}
+      if (typeof out === 'string') {
+        try { return JSON.parse(out); }
+        catch { return { error: 'parse-error', raw: out }; }
+      }
+      return out;
+    }
+
+    async function applyRemovalWithBackup(bytesU8, visibilityMap, originalBytes) {
+      await ensurePy();
+      const fn = py.globals.get('apply_removal_with_backup');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8);
+      const pyBytes = py.toPy(buf);
+      const pyMap   = py.toPy(serializeVisibilityMapForPython(visibilityMap));
+      const pyPath  = py.toPy('customXml/originalDocument.xml');
+      const origBuf = (originalBytes instanceof Uint8Array)
+        ? originalBytes
+        : (originalBytes ? new Uint8Array(originalBytes) : null);
+      let pyOut;
+      let pyOrig = null;
+      try {
+        if (origBuf) {
+          pyOrig = py.toPy(origBuf);
+          pyOut = fn(pyBytes, pyMap, pyPath, pyOrig);
+        } else {
+          pyOut = fn(pyBytes, pyMap, pyPath);
+        }
+      }
+      finally {
+        try{fn.destroy();}catch{}
+        try{pyBytes.destroy();}catch{}
+        try{pyMap.destroy();}catch{}
+        try{pyPath.destroy();}catch{}
+        try{pyOrig?.destroy();}catch{}
+      }
+      let u8;
+      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+      else u8 = new Uint8Array([]);
+      try { pyOut?.destroy?.(); } catch {}
+      return u8;
+    }
+
+    async function restoreDocxFromBackup(bytesU8, backupPath = 'customXml/originalDocument.xml') {
+      await ensurePy();
+      const fn = py.globals.get('restore_document_from_backup');
+      const buf = bytesU8 instanceof Uint8Array ? bytesU8 : new Uint8Array(bytesU8 || []);
+      const pyBytes = py.toPy(buf);
+      const pyPath = py.toPy(String(backupPath || 'customXml/originalDocument.xml'));
+      let pyOut;
+      try {
+        pyOut = fn(pyBytes, pyPath);
+      } finally {
+        try { fn.destroy(); } catch {}
+        try { pyBytes.destroy(); } catch {}
+        try { pyPath.destroy(); } catch {}
+      }
+      let u8;
+      if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+      else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+      else u8 = new Uint8Array(buf);
+      try { pyOut?.destroy?.(); } catch {}
+      return u8;
     }
 
     // =========================
@@ -2599,11 +3682,19 @@
       const out = Object.create(null);
       if (!Array.isArray(rules) || !rules.length) return out;
 
-      const cleanVals = values || {};
+      const cleanVals = sanitizeValues(schema, values || {});
       const getVal = (fid) => cleanVals[fid];
+
+      const toSlug = (s) => String(s||'')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
 
       for (const r of rules) {
         if (!r) continue;
+
         const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
                     : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
                     : null;
@@ -2611,42 +3702,138 @@
 
         const fieldId = r.fieldId || r.field || r.whenField;
         const op      = r.op || r.operator || 'equals';
-               const exp     = r.values ?? r.value ?? r.expected;
+        const exp     = r.values ?? r.value ?? r.expected;
         const targets = Array.isArray(r.targets) ? r.targets : [];
 
-        const actual  = getVal(fieldId);
-        if (!ruleMatchesValue(op, exp, actual)) continue;
+        // --- match condition ---
+        let match = false;
 
+        // option-sourced boolean (e.g., "services__opt__cleaning")
+        if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
+          const [baseId, slug] = fieldId.split('__opt__');
+          const actualArr = Array.isArray(getVal(baseId)) ? getVal(baseId).map(String) : [];
+          const selected = actualArr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
+          const expect = Array.isArray(exp) ? exp[0] : exp;
+          const expectBool = (String(expect) === 'true');
+          if (op === 'equals') match = (selected === expectBool);
+        } else {
+          // normal field comparison
+          const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
+          const t = String(fld?.type||'').toLowerCase();
+          const actual = getVal(fieldId);
+
+          if (t === 'date') {
+            const expStr = Array.isArray(exp) ? String(exp[0]||'') : String(exp||'');
+            const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
+            const a = toDay(actual);
+            const b = toDay(expStr);
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false;
+            else if (op === 'before') match = a < b;
+            else if (op === 'after')  match = a > b;
+            else if (op === 'equals') match = a === b;
+          } else if (t === 'text' || t === 'number' || t === 'select') {
+            const expVal = Array.isArray(exp) ? exp[0] : exp;
+            if (op === 'equals')    match = String(actual) === String(expVal);
+            else if (op === 'notEquals') match = String(actual) !== String(expVal);
+            else if (t === 'text' && op === 'contains') match = String(actual ?? '').toLowerCase().includes(String(expVal ?? '').toLowerCase());
+          } else if (t === 'multichoice') {
+            match = ruleMatchesValue(op, exp, actual);
+          } else {
+            match = ruleMatchesValue(op, exp, actual);
+          }
+        }
+
+        if (!match) continue;
+
+        // --- apply effect to heading indices ---
         for (const t of targets) {
-          let idx = NaN;
-          if (headingResolver && typeof headingResolver.normalizeTarget === 'function') {
-            const normalized = headingResolver.normalizeTarget(t);
-            if (normalized && Number.isFinite(Number(normalized.idx))) {
-              idx = Number(normalized.idx);
-            }
-          }
-          if (!Number.isFinite(idx) && headingResolver && typeof headingResolver.resolveIdx === 'function') {
-            const resolved = headingResolver.resolveIdx(t);
-            if (Number.isFinite(resolved)) idx = resolved;
-          }
-          if (!Number.isFinite(idx)) {
-            const raw = t?.key ?? t?.idx ?? t?.id;
-            if (raw != null) {
-              if (typeof raw === 'number') idx = Number(raw);
-              else {
-                const s = String(raw);
-                const head = s.split('|', 1)[0];
-                const n = Number(head);
-                if (Number.isFinite(n)) idx = n;
-              }
-            }
-          }
+          const idx = parseTargetIdx(t, headingResolver);
           if (!Number.isFinite(idx)) continue;
           const prev = out[idx];
           if (action === 'SHOW') out[idx] = 'SHOW';
           else if (action === 'HIDE' && prev !== 'SHOW') out[idx] = 'HIDE';
         }
       }
+      return out;
+    }
+
+    function evaluateFieldRulesToVisibility(schema, values, rules) {
+      const out = Object.create(null);
+      if (!Array.isArray(rules) || !rules.length) return out;
+
+      const cleanVals = sanitizeValues(schema, values || {});
+      const getVal = (fid) => cleanVals[fid];
+
+      const toSlug = (s) => String(s||'')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .toLowerCase();
+
+      for (const r of rules) {
+        if (!r) continue;
+
+        const action = (String(r.action || '').toUpperCase() === 'SHOW') ? 'SHOW'
+                    : (String(r.action || '').toUpperCase() === 'HIDE') ? 'HIDE'
+                    : null;
+        if (!action) continue;
+
+        const fieldId = r.fieldId || r.field || r.whenField;
+        const op      = r.op || r.operator || 'equals';
+        const exp     = r.values ?? r.value ?? r.expected;
+        const targets = Array.isArray(r.targets) ? r.targets : [];
+        const effect  = (String(r.hideMode||'hide').toLowerCase() === 'disable') ? 'DISABLE' : 'HIDE';
+
+        // --- match condition ---
+        let match = false;
+
+        if (typeof fieldId === 'string' && fieldId.includes('__opt__')) {
+          const [baseId, slug] = fieldId.split('__opt__');
+          const actualArr = Array.isArray(getVal(baseId)) ? getVal(baseId).map(String) : [];
+          const selected = actualArr.some(v => toSlug(v) === String(slug||'').replace(/^_+/,'').toLowerCase());
+          const expect = Array.isArray(exp) ? exp[0] : exp;
+          const expectBool = (String(expect) === 'true');
+          if (op === 'equals') match = (selected === expectBool);
+        } else {
+          const fld = (schema?.fields||[]).find(f => String(f.id) === String(fieldId));
+          const t = String(fld?.type||'').toLowerCase();
+          const actual = getVal(fieldId);
+
+          if (t === 'date') {
+            const expStr = Array.isArray(exp) ? String(exp[0]||'') : String(exp||'');
+            const toDay = (s) => { if (!s) return NaN; const d = new Date(s); return isNaN(d) ? NaN : Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); };
+            const a = toDay(actual);
+            const b = toDay(expStr);
+            if (Number.isNaN(a) || Number.isNaN(b)) match = false;
+            else if (op === 'before') match = a < b;
+            else if (op === 'after')  match = a > b;
+            else if (op === 'equals') match = a === b;
+          } else if (t === 'text' || t === 'number' || t === 'select') {
+            const expVal = Array.isArray(exp) ? exp[0] : exp;
+            if (op === 'equals')    match = String(actual) === String(expVal);
+            else if (op === 'notEquals') match = String(actual) !== String(expVal);
+            else if (t === 'text' && op === 'contains') match = String(actual ?? '').toLowerCase().includes(String(expVal ?? '').toLowerCase());
+          } else if (t === 'multichoice') {
+            match = ruleMatchesValue(op, exp, actual);
+          } else {
+            match = ruleMatchesValue(op, exp, actual);
+          }
+        }
+
+        if (!match) continue;
+
+        // --- apply to field/option targets ---
+        for (const t of targets) {
+          // field rules target either a field id or a multichoice option id ("field__opt__slug")
+          const id = String(t?.id ?? t?.fieldId ?? t?.key ?? '');
+          if (!id) continue;
+          const prev = out[id];
+          if (action === 'SHOW') out[id] = 'SHOW';
+          else if (action === 'HIDE' && prev !== 'SHOW') out[id] = effect; // DISABLE or HIDE
+        }
+      }
+
       return out;
     }
 
@@ -2832,6 +4019,10 @@
       try {
         if (!gArrayBuffer) return;
 
+        const originalBytes = (gArrayBuffer instanceof Uint8Array)
+          ? gArrayBuffer.slice()
+          : new Uint8Array(gArrayBuffer);
+
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
         if (restored) {
           adoptHeadingBaseline({
@@ -2893,7 +4084,10 @@
         // 3) apply visibility/removal actions
         const headingResolver = buildHeadingTargetIndex(gHeadingBaseline);
         const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, rules, headingResolver);
-        updated = await applyVisibilityActions(updated, visibilityMap);
+        try {
+          await inspectRemovalPlan(updated, visibilityMap);
+        } catch (e) { tr.warn('inspectRemovalPlan failed', e); }
+        updated = await applyRemovalWithBackup(updated, visibilityMap, originalBytes);
         const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
 
         // 4) download/save as a new file
@@ -3090,184 +4284,46 @@
     // =========================
     // HEADINGS (H1..H9) PARSING & TREE
     // =========================
-    function levelFromStyleHint(str) {
-      if (!str) return 0;
-      const s = String(str).trim().toLowerCase();
-      const patterns = [
-        /heading\s*([1-9])/,
-        /überschrift\s*([1-9])/,
-        /titre\s*([1-9])/,
-        /t[ií]tulo\s*([1-9])/,
-        /encabezado\s*([1-9])/,
-        /rubrik\s*([1-9])/,
-        /zagolovok\s*([1-9])/,
-        /заголовок\s*([1-9])/,
-      ];
-      for (const re of patterns) {
-        const m = s.match(re);
-        if (m) return parseInt(m[1], 10);
-      }
-      const m2 = s.match(/^heading([1-9])$/i);
-      if (m2) return parseInt(m2[1], 10);
-      return 0;
-    }
-
-    async function buildStyleOutlineMap(arrayBuffer) {
-      const tr = TRACE('buildStyleOutlineMap');
-      try {
-        const zip = await JSZip.loadAsync(arrayBuffer);
-        const stylesFile = zip.file('word/styles.xml');
-        if (!stylesFile) { tr.end('no styles.xml'); return {}; }
-
-        const xmlTextContent = await stylesFile.async('string');
-        const parser = new DOMParser();
-        const xml = parser.parseFromString(xmlTextContent, "application/xml");
-
-        const byId = {};
-        const styles = xml.getElementsByTagNameNS(W_NS, 'style');
-        for (let i = 0; i < styles.length; i++) {
-          const st = styles[i];
-          if ((st.getAttributeNS(W_NS, 'type') || st.getAttribute('w:type')) !== 'paragraph') continue;
-
-          const id = st.getAttributeNS(W_NS, 'styleId') || st.getAttribute('w:styleId') || '';
-          if (!id) continue;
-
-          const nameEl = st.getElementsByTagNameNS(W_NS, 'name')[0];
-          const name = nameEl ? (nameEl.getAttributeNS(W_NS, 'val') || nameEl.getAttribute('w:val') || '') : '';
-
-          const basedEl = st.getElementsByTagNameNS(W_NS, 'basedOn')[0];
-          const basedOn = basedEl ? (basedEl.getAttributeNS(W_NS, 'val') || basedEl.getAttribute('w:val') || '') : '';
-
-          let rawLevel = 0;
-          const pPr = st.getElementsByTagNameNS(W_NS, 'pPr')[0];
-          if (pPr) {
-            const outline = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
-            if (outline) {
-              const v = outline.getAttributeNS(W_NS, 'val') || outline.getAttribute('w:val') || null;
-              if (v != null && v !== '') {
-                const n = parseInt(v, 10);
-                if (Number.isFinite(n)) rawLevel = Math.min(Math.max(n + 1, 1), 9);
-              }
-            }
-          }
-          if (!rawLevel) {
-            rawLevel = levelFromStyleHint(id) || levelFromStyleHint(name) || 0;
-          }
-          byId[id] = { id, name, basedOn, rawLevel };
-        }
-
-        const resolved = {};
-        const resolveLevel = (id, depth = 0) => {
-          if (!id || !byId[id] || depth > 12) return 0;
-          if (resolved[id] != null) return resolved[id];
-          const info = byId[id];
-          if (info.rawLevel) { resolved[id] = info.rawLevel; return info.rawLevel; }
-          const parent = info.basedOn;
-          const lvl = resolveLevel(parent, depth + 1);
-          resolved[id] = lvl || 0;
-          return resolved[id];
-        };
-        Object.keys(byId).forEach(id => resolveLevel(id));
-
-        tr.end({ styles: Object.keys(byId).length, mapped: Object.keys(resolved).length });
-        return resolved;
-      } catch (e) {
-        tr.error('buildStyleOutlineMap failed', e); tr.end();
-        return {};
-      }
-    }
-
-    function paraText(pEl) {
-      const ts = pEl.getElementsByTagNameNS(W_NS, 't');
-      let s = '';
-      for (let i = 0; i < ts.length; i++) s += ts[i].textContent;
-      return s.trim();
-    }
-
-    function detectHeadingLevel(pEl, styleMap) {
-      const pPr = pEl.getElementsByTagNameNS(W_NS, 'pPr')[0];
-      if (pPr) {
-        const outline = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
-        if (outline) {
-          const v = outline.getAttributeNS(W_NS, 'val') || outline.getAttribute('w:val') || null;
-          if (v != null && v !== '') {
-            const n = parseInt(v, 10);
-            if (Number.isFinite(n)) return Math.min(Math.max(n + 1, 1), 9);
-          }
-        }
-        const pStyle = pPr.getElementsByTagNameNS(W_NS, 'pStyle')[0];
-        if (pStyle) {
-          const styleId = pStyle.getAttributeNS(W_NS, 'val') || pStyle.getAttribute('w:val') || '';
-          const lvl = styleMap?.[styleId];
-          if (lvl && Number.isFinite(lvl)) return lvl;
-        }
-      }
-      return 0;
-    }
-
-    function numberHeadingsTree(tree) {
-      const walk = (nodes, prefix=[]) => {
-        for (let i = 0; i < nodes.length; i++) {
-          const n = nodes[i];
-          const current = [...prefix, i + 1];
-          n.num = current.join('.');
-          if (Array.isArray(n.children) && n.children.length) {
-            walk(n.children, current);
-          }
-        }
-      };
-      walk(tree, []);
-      return tree;
-    }
 
     async function parseHeadings_JS(arrayBuffer) {
       const tr = TRACE('parseHeadings_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
       try {
         if (!arrayBuffer) return { flat: [], tree: [], count: 0 };
 
-        const styleMap = await buildStyleOutlineMap(arrayBuffer);
-        tr.step('styleMap', { entries: Object.keys(styleMap || {}).length });
+        const bytes = (arrayBuffer instanceof Uint8Array) ? arrayBuffer : new Uint8Array(arrayBuffer);
+        const plan = await inspectRemovalPlan(bytes, {});
+        const parts = Array.isArray(plan?.parts) ? plan.parts : [];
 
-        const zip = await JSZip.loadAsync(arrayBuffer);
-        const docPart = zip.file('word/document.xml');
-        if (!docPart) { tr.end({ count: 0, reason: 'no-document-xml' }); return { flat: [], tree: [], count: 0 }; }
-
-        const parser = new DOMParser();
-        const xmlTextContent = await docPart.async('string');
-        const xml = parser.parseFromString(xmlTextContent, "application/xml");
-        const paras = xml.getElementsByTagNameNS(W_NS, 'p');
-        const totalParas = paras.length;
+        const seen = new Set();
         const flat = [];
 
-        for (let i = 0; i < totalParas; i++) {
-          const p = paras[i];
-          const lvl = detectHeadingLevel(p, styleMap);
-          if (!lvl) continue;
-          const text = paraText(p);
-          if (!text) continue;
-          const idx = flat.length;
-          const uid = `sec_${String(i).padStart(6, '0')}`;
-          flat.push({
-            idx,
-            level: lvl,
-            text,
-            part: 'document',
-            paraIndex: i,
-            start: i,
-            end: totalParas,
-            uid,
-            label: text
-          });
+        for (const part of parts) {
+          const headings = Array.isArray(part?.headings) ? part.headings : [];
+          for (const heading of headings) {
+            const idx = Number(heading?.idx);
+            if (!Number.isFinite(idx) || seen.has(idx)) continue;
+            seen.add(idx);
+            const text = String(heading?.text || '').trim();
+            const lvl = Number(heading?.level);
+            const entry = {
+              idx,
+              key: idx,
+              id: idx,
+              text,
+              title: text,
+              label: text,
+              part: heading?.part || part?.name || 'document'
+            };
+            if (Number.isFinite(lvl)) entry.level = lvl;
+            const number = heading?.number ?? heading?.num;
+            if (number != null && number !== '') entry.number = String(number);
+            flat.push(entry);
+          }
         }
 
-        for (let i = 0; i < flat.length; i++) {
-          const cur = flat[i];
-          let end = totalParas;
-          for (let j = i + 1; j < flat.length; j++) {
-            if (flat[j].level <= cur.level) { end = flat[j].paraIndex; break; }
-          }
-          cur.end = end;
-        }
+        if (!flat.length) { tr.end({ count: 0, reason: 'no-headings' }); return { flat: [], tree: [], count: 0 }; }
+
+        flat.sort((a, b) => a.idx - b.idx);
 
         const tree = buildHeadingTree(flat);
         numberHeadingsTree(tree);
@@ -3289,8 +4345,10 @@
         propagate(tree);
 
         flat.forEach((h) => {
-          if (!h.number && h.idx != null) h.number = String(h.idx + 1);
-          if (!h.compositeKey) h.compositeKey = `${h.number}|${h.text}`.trim();
+          const num = h.number || h.num;
+          const idx = Number(h.idx);
+          const prefix = num ? String(num) : Number.isFinite(idx) ? String(idx + 1) : '';
+          if (!h.compositeKey) h.compositeKey = `${prefix}|${h.text}`.trim();
         });
 
         tr.end({ count: flat.length, rootChildren: tree.length });
