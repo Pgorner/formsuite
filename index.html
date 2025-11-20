@@ -174,7 +174,12 @@
       const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
       schema = st?.schema || null;
       values = st?.values || {};
-      fieldRules = Array.isArray(st?.fieldRules) ? st.fieldRules : [];
+      const baseline = {
+        flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : Array.isArray(st?.headings) ? st.headings : [],
+        tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
+      };
+      const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
+      fieldRules = normalized.fieldRules || [];
       if (!schema) {
         // Attempt one-time hydration from DOCX payload so Form loads without visiting Extractor
         await hydrateWorkspaceFromDocxIfEmpty();
@@ -198,7 +203,12 @@
         const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
         schema = st?.schema || null;
         values = st?.values || {};
-        fieldRules = Array.isArray(st?.fieldRules) ? st.fieldRules : [];
+        const baseline = {
+          flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : Array.isArray(st?.headings) ? st.headings : [],
+          tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
+        };
+        const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
+        fieldRules = normalized.fieldRules || [];
         if (!schema) {
           await hydrateWorkspaceFromDocxIfEmpty();
         }
@@ -1593,9 +1603,15 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
           Array.isArray(payload.rules) ? payload.rules :
           Array.isArray(payload.headingRules) ? payload.headingRules : [];
 
-        const fieldRules =
+        const fieldRulesRaw =
           Array.isArray(payload.fieldRules) ? payload.fieldRules :
           Array.isArray(payload.fieldsRules) ? payload.fieldsRules : []; // legacy guard
+
+        const normalized = deriveNormalizedRulesForDoc(
+          { rules, fieldRules: fieldRulesRaw },
+          nextSchema,
+          { flat: [], tree: [] }
+        );
 
         // Persist complete state back into workspace
         await window.formSuitePersist.saveState(currentDoc.docId, {
@@ -1603,13 +1619,14 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
           values: cleanValues,
           tagMap,
           rules,
-          fieldRules,
+          fieldRules: normalized.fieldRules,
           schemaUpdatedAt: new Date().toISOString()
         });
 
         // refresh local variables + UI
         schema = nextSchema;
         values = cleanValues;
+        fieldRules = normalized.fieldRules || [];
         renderForm();
         setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>`);
         return true;
@@ -3082,9 +3099,6 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const validIds   = new Set((schema?.fields || []).map(f => f.id));
       const safeValues = sanitizeValues(schema, values || {});
       const cleanTagMap = sanitizeTagMap(tagMap, validIds);
-      const rules = loadRulesForDoc(state);
-      const fieldRulesForDoc = loadFieldRulesForDoc(state);
-
       const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
         ? state.headingsFlat
         : Array.isArray(state?.headings) ? state.headings
@@ -3092,6 +3106,12 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       const baselineHeadingsTree = Array.isArray(state?.headingsTree)
         ? state.headingsTree
         : [];
+
+      const { rules, fieldRules: fieldRulesForDoc } = deriveNormalizedRulesForDoc(
+        state,
+        schema,
+        { flat: baselineHeadingsFlat, tree: baselineHeadingsTree }
+      );
 
       const fallbackHeadingResolver = buildHeadingTargetIndex({
         flat: baselineHeadingsFlat,
@@ -3728,37 +3748,404 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
       }
     }
 
-    // ---------- Rules → loaders (workspace first, then payload mirror) ----------
-    function loadRulesForDoc(state) {
-      // workspace (authoritative during editing)
-      if (Array.isArray(state?.rules)) return state.rules;
-
-      // payload mirrors (support both nested + flat mirrors)
-      const pl = state?.payload?.CRONOS_PAYLOAD
-              || state?.CRONOS_PAYLOAD
-              || state?.cronos_payload
-              || state?.payload;
-
-      if (Array.isArray(pl?.rules)) return pl.rules;
-
-      // very old keys
-      return state?.CRONOS_RULES || state?.cronos_rules || [];
+    // ---------- Rules: normalization + resolution ----------
+    function normalizeRuleCollection(raw) {
+      if (raw == null) return [];
+      if (Array.isArray(raw)) {
+        const acc = [];
+        for (const item of raw) acc.push(...normalizeRuleCollection(item));
+        return acc;
+      }
+      if (raw instanceof Set) return normalizeRuleCollection([...raw]);
+      if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        if (!trimmed) return [];
+        try { return normalizeRuleCollection(JSON.parse(trimmed)); }
+        catch { return []; }
+      }
+      if (typeof raw === 'object') {
+        const maybeRule = raw;
+        if (maybeRule && (maybeRule.action || maybeRule.fieldId || maybeRule.whenField || maybeRule.targets)) {
+          return [maybeRule];
+        }
+        const vals = [];
+        for (const value of Object.values(maybeRule)) vals.push(...normalizeRuleCollection(value));
+        return vals;
+      }
+      return [];
     }
 
-    function loadFieldRulesForDoc(state) {
-      // workspace (authoritative during editing)
-      if (Array.isArray(state?.fieldRules)) return state.fieldRules;
+    function dedupeRules(arr) {
+      const seen = new Set();
+      const res = [];
+      for (const r of (arr || [])) {
+        if (!r) continue;
+        const shallow = (r && typeof r === 'object') ? { ...r } : r;
+        if (shallow && typeof shallow === 'object') {
+          delete shallow.version;
+          delete shallow.ts;
+        }
+        const key = JSON.stringify(shallow ?? {});
+        if (!seen.has(key)) { seen.add(key); res.push(r); }
+      }
+      return res;
+    }
 
-      // payload mirrors (support both nested + flat mirrors)
-      const pl = state?.payload?.CRONOS_PAYLOAD
-              || state?.CRONOS_PAYLOAD
-              || state?.cronos_payload
-              || state?.payload;
+    function extractRulesFromState(state) {
+      const out = { rules: [], fieldRules: [], meta: { rulesSources: [], fieldRuleSources: [] } };
+      if (!state || typeof state !== 'object') return out;
 
-      if (Array.isArray(pl?.fieldRules)) return pl.fieldRules;
+      const payload =
+            state?.payload?.CRONOS_PAYLOAD ? state.payload.CRONOS_PAYLOAD
+          : state?.CRONOS_PAYLOAD         ? state.CRONOS_PAYLOAD
+          : state?.cronos_payload         ? state.cronos_payload
+          : state?.payload                ? state.payload
+          : {};
 
-      // very old keys
-      return state?.CRONOS_FIELD_RULES || state?.cronos_field_rules || [];
+      const ruleSources = [
+        ['workspace.rules', normalizeRuleCollection(state?.rules)],
+        ['payload.CRONOS_PAYLOAD.rules', normalizeRuleCollection(payload?.rules)],
+        ['payload.rules', normalizeRuleCollection(state?.payload?.rules)],
+        ['CRONOS_RULES', normalizeRuleCollection(state?.CRONOS_RULES)],
+        ['cronos_rules', normalizeRuleCollection(state?.cronos_rules)],
+      ];
+
+      const fieldRuleSources = [
+        ['workspace.fieldRules', normalizeRuleCollection(state?.fieldRules)],
+        ['payload.CRONOS_PAYLOAD.fieldRules', normalizeRuleCollection(payload?.fieldRules)],
+        ['payload.fieldRules', normalizeRuleCollection(state?.payload?.fieldRules)],
+        ['CRONOS_FIELD_RULES', normalizeRuleCollection(state?.CRONOS_FIELD_RULES)],
+        ['cronos_field_rules', normalizeRuleCollection(state?.cronos_field_rules)],
+      ];
+
+      out.rules = dedupeRules(ruleSources.flatMap(([, arr]) => arr));
+      out.fieldRules = dedupeRules(fieldRuleSources.flatMap(([, arr]) => arr));
+      out.meta.rulesSources = ruleSources.filter(([, arr]) => arr.length > 0).map(([name]) => name);
+      out.meta.fieldRuleSources = fieldRuleSources.filter(([, arr]) => arr.length > 0).map(([name]) => name);
+
+      return out;
+    }
+
+    function hasOwn(obj, key) {
+      return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+    }
+
+    function resolveRulesForState(state, payloadOverride = null) {
+      const view = state && typeof state === 'object' ? { ...state } : {};
+      if (payloadOverride) {
+        view.payload = { ...(state?.payload || {}), CRONOS_PAYLOAD: payloadOverride };
+        view.CRONOS_PAYLOAD = payloadOverride;
+        view.cronos_payload = payloadOverride;
+      }
+
+      const aggregated = extractRulesFromState(view);
+      const wsRulesRaw = hasOwn(view, 'rules') ? normalizeRuleCollection(view.rules) : [];
+      const wsFieldRulesRaw = hasOwn(view, 'fieldRules') ? normalizeRuleCollection(view.fieldRules) : [];
+
+      const rules = hasOwn(view, 'rules') ? dedupeRules(wsRulesRaw) : aggregated.rules;
+      const fieldRules = hasOwn(view, 'fieldRules') ? dedupeRules(wsFieldRulesRaw) : aggregated.fieldRules;
+
+      const source = {
+        rules: hasOwn(view, 'rules') ? 'workspace.rules' : (aggregated.meta?.rulesSources?.[0] || 'none'),
+        fieldRules: hasOwn(view, 'fieldRules') ? 'workspace.fieldRules' : (aggregated.meta?.fieldRuleSources?.[0] || 'none'),
+        contributingRules: aggregated.meta?.rulesSources || [],
+        contributingFieldRules: aggregated.meta?.fieldRuleSources || []
+      };
+
+      return { rules, fieldRules, source };
+    }
+
+    function __buildSchemaIndex(schema) {
+      const idx = { byId: new Map(), byLabel: new Map(), optionToField: new Map() };
+      for (const f of (schema?.fields || [])) {
+        const id = String(f.id);
+        idx.byId.set(id, f);
+        if (f.label) idx.byLabel.set(String(f.label).trim().toLowerCase(), f);
+
+        const opts = [];
+        if (Array.isArray(f.options)) {
+          for (const o of f.options) {
+            const label = (o?.label ?? o?.text ?? o?.value ?? o);
+            if (label != null) opts.push(String(label));
+          }
+        }
+        if (f.mc?.groups) {
+          for (const g of f.mc.groups) {
+            for (const it of (g.items || [])) {
+              if (it?.value != null) opts.push(String(it.value));
+            }
+          }
+        }
+        for (const label of opts) idx.optionToField.set(label.trim().toLowerCase(), f);
+      }
+      return idx;
+    }
+
+    function __resolveFieldRef(schema, raw) {
+      if (!raw) return null;
+      const s = String(raw).trim();
+      const idx = __buildSchemaIndex(schema);
+
+      if (s.includes('__opt__')) {
+        const baseId = s.split('__opt__')[0];
+        if (idx.byId.has(baseId)) return idx.byId.get(baseId);
+        const slug = s.split('__opt__').pop();
+        for (const [labelLower, field] of idx.optionToField.entries()) {
+          const labelSlug = labelLower
+            .normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+            .replace(/[^a-z0-9]+/gi,'_').replace(/^_+|_+$/g,'')
+            .toLowerCase();
+          if (labelSlug === String(slug).toLowerCase()) return field;
+        }
+      }
+
+      if (idx.byId.has(s)) return idx.byId.get(s);
+      const byLabel = idx.byLabel.get(s.toLowerCase());
+      if (byLabel) return byLabel;
+
+      const parts = s.split(':').map(x => x.trim());
+      if (parts.length >= 1) {
+        const tryLabel = idx.byLabel.get(parts[0].toLowerCase());
+        if (tryLabel) return tryLabel;
+      }
+
+      const own = idx.optionToField.get(s.toLowerCase());
+      if (own) return own;
+
+      console.warn('[resolveFieldRef] could not resolve field for:', s, {
+        schemaFields: (schema?.fields || []).map(f => f.id),
+        sampleField: schema?.fields?.[0]
+      });
+      return null;
+    }
+
+    function __coerceRuleForMultichoiceOption(schema, rule, whenField) {
+      if (!whenField) return rule;
+      const type = whenField.type;
+      if (!['multichoice','select'].includes(type)) return rule;
+
+      const r = { ...rule };
+      if (!Array.isArray(r.values)) r.values = [r.values];
+      return r;
+    }
+
+    function normalizeHeadingsRulesForSchema(schema, rulesIn, headingBaseline = { flat: [], tree: [] }) {
+      const rules = Array.isArray(rulesIn) ? rulesIn : [];
+      const out = [];
+      const headingIndex = buildHeadingTargetIndex(headingBaseline);
+      for (const raw of rules) {
+        if (!raw) continue;
+
+        const got = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
+        if (!got) continue;
+
+        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, got);
+
+        const refAfterCoerce = r0?.fieldId ?? r0?.field ?? r0?.whenField;
+        if (!__resolveFieldRef(schema, refAfterCoerce)) {
+          const fallbackId = String(got.id);
+          if (fallbackId) {
+            r0.fieldId = fallbackId;
+            if (r0.field != null) r0.field = fallbackId;
+            if (r0.whenField != null) r0.whenField = fallbackId;
+          }
+        }
+
+        if (Array.isArray(r0.conditions)) {
+          r0.conditions = r0.conditions.filter(c => {
+            const ref = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
+            if (!ref) return false;
+            return !!__resolveFieldRef(schema, ref);
+          });
+        }
+
+        if (Array.isArray(r0.targets)) {
+          r0.targets = r0.targets
+            .map(t => headingIndex.normalizeTarget(t))
+            .filter(Boolean);
+        }
+
+        out.push(r0);
+      }
+      return out;
+    }
+
+    function __slug(s) {
+      return String(s ?? '')
+        .normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+        .replace(/[^a-z0-9]+/gi,'_')
+        .replace(/^_+|_+$/g,'')
+        .toLowerCase();
+    }
+
+    function __buildOptionIndex(schema) {
+      const byField = new Map();
+      for (const f of (schema?.fields || [])) {
+        const rec = { id: String(f.id), label: String(f.label || f.id), type: f.type, options: [] };
+
+        if (Array.isArray(f.options)) {
+          for (const opt of f.options) {
+            const value = String(opt?.value ?? opt?.id ?? opt);
+            const label = String(opt?.label ?? opt?.text ?? value);
+            rec.options.push({ value, label, slug: __slug(label) });
+          }
+        }
+
+        if (f?.mc?.groups) {
+          for (const g of f.mc.groups) {
+            for (const it of (g.items||[])) {
+              const value = String(it?.value ?? it?.id ?? it);
+              const label = String(it?.label ?? it?.text ?? value);
+              rec.options.push({ value, label, slug: __slug(label) });
+            }
+          }
+        }
+
+        byField.set(rec.id, rec);
+      }
+      return byField;
+    }
+
+    function normalizeFieldRulesForSchema(schema, rulesIn) {
+      const rules = Array.isArray(rulesIn) ? rulesIn : [];
+      const out = [];
+      const optionIndex = __buildOptionIndex(schema);
+      const fieldIndex  = new Map((schema?.fields || []).map(f => [String(f.id), f]));
+
+      for (const raw of rules) {
+        if (!raw) continue;
+
+        const resolvedField = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
+        if (!resolvedField) continue;
+
+        const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, resolvedField);
+
+        const refAfterCoerce = r0?.fieldId ?? r0?.field ?? r0?.whenField;
+        if (!__resolveFieldRef(schema, refAfterCoerce)) {
+          const fallbackId = String(resolvedField.id);
+          if (fallbackId) {
+            r0.fieldId = fallbackId;
+            if (r0.field != null) r0.field = fallbackId;
+            if (r0.whenField != null) r0.whenField = fallbackId;
+          }
+        }
+
+        if (Array.isArray(r0.conditions)) {
+          r0.conditions = r0.conditions.filter(c => {
+            const ref = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
+            return !!__resolveFieldRef(schema, ref);
+          });
+        }
+
+        const normTargets = [];
+        const tIn = Array.isArray(r0.targets) ? r0.targets : [];
+        const pf  = optionIndex.get(resolvedField.id);
+
+        for (const t of tIn) {
+          if (t && typeof t === 'object' && (t.optionValue != null || t.optionLabel != null)) {
+            const id = String(t.id ?? resolvedField.id);
+            const optVal = String(t.optionValue ?? '');
+            const optLab = String(t.optionLabel ?? optVal);
+            const parentLabel = fieldIndex.get(id)?.label || id;
+            normTargets.push({
+              id,
+              optionValue: optVal,
+              optionLabel: optLab,
+              label: t.label || `${parentLabel}: ${optLab || optVal}`
+            });
+            continue;
+          }
+
+          if (typeof t === 'string') {
+            const s = t.trim();
+
+            if (s.includes('__opt__')) {
+              const [maybeId, slug] = s.split('__opt__');
+              const id = String(maybeId);
+              const cat = optionIndex.get(id) || pf;
+              if (cat && cat.options?.length) {
+                const hit = cat.options.find(o => o.slug === __slug(slug));
+                if (hit) {
+                  normTargets.push({
+                    id: cat.id,
+                    optionValue: hit.value,
+                    optionLabel: hit.label,
+                    label: `${cat.label}: ${hit.label}`
+                  });
+                  continue;
+                }
+              }
+            }
+
+            if (s.includes(':')) {
+              const [lhs, rhs] = s.split(':');
+              const fieldLike = lhs.trim();
+              const optLike   = rhs.trim();
+
+              let cat = optionIndex.get(fieldLike);
+              if (!cat) {
+                for (const [_id, rec] of optionIndex.entries()) {
+                  if (__slug(rec.label) === __slug(fieldLike)) { cat = rec; break; }
+                }
+              }
+              if (!cat) cat = pf;
+
+              if (cat && cat.options?.length) {
+                const hit = cat.options.find(o => __slug(o.label) === __slug(optLike) || __slug(o.value) === __slug(optLike));
+                if (hit) {
+                  normTargets.push({
+                    id: cat.id,
+                    optionValue: hit.value,
+                    optionLabel: hit.label,
+                    label: `${cat.label}: ${hit.label}`
+                  });
+                  continue;
+                }
+              }
+            }
+
+            if (fieldIndex.has(s)) {
+              const f = fieldIndex.get(s);
+              normTargets.push({ id: f.id, label: f.label || f.id });
+              continue;
+            }
+
+            for (const f of fieldIndex.values()) {
+              if (__slug(f.label || f.id) === __slug(s)) {
+                normTargets.push({ id: f.id, label: f.label || f.id });
+                break;
+              }
+            }
+            continue;
+          }
+
+          if (t && typeof t === 'object') {
+            const id = String(t.id ?? t.fieldId ?? '');
+            if (fieldIndex.has(id)) {
+              normTargets.push({ id, label: t.label || fieldIndex.get(id).label || id });
+            }
+          }
+        }
+
+        const ensureFieldTarget = () => {
+          if (!normTargets.length) {
+            normTargets.push({ id: String(resolvedField.id), label: resolvedField.label || resolvedField.id });
+          }
+        };
+
+        ensureFieldTarget();
+        r0.targets = normTargets;
+        out.push(r0);
+      }
+      return out;
+    }
+
+    function deriveNormalizedRulesForDoc(state, schema, headingBaseline) {
+      const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw } = resolveRulesForState(state || {});
+      return {
+        rules: normalizeHeadingsRulesForSchema(schema, mergedRulesRaw, headingBaseline),
+        fieldRules: normalizeFieldRulesForSchema(schema, mergedFieldRaw)
+      };
     }
 
 
@@ -4274,17 +4661,6 @@ def apply_removal_with_backup(u8, idx_to_action_json, backup_path="customXml/ori
         }
       }
       return out;
-    }
-
-    // ---------- Field Rules (UI visibility) ----------
-    function loadFieldRulesForDoc(state) {
-      return (
-        state?.fieldRules ||
-        state?.payload?.fieldRules ||
-        state?.CRONOS_FIELD_RULES ||
-        state?.cronos_field_rules ||
-        []
-      );
     }
 
     function evaluateFieldRulesToVisibility(schema, values, rules) {
