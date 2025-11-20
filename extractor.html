@@ -2299,6 +2299,27 @@
       } catch (e) { tr.error('failed', e); tr.end(); throw e; }
     }
 
+    async function applyVisibilityActions(arrayBufferOrBytes, visibilityMap) {
+      const tr = TRACE('applyVisibilityActions', { actions: Object.keys(visibilityMap || {}).length });
+      try {
+        const py = await pyodideReady;
+        const u8in = arrayBufferOrBytes instanceof Uint8Array ? arrayBufferOrBytes : new Uint8Array(arrayBufferOrBytes || []);
+        const fn = py.globals.get('apply_visibility');
+        const pyBytes = py.toPy(u8in);
+        const pyMap = py.toPy(JSON.stringify(visibilityMap || {}));
+        let pyOut;
+        try { pyOut = fn(pyBytes, pyMap); }
+        finally { try{fn.destroy();}catch{} try{pyBytes.destroy();}catch{} try{pyMap.destroy();}catch{} }
+        let u8;
+        if (pyOut?.toJs) u8 = pyOut.toJs({ create_proxies:false });
+        else if (pyOut?.getBuffer) u8 = new Uint8Array(pyOut.getBuffer());
+        else u8 = new Uint8Array([]);
+        try { pyOut.destroy?.(); } catch {}
+        tr.end({ outLen: u8?.byteLength });
+        return u8;
+      } catch (e) { tr.error('failed', e); tr.end(); throw e; }
+    }
+
     // =========================
     // (REPLACE) renderFromCurrentBytes(prefix = '')
     // =========================
@@ -2868,9 +2889,14 @@
           sdtMap[tag] = String(v);
         }
         updated = await writeSDTs(updated, sdtMap);
+
+        // 3) apply visibility/removal actions
+        const headingResolver = buildHeadingTargetIndex(gHeadingBaseline);
+        const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, rules, headingResolver);
+        updated = await applyVisibilityActions(updated, visibilityMap);
         const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
 
-        // 3) download/save as a new file
+        // 4) download/save as a new file
         const suggested = (gFileName?.replace(/\.(docx|docm|dotx|dotm)$/i,'') || 'document') + '_export.' + gFileExt;
         if (window.showSaveFilePicker) {
           try {
