@@ -9,6 +9,8 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css">
   <script src="persistence.js"></script>
+  <script src="fs-active-doc.js"></script>
+  <script src="fs-focus-nav.js"></script>
 </head>
 <body>
   <header>
@@ -201,100 +203,10 @@
       }
     }
 
-    // ---------- One Active-Doc Signal (unifier) ----------
-    const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // canonical key (same as index/extractor)
-
-    // Read current active doc meta (pref: persistence → LS → legacy LS)
-    function readActiveDocSync() {
-      const meta = window.formSuitePersist?.getActiveDocMeta?.()
-                || window.formSuitePersist?.getCurrentDocMeta?.();
-      if (meta?.docId) {
-        const m = { docId: meta.docId, name: meta.name || meta.docTitle || 'document' };
-        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(m)); } catch {}
-        return m;
-      }
-      try {
-        const v = localStorage.getItem(ACTIVE_DOC_KEY);
-        if (v) return JSON.parse(v);
-      } catch {}
-      try {
-        const legacy = localStorage.getItem('FS_CURRENT_DOC_META');
-        if (legacy) {
-          const m = JSON.parse(legacy);
-          if (m?.docId) {
-            localStorage.setItem(ACTIVE_DOC_KEY, legacy);
-            return m;
-          }
-        }
-      } catch {}
-      return null;
-    }
-
-    // Normalize all cross-tab signals into ACTIVE_DOC_KEY + callback
-    function installActiveDocListener(onChange) {
-      const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-      const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
-
-      function emit(meta) {
-        if (meta?.docId) {
-          try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify({ docId: meta.docId, name: meta.name })); } catch {}
-        } else {
-          try { localStorage.removeItem(ACTIVE_DOC_KEY); } catch {}
-        }
-        onChange(meta || null);
-      }
-
-      // Map old messages → canonical
-      bcLegacy?.addEventListener('message', async (ev) => {
-        const m = ev?.data || {};
-        if (m.type === 'doc-cleared') { emit(null); return; }
-        if (m.type === 'doc-switched' || m.type === 'doc-updated') {
-          emit((m.docId) ? { docId: m.docId, name: m.name } : readActiveDocSync());
-          return;
-        }
-        if (m.type === 'schema-updated') {
-          const meta = readActiveDocSync();
-          if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
-        }
-      });
-
-      // Canonical channel
-      bcCanon?.addEventListener('message', (ev) => {
-        const m = ev?.data || {};
-        if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
-        if (m.type === 'active:clear') emit(null);
-        if (m.type === 'active:updated') {
-          const meta = readActiveDocSync();
-          if (meta?.docId) emit(meta);
-        }
-        if (m.type === 'schema-updated') {
-          const meta = readActiveDocSync();
-          if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
-        }
-      });
-
-      // Storage sync (also migrates legacy key once)
-      window.addEventListener('storage', (e) => {
-        if (e.key === ACTIVE_DOC_KEY) {
-          const v = e.newValue ? JSON.parse(e.newValue) : null;
-          emit(v);
-        }
-        if (e.key === 'FS_CURRENT_DOC_META' && !localStorage.getItem(ACTIVE_DOC_KEY)) {
-          const v = e.newValue ? JSON.parse(e.newValue) : null;
-          if (v?.docId) {
-            try { localStorage.setItem(ACTIVE_DOC_KEY, e.newValue); } catch {}
-            emit(v);
-          }
-        }
-      });
-    }
-
-    // Drive Builder UI from the single signal
     installActiveDocListener(async (meta) => {
       currentDoc = meta;
 
       if (!currentDoc?.docId) {
-        // No active doc → local draft
         const draft = loadLS() || { title: 'Untitled form', fields: [] };
         FORM_BUILDER.schema = draft;
         els.formTitle.value = draft.title || '';
@@ -304,7 +216,6 @@
         return;
       }
 
-      // Active doc → per-doc workspace state only (no LS fallback)
       const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
       if (st?.schema) {
         FORM_BUILDER.schema = st.schema;
@@ -314,7 +225,8 @@
         els.formTitle.value = '';
       }
       renderAll({ persist: false });
-      els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
+      els.docStatus.textContent =
+        `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
       els.docStatus.classList.remove('muted');
     });
 
@@ -1923,37 +1835,7 @@
     els.formTitle.addEventListener('input', () => mirror(false));
 
     // Triple-click logo: focus mode + go to index, toggle header links
-    (function() {
-      const logo = document.querySelector('header .logo');
-      const header = document.querySelector('header .row');
-      if (!logo || !header) return;
-
-      let clickCount = 0;
-      let clickTimer = null;
-      let focusMode = false;
-
-      logo.addEventListener('click', () => {
-        clickCount++;
-        clearTimeout(clickTimer);
-        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
-
-        if (clickCount === 3) {
-          clickCount = 0;
-          focusMode = !focusMode;
-
-          if (focusMode) {
-            header.querySelectorAll('a, span.muted').forEach(el => {
-              if (!el.closest('.brand')) el.style.display = 'none';
-            });
-            if (!location.pathname.endsWith('index.html')) {
-              location.href = 'index.html';
-            }
-          } else {
-            header.querySelectorAll('a, span.muted').forEach(el => { el.style.display = ''; });
-          }
-        }
-      });
-    })();
+    installLogoFocusNav();
   </script>
 </body>
 </html>

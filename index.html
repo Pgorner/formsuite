@@ -45,8 +45,9 @@
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <script src="persistence.js"></script>
   <script src="rules-core.js"></script>
-  <script src="persistence.js"></script>
   <script src="docx-core.js"></script>
+  <script src="fs-active-doc.js"></script> <!-- new -->
+  <script src="fs-focus-nav.js"></script>
   <script src="address-autocomplete.js"></script>
   <script>
     const STORAGE_KEY = 'FORM_SCHEMA_V1';
@@ -93,104 +94,36 @@
       else setStatus(`No active document. Open one in the <a href="extractor.html">Extractor</a>.`);
     }
 
-    // ---------- One Active-Doc Signal (canonical) ----------
-    const ACTIVE_DOC_KEY = 'FS_ACTIVE_DOC_META'; // unified key across the app
+  // use shared helper
+  installActiveDocListener(async (meta) => {
+    currentDoc = meta;
+    if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
 
-    function readActiveDocSync() {
-      // Prefer live persistence info in this tab
-      const p = window.formSuitePersist?.getCurrentDocMeta?.()
-             || window.formSuitePersist?.getActiveDoc?.sync?.();
-      if (p?.docId) {
-        const meta = { docId: p.docId, name: p.name || p.docTitle || 'document' };
-        try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify(meta)); } catch {}
-        return meta;
-      }
-      // Canonical LS
-      try { const v = localStorage.getItem(ACTIVE_DOC_KEY); if (v) return JSON.parse(v); } catch {}
-      // Legacy migration (older Extractor)
-      try {
-        const legacy = localStorage.getItem('FS_CURRENT_DOC_META');
-        if (legacy) {
-          const m = JSON.parse(legacy);
-          if (m?.docId) {
-            localStorage.setItem(ACTIVE_DOC_KEY, legacy);
-            return m;
-          }
-        }
-      } catch {}
-      return null;
+    const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+    schema = st?.schema || null;
+    values = st?.values || {};
+
+    const baseline = {
+      flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat
+        : Array.isArray(st?.headings) ? st.headings : [],
+      tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
+    };
+
+    const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
+    fieldRules = normalized.fieldRules || [];
+
+    if (!schema) {
+      await hydrateWorkspaceFromDocxIfEmpty();
     }
 
-    function installActiveDocListener(onChange) {
-      const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-      const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+    setStatus(
+      `Active DOCX: <span class="kbd">${currentDoc.name}</span>` +
+      (schema ? '' : ' — <span class="muted">no schema yet</span>')
+    );
+    renderForm();
+    await updateWriteAccessBanner();
+  });
 
-      function emit(meta) {
-        if (meta?.docId) {
-          try { localStorage.setItem(ACTIVE_DOC_KEY, JSON.stringify({ docId: meta.docId, name: meta.name })); } catch {}
-        } else {
-          try { localStorage.removeItem(ACTIVE_DOC_KEY); } catch {}
-        }
-        onChange(meta || null);
-      }
-
-      bcLegacy?.addEventListener('message', (ev) => {
-        const m = ev?.data || {};
-        if (m.type === 'doc-cleared') { emit(null); return; }
-        if (m.type === 'doc-switched' || m.type === 'doc-updated') {
-          emit((m.docId) ? { docId: m.docId, name: m.name } : readActiveDocSync());
-        }
-        if (m.type === 'schema-updated') {
-          const meta = readActiveDocSync();
-          if (meta?.docId && (!m.docId || m.docId === meta.docId)) emit(meta);
-        }
-      });
-
-      bcCanon?.addEventListener('message', (ev) => {
-        const m = ev?.data || {};
-        if (m.type === 'active:set')   emit({ docId: m.docId, name: m.name });
-        if (m.type === 'active:clear') emit(null);
-        if (m.type === 'active:updated') {
-          const meta = readActiveDocSync();
-          if (meta?.docId) emit(meta);
-        }
-      });
-
-      window.addEventListener('storage', (e) => {
-        if (e.key === ACTIVE_DOC_KEY) {
-          const v = e.newValue ? JSON.parse(e.newValue) : null;
-          emit(v);
-        }
-        if (e.key === 'FS_CURRENT_DOC_META' && !localStorage.getItem(ACTIVE_DOC_KEY)) {
-          const v = e.newValue ? JSON.parse(e.newValue) : null;
-          if (v?.docId) {
-            try { localStorage.setItem(ACTIVE_DOC_KEY, e.newValue); } catch {}
-            emit(v);
-          }
-        }
-      });
-    }
-
-    installActiveDocListener(async (meta) => {
-      currentDoc = meta;
-      if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
-      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-      schema = st?.schema || null;
-      values = st?.values || {};
-      const baseline = {
-        flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : Array.isArray(st?.headings) ? st.headings : [],
-        tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
-      };
-      const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
-      fieldRules = normalized.fieldRules || [];
-      if (!schema) {
-        // Attempt one-time hydration from DOCX payload so Form loads without visiting Extractor
-        await hydrateWorkspaceFromDocxIfEmpty();
-      }
-      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-      renderForm();
-      await updateWriteAccessBanner();
-    });
 
     // ---------- Foreground refresh (coalesced) ----------
     let __refreshLock = false;
@@ -2588,38 +2521,7 @@
       window.renderExportDebugPanel = renderExportDebugPanel;
     } catch {}
 
-    // ---------- Logo triple-click: focus mode ----------
-    (function() {
-      const logo = document.querySelector('header .logo');
-      const header = document.querySelector('header .row');
-      if (!logo || !header) return;
-
-      let clickCount = 0;
-      let clickTimer = null;
-      let focusMode = false;
-
-      logo.addEventListener('click', () => {
-        clickCount++;
-        clearTimeout(clickTimer);
-        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
-
-        if (clickCount === 3) {
-          clickCount = 0;
-          focusMode = !focusMode;
-
-          if (focusMode) {
-            header.querySelectorAll('a, span.muted').forEach(el => {
-              if (!el.closest('.brand')) el.style.display = 'none';
-            });
-            if (!location.pathname.endsWith('index.html')) {
-              location.href = 'index.html';
-            }
-          } else {
-            header.querySelectorAll('a, span.muted').forEach(el => { el.style.display = ''; });
-          }
-        }
-      });
-    })();
+    installLogoFocusNav();
   </script>
 </body>
 </html>

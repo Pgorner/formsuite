@@ -14,6 +14,8 @@
   <script src="persistence.js"></script>
   <script src="rules-core.js"></script>
   <script src="docx-core.js"></script>
+  <script src="fs-active-doc.js"></script>
+  <script src="fs-focus-nav.js"></script>
   <!-- flatpickr JS (date inputs) -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <!-- JSZip for JS-based SDT scanning (parity with Tag Matcher) -->
@@ -313,32 +315,6 @@
     const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
     const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
 
-    function persistActiveMeta(meta) {
-      try { localStorage.setItem(ACTIVE_LS_KEY, JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
-      try { localStorage.setItem(META_LS_KEY,   JSON.stringify({ docId: meta?.docId, name: meta?.name })); } catch {}
-      try { bcCanon?.postMessage({ type: 'active:set', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
-      try { bcLegacy?.postMessage({ type: 'doc-switched', docId: meta?.docId, name: meta?.name, ts: Date.now() }); } catch {}
-    }
-    function readActiveMeta() {
-      try {
-        const v = localStorage.getItem(ACTIVE_LS_KEY) || localStorage.getItem(META_LS_KEY);
-        return v ? JSON.parse(v) : null;
-      } catch { return null; }
-    }
-    function announceDocSwitch() {
-      persistActiveMeta({ docId: gDocId, name: gFileName });
-    }
-    function announceDocUpdate() {
-      try { bcLegacy?.postMessage({ type: 'doc-updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
-      try { bcCanon?.postMessage({ type: 'active:updated', docId: gDocId, name: gFileName, ts: Date.now() }); } catch {}
-    }
-    function clearActiveMeta() {
-      try { localStorage.removeItem(ACTIVE_LS_KEY); } catch {}
-      try { localStorage.removeItem(META_LS_KEY); } catch {}
-      try { bcCanon?.postMessage({ type: 'active:clear', ts: Date.now() }); } catch {}
-      try { bcLegacy?.postMessage({ type: 'doc-cleared', ts: Date.now() }); } catch {}
-    }
-
     function clearUiForNewDoc(message = 'Loading new document…') {
       try {
         tableBody.innerHTML = '<tr><td colspan="5" class="empty">Loading…</td></tr>';
@@ -366,7 +342,9 @@
       } catch (e) { tr.error('saveState failed', e); }
       gArrayBuffer = null; gFileHandle = null; gFileName = null; gDocId = null; gSDTs = [];
       adoptHeadingBaseline({ flat: [], tree: [] });
-      clearActiveMeta();
+
+      // Centralized active-doc clear (fs-active-doc.js)
+      window.clearActiveDocMeta?.();
       try {
         tableBody.innerHTML = '<tr><td colspan="5" class="empty">No document loaded.</td></tr>';
         formMount.innerHTML = '<div class="empty">No schema found.</div>';
@@ -457,7 +435,7 @@
       const tr = TRACE('storage:event', { key:e.key, newValue: !!e.newValue });
       try {
         if ((e.key === ACTIVE_LS_KEY || e.key === META_LS_KEY) && e.newValue) {
-          const meta = JSON.parse(e.newValue || 'null');
+          const meta = window.readActiveDocSync?.() || null;
           if (!meta?.docId || meta.docId === gDocId) return;
           clearUiForNewDoc('Switching to another document…');
           let bytes = await window.formSuitePersist.getBytes?.(meta.docId) || await window.formSuitePersist.getCurrentDocBytes?.();
@@ -623,7 +601,10 @@
           if (!gDocId) {
             // late-bind this tab to the active doc so we don’t miss future changes
             gDocId = targetId;
-            persistActiveMeta({ docId: gDocId, name: pickActiveMeta()?.name || gFileName || 'document' });
+            window.setActiveDocMeta?.({
+              docId: gDocId,
+              name: pickActiveMeta()?.name || gFileName || 'document'
+            });
             console.log('[Extractor][BC] late-bound to docId', gDocId);
           }
           if (gDocId !== targetId) {
@@ -667,7 +648,7 @@
       async function tick() {
         try {
           if (!gDocId) {
-            const meta = readActiveMeta();
+            const meta = window.readActiveDocSync?.();
             if (meta?.docId) {
               gDocId = meta.docId;
               console.log('[Extractor][Watchdog] late-bound gDocId from active meta', gDocId);
@@ -1223,8 +1204,8 @@
     (async function boot() {
       const tr = TRACE('boot');
       try {
-        let meta = readActiveMeta();
-        tr.step('readActiveMeta', meta);
+        let meta = window.readActiveDocSync?.();
+        tr.step('readActiveDocSync', meta);
         if (!meta?.docId) { meta = window.formSuitePersist?.getCurrentDocMeta?.(); tr.step('getCurrentDocMeta', meta); }
         if (!meta?.docId) { tr.end('no meta; idle'); return; }
 
@@ -1365,10 +1346,11 @@
         });
 
         // 3) Switch local context to the NEW docId (even if filename is identical)
-        gDocId        = metaObj.docId;
-        gArrayBuffer  = bytes.buffer;
-        persistActiveMeta(metaObj);     // keep existing cross-tab signals
-        announceDocSwitch();
+        gDocId       = metaObj.docId;
+        gArrayBuffer = bytes.buffer;
+
+        // Centralized active-doc update (fs-active-doc.js)
+        window.setActiveDocMeta?.(metaObj);
 
         // 4) Re-render and refresh permission banner
         await renderFromCurrentBytes();
@@ -1484,8 +1466,10 @@
 
         const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
         gDocId = metaObj.docId;
-        persistActiveMeta(metaObj);
-        announceDocUpdate();
+
+        // keep active-doc meta in sync across tabs
+        window.setActiveDocMeta?.(metaObj);
+        window.notifyActiveDocUpdated?.(metaObj);
 
         if (window.showSaveFilePicker && gFileHandle) {
           const p = await ensureWritePermission(gFileHandle, 'readwrite');
@@ -1736,44 +1720,23 @@
       try {
         if (!gDocId) { tr.end('no docId'); return; }
         const vals = collectFormValues(gSchema);
-        await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: { ...(gValues||{}), ...vals } });
-        persistActiveMeta({ docId: gDocId, name: gFileName });
-      } catch (e) { tr.warn('beforeunload failed', e); }
-      finally { tr.end(); }
+        await window.formSuitePersist.saveState(gDocId, {
+          schema: gSchema,
+          values: { ...(gValues || {}), ...vals }
+        });
+        window.setActiveDocMeta?.({ docId: gDocId, name: gFileName });
+      } catch (e) {
+        tr.warn('beforeunload failed', e);
+      } finally {
+        tr.end();
+      }
     });
+
 
     // =========================
     // TRIPLE-CLICK FOCUS NAV
     // =========================
-    (function() {
-      const logo = document.querySelector('header .logo');
-      const header = document.querySelector('header .row');
-      if (!logo || !header) return;
-
-      let clickCount = 0;
-      let clickTimer = null;
-      let focusMode = false;
-
-      logo.addEventListener('click', () => {
-        clickCount++;
-        clearTimeout(clickTimer);
-        clickTimer = setTimeout(() => { clickCount = 0; }, 600);
-
-        if (clickCount === 3) {
-          clickCount = 0;
-          focusMode = !focusMode;
-
-          if (focusMode) {
-            header.querySelectorAll('a, span.muted').forEach(el => {
-              if (!el.closest('.brand')) el.style.display = 'none';
-            });
-            if (!location.pathname.endsWith('index.html')) location.href = 'index.html';
-          } else {
-            header.querySelectorAll('a, span.muted').forEach(el => { el.style.display = ''; });
-          }
-        }
-      });
-    })();
+    installLogoFocusNav();
 
     // =========================
     // HEADINGS (H1..H9) PARSING & TREE
