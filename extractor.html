@@ -16,6 +16,7 @@
   <script src="docx-core.js"></script>
   <script src="fs-active-doc.js"></script>
   <script src="fs-focus-nav.js"></script>
+  <script src="fs-export-core.js"></script>
   <!-- flatpickr JS (date inputs) -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <!-- JSZip for JS-based SDT scanning (parity with Tag Matcher) -->
@@ -1495,20 +1496,37 @@
     async function doExport() {
       const tr = TRACE('doExport');
       try {
-        if (!gArrayBuffer) return;
+        if (!gArrayBuffer) {
+          alert('No DOCX loaded.');
+          return;
+        }
+        if (!gSchema) {
+          alert('No schema available — parse or hydrate first.');
+          return;
+        }
 
-        const originalBytes = (gArrayBuffer instanceof Uint8Array)
-          ? gArrayBuffer.slice()
-          : new Uint8Array(gArrayBuffer);
+        setStatus('Preparing export…');
+        const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+        const originalBytes = new Uint8Array(gArrayBuffer);
 
         const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
+
+        // Make sure we have the latest headings baseline and schema
         if (restored) {
           adoptHeadingBaseline({
-            flat: Array.isArray(restored.headingsFlat) ? restored.headingsFlat : Array.isArray(restored.headings) ? restored.headings : [],
-            tree: Array.isArray(restored.headingsTree) ? restored.headingsTree : gHeadingBaseline.tree
+            flat: Array.isArray(restored.headingsFlat)
+              ? restored.headingsFlat
+              : Array.isArray(restored.headings)
+                ? restored.headings
+                : [],
+            tree: Array.isArray(restored.headingsTree)
+              ? restored.headingsTree
+              : gHeadingBaseline.tree
           });
         }
-        if (restored?.schema) gSchema = restored.schema;
+        if (restored?.schema) {
+          gSchema = restored.schema;
+        }
 
         const domVals  = collectFormValues(gSchema);
         const baseVals = (restored && restored.values) ? restored.values : {};
@@ -1531,74 +1549,120 @@
           plRules: normalizeRuleCollection(payloadSnapshot?.rules).length
         });
 
+        console.log('[doExport][normalized]', {
+          rules: rules.length,
+          fieldRules: fieldRules.length,
+          source: ruleSourceMeta
+        });
+
         const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
+          normalizeForSchema(gSchema, { baseVals, domVals }, tagMapRaw);
 
         gValues = prunedValues;
+        await updatePreview(gValues);
 
-        // 1) embed payload
-        const payloadObj = {
-          title:  gSchema.title || 'Form',
-          fields: gSchema.fields || [],
-          values: gValues || {},
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules,
-          updatedAt: new Date().toISOString()
-        };
-        let updated = await writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
+        const baseline = gHeadingBaseline && (gHeadingBaseline.flat || gHeadingBaseline.tree)
+          ? gHeadingBaseline
+          : { flat: [], tree: [] };
 
-        // 2) replace SDTs via tagMap
-        const sdtMap = {};
-        for (const [tag, fieldId] of Object.entries(prunedTagMap)) {
-          let v = gValues?.[fieldId];
-          if (v == null) v = '';
-          if (typeof v === 'object')
-            v = v.formatted ?? (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
-          sdtMap[tag] = String(v);
+        setStatus('Writing payload & applying rules…');
+
+        const { updatedBytes, payload, visibilityMap } =
+          await window.fsExportCore.buildDoc({
+            originalBytes,
+            schema: gSchema,
+            values: gValues,
+            tagMap: prunedTagMap,
+            rules,
+            fieldRules,
+            headingBaseline: baseline,
+            payloadKey: PAYLOAD_KEY,
+            writerKind: 'settings',               // extractor previously wrote into settings
+            debugLabel: 'extractor.doExport',
+            buildHeadingResolver: async () => {
+              // extractor: we rely on the baseline-driven index
+              return buildHeadingTargetIndex(baseline);
+            }
+          });
+
+        const updatedU8 = updatedBytes;
+        gArrayBuffer = updatedU8.slice().buffer;
+
+        // Persist canonical state back into workspace
+        if (gDocId) {
+          const stamp = Date.now();
+          await window.formSuitePersist.saveState(gDocId, {
+            schema: gSchema,
+            values: gValues,
+            rules,
+            fieldRules,
+            tagMap: prunedTagMap,
+            payload: { CRONOS_PAYLOAD: payload },
+            CRONOS_PAYLOAD: payload,
+            cronos_payload: payload,
+            rulesVersion: stamp,
+            headingsFlat: baseline.flat || [],
+            headings: baseline.flat || [],
+            headingsTree: baseline.tree || [],
+            headingsUpdatedAt: new Date().toISOString(),
+            schemaUpdatedAt: new Date().toISOString()
+          });
+          await window.formSuitePersist.putBytes(gDocId, updatedU8);
         }
-        updated = await writeSDTs(updated, sdtMap);
 
-        // 3) apply visibility/removal actions
-        const headingResolver = buildHeadingTargetIndex(gHeadingBaseline);
-        const visibilityMap = evaluateRulesToVisibility(gSchema, gValues, rules, headingResolver);
-        try {
-          await inspectRemovalPlan(updated, visibilityMap);
-        } catch (e) { tr.warn('inspectRemovalPlan failed', e); }
-        updated = await applyRemovalWithBackup(updated, visibilityMap, originalBytes);
-        const updatedU8 = (updated instanceof Uint8Array) ? updated : new Uint8Array(updated);
+        // Persist to the underlying file handle (if we have one)
+        const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
+        gDocId = metaObj.docId;
+        persistActiveMeta(metaObj);
+        announceDocUpdate();
 
-        // 4) download/save as a new file
-        const suggested = (gFileName?.replace(/\.(docx|docm|dotx|dotm)$/i,'') || 'document') + '_export.' + gFileExt;
+        // Offer final export as separate file (same behavior as before)
+        const outName = (gFileName || 'document').replace(/\.docx$/i, '') + ' (export).docx';
+
         if (window.showSaveFilePicker) {
           try {
             const handle = await window.showSaveFilePicker({
-              suggestedName: suggested,
-              types: [{ description: 'Word document', accept: { [wordMimeFor(gFileExt)]: [`.${gFileExt}`] } }]
+              suggestedName: outName,
+              types: [{
+                description: 'Word Document',
+                accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
+              }]
             });
             const stream = await handle.createWritable();
             await stream.write(updatedU8);
             await stream.close();
-            setStatus(`Exported as “${handle.name || suggested}”.`);
-            gDirty = false;
+            setStatus('Exported & saved.');
             return;
           } catch (e) {
-            if (e?.name === 'AbortError') { setStatus('Export canceled.'); return; }
+            console.warn('SaveFilePicker canceled/failed; falling back to download link.', e);
           }
         }
-        const blob = new Blob([updatedU8], { type: wordMimeFor(gFileExt) });
+
+        // Fallback: classic download
+        const blob = new Blob([updatedU8], {
+          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        });
         const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = suggested; a.click();
-        URL.revokeObjectURL(url);
-        setStatus(`Exported as “${suggested}”.`);
-        gDirty = false;
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = outName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          a.remove();
+        }, 5000);
+
+        setStatus('Exported (download started).');
       } catch (e) {
         tr.error('failed', e);
-        setStatus('Export failed.');
+        console.error(e);
+        setStatus('Export failed — see console for details.');
       } finally {
         tr.end();
       }
     }
+
 
     // =========================
     // PAYLOAD PREVIEW (editable)
