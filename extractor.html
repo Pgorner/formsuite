@@ -17,10 +17,7 @@
   <script src="fs-active-doc.js"></script>
   <script src="fs-focus-nav.js"></script>
   <script src="fs-export-core.js"></script>
-<<<<<<< HEAD
 
-=======
->>>>>>> 9dc2080f9bd76002afc3c2fdfe2ecc27ed74cdbc
   <!-- flatpickr JS (date inputs) -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
 
@@ -1246,7 +1243,6 @@
         mergedFieldRaw = Array.isArray(payloadObj.fieldRules) ? payloadObj.fieldRules : [];
       }
 
-<<<<<<< HEAD
       let rules = mergedRulesRaw;
       if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
         try {
@@ -1255,175 +1251,6 @@
           tr.warn('normalizeHeadingsRulesForSchema failed in updatePreview', e);
           rules = mergedRulesRaw;
         }
-=======
-    async function doExport() {
-      const tr = TRACE('doExport');
-      try {
-        if (!gArrayBuffer) {
-          alert('No DOCX loaded.');
-          return;
-        }
-        if (!gSchema) {
-          alert('No schema available — parse or hydrate first.');
-          return;
-        }
-
-        setStatus('Preparing export…');
-        const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
-        const originalBytes = new Uint8Array(gArrayBuffer);
-
-        const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId)) : null;
-
-        // Make sure we have the latest headings baseline and schema
-        if (restored) {
-          adoptHeadingBaseline({
-            flat: Array.isArray(restored.headingsFlat)
-              ? restored.headingsFlat
-              : Array.isArray(restored.headings)
-                ? restored.headings
-                : [],
-            tree: Array.isArray(restored.headingsTree)
-              ? restored.headingsTree
-              : gHeadingBaseline.tree
-          });
-        }
-        if (restored?.schema) {
-          gSchema = restored.schema;
-        }
-
-        const domVals  = collectFormValues(gSchema);
-        const baseVals = (restored && restored.values) ? restored.values : {};
-        const tagMapRaw = restored?.tagMap || await getTagMapFor(gDocId);
-
-        const payloadSnapshot = restored?.payload?.CRONOS_PAYLOAD
-                              || restored?.CRONOS_PAYLOAD
-                              || restored?.cronos_payload
-                              || {};
-
-        const { rules: mergedRulesRaw, fieldRules: mergedFieldRaw, source: ruleSourceMeta } =
-          resolveRulesForState(restored || {}, payloadSnapshot);
-
-        const rules      = normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
-        const fieldRules = normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
-
-        console.log('[doExport][rulesSource]', {
-          source: ruleSourceMeta,
-          wsRules: normalizeRuleCollection(restored?.rules).length,
-          plRules: normalizeRuleCollection(payloadSnapshot?.rules).length
-        });
-
-        console.log('[doExport][normalized]', {
-          rules: rules.length,
-          fieldRules: fieldRules.length,
-          source: ruleSourceMeta
-        });
-
-        const { values: prunedValues, tagMap: prunedTagMap } =
-          normalizeForSchema(gSchema, { baseVals, domVals }, tagMapRaw);
-
-        gValues = prunedValues;
-        await updatePreview(gValues);
-
-        const baseline = gHeadingBaseline && (gHeadingBaseline.flat || gHeadingBaseline.tree)
-          ? gHeadingBaseline
-          : { flat: [], tree: [] };
-
-        setStatus('Writing payload & applying rules…');
-
-        const { updatedBytes, payload, visibilityMap } =
-          await window.fsExportCore.buildDoc({
-            originalBytes,
-            schema: gSchema,
-            values: gValues,
-            tagMap: prunedTagMap,
-            rules,
-            fieldRules,
-            headingBaseline: baseline,
-            payloadKey: PAYLOAD_KEY,
-            writerKind: 'settings',               // extractor previously wrote into settings
-            debugLabel: 'extractor.doExport',
-            buildHeadingResolver: async () => {
-              // extractor: we rely on the baseline-driven index
-              return buildHeadingTargetIndex(baseline);
-            }
-          });
-
-        const updatedU8 = updatedBytes;
-        gArrayBuffer = updatedU8.slice().buffer;
-
-        // Persist canonical state back into workspace
-        if (gDocId) {
-          const stamp = Date.now();
-          await window.formSuitePersist.saveState(gDocId, {
-            schema: gSchema,
-            values: gValues,
-            rules,
-            fieldRules,
-            tagMap: prunedTagMap,
-            payload: { CRONOS_PAYLOAD: payload },
-            CRONOS_PAYLOAD: payload,
-            cronos_payload: payload,
-            rulesVersion: stamp,
-            headingsFlat: baseline.flat || [],
-            headings: baseline.flat || [],
-            headingsTree: baseline.tree || [],
-            headingsUpdatedAt: new Date().toISOString(),
-            schemaUpdatedAt: new Date().toISOString()
-          });
-          await window.formSuitePersist.putBytes(gDocId, updatedU8);
-        }
-
-        // Persist to the underlying file handle (if we have one)
-        const metaObj = await persistCurrentDoc(updatedU8, gFileHandle, gFileName, gFileExt);
-        gDocId = metaObj.docId;
-        persistActiveMeta(metaObj);
-        announceDocUpdate();
-
-        // Offer final export as separate file (same behavior as before)
-        const outName = (gFileName || 'document').replace(/\.docx$/i, '') + ' (export).docx';
-
-        if (window.showSaveFilePicker) {
-          try {
-            const handle = await window.showSaveFilePicker({
-              suggestedName: outName,
-              types: [{
-                description: 'Word Document',
-                accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
-              }]
-            });
-            const stream = await handle.createWritable();
-            await stream.write(updatedU8);
-            await stream.close();
-            setStatus('Exported & saved.');
-            return;
-          } catch (e) {
-            console.warn('SaveFilePicker canceled/failed; falling back to download link.', e);
-          }
-        }
-
-        // Fallback: classic download
-        const blob = new Blob([updatedU8], {
-          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = outName;
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => {
-          URL.revokeObjectURL(url);
-          a.remove();
-        }, 5000);
-
-        setStatus('Exported (download started).');
-      } catch (e) {
-        tr.error('failed', e);
-        console.error(e);
-        setStatus('Export failed — see console for details.');
-      } finally {
-        tr.end();
->>>>>>> 9dc2080f9bd76002afc3c2fdfe2ecc27ed74cdbc
       }
 
       let fieldRules = mergedFieldRaw;
@@ -1457,7 +1284,6 @@
     }
   }
 
-<<<<<<< HEAD
   // =========================
   // RENDER FROM BYTES
   // =========================
@@ -1468,14 +1294,6 @@
         setStatus('No DOCX loaded.');
         return;
       }
-=======
-
-    // =========================
-    // PAYLOAD PREVIEW (editable)
-    // =========================
-    let __payloadApplyTimer = null;
-    let __payloadEditBusy = false;
->>>>>>> 9dc2080f9bd76002afc3c2fdfe2ecc27ed74cdbc
 
       setStatus((prefix || '') + 'Parsing…');
 
