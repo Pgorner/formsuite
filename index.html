@@ -48,6 +48,7 @@
   <script src="docx-core.js"></script>
   <script src="fs-active-doc.js"></script> <!-- new -->
   <script src="fs-focus-nav.js"></script>
+  <script src="fs-export-core.js"></script>
   <script src="address-autocomplete.js"></script>
   <script>
     const STORAGE_KEY = 'FORM_SCHEMA_V1';
@@ -1559,93 +1560,98 @@
       return String(err);
     }
 
-    async function gatherExportArtifacts(preloadedBytes = null) {
-      if (!currentDoc?.docId) return null;
-
-      let docBytes = preloadedBytes;
-      if (!docBytes) {
-        docBytes = await fetchWorkingDocBytes();
-      }
-      if (!docBytes) return null;
-
-      if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
-        throw new Error('Cannot export: no schema loaded for the current document.');
-      }
-
-      const originalBytes = docBytes instanceof Uint8Array ? new Uint8Array(docBytes) : new Uint8Array(docBytes);
-
-      const state  = await window.formSuitePersist.loadState?.(currentDoc.docId);
-      const tagMap = (state?.payload?.CRONOS_PAYLOAD?.tagMap)
-                  || (state?.cronos_payload?.tagMap)
-                  || (state?.CRONOS_PAYLOAD?.tagMap)
-                  || (state?.tagMap)
-                  || {};
-      const validIds   = new Set((schema?.fields || []).map(f => f.id));
-      const safeValues = sanitizeValues(schema, values || {});
-      const cleanTagMap = sanitizeTagMap(tagMap, validIds);
-      const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
-        ? state.headingsFlat
-        : Array.isArray(state?.headings) ? state.headings
-        : [];
-      const baselineHeadingsTree = Array.isArray(state?.headingsTree)
-        ? state.headingsTree
-        : [];
-
-      const { rules, fieldRules: fieldRulesForDoc } = deriveNormalizedRulesForDoc(
-        state,
-        schema,
-        { flat: baselineHeadingsFlat, tree: baselineHeadingsTree }
-      );
-
-      const fallbackHeadingResolver = buildHeadingTargetIndex({
-        flat: baselineHeadingsFlat,
-        tree: baselineHeadingsTree
-      });
-
-      const payload = JSON.stringify({
-        title: schema?.title || 'Form',
-        fields: schema?.fields || [],
-        values: safeValues,
-        tagMap: cleanTagMap,
-        rules,
-        fieldRules: fieldRulesForDoc
-      });
-
-      const updated = await writeDocVar(originalBytes, PAYLOAD_KEY, payload);
-
-      const sdtMap = {};
-      for (const [tag, fieldId] of Object.entries(cleanTagMap)) {
-        let v = safeValues?.[fieldId];
-        if (v == null) v = '';
-        if (typeof v === 'object') {
-          v = v.formatted ?? (function(){ try { return JSON.stringify(v); } catch { return String(v); } })();
+    async function gatherExportArtifacts(canBytes) {
+      const tr = TRACE('gatherExportArtifacts');
+      try {
+        if (!currentDoc?.docId) {
+          throw new Error('No active docId for export.');
         }
-        sdtMap[tag] = String(v);
+
+        const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+        const originalBytes = canBytes
+          ? (canBytes instanceof Uint8Array ? canBytes : new Uint8Array(canBytes))
+          : new Uint8Array(await fetchWorkingDocBytes());
+
+        const state = await window.formSuitePersist.loadState(currentDoc.docId);
+        const effectiveSchema = schema || state?.schema || { title: 'Form', fields: [] };
+
+        const tagMapRaw =
+          (state?.payload?.CRONOS_PAYLOAD?.tagMap) ||
+          (state?.cronos_payload?.tagMap) ||
+          (state?.CRONOS_PAYLOAD?.tagMap) ||
+          (state?.tagMap) ||
+          {};
+
+        const validIds = new Set((effectiveSchema.fields || []).map(f => f.id));
+        const safeValues = sanitizeValues(effectiveSchema, values || {});
+        const cleanTagMap = sanitizeTagMap(tagMapRaw, validIds);
+
+        const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
+          ? state.headingsFlat
+          : Array.isArray(state?.headings) ? state.headings
+          : [];
+
+        const baselineHeadingsTree = Array.isArray(state?.headingsTree)
+          ? state.headingsTree
+          : [];
+
+        const { rules, fieldRules: fieldRulesForDoc } = deriveNormalizedRulesForDoc(
+          state,
+          effectiveSchema,
+          { flat: baselineHeadingsFlat, tree: baselineHeadingsTree }
+        );
+
+        const baseline = {
+          flat: baselineHeadingsFlat,
+          tree: baselineHeadingsTree
+        };
+
+        const fallbackHeadingResolver = buildHeadingTargetIndex(baseline);
+
+        // Centralized export engine
+        const { updatedBytes, payload, visibilityMap, headingResolver } =
+          await window.fsExportCore.buildDoc({
+            originalBytes,
+            schema: effectiveSchema,
+            values: safeValues,
+            tagMap: cleanTagMap,
+            rules,
+            fieldRules: fieldRulesForDoc,
+            headingBaseline: baseline,
+            payloadKey: PAYLOAD_KEY,
+            writerKind: 'auto',
+            debugLabel: 'index.gatherExportArtifacts',
+            buildHeadingResolver: async (updatedDocBytes) => {
+              const asU8 = (updatedDocBytes instanceof Uint8Array)
+                ? updatedDocBytes
+                : new Uint8Array(updatedDocBytes);
+              return await buildHeadingResolverFromDoc(asU8, {
+                fallbackResolver: fallbackHeadingResolver,
+                baselineFlat: baselineHeadingsFlat,
+                baselineTree: baselineHeadingsTree
+              });
+            }
+          });
+
+        return {
+          originalBytes,
+          updatedBytes,
+          visibilityMap,
+          safeValues,
+          cleanTagMap,
+          rules,
+          fieldRulesForDoc,
+          headingResolver,
+          state,
+          payload: JSON.stringify(payload),
+          rawTagMap: tagMapRaw
+        };
+      } finally {
+        tr.end();
       }
-      const updated2 = await writeSDTs(updated, sdtMap);
-
-      const headingResolver = await buildHeadingResolverFromDoc(updated2, {
-        fallbackResolver: fallbackHeadingResolver,
-        baselineFlat: baselineHeadingsFlat,
-        baselineTree: baselineHeadingsTree
-      });
-
-      const visibilityMap = evaluateRulesToVisibility(schema, safeValues, rules, headingResolver);
-
-      return {
-        originalBytes,
-        updatedBytes: updated2,
-        visibilityMap,
-        safeValues,
-        cleanTagMap,
-        rules,
-        fieldRulesForDoc,
-        headingResolver,
-        state,
-        payload,
-        rawTagMap: tagMap,
-      };
     }
+
+
 
     function renderExportDebugPanel(plan, context = {}) {
       if (!plan || typeof plan !== 'object') {
