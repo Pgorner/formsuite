@@ -9,6 +9,11 @@
 
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css">
+  <!-- flatpickr JS (date inputs) -->
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+
+  <!-- JSZip for SDT scanning -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
   <!-- Core app plumbing -->
   <script src="persistence.js"></script>
@@ -18,11 +23,6 @@
   <script src="fs-focus-nav.js"></script>
   <script src="fs-export-core.js"></script>
 
-  <!-- flatpickr JS (date inputs) -->
-  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-
-  <!-- JSZip for SDT scanning -->
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
   <!-- Address autocomplete widget -->
   <script src="address-autocomplete.js"></script>
@@ -158,7 +158,7 @@
   const META_LS_KEY   = 'FS_CURRENT_DOC_META';
   const supportsFS    = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
 
-  const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const DOCX_NS = window.DOCX_W_NS || window.W_NS || "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
   let gArrayBuffer   = null;
   let gFileName      = null;       // basename (no extension)
@@ -922,18 +922,18 @@
         const countBefore = sdts.length;
         try {
           const xml = parser.parseFromString(xmlTextContent, "application/xml");
-          const found = Array.from(xml.getElementsByTagNameNS(W_NS, 'sdt'));
+          const found = Array.from(xml.getElementsByTagNameNS(DOCX_NS, 'sdt'));
           for (const sdt of found) {
-            const pr = sdt.getElementsByTagNameNS(W_NS, 'sdtPr')[0];
-            const content = sdt.getElementsByTagNameNS(W_NS, 'sdtContent')[0] || sdt;
+            const pr = sdt.getElementsByTagNameNS(DOCX_NS, 'sdtPr')[0];
+            const content = sdt.getElementsByTagNameNS(DOCX_NS, 'sdtContent')[0] || sdt;
             let tagVal = '';
             let alias = '';
 
             if (pr) {
-              const tEl = pr.getElementsByTagNameNS(W_NS, 'tag')[0];
-              if (tEl) tagVal = tEl.getAttributeNS(W_NS, 'val') || tEl.getAttribute('w:val') || '';
-              const aEl = pr.getElementsByTagNameNS(W_NS, 'alias')[0];
-              if (aEl) alias = aEl.getAttributeNS(W_NS, 'val') || aEl.getAttribute('w:val') || '';
+              const tEl = pr.getElementsByTagNameNS(DOCX_NS, 'tag')[0];
+              if (tEl) tagVal = tEl.getAttributeNS(DOCX_NS, 'val') || tEl.getAttribute('w:val') || '';
+              const aEl = pr.getElementsByTagNameNS(DOCX_NS, 'alias')[0];
+              if (aEl) alias = aEl.getAttributeNS(DOCX_NS, 'val') || aEl.getAttribute('w:val') || '';
             }
 
             sdts.push({
@@ -1136,18 +1136,21 @@
         const headings = Array.isArray(part.headings) ? part.headings : [];
         for (const heading of headings) {
           const idx = Number(heading.idx);
-          if (!Number.isFinite(idx) || seen.has(idx)) continue;
-          seen.add(idx);
+          const dedupeKey = `${part.name || part.part || 'document'}:${idx}`;
+          if (!Number.isFinite(idx) || seen.has(dedupeKey)) continue;
+          seen.add(dedupeKey);
           const text = String(heading.text || '').trim();
           const lvl = Number(heading.level);
           const entry = {
             idx,
-            key: idx,
-            id: idx,
+            key: (heading.id || `sec_${String(idx).padStart(6,'0')}`),
+            id: (heading.id || `sec_${String(idx).padStart(6,'0')}`),
             text,
             title: text,
             label: text,
-            part: heading.part || part.name || 'document'
+            part: heading.part || part.name || 'document',
+            startIdx: Number.isFinite(Number(heading.startIdx)) ? Number(heading.startIdx) : idx,
+            endIdx: Number.isFinite(Number(heading.endIdx)) ? Number(heading.endIdx) : null
           };
           if (Number.isFinite(lvl)) entry.level = lvl;
           const number = heading.number ?? heading.num;
