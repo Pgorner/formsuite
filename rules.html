@@ -571,16 +571,23 @@ function buildHeadingsTreeNodes(){
   function walk(nodes, depth, counters){
     const out = [];
     counters[depth] = 0;
+
     (nodes || []).forEach(n => {
       counters[depth]++;
       const number = counters.slice(0, depth + 1).join('.');
       const title  = (n.label?.trim?.() ? n.label : n.text) || '';
+
+      // IMPORTANT: use real paragraph idx as node id
+      const idx = Number(n.idx);
+      const id  = Number.isFinite(idx) ? String(idx) : `${number}|${title}`;
+
       out.push({
-        id: `${number}|${title}`,
-        label: `${number} ${title}`,
+        id,
+        label: `${number} ${title}`.trim(),
         children: walk(n.children || [], depth + 1, counters.slice())
       });
     });
+
     return out;
   }
   return walk(gHeadingsTree || [], 0, []);
@@ -1050,13 +1057,26 @@ function renderEditor(){
         renderTreeMenu(pop, nodes, {
           disableIds: new Set(),
           onPick: async (id) => {
-            const already = (rule.targets||[]).some(t=> String(typeof t==='string' ? t : t.key) === String(id));
+            // id should now be the paragraph idx string
+            const idx = Number(id);
+            if (!Number.isFinite(idx)) return;
+
+            const already = (rule.targets || []).some(t =>
+              Number(t.idx ?? t.key) === idx
+            );
             if (already) return;
-            const label = id.includes('|') ? id.split('|').slice(1).join('|') : getHeadingLabelFromKey(String(id));
+
+            // Build label from the canonical index resolver (works off flat + tree)
+            const hIdx = currentHeadingIndex();
+            const entry = hIdx.resolve({ idx }) || null;
+            const label = hIdx.buildLabel(entry, `Heading ${idx + 1}`);
+
             rule.targets = rule.targets || [];
-            rule.targets.push({ key:id, label });
+            rule.targets.push({ idx, key: idx, label });
+
             await persistRules('change:addHeading');
-            renderEditor(); renderList();
+            renderEditor();
+            renderList();
           }
         });
         pop.style.display='block';

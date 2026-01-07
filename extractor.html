@@ -1113,96 +1113,246 @@
 
       const bytes = (arrayBuffer instanceof Uint8Array) ? arrayBuffer : new Uint8Array(arrayBuffer);
 
+      // -----------------------------
+      // 1) Preferred path: inspectRemovalPlan
+      // -----------------------------
       let plan = { parts: [] };
+      let flat = [];
       try {
         if (typeof window.inspectRemovalPlan === 'function') {
           plan = await window.inspectRemovalPlan(bytes, {}) || { parts: [] };
         } else if (window.docxCore && typeof window.docxCore.inspectRemovalPlan === 'function') {
           plan = await window.docxCore.inspectRemovalPlan(bytes, {}) || { parts: [] };
-        } else {
-          tr.step('inspectRemovalPlan not available; skipping headings');
-          return { flat: [], tree: [], count: 0 };
         }
       } catch (e) {
-        tr.warn('inspectRemovalPlan call failed; skipping headings', e);
-        return { flat: [], tree: [], count: 0 };
+        tr.warn('inspectRemovalPlan call failed; will try fallback heading scan', e);
       }
 
-      const parts = Array.isArray(plan.parts) ? plan.parts : [];
-      const seen = new Set();
-      const flat = [];
+      const parts = Array.isArray(plan?.parts) ? plan.parts : [];
+      if (parts.length) {
+        const seen = new Set();
+        for (const part of parts) {
+          const headings = Array.isArray(part?.headings) ? part.headings : [];
+          for (const heading of headings) {
+            const idx = Number(heading?.idx);
+            const dedupeKey = `${part?.name || part?.part || 'document'}:${idx}`;
+            if (!Number.isFinite(idx) || seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
 
-      for (const part of parts) {
-        const headings = Array.isArray(part.headings) ? part.headings : [];
-        for (const heading of headings) {
-          const idx = Number(heading.idx);
-          const dedupeKey = `${part.name || part.part || 'document'}:${idx}`;
-          if (!Number.isFinite(idx) || seen.has(dedupeKey)) continue;
-          seen.add(dedupeKey);
-          const text = String(heading.text || '').trim();
-          const lvl = Number(heading.level);
-          const entry = {
-            idx,
-            key: (heading.id || `sec_${String(idx).padStart(6,'0')}`),
-            id: (heading.id || `sec_${String(idx).padStart(6,'0')}`),
-            text,
-            title: text,
-            label: text,
-            part: heading.part || part.name || 'document',
-            startIdx: Number.isFinite(Number(heading.startIdx)) ? Number(heading.startIdx) : idx,
-            endIdx: Number.isFinite(Number(heading.endIdx)) ? Number(heading.endIdx) : null
-          };
-          if (Number.isFinite(lvl)) entry.level = lvl;
-          const number = heading.number ?? heading.num;
-          if (number != null && number !== '') entry.number = String(number);
-          flat.push(entry);
+            const text = String(heading?.text || '').trim();
+            const lvl = Number(heading?.level);
+
+            const entry = {
+              idx,
+              key: (heading?.id || `sec_${String(idx).padStart(6, '0')}`),
+              id:  (heading?.id || `sec_${String(idx).padStart(6, '0')}`),
+              text,
+              title: text,
+              label: text,
+              part: heading?.part || part?.name || 'document',
+              startIdx: Number.isFinite(Number(heading?.startIdx)) ? Number(heading.startIdx) : idx,
+              endIdx:   Number.isFinite(Number(heading?.endIdx)) ? Number(heading.endIdx) : null
+            };
+            if (Number.isFinite(lvl)) entry.level = lvl;
+
+            const number = heading?.number ?? heading?.num;
+            if (number != null && number !== '') entry.number = String(number);
+
+            flat.push(entry);
+          }
         }
       }
 
-      if (!flat.length) {
-        tr.end({ count: 0, reason: 'no-headings' });
+      // If we got headings from inspectRemovalPlan, use them.
+      if (flat.length) {
+        flat.sort((a, b) => a.idx - b.idx);
+        const tree = buildHeadingTree(flat);
+
+        if (typeof window.numberHeadingsTree === 'function') {
+          try { window.numberHeadingsTree(tree); } catch (e) { tr.warn('numberHeadingsTree failed', e); }
+        }
+
+        tr.end({ count: flat.length, mode: 'inspectRemovalPlan' });
+        return { flat, tree, count: flat.length };
+      }
+
+      // -----------------------------
+      // 2) Fallback path: direct DOCX scan (workingrmv-style)
+      // -----------------------------
+      tr.step('No headings from inspectRemovalPlan; using fallback scan');
+
+      const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+      const normalizeText = (s) => String(s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+
+      const levelFromStyleHint = (str) => {
+        if (!str) return 0;
+        const s = String(str).trim().toLowerCase();
+        const ps = [
+          /heading\s*([1-9])/,
+          /überschrift\s*([1-9])/,
+          /titre\s*([1-9])/,
+          /t[ií]tulo\s*([1-9])/,
+          /encabezado\s*([1-9])/,
+          /rubrik\s*([1-9])/,
+          /zagolovok\s*([1-9])/,
+          /заголовок\s*([1-9])/
+        ];
+        for (const re of ps) {
+          const m = s.match(re);
+          if (m) return +m[1];
+        }
+        const m2 = s.match(/^heading([1-9])$/i);
+        return m2 ? +m2[1] : 0;
+      };
+
+      const buildStyleMap = async (zip) => {
+        const f = zip.file('word/styles.xml');
+        if (!f) return {};
+        const xml = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
+        const byId = {};
+        const styles = xml.getElementsByTagNameNS(W_NS, 'style');
+
+        for (let i = 0; i < styles.length; i++) {
+          const st = styles[i];
+          const type = st.getAttributeNS(W_NS, 'type') || st.getAttribute('w:type');
+          if (type !== 'paragraph') continue;
+
+          const id = st.getAttributeNS(W_NS, 'styleId') || st.getAttribute('w:styleId') || '';
+          if (!id) continue;
+
+          const nameEl = st.getElementsByTagNameNS(W_NS, 'name')[0];
+          const name = nameEl ? (nameEl.getAttributeNS(W_NS, 'val') || nameEl.getAttribute('w:val') || '') : '';
+
+          const basedEl = st.getElementsByTagNameNS(W_NS, 'basedOn')[0];
+          const basedOn = basedEl
+            ? (basedEl.getAttributeNS?.(W_NS, 'val') || basedEl.getAttribute?.('w:val') || '')
+            : '';
+
+          let lvl = 0;
+          const pPr = st.getElementsByTagNameNS(W_NS, 'pPr')[0];
+          if (pPr) {
+            const ol = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
+            if (ol) {
+              const v = ol.getAttributeNS(W_NS, 'val') || ol.getAttribute('w:val');
+              if (v != null && v !== '') {
+                const n = +v;
+                if (Number.isFinite(n)) lvl = Math.max(1, Math.min(9, n + 1));
+              }
+            }
+          }
+          if (!lvl) lvl = levelFromStyleHint(id) || levelFromStyleHint(name) || 0;
+
+          byId[id] = { basedOn, rawLevel: lvl };
+        }
+
+        const resolved = {};
+        const resolve = (id, d = 0) => {
+          if (!id || !byId[id] || d > 12) return 0;
+          if (resolved[id] != null) return resolved[id];
+          const info = byId[id];
+          if (info.rawLevel) return (resolved[id] = info.rawLevel);
+          return (resolved[id] = resolve(info.basedOn, d + 1) || 0);
+        };
+
+        Object.keys(byId).forEach((id) => resolve(id));
+        return resolved;
+      };
+
+      const textOfPara = (p) => {
+        const ts = p.getElementsByTagNameNS(W_NS, 't');
+        let s = '';
+        for (let i = 0; i < ts.length; i++) s += ts[i].textContent;
+        return normalizeText(s);
+      };
+
+      const detectHeadingLevel = (p, styleMap) => {
+        const pPr = p.getElementsByTagNameNS(W_NS, 'pPr')[0];
+        if (pPr) {
+          const ol = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
+          if (ol) {
+            const v = ol.getAttributeNS(W_NS, 'val') || ol.getAttribute('w:val');
+            if (v != null && v !== '') {
+              const n = +v;
+              if (Number.isFinite(n)) return Math.max(1, Math.min(9, n + 1));
+            }
+          }
+          const pStyle = pPr.getElementsByTagNameNS(W_NS, 'pStyle')[0];
+          if (pStyle) {
+            const id = pStyle.getAttributeNS(W_NS, 'val') || pStyle.getAttribute('w:val') || '';
+            const lvl = styleMap?.[id];
+            if (lvl) return lvl;
+          }
+        }
+        return 0;
+      };
+
+      // Load DOCX parts
+      const zip = await window.JSZip.loadAsync(bytes);
+      const styleMap = await buildStyleMap(zip);
+
+      const docXml = await zip.file('word/document.xml')?.async('string');
+      if (!docXml) {
+        tr.end({ count: 0, mode: 'fallback', reason: 'missing word/document.xml' });
+        return { flat: [], tree: [], count: 0 };
+      }
+      const doc = new DOMParser().parseFromString(docXml, 'application/xml');
+      const paras = Array.from(doc.getElementsByTagNameNS(W_NS, 'p'));
+
+      // Build flat headings list
+      const fallbackFlat = [];
+      for (let i = 0; i < paras.length; i++) {
+        const p = paras[i];
+        const lvl = detectHeadingLevel(p, styleMap);
+        if (!lvl) continue;
+        const t = textOfPara(p);
+        if (!t) continue;
+        fallbackFlat.push({
+          idx: i,
+          id: `sec_${String(i).padStart(6, '0')}`,
+          key: `sec_${String(i).padStart(6, '0')}`,
+          level: lvl,
+          text: t,
+          title: t,
+          label: t,
+          part: 'document',
+          startIdx: i,
+          endIdx: null
+        });
+      }
+
+      // Compute endIdx similarly to workingrmv (next heading with level <= current)
+      for (let i = 0; i < fallbackFlat.length; i++) {
+        const cur = fallbackFlat[i];
+        let end = paras.length;
+        for (let j = i + 1; j < fallbackFlat.length; j++) {
+          if (fallbackFlat[j].level <= cur.level) { end = fallbackFlat[j].idx; break; }
+        }
+        cur.endIdx = end;
+      }
+
+      if (!fallbackFlat.length) {
+        tr.end({ count: 0, mode: 'fallback', reason: 'no-headings' });
         return { flat: [], tree: [], count: 0 };
       }
 
-      flat.sort((a, b) => a.idx - b.idx);
-      const tree = buildHeadingTree(flat);
+      fallbackFlat.sort((a, b) => a.idx - b.idx);
+      const tree = buildHeadingTree(fallbackFlat);
 
       if (typeof window.numberHeadingsTree === 'function') {
         try { window.numberHeadingsTree(tree); } catch (e) { tr.warn('numberHeadingsTree failed', e); }
       }
 
-      const byIdx = new Map(flat.map(h => [Number(h.idx), h]));
-      const propagate = (nodes) => {
-        if (!Array.isArray(nodes)) return;
-        for (const n of nodes) {
-          const idx = Number(n.idx);
-          const ref = byIdx.get(idx);
-          if (ref) {
-            if (n.num) {
-              ref.number = n.num;
-              ref.compositeKey = `${n.num}|${ref.text}`.trim();
-            }
-          }
-          if (Array.isArray(n.children) && n.children.length) propagate(n.children);
-        }
-      };
-      propagate(tree);
+      tr.end({ count: fallbackFlat.length, mode: 'fallback-scan' });
+      return { flat: fallbackFlat, tree, count: fallbackFlat.length };
 
-      flat.forEach((h) => {
-        const num = h.number || h.num;
-        const idx = Number(h.idx);
-        const prefix = num ? String(num) : (Number.isFinite(idx) ? String(idx + 1) : '');
-        if (!h.compositeKey) h.compositeKey = `${prefix}|${h.text}`.trim();
-      });
-
-      tr.end({ count: flat.length, rootChildren: tree.length });
-      return { flat, tree, count: flat.length };
     } catch (e) {
       tr.error('parseHeadings_JS failed', e);
       tr.end();
       return { flat: [], tree: [], count: 0 };
     }
   }
+
 
   // =========================
   // PAYLOAD PREVIEW
