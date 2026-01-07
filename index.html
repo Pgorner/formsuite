@@ -1609,7 +1609,7 @@
         const fallbackHeadingResolver = buildHeadingTargetIndex(baseline);
 
         // Centralized export engine
-        const { updatedBytes, payload, visibilityMap, headingResolver } =
+        const { updatedBytes, preRemovalBytes, payload, visibilityMap, headingResolver } =
           await window.fsExportCore.buildDoc({
             originalBytes,
             schema: effectiveSchema,
@@ -1636,6 +1636,7 @@
         return {
           originalBytes,
           updatedBytes,
+          preRemovalBytes,
           visibilityMap,
           safeValues,
           cleanTagMap,
@@ -2060,7 +2061,7 @@
       controls.appendChild(downloadBtn);
 
       appendDocDownloadButton(context?.originalBytes, 'Download original DOCX snapshot', 'original-snapshot');
-      appendDocDownloadButton(context?.updatedBytes, 'Download DOCX before removal', 'pre-removal');
+      appendDocDownloadButton(context?.preRemovalBytes || context?.updatedBytes, 'Download DOCX before removal', 'pre-removal');
       appendDocDownloadButton(removalPreview?.bytes, 'Download removal preview DOCX', 'post-removal-preview');
 
       overlay.appendChild(controls);
@@ -2097,10 +2098,11 @@
           alert('Could not access the current DOCX bytes.');
           return;
         }
-        const plan = await inspectRemovalPlan(prepared.updatedBytes, prepared.visibilityMap);
+        const inspectionBytes = prepared.preRemovalBytes || prepared.updatedBytes;
+        const plan = await inspectRemovalPlan(inspectionBytes, prepared.visibilityMap);
         let removalPreview = null;
         try {
-          const removalBytes = await applyRemovalWithBackup(prepared.updatedBytes, prepared.visibilityMap, prepared.originalBytes);
+          const removalBytes = await applyRemovalWithBackup(inspectionBytes, prepared.visibilityMap, prepared.originalBytes);
           let previewPlan = null;
           let previewPlanError = null;
           try {
@@ -2184,15 +2186,15 @@
         const prepared = await gatherExportArtifacts(canBytes);
         if (!prepared) { await hardResetOpenForm('no bytes / no permission'); return; }
 
-        const updated3 = await applyRemovalWithBackup(prepared.updatedBytes, prepared.visibilityMap, prepared.originalBytes);
+        const updatedFinal = prepared.updatedBytes;
 
-        await window.formSuitePersist.putBytes?.(currentDoc.docId, updated3);
+        await window.formSuitePersist.putBytes?.(currentDoc.docId, updatedFinal);
 
         let saved = false;
         if (fileHandle) {
           try {
             const stream = await fileHandle.createWritable();
-            await stream.write(updated3);
+            await stream.write(updatedFinal);
             await stream.close();
             saved = true;
           } catch (e) {
@@ -2206,7 +2208,7 @@
           if (skipPickerReason) {
             console.info(`Falling back to download due to: ${skipPickerReason}`);
           }
-          const blob = new Blob([updated3], {
+          const blob = new Blob([updatedFinal], {
             type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
           });
           const a = document.createElement('a');

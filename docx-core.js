@@ -536,20 +536,39 @@ async function writeSDTs(bytesU8, tagToTextMap) {
 function serializeVisibilityMapForPython(map) {
   // Keep existing behavior expected by your python helpers.
   // Supports Map, plain objects, or arrays of entries.
+  const normalizeValue = (value) => {
+    if (value == null) return false;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const s = value.trim().toLowerCase();
+      if (!s) return false;
+      if (s === 'show' || s === 'visible' || s === 'keep') return false;
+      if (s === 'hide' || s === 'remove' || s === 'true') return true;
+    }
+    if (typeof value === 'object' && value) {
+      const action = value.action || value.visibility || value.state;
+      if (typeof action === 'string') {
+        const s = action.trim().toLowerCase();
+        if (s === 'show' || s === 'visible' || s === 'keep') return false;
+        if (s === 'hide' || s === 'remove') return true;
+      }
+    }
+    return !!value;
+  };
   if (!map) return {};
   if (map instanceof Map) {
     const o = {};
-    for (const [k, v] of map.entries()) o[String(k)] = !!v;
+    for (const [k, v] of map.entries()) o[String(k)] = normalizeValue(v);
     return o;
   }
   if (Array.isArray(map)) {
     const o = {};
-    for (const [k, v] of map) o[String(k)] = !!v;
+    for (const [k, v] of map) o[String(k)] = normalizeValue(v);
     return o;
   }
   if (typeof map === 'object') {
     const o = {};
-    for (const k of Object.keys(map)) o[String(k)] = !!map[k];
+    for (const k of Object.keys(map)) o[String(k)] = normalizeValue(map[k]);
     return o;
   }
   return {};

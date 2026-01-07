@@ -134,8 +134,10 @@
       }
 
       let updated3 = updated2;
+      let removalApplied = false;
       if (typeof global.applyRemovalWithBackup === 'function') {
         updated3 = await global.applyRemovalWithBackup(updated2, visibilityMap, origU8);
+        removalApplied = true;
       }
 
       const finalU8 = (updated3 instanceof Uint8Array)
@@ -144,6 +146,8 @@
 
       return {
         updatedBytes: finalU8,
+        preRemovalBytes: updated2 instanceof Uint8Array ? updated2 : new Uint8Array(updated2 || []),
+        removalApplied,
         payload: payloadObj,
         visibilityMap,
         headingResolver,
