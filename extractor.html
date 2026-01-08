@@ -147,7 +147,56 @@
   });
   window.addEventListener('unhandledrejection', (e) => {
     console.error(tag('window.unhandledrejection'), tagStyle, e.reason);
+
   });
+
+// =========================
+// ONE-LINE DEBUG PRINTS (bulletproof tracing)
+// =========================
+const DBG_ON = true;
+function DBG(msg, data) {
+  if (!DBG_ON) return;
+  try {
+    if (typeof data === 'undefined') console.log(`[ExtractorDBG ${_t()}] ${msg}`);
+    else console.log(`[ExtractorDBG ${_t()}] ${msg}`, data);
+  } catch {}
+}
+function _safeParseJSON(txt) { try { return txt ? JSON.parse(txt) : null; } catch { return null; } }
+function _verOf(obj) {
+  if (!obj || typeof obj !== 'object') return 0;
+  const rv = obj.rulesVersion;
+  if (Number.isFinite(rv)) return rv;
+  const t = Date.parse(obj.updatedAt || obj.schemaUpdatedAt || obj.headingsUpdatedAt || '');
+  return Number.isFinite(t) ? t : 0;
+}
+function pickNewestRulesBundle(docId, wsState, payloadFromDoc) {
+  const cands = [];
+  const wsPayload = (wsState?.payload?.CRONOS_PAYLOAD) || (wsState?.CRONOS_PAYLOAD) || (wsState?.cronos_payload) || null;
+  cands.push({ src: 'ws.state',   obj: wsState || null });
+  cands.push({ src: 'ws.payload', obj: wsPayload });
+
+  // localStorage mirrors written by rules.html
+  const lsDoc = _safeParseJSON(localStorage.getItem(`CRONOS_PAYLOAD:${docId}`));
+  if (lsDoc) cands.push({ src: `ls:CRONOS_PAYLOAD:${docId}`, obj: lsDoc });
+
+  const lsGlobal = _safeParseJSON(localStorage.getItem('CRONOS_PAYLOAD'));
+  if (lsGlobal) cands.push({ src: 'ls:CRONOS_PAYLOAD', obj: lsGlobal });
+
+  if (payloadFromDoc) cands.push({ src: 'docx', obj: payloadFromDoc });
+
+  let best = { src: 'none', ver: 0, rules: [], fieldRules: [], target0: null };
+  for (const c of cands) {
+    const o = c.obj;
+    if (!o || typeof o !== 'object') continue;
+    const rules = Array.isArray(o.rules) ? o.rules : [];
+    const fieldRules = Array.isArray(o.fieldRules) ? o.fieldRules : [];
+    const ver = Math.max(_verOf(o), _verOf(o.payload?.CRONOS_PAYLOAD));
+    if (ver > best.ver || (ver === best.ver && (rules.length || fieldRules.length))) {
+      best = { src: c.src, ver, rules, fieldRules, target0: rules?.[0]?.targets?.[0] || null };
+    }
+  }
+  return best;
+};
 
   // =========================
   // CONSTANTS & STATE
@@ -1484,6 +1533,9 @@
       try { payloadFromDoc = payloadJson ? JSON.parse(payloadJson) : null; }
       catch { payloadFromDoc = null; }
 
+      DBG('docx payload target0', payloadFromDoc?.rules?.[0]?.targets?.[0] || null);
+      DBG('docx payload rulesVersion', payloadFromDoc?.rulesVersion || payloadFromDoc?.updatedAt || null);
+
       const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId) || {}) : {};
 
       const asTs = (x) => {
@@ -1519,24 +1571,13 @@
         wsState.tagMap || {}
       );
 
-      let mergedRulesRaw = [];
-      let mergedFieldRaw = [];
-      try {
-        if (typeof window.resolveRulesForState === 'function') {
-          const resolved = window.resolveRulesForState(wsState, payloadFromDoc || {});
-          mergedRulesRaw = Array.isArray(resolved.rules) ? resolved.rules : [];
-          mergedFieldRaw = Array.isArray(resolved.fieldRules) ? resolved.fieldRules : [];
-        } else {
-          mergedRulesRaw = Array.isArray(payloadFromDoc?.rules) ? payloadFromDoc.rules : [];
-          mergedFieldRaw = Array.isArray(payloadFromDoc?.fieldRules) ? payloadFromDoc.fieldRules : [];
-        }
-      } catch (e) {
-        tr.warn('resolveRulesForState failed in renderFromCurrentBytes; payload-only rules', e);
-        mergedRulesRaw = Array.isArray(payloadFromDoc?.rules) ? payloadFromDoc.rules : [];
-        mergedFieldRaw = Array.isArray(payloadFromDoc?.fieldRules) ? payloadFromDoc.fieldRules : [];
-      }
+      // Rules selection (bulletproof): pick newest from ws / LS mirrors / docx by rulesVersion/updatedAt
+const pickedRules = pickNewestRulesBundle(gDocId, wsState, payloadFromDoc || null);
+let mergedRulesRaw = Array.isArray(pickedRules.rules) ? pickedRules.rules : [];
+let mergedFieldRaw = Array.isArray(pickedRules.fieldRules) ? pickedRules.fieldRules : [];
+DBG(`render rulesPick src=${pickedRules.src} ver=${pickedRules.ver}`, pickedRules.target0);
 
-      let rules = mergedRulesRaw;
+let rules = mergedRulesRaw;
       if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
         try {
           rules = window.normalizeHeadingsRulesForSchema(chosenSchema, mergedRulesRaw, headingsParsed);
@@ -1775,7 +1816,8 @@
       try { bcCanon?.postMessage({ type: 'active:set', docId: meta.docId, name: meta.name }); } catch {}
       try { bcLegacy?.postMessage({ type: 'doc-switched', docId: meta.docId, name: meta.name }); } catch {}
 
-      tr.step('opened', { docId: gDocId, name: meta.name, len: bytes.byteLength, sha: await sha256Hex(bytes) });
+      DBG('opened doc', { docId: gDocId, name: meta.name, len: bytes.byteLength });
+            tr.step('opened', { docId: gDocId, name: meta.name, len: bytes.byteLength, sha: await sha256Hex(bytes) });
 
       await renderFromCurrentBytes();
       await updateWriteAccessBanner({ tryPrompt: true });
@@ -1798,137 +1840,145 @@
     try {
       if (!gArrayBuffer || !gDocId) return;
 
-      const restored = await window.formSuitePersist.loadState(gDocId) || {};
+      // Canonical state ONLY (single source of truth)
+      const wsState = await window.formSuitePersist.loadState(gDocId) || {};
 
       adoptHeadingBaseline({
-        flat: Array.isArray(restored.headingsFlat)
-          ? restored.headingsFlat
-          : Array.isArray(restored.headings) ? restored.headings : gHeadingBaseline.flat,
-        tree: Array.isArray(restored.headingsTree)
-          ? restored.headingsTree
+        flat: Array.isArray(wsState.headingsFlat)
+          ? wsState.headingsFlat
+          : Array.isArray(wsState.headings) ? wsState.headings : gHeadingBaseline.flat,
+        tree: Array.isArray(wsState.headingsTree)
+          ? wsState.headingsTree
           : gHeadingBaseline.tree
       });
 
-      if (restored.schema) gSchema = restored.schema;
+      // Canonical rules / fieldRules / tagMap come ONLY from workspace state
+      const rulesRaw = Array.isArray(wsState.rules) ? wsState.rules : [];
+      const fieldRaw = Array.isArray(wsState.fieldRules) ? wsState.fieldRules : [];
+      const tagMapRaw = (wsState.tagMap && typeof wsState.tagMap === 'object') ? wsState.tagMap : {};
+      const rulesVersion = Number.isFinite(wsState.rulesVersion) ? wsState.rulesVersion : Date.now();
 
-      const domVals  = collectFormValues(gSchema);
-      const baseVals = restored.values || {};
+      // Values: canonical base from wsState + live DOM overlay
+      const baseVals = (wsState.values && typeof wsState.values === 'object') ? wsState.values : (gValues || {});
+      const domVals = collectFormValues(gSchema);
+      const mergedVals = { ...(baseVals || {}), ...(domVals || {}) };
 
-      const payloadSnapshot =
-        restored.payload?.CRONOS_PAYLOAD ||
-        restored.CRONOS_PAYLOAD ||
-        restored.cronos_payload ||
-        {};
-
-      const tagMapRaw = restored.tagMap || payloadSnapshot.tagMap || await getTagMapFor(gDocId);
-
-      let mergedRulesRaw = [];
-      let mergedFieldRaw = [];
-      try {
-        if (typeof window.resolveRulesForState === 'function') {
-          const resolved = window.resolveRulesForState(restored, payloadSnapshot);
-          mergedRulesRaw = Array.isArray(resolved.rules) ? resolved.rules : [];
-          mergedFieldRaw = Array.isArray(resolved.fieldRules) ? resolved.fieldRules : [];
-        } else {
-          mergedRulesRaw = Array.isArray(payloadSnapshot.rules) ? payloadSnapshot.rules : [];
-          mergedFieldRaw = Array.isArray(payloadSnapshot.fieldRules) ? payloadSnapshot.fieldRules : [];
-        }
-      } catch (e) {
-        tr.warn('resolveRulesForState failed in doSave; payload-only rules', e);
-        mergedRulesRaw = Array.isArray(payloadSnapshot.rules) ? payloadSnapshot.rules : [];
-        mergedFieldRaw = Array.isArray(payloadSnapshot.fieldRules) ? payloadSnapshot.fieldRules : [];
-      }
-
-      let rules = mergedRulesRaw;
+      // Normalize rules to headings/schema (optional but consistent)
+      let rules = rulesRaw;
       if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
         try {
-          rules = window.normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
+          rules = window.normalizeHeadingsRulesForSchema(gSchema, rulesRaw, gHeadingBaseline);
         } catch (e) {
           tr.warn('normalizeHeadingsRulesForSchema failed in doSave', e);
-          rules = mergedRulesRaw;
+          rules = rulesRaw;
         }
       }
 
-      let fieldRules = mergedFieldRaw;
+      let fieldRules = fieldRaw;
       if (typeof window.normalizeFieldRulesForSchema === 'function') {
         try {
-          fieldRules = window.normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
+          fieldRules = window.normalizeFieldRulesForSchema(gSchema, fieldRaw);
         } catch (e) {
           tr.warn('normalizeFieldRulesForSchema failed in doSave', e);
-          fieldRules = mergedFieldRaw;
+          fieldRules = fieldRaw;
         }
       }
 
+      // Prune values/tagMap to schema
       const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
+        normalizeForSchema(gSchema, mergedVals, tagMapRaw);
 
       gValues = prunedValues;
       await updatePreview(gValues);
 
+      // Build payload that will be embedded
       const payloadObj = {
-        title:  gSchema.title || 'Form',
-        fields: gSchema.fields || [],
+        title: gSchema?.title || 'Form',
+        fields: gSchema?.fields || [],
         values: gValues || {},
-        tagMap: prunedTagMap,
+        tagMap: prunedTagMap || {},
         rules,
         fieldRules,
+        rulesVersion,
         updatedAt: new Date().toISOString()
       };
+      const payloadJsonStr = JSON.stringify(payloadObj);
 
+      // Write payload into DOCX bytes (writer expects JSON string)
+      const srcU8 = new Uint8Array(gArrayBuffer);
       let updatedU8 = null;
+
       if (typeof window.writeDocVarSettings === 'function') {
-        setStatus('Writing payload to DOCX…');
-        const updatedBuf = await window.writeDocVarSettings(gArrayBuffer, PAYLOAD_KEY, JSON.stringify(payloadObj));
-        updatedU8  = updatedBuf instanceof Uint8Array ? updatedBuf : new Uint8Array(updatedBuf);
+        updatedU8 = await window.writeDocVarSettings(srcU8, PAYLOAD_KEY, payloadJsonStr);
+      } else if (typeof window.writeDocVarCustom === 'function') {
+        updatedU8 = await window.writeDocVarCustom(srcU8, PAYLOAD_KEY, payloadJsonStr);
+      } else if (typeof window.writeDocVar === 'function') {
+        updatedU8 = await window.writeDocVar(srcU8, PAYLOAD_KEY, payloadJsonStr);
       } else {
-        tr.warn('writeDocVarSettings not available; workspace-only save');
-        updatedU8 = new Uint8Array(gArrayBuffer);
+        setStatus('Save failed: no DOCX payload writer available.');
+        gDirty = true;
+        return;
       }
 
+      updatedU8 = (updatedU8 instanceof Uint8Array) ? updatedU8 : new Uint8Array(updatedU8);
       gArrayBuffer = updatedU8.buffer;
 
-      const stamp = Date.now();
+      // Real disk write only; no fake success
+      if (!supportsFS) {
+        setStatus('Save failed: browser cannot write to files (no File System Access API).');
+        gDirty = true;
+        return;
+      }
+
+      const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
+      if (!handle || typeof handle.createWritable !== 'function') {
+        setStatus('Save failed: no file handle for original. Use Open DOCX… again.');
+        gDirty = true;
+        return;
+      }
+
+      const perm =
+        (await window.formSuitePersist.ensurePermission?.(handle, 'readwrite'))
+        ?? (await updateWriteAccessBanner({ tryPrompt: true }));
+
+      if (perm !== 'granted') {
+        setStatus('Save failed: no write permission for original file.');
+        gDirty = true;
+        return;
+      }
+
+      // CRITICAL FIX: truncate on overwrite
+      const stream = await handle.createWritable({ keepExistingData: false });
+      await stream.write(updatedU8);
+      await stream.close();
+
+      gFileHandle = handle;
+
+      // Canonical state update (no legacy keys)
       await window.formSuitePersist.saveState(gDocId, {
-        schema: gSchema,
         values: gValues,
+        tagMap: prunedTagMap,
         rules,
         fieldRules,
-        tagMap: prunedTagMap,
-        payload: { CRONOS_PAYLOAD: payloadObj },
-        CRONOS_PAYLOAD: payloadObj,
-        cronos_payload: payloadObj,
-        rulesVersion: stamp,
+        rulesVersion,
         schemaUpdatedAt: new Date().toISOString()
       });
       await window.formSuitePersist.putBytes?.(gDocId, updatedU8);
 
       announceDocUpdated({ docId: gDocId });
 
-      if (supportsFS && gFileHandle && typeof gFileHandle.createWritable === 'function') {
-        const p = await updateWriteAccessBanner({ tryPrompt: false });
-        if (p === 'granted') {
-          try {
-            const stream = await gFileHandle.createWritable();
-            await stream.write(updatedU8);
-            await stream.close();
-            setStatus('Saved.');
-            gDirty = false;
-            return;
-          } catch (e) {
-            tr.warn('write back to handle failed; falling back to workspace-only', e);
-          }
-        }
-      }
-
-      setStatus('Saved in workspace (file write not available).');
+      setStatus('Saved to original DOCX (canonical payload).');
       gDirty = false;
+
     } catch (e) {
       tr.error('Save failed', e);
-      setStatus('Save failed: ' + (e.message || e));
+      setStatus('Save failed: ' + (e?.message || String(e)));
+      gDirty = true;
     } finally {
       tr.end();
     }
   }
+
 
   async function doExport() {
     const tr = TRACE('doExport');

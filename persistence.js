@@ -9,7 +9,7 @@
    • Broadcast payload patches across tabs + snapshot/rehydration
 
    IMPORTANT (Oct 2025):
-   • Content-addressed identity: docId = "<basename>#<sha256:12>"
+   • Stable identity (Jan 2026): docId is stable per file handle / embedded FS_DOC_GUID; falls back to legacy "<basename>#<sha256:12>" for raw uploads
      - Different file contents → different docId (even if filename is identical)
      - Everything is strictly keyed by docId
    • Rules are handled like values/tagMap:
@@ -41,6 +41,53 @@
   const DB_NAME = 'formsuite_v1';
   const DB_STORE_HANDLES = 'handles';
   const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+  const DOC_GUID_KEY = 'FS_DOC_GUID'; // stable per-file identity (stored in DOCX docVars)
+  const STABLE_DOCID_PREFIX = 'fsdoc:';
+
+  // Fingerprint → stable docId map (supports raw uploads without file handles)
+  const FP_MAP_KEY = 'FS_DOC_FINGERPRINT_MAP_V1'; // { [sha256]: { docId:'fsdoc:...', ts:number } }
+
+  function _readFpMap() {
+    try {
+      const raw = localStorage.getItem(FP_MAP_KEY);
+      const obj = raw ? JSON.parse(raw) : {};
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch {
+      return {};
+    }
+  }
+  function _writeFpMap(map) {
+    try { localStorage.setItem(FP_MAP_KEY, JSON.stringify(map || {})); } catch {}
+  }
+  function getMappedDocIdForFingerprint(fp) {
+    if (!fp) return null;
+    const m = _readFpMap();
+    const v = m[fp];
+    const id = (typeof v === 'string') ? v : (v && typeof v === 'object') ? v.docId : null;
+    return normalizeStableDocId(id);
+  }
+  function setMappedDocIdForFingerprint(fp, docId) {
+    const norm = normalizeStableDocId(docId);
+    if (!fp || !norm) return;
+    const m = _readFpMap();
+    m[fp] = { docId: norm, ts: Date.now() };
+
+    // bounded growth: keep most recent 200 entries (best-effort)
+    try {
+      const entries = Object.entries(m);
+      if (entries.length > 250) {
+        entries.sort((a, b) => ((a[1]?.ts || 0) - (b[1]?.ts || 0)));
+        const keep = entries.slice(-200);
+        const nm = {};
+        for (const [k, v] of keep) nm[k] = v;
+        _writeFpMap(nm);
+        return;
+      }
+    } catch {}
+
+    _writeFpMap(m);
+  }
+
 
   // ===== Utils =====
   const readJSON = (k) => { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch { return null; } };
@@ -86,6 +133,33 @@
     return `${base}#${hex.slice(0,12)}`; // short, collision-resistant id
   }
 
+  function makeStableDocId() {
+    // UUIDv4-like (crypto-safe if available)
+    try {
+      if (crypto?.randomUUID) return STABLE_DOCID_PREFIX + crypto.randomUUID();
+    } catch {}
+    const u8 = new Uint8Array(16);
+    try { crypto.getRandomValues(u8); } catch { for (let i=0;i<16;i++) u8[i] = Math.floor(Math.random()*256); }
+    // RFC 4122 variant/version bits
+    u8[6] = (u8[6] & 0x0f) | 0x40;
+    u8[8] = (u8[8] & 0x3f) | 0x80;
+    const hex = Array.from(u8).map(b => b.toString(16).padStart(2,'0')).join('');
+    return STABLE_DOCID_PREFIX + (
+      hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20)
+    );
+  }
+
+  function normalizeStableDocId(raw) {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    if (!s) return null;
+    if (s.startsWith(STABLE_DOCID_PREFIX)) return s;
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) {
+      return STABLE_DOCID_PREFIX + s;
+    }
+    return null;
+  }
+
   // ===== IndexedDB for FileSystemFileHandle =====
   function openDB() {
     return new Promise((resolve, reject) => {
@@ -120,6 +194,34 @@
         req.onerror = () => rej(req.error);
       });
     } catch { return null; }
+  }
+
+  async function idbGetAllHandleRecords() {
+    try {
+      const db = await openDB();
+      return await new Promise((res, rej) => {
+        const tx = db.transaction(DB_STORE_HANDLES, 'readonly');
+        const req = tx.objectStore(DB_STORE_HANDLES).getAll();
+        req.onsuccess = () => res(Array.isArray(req.result) ? req.result : []);
+        req.onerror = () => rej(req.error);
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  async function findDocIdByHandle(handle) {
+    if (!handle) return null;
+    if (typeof handle.isSameEntry !== 'function') return null;
+    const recs = await idbGetAllHandleRecords();
+    for (const r of recs) {
+      const h = r?.handle;
+      if (!h || typeof h.isSameEntry !== 'function') continue;
+      try {
+        if (await h.isSameEntry(handle)) return r.docId;
+      } catch {}
+    }
+    return null;
   }
   async function idbEachHandle(cb) {
     let rows = [];
@@ -373,6 +475,13 @@
   async function putBytes(docId, bytes, { broadcast = true } = {}) {
     if (!docId) return false;
     const ok = await opfsPut(docId, bytes);
+    // Keep fingerprint in sync with working copy (best-effort, coalesced)
+    try {
+      const u8 = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
+      coalesce('fp:' + docId, async () => {
+        try { await saveState(docId, { fingerprint: await sha256Hex(u8) }); } catch {}
+      }, 250);
+    } catch {}
     if (ok && broadcast) {
       const meta = getActiveDocMeta();
       broadcastDocUpdated(docId, meta?.name);
@@ -431,6 +540,71 @@
       }
     } catch (e) { dbg('readPayloadFromDocx error', e); }
     return null;
+  }
+
+  async function readDocGuidFromDocx(bytes) {
+    // Returns a normalized stable docId (fsdoc:UUID) if present, else null
+    try {
+      await ensureJSZip();
+      const zip = await window.JSZip.loadAsync(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+
+      // 1) word/settings.xml (docVars)
+      const settings = zip.file('word/settings.xml');
+      if (settings) {
+        const xmlText = await settings.async('string');
+        const xml = new DOMParser().parseFromString(xmlText, 'application/xml');
+        const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
+        if (docVars) {
+          const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
+          for (let i = 0; i < vars.length; i++) {
+            const dv = vars[i];
+            const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
+            if (name === DOC_GUID_KEY) {
+              const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
+              const norm = normalizeStableDocId(val);
+              if (norm) return norm;
+            }
+          }
+        }
+      }
+
+      // 2) docProps/custom.xml (custom property)
+      const custom = zip.file('docProps/custom.xml');
+      if (custom) {
+        const xmlText = await custom.async('string');
+        const xml = new DOMParser().parseFromString(xmlText, 'application/xml');
+        const props = xml.getElementsByTagName('property');
+        for (let i = 0; i < props.length; i++) {
+          const p = props[i];
+          const nm = p.getAttribute('name');
+          if (nm === DOC_GUID_KEY) {
+            const child = p.firstElementChild;
+            const val = child && child.textContent ? child.textContent : null;
+            const norm = normalizeStableDocId(val);
+            if (norm) return norm;
+          }
+        }
+      }
+    } catch (e) {
+      dbg('readDocGuidFromDocx error', e);
+    }
+    return null;
+  }
+
+  async function writeDocGuidToDocx(bytes, stableDocId) {
+    const norm = normalizeStableDocId(stableDocId);
+    if (!norm) return bytes;
+    const raw = norm.startsWith(STABLE_DOCID_PREFIX) ? norm.slice(STABLE_DOCID_PREFIX.length) : norm;
+    try {
+      if (typeof writeDocVarSettings === 'function') {
+        const out = await writeDocVarSettings(bytes, DOC_GUID_KEY, raw);
+        return out;
+      }
+    } catch (e) {
+      dbg('writeDocGuidToDocx failed', e);
+    }
+    return bytes;
   }
   async function writeDocVarSettings(bytes, key, jsonValue) {
     // NOTE: kept for Export flows. We do NOT auto-embed while editing rules anymore.
@@ -491,45 +665,135 @@
     return newBuf.buffer;
   }
 
-  // ===== High-level “set current” APIs (CONTENT-ADDRESSED) =====
+  
+  // ===== High-level “set current” APIs (STABLE identity + legacy migration) =====
   /**
-   * Set the active document from bytes/handle/name.
-   * Always computes docId = "<basename>#<sha256:12>" from BYTES if available.
-   * If only a handle is provided, this attempts to read its bytes for hashing.
+   * Active document identity rules:
+   *  - If opened via File System Access handle: docId is stable for that handle (IDB mapping),
+   *    and optionally stored inside the DOCX as docVar `FS_DOC_GUID` for portability.
+   *  - If opened via raw upload (no handle): docId comes from embedded `FS_DOC_GUID` if present,
+   *    else falls back to legacy content-hash "<basename>#<sha256:12>".
+   *
+   * This prevents “workspace loss” when the DOCX bytes change (Save/Export modifies payload).
    */
   async function setCurrentDoc({ bytes, handle, name }) {
-    // 1) Normalize name and obtain bytes for hashing
-    const fileName = name || 'document.docx';
-    let theBytes = bytes;
-    if (!theBytes && handle?.getFile) {
-      try { const f = await handle.getFile(); theBytes = await f.arrayBuffer(); } catch {}
+    let fileName = name || 'document.docx';
+    let inputBytes = bytes;
+
+    // Normalize name + bytes
+    if (!inputBytes && handle?.getFile) {
+      try {
+        const f = await handle.getFile();
+        fileName = name || f.name || fileName;
+        inputBytes = await f.arrayBuffer();
+      } catch {}
     }
-    if (!theBytes) throw new Error('setCurrentDoc: bytes or readable handle required to compute content id');
+    if (!inputBytes) throw new Error('setCurrentDoc: bytes or readable handle required');
 
-    // 2) Compute content-addressed docId
-    const docId = await computeDocIdFromBytes(theBytes, fileName);
-    const meta  = { docId, name: fileName };
+    // Compute identity helpers from the *input* bytes (what the user opened/uploaded)
+    const legacyDocId      = await computeDocIdFromBytes(inputBytes, fileName);
+    const fingerprintInput = await sha256Hex(inputBytes);
 
-    // 3) Persist handle & bytes (best-effort)
+    // Resolve stable id from: (1) handle mapping, (2) embedded doc guid, (3) fingerprint-map, (4) new stable id
+    let stableFromHandle = null;
+    if (handle) {
+      stableFromHandle = await findDocIdByHandle(handle);
+    }
+
+    let stableFromDoc = null;
+    try { stableFromDoc = await readDocGuidFromDocx(inputBytes); } catch {}
+
+    let docId = null;
+    if (handle) {
+      // Handle-based opens: prefer stored mapping; else use embedded guid; else mint a new stable id.
+      docId = stableFromHandle || stableFromDoc || makeStableDocId();
+    } else {
+      // Raw uploads: use embedded guid if present; else reuse a prior stable mapping for these exact bytes;
+      // else mint a new stable id (and embed it into the OPFS working copy for future exports).
+      const mapped = (!stableFromDoc) ? getMappedDocIdForFingerprint(fingerprintInput) : null;
+      if (mapped) dbg('fp-map hit', { fp12: String(fingerprintInput || '').slice(0, 12), docId: mapped });
+      docId = stableFromDoc || mapped || makeStableDocId();
+    }
+    if (!handle && !stableFromDoc && docId && String(docId).startsWith(STABLE_DOCID_PREFIX)) {
+      dbg('mint stable docId (raw upload)', { fp12: String(fingerprintInput || '').slice(0, 12), docId });
+    }
+
+
+    // Prepare the working bytes that will be written to OPFS. If we minted a stable id but the DOCX
+    // does not yet contain the guid, embed it into the OPFS working copy (best-effort).
+    let workingBytes = inputBytes;
+    let fingerprintWorking = fingerprintInput;
+
+    if (docId.startsWith(STABLE_DOCID_PREFIX) && !stableFromDoc) {
+      try {
+        const withGuid = await writeDocGuidToDocx(inputBytes, docId);
+        if (withGuid && withGuid !== inputBytes) {
+          workingBytes = withGuid;
+          try { fingerprintWorking = await sha256Hex(workingBytes); } catch {}
+        }
+      } catch {}
+    }
+
+    // Persist handle mapping + OPFS working bytes (best-effort)
     if (handle) await idbPutHandle(docId, handle);
-    await opfsPut(docId, theBytes);
+    await opfsPut(docId, workingBytes);
 
-    // 4) Ensure minimal state and content fingerprint
-    const fingerprint = await sha256Hex(theBytes);
+    // Fingerprint → docId mapping (so raw uploads can remain stable across sessions for the same file bytes)
+    try {
+      setMappedDocIdForFingerprint(fingerprintInput, docId);
+      if (fingerprintWorking && fingerprintWorking !== fingerprintInput) {
+        setMappedDocIdForFingerprint(fingerprintWorking, docId);
+      }
+    } catch {}
+
+    // Legacy migration: if we switched away from legacyDocId and legacy state exists, migrate once.
+    if (docId !== legacyDocId) {
+      try {
+        const legacyState = await loadState(legacyDocId);
+        const nextState = await loadState(docId);
+        const shouldMigrate = legacyState && !isEmptyState(legacyState) && (!nextState || isEmptyState(nextState));
+        if (shouldMigrate) {
+          dbg('migrate:state', { from: legacyDocId, to: docId });
+          await saveState(docId, { ...legacyState, fingerprint: fingerprintWorking });
+        }
+        // Copy legacy OPFS bytes if new doesn't exist (best-effort)
+        try {
+          const cur = await opfsGet(docId);
+          if (!cur) {
+            const oldBytes = await opfsGet(legacyDocId);
+            if (oldBytes) await opfsPut(docId, oldBytes);
+          }
+        } catch {}
+      } catch (e) {
+        dbg('migrate failed', e);
+      }
+    }
+
+    // Ensure minimal state and fingerprint (fingerprint tracks OPFS working bytes)
     const existing = await loadState(docId);
     if (!existing || isEmptyState(existing)) {
-      await saveState(docId, { schema: null, values: {}, rules: [], fieldRules: [], fingerprint });
-    } else if (existing.fingerprint !== fingerprint) {
-      await saveState(docId, { fingerprint });
+      await saveState(docId, { schema: null, values: {}, rules: [], fieldRules: [], fingerprint: fingerprintWorking });
+    } else if (existing.fingerprint !== fingerprintWorking) {
+      await saveState(docId, { fingerprint: fingerprintWorking });
     }
 
-    // 5) Flip active & try to hydrate schema/payload from DOCX if none present
-    await setActiveDoc(meta); // BC + LS
+    // Flip active & hydrate schema/payload if missing
+    await setActiveDoc({ docId, name: fileName });
     try { await hydrateFromDocxIfEmpty(docId); } catch {}
-    return meta;
+
+    dbg('setCurrentDoc', {
+      docId,
+      legacyDocId,
+      stableFromHandle,
+      stableFromDoc,
+      fp12_in: String(fingerprintInput || '').slice(0, 12),
+      fp12_ws: String(fingerprintWorking || '').slice(0, 12),
+      name: fileName
+    });
+    return { docId, name: fileName };
   }
+
   async function setCurrentDocFromBytes(bytes, meta = {}) {
-    // Accept meta.name for basename, meta.handle optional
     const fileName = meta?.name || 'document.docx';
     return await setCurrentDoc({ bytes, handle: meta.handle, name: fileName });
   }
@@ -821,6 +1085,8 @@
     // canonical storage key (pages listen for it)
     ACTIVE_DOC_KEY: LS_KEYS.CANON_ACTIVE,
     PAYLOAD_KEY,
+    DOC_GUID_KEY,
+    STABLE_DOCID_PREFIX,
 
     // Active doc (single source of truth)
     getActiveDocMeta,
@@ -865,6 +1131,8 @@
     hydrateFromDocxIfEmpty,
     readPayloadFromDocx,
     writeDocVarSettings,
+    readDocGuidFromDocx,
+    writeDocGuidToDocx,
 
     // Optional init hook used by some pages
     ensureHydrated,
@@ -1158,3 +1426,129 @@
     clear: () => ensureOverlay().querySelector('#fsdgClear')?.click(),
   };
 })();
+
+  // =========================================================
+  // CANONICAL PAYLOAD API + LEGACY KEY REDIRECTOR (DROP-IN)
+  // =========================================================
+  (function installCanonicalPayloadLayer() {
+    const LEGACY_GLOBAL = 'CRONOS_PAYLOAD';
+    const LEGACY_PREFIX = 'CRONOS_PAYLOAD:';
+
+    function _activeDocIdFallback() {
+      try {
+        // Prefer in-memory active
+        if (_active?.docId) return _active.docId;
+
+        // Fallback to storage active meta
+        const meta = readActiveFromStorage();
+        return meta?.docId || null;
+      } catch {
+        return null;
+      }
+    }
+
+    function _parsePayloadJson(value) {
+      try {
+        if (!value) return null;
+        const obj = JSON.parse(String(value));
+        return (obj && typeof obj === 'object') ? obj : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function _payloadToStatePatch(payloadObj, { bumpRulesVersion } = {}) {
+      // payloadObj is the CRONOS_PAYLOAD object: {title, fields, values, tagMap, rules, fieldRules, ...}
+      const schema = {
+        title: payloadObj?.title || 'Form',
+        fields: Array.isArray(payloadObj?.fields) ? payloadObj.fields : []
+      };
+      const patch = {
+        schema,
+        values: (payloadObj?.values && typeof payloadObj.values === 'object') ? payloadObj.values : {},
+        tagMap: (payloadObj?.tagMap && typeof payloadObj.tagMap === 'object') ? payloadObj.tagMap : {},
+        rules: Array.isArray(payloadObj?.rules) ? payloadObj.rules : [],
+        fieldRules: Array.isArray(payloadObj?.fieldRules) ? payloadObj.fieldRules : [],
+      };
+
+      if (bumpRulesVersion) patch.rulesVersion = Date.now();
+      // keep any explicit rulesVersion if provided (unless bumpRulesVersion requested)
+      if (!bumpRulesVersion && Number.isFinite(payloadObj?.rulesVersion)) {
+        patch.rulesVersion = payloadObj.rulesVersion;
+      }
+      return patch;
+    }
+
+    // ---- Canonical APIs on formSuitePersist ----
+    try {
+      window.formSuitePersist.getPayload = async function getPayload(docId) {
+        const st = getState(docId);
+        return st?.payload?.[PAYLOAD_KEY] || st?.[PAYLOAD_KEY] || st?.cronos_payload || null;
+      };
+
+      window.formSuitePersist.setPayload = async function setPayload(docId, payloadObj, opts) {
+        if (!docId) docId = _activeDocIdFallback();
+        if (!docId || !payloadObj || typeof payloadObj !== 'object') return null;
+
+        const patch = _payloadToStatePatch(payloadObj, opts || {});
+        return setState(docId, patch);
+      };
+    } catch {}
+
+    // ---- Redirect legacy localStorage writes into canonical store ----
+    const _origSetItem = localStorage.setItem.bind(localStorage);
+    const _origRemoveItem = localStorage.removeItem.bind(localStorage);
+
+    function _handleLegacyWrite(key, value) {
+      if (key !== LEGACY_GLOBAL && !String(key).startsWith(LEGACY_PREFIX)) return false;
+
+      const payloadObj = _parsePayloadJson(value);
+      if (!payloadObj) return false;
+
+      let docId = null;
+      if (key === LEGACY_GLOBAL) docId = _activeDocIdFallback();
+      else docId = String(key).slice(LEGACY_PREFIX.length);
+
+      if (!docId) return false;
+
+      // Write to canonical store
+      try {
+        setState(docId, _payloadToStatePatch(payloadObj, { bumpRulesVersion: true }));
+      } catch {}
+
+      // Rewrite legacy key to match canonical payload snapshot (BWC)
+      try {
+        const st = getState(docId);
+        const canonical = st?.payload?.[PAYLOAD_KEY] || payloadObj;
+        _origSetItem(key, JSON.stringify(canonical));
+      } catch {
+        // If rewrite fails, at least let original write happen
+        _origSetItem(key, value);
+      }
+      return true;
+    }
+
+    localStorage.setItem = function (key, value) {
+      try {
+        if (_handleLegacyWrite(key, value)) return;
+      } catch {}
+      return _origSetItem(key, value);
+    };
+
+    localStorage.removeItem = function (key) {
+      // If someone removes the legacy key, do not delete canonical state.
+      // We still allow removal of legacy key itself.
+      return _origRemoveItem(key);
+    };
+
+    // Also catch cross-tab legacy writes via storage events
+    window.addEventListener('storage', (e) => {
+      try {
+        if (!e?.key) return;
+        if (e.key !== LEGACY_GLOBAL && !String(e.key).startsWith(LEGACY_PREFIX)) return;
+        if (!e.newValue) return;
+        _handleLegacyWrite(e.key, e.newValue);
+      } catch {}
+    });
+
+  })();

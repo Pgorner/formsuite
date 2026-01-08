@@ -288,28 +288,54 @@ function __coerceRuleForMultichoiceOption(schema, rule, whenField) {
 // ---------- heading baseline ----------
 
 function buildHeadingTargetIndex(baseline) {
-  const flat = Array.isArray(baseline?.flat)
+  // IMPORTANT: baseline headings often carry a sparse/stable `idx` coming from the DOCX parser.
+  // Do NOT overwrite it with the array position — doing so causes targets to "jump" on reload.
+  const flatRaw = Array.isArray(baseline?.flat)
     ? baseline.flat
     : Array.isArray(baseline) ? baseline
     : Array.isArray(baseline?.headings) ? baseline.headings
     : [];
 
+  const flat = Array.isArray(flatRaw) ? flatRaw.slice() : [];
+
   const byId = new Map();
+  const byIdx = new Map();      // keyed by stable heading idx
   const byNumber = new Map();
   const bySlug = new Map();
 
-  flat.forEach((h, idx) => {
+  const canonicalSecId = (idx) => `sec_${String(idx).padStart(6, '0')}`;
+
+  // One-time diagnostic: detect if baseline idx is sparse / differs from array index
+  try {
+    let seenMismatch = false;
+    for (let i = 0; i < Math.min(flat.length, 50); i++) {
+      const h = flat[i];
+      const hIdx = Number(h?.idx);
+      if (Number.isFinite(hIdx) && hIdx !== i) { seenMismatch = true; break; }
+    }
+    if (seenMismatch) {
+      console.log('[rules-core] heading baseline uses stable/sparse idx (good). Using h.idx, not array position.');
+    }
+  } catch {}
+
+  flat.forEach((h, arrayPos) => {
+    const stableIdx = Number.isFinite(Number(h?.idx)) ? Number(h.idx) : arrayPos;
+
     const id = String(
-      h.id != null ? h.id :
-      h.uid != null ? h.uid :
-      h.key != null ? h.key : idx
+      h?.id != null ? h.id :
+      h?.uid != null ? h.uid :
+      h?.key != null ? h.key :
+      canonicalSecId(stableIdx)
     );
-    const label = String(h.label || h.text || h.title || id);
-    const num = (h.number || h.num || h.key || '').toString().trim();
-    const entry = { ...h, id, label, idx };
+
+    const label = String(h?.label || h?.text || h?.title || id);
+    const num = (h?.number || h?.num || '').toString().trim();
+
+    const entry = { ...(h || {}), id, label, idx: stableIdx };
 
     byId.set(id, entry);
-    if (num) byNumber.set(num, entry);
+    byIdx.set(String(stableIdx), entry);
+    if (num) byNumber.set(String(num), entry);
 
     const slug = __slug(label);
     if (slug) bySlug.set(slug, entry);
@@ -318,46 +344,91 @@ function buildHeadingTargetIndex(baseline) {
   function normalizeTarget(t) {
     if (!t && t !== 0) return null;
 
-    if (typeof t === 'string' || typeof t === 'number') {
-      const s = String(t).trim();
-      if (byId.has(s)) {
-        const e = byId.get(s);
-        return { id: e.id, idx: e.idx, label: e.label };
-      }
-      if (byNumber.has(s)) {
-        const e = byNumber.get(s);
-        return { id: e.id, idx: e.idx, label: e.label };
-      }
-      const slug = __slug(s);
-      if (bySlug.has(slug)) {
-        const e = bySlug.get(slug);
-        return { id: e.id, idx: e.idx, label: e.label };
-      }
-      const n = Number(s);
-      if (Number.isFinite(n) && flat[n - 1]) {
-        const e = flat[n - 1];
-        const id = String(e.id ?? e.uid ?? e.key ?? (n - 1));
-        return { id, idx: n - 1, label: e.label || e.text || e.title || id };
-      }
-      return null;
-    }
-
+    // object target: prefer stable identifiers in this order: id/uid, idx/key, number, label
     if (typeof t === 'object') {
-      if (t.id && byId.has(String(t.id))) {
-        const e = byId.get(String(t.id));
+      const tid = (t.id != null) ? String(t.id) : '';
+      if (tid && byId.has(tid)) {
+        const e = byId.get(tid);
         return { id: e.id, idx: e.idx, label: e.label };
       }
-      if (t.number && byNumber.has(String(t.number))) {
-        const e = byNumber.get(String(t.number));
-        return { id: e.id, idx: e.idx, label: e.label };
+
+      if (t.uid != null) {
+        const tuid = String(t.uid);
+        if (byId.has(tuid)) { // some baselines use uid as id
+          const e = byId.get(tuid);
+          return { id: e.id, idx: e.idx, label: e.label };
+        }
       }
+
+      if (t.idx != null) {
+        const idx = Number(t.idx);
+        if (Number.isFinite(idx) && byIdx.has(String(idx))) {
+          const e = byIdx.get(String(idx));
+          return { id: e.id, idx: e.idx, label: e.label };
+        }
+      }
+
+      if (t.key != null) {
+        const idx = Number(t.key);
+        if (Number.isFinite(idx) && byIdx.has(String(idx))) {
+          const e = byIdx.get(String(idx));
+          return { id: e.id, idx: e.idx, label: e.label };
+        }
+      }
+
+      if (t.number != null) {
+        const s = String(t.number).trim();
+        if (s && byNumber.has(s)) {
+          const e = byNumber.get(s);
+          return { id: e.id, idx: e.idx, label: e.label };
+        }
+      }
+
       if (t.label) {
         const slug = __slug(t.label);
-        if (bySlug.has(slug)) {
+        if (slug && bySlug.has(slug)) {
           const e = bySlug.get(slug);
           return { id: e.id, idx: e.idx, label: e.label };
         }
       }
+
+      // Fallback: preserve provided idx/label if present (do NOT drop targets)
+      if (t.idx != null && Number.isFinite(Number(t.idx))) {
+        const idx = Number(t.idx);
+        const id = tid || canonicalSecId(idx);
+        const label = String(t.label || id);
+        return { id, idx, label };
+      }
+
+      return null;
+    }
+
+    // primitive target: try exact id, then numeric idx, then number string, then slug
+    const s = String(t).trim();
+    if (byId.has(s)) {
+      const e = byId.get(s);
+      return { id: e.id, idx: e.idx, label: e.label };
+    }
+    if (byIdx.has(s)) {
+      const e = byIdx.get(s);
+      return { id: e.id, idx: e.idx, label: e.label };
+    }
+    if (byNumber.has(s)) {
+      const e = byNumber.get(s);
+      return { id: e.id, idx: e.idx, label: e.label };
+    }
+
+    const slug = __slug(s);
+    if (slug && bySlug.has(slug)) {
+      const e = bySlug.get(slug);
+      return { id: e.id, idx: e.idx, label: e.label };
+    }
+
+    // Numeric fallback: treat as stable idx (NOT 1-based position)
+    const n = Number(s);
+    if (Number.isFinite(n) && byIdx.has(String(n))) {
+      const e = byIdx.get(String(n));
+      return { id: e.id, idx: e.idx, label: e.label };
     }
 
     return null;
@@ -384,6 +455,7 @@ function buildHeadingTargetIndex(baseline) {
   return {
     flat,
     byId,
+    byIdx,
     byNumber,
     bySlug,
     normalizeTarget,
@@ -590,9 +662,19 @@ function normalizeHeadingsRulesForSchema(schema, rulesIn, headingBaseline) {
     }
 
     if (Array.isArray(r0.targets)) {
-      r0.targets = r0.targets
-        .map(t => headingIndex.normalizeTarget(t))
-        .filter(Boolean);
+      const hasBaseline = Array.isArray(headingIndex?.flat) && headingIndex.flat.length > 0;
+      if (!hasBaseline) {
+        // Preserve targets when we do not have a heading baseline; never drop user selections silently.
+        if (!normalizeHeadingsRulesForSchema.__warnedNoBaseline) {
+          normalizeHeadingsRulesForSchema.__warnedNoBaseline = true;
+          console.log('[rules-core] normalizeHeadingsRulesForSchema: heading baseline is empty; preserving targets as-is.');
+        }
+        r0.targets = r0.targets.filter(t => t != null);
+      } else {
+        r0.targets = r0.targets
+          .map(t => headingIndex.normalizeTarget(t) || t)
+          .filter(t => t != null);
+      }
     }
 
     out.push(r0);

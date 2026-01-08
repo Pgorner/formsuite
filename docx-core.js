@@ -687,3 +687,160 @@ if (typeof window !== 'undefined') {
     restoreDocxFromBackup
   });
 }
+
+// =========================================================
+// DROP-IN: JSZip-first docVar settings read/write (no Pyodide)
+// Paste at END of docx-core.js (after exports)
+// =========================================================
+(function () {
+  'use strict';
+
+  const W_NS = window.DOCX_W_NS || "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+  function _asU8(bytesU8) {
+    return (bytesU8 instanceof Uint8Array) ? bytesU8 : new Uint8Array(bytesU8 || []);
+  }
+
+  function _minSettingsXml() {
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:w="${W_NS}">
+</w:settings>`;
+  }
+
+  function _parseXml(xmlText) {
+    const dp = new DOMParser();
+    const doc = dp.parseFromString(xmlText, 'application/xml');
+    const pe = doc.getElementsByTagName('parsererror');
+    if (pe && pe.length) throw new Error('XML parse error');
+    return doc;
+  }
+
+  function _serializeXml(doc) {
+    return new XMLSerializer().serializeToString(doc);
+  }
+
+  function _getWAttr(el, local) {
+    // Try both namespaced and prefixed forms
+    return el.getAttributeNS(W_NS, local) ?? el.getAttribute(`w:${local}`) ?? el.getAttribute(local);
+  }
+
+  function _setWAttr(el, local, value) {
+    try {
+      el.setAttributeNS(W_NS, `w:${local}`, String(value));
+    } catch {
+      el.setAttribute(`w:${local}`, String(value));
+    }
+  }
+
+  function _firstNS(parent, localName) {
+    const els = parent.getElementsByTagNameNS(W_NS, localName);
+    return (els && els.length) ? els[0] : null;
+  }
+
+  async function _readDocVarSettings_JS(bytesU8, key) {
+    const JSZip = await (window.ensureJSZip ? window.ensureJSZip() : window.JSZip);
+    if (!JSZip) throw new Error('JSZip not available');
+
+    const zip = await JSZip.loadAsync(_asU8(bytesU8));
+    const f = zip.file('word/settings.xml');
+    if (!f) return null;
+
+    const xmlText = await f.async('string');
+    const doc = _parseXml(xmlText);
+
+    const docVars = doc.getElementsByTagNameNS(W_NS, 'docVar');
+    for (let i = 0; i < docVars.length; i++) {
+      const dv = docVars[i];
+      const name = _getWAttr(dv, 'name');
+      if (name === key) {
+        const val = _getWAttr(dv, 'val');
+        return (val == null) ? '' : String(val);
+      }
+    }
+    return null;
+  }
+
+  async function _writeDocVarSettings_JS(bytesU8, key, jsonStr) {
+    const JSZip = await (window.ensureJSZip ? window.ensureJSZip() : window.JSZip);
+    if (!JSZip) throw new Error('JSZip not available');
+
+    const inU8 = _asU8(bytesU8);
+    const zip = await JSZip.loadAsync(inU8);
+
+    let settingsText = null;
+    const settingsFile = zip.file('word/settings.xml');
+    if (settingsFile) {
+      settingsText = await settingsFile.async('string');
+    } else {
+      settingsText = _minSettingsXml();
+    }
+
+    const doc = _parseXml(settingsText);
+
+    // Ensure root
+    const root = doc.documentElement;
+    if (!root || root.localName !== 'settings') {
+      throw new Error('Invalid settings.xml root');
+    }
+
+    // Ensure <w:docVars>
+    let docVarsEl = _firstNS(root, 'docVars');
+    if (!docVarsEl) {
+      docVarsEl = doc.createElementNS(W_NS, 'w:docVars');
+      root.appendChild(docVarsEl);
+    }
+
+    // Find or create <w:docVar w:name="key">
+    let found = null;
+    const docVarEls = docVarsEl.getElementsByTagNameNS(W_NS, 'docVar');
+    for (let i = 0; i < docVarEls.length; i++) {
+      const dv = docVarEls[i];
+      const name = _getWAttr(dv, 'name');
+      if (name === key) { found = dv; break; }
+    }
+
+    if (!found) {
+      found = doc.createElementNS(W_NS, 'w:docVar');
+      _setWAttr(found, 'name', key);
+      docVarsEl.appendChild(found);
+    }
+
+    _setWAttr(found, 'val', jsonStr);
+
+    const outXml = _serializeXml(doc);
+    zip.file('word/settings.xml', outXml);
+
+    const outU8 = await zip.generateAsync({ type: 'uint8array' });
+    return outU8;
+  }
+
+  // ---- Override globals to be JSZip-first and bulletproof ----
+  const _oldRead = window.readDocVarSettings;
+  const _oldWrite = window.writeDocVarSettings;
+
+  window.readDocVarSettings = async function (bytesU8, key) {
+    try {
+      return await _readDocVarSettings_JS(bytesU8, key);
+    } catch (e) {
+      // fallback to previous implementation (pyodide) if needed
+      if (typeof _oldRead === 'function') return await _oldRead(bytesU8, key);
+      throw e;
+    }
+  };
+
+  window.writeDocVarSettings = async function (bytesU8, key, jsonStr) {
+    try {
+      return await _writeDocVarSettings_JS(bytesU8, key, jsonStr);
+    } catch (e) {
+      // fallback to previous implementation (pyodide) if needed
+      if (typeof _oldWrite === 'function') return await _oldWrite(bytesU8, key, jsonStr);
+      throw e;
+    }
+  };
+
+  // Keep docxCore namespace aligned if present
+  if (window.docxCore) {
+    window.docxCore.readDocVarSettings = window.readDocVarSettings;
+    window.docxCore.writeDocVarSettings = window.writeDocVarSettings;
+  }
+})();
