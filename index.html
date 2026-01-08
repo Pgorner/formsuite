@@ -68,6 +68,59 @@
     let lastExportDebug = null;
     let exportDebugEscHandler = null;
 
+
+    // =========================
+// DEBUG / TRACE (index.html)
+// =========================
+(function ensureTrace() {
+  // Do not override if another page/script already provided TRACE.
+  if (typeof window.TRACE === 'function') return;
+
+  const DEBUG = { on: true, seq: 0 };
+  const _t = () => new Date().toISOString().slice(11, 23);
+  const tagStyle = 'color:#6b7280;font-weight:600';
+
+  function tag(name) {
+    return `%c[Form ${_t()} #${++DEBUG.seq}] ${name}`;
+  }
+
+  window.TRACE = function TRACE(name, details) {
+    const label = `${name} :: ${_t()} :: #${DEBUG.seq + 1}`;
+
+    if (DEBUG.on) {
+      try { console.groupCollapsed(tag(name), tagStyle, details ?? ''); } catch {}
+      try { console.time(label); } catch {}
+    }
+
+    let ended = false;
+    const safe = (fn, ...args) => { try { fn(...args); } catch {} };
+
+    return {
+      step(msg, data) {
+        if (!DEBUG.on) return;
+        safe(console.log, tag(`  ↳ ${msg}`), tagStyle, data ?? '');
+      },
+      warn(msg, data) {
+        if (!DEBUG.on) return;
+        safe(console.warn, tag(`  ⚠ ${msg}`), tagStyle, data ?? '');
+      },
+      error(msg, err) {
+        if (!DEBUG.on) return;
+        safe(console.error, tag(`  ✖ ${msg}`), tagStyle, err);
+      },
+      end(extra) {
+        if (ended) return;
+        ended = true;
+        if (!DEBUG.on) return;
+        if (extra) safe(console.log, tag('done'), tagStyle, extra);
+        safe(console.timeEnd, label);
+        safe(console.groupEnd);
+      }
+    };
+  };
+})();
+
+
     function clearExportDebugPanel() {
       if (exportDebugEscHandler) {
         try { document.removeEventListener('keydown', exportDebugEscHandler); } catch {}
