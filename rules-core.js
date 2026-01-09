@@ -100,10 +100,14 @@ function extractRulesFromState(state) {
   function addSource(name, obj) {
     if (!obj || typeof obj !== 'object') return;
     if (obj.rules) {
-      ruleSources.push([name, normalizeRuleCollection(obj.rules)]);
+      const arr = normalizeRuleCollection(obj.rules);
+      ruleSources.push([name, arr]);
+      try { console.log('[DBG rules-core.extractRulesFromState] saw rules', { source: name, len: arr.length }); } catch {}
     }
     if (obj.fieldRules) {
-      fieldRuleSources.push([name, normalizeRuleCollection(obj.fieldRules)]);
+      const arr = normalizeRuleCollection(obj.fieldRules);
+      fieldRuleSources.push([name, arr]);
+      try { console.log('[DBG rules-core.extractRulesFromState] saw fieldRules', { source: name, len: arr.length }); } catch {}
     }
   }
 
@@ -132,11 +136,29 @@ function extractRulesFromState(state) {
     .filter(([, arr]) => arr.length > 0)
     .map(([name]) => name);
 
+  try {
+    console.log('[DBG rules-core.extractRulesFromState] aggregated', {
+      outRulesLen: out.rules.length,
+      outFieldRulesLen: out.fieldRules.length,
+      rulesSources: out.meta.rulesSources,
+      fieldRuleSources: out.meta.fieldRuleSources
+    });
+  } catch {}
+
   return out;
 }
 
+
 function resolveRulesForState(state, payloadOverride) {
   const view = state && typeof state === 'object' ? { ...state } : {};
+
+  // DBG: show what keys we got (without dumping huge payloads)
+  try {
+    const keys = Object.keys(view || {});
+    const rLen = Array.isArray(view.rules) ? view.rules.length : null;
+    const frLen = Array.isArray(view.fieldRules) ? view.fieldRules.length : null;
+    console.log('[DBG rules-core.resolveRulesForState] input', { keys, hasRules: hasOwn(view,'rules'), rulesLen: rLen, hasFieldRules: hasOwn(view,'fieldRules'), fieldRulesLen: frLen, hasPayloadOverride: !!payloadOverride });
+  } catch {}
 
   if (payloadOverride) {
     view.payload = {
@@ -171,8 +193,18 @@ function resolveRulesForState(state, payloadOverride) {
     contributingFieldRules: aggregated.meta?.fieldRuleSources || []
   };
 
+  // DBG: show what we resolved and why
+  try {
+    console.log('[DBG rules-core.resolveRulesForState] resolved', {
+      outRulesLen: Array.isArray(rules) ? rules.length : null,
+      outFieldRulesLen: Array.isArray(fieldRules) ? fieldRules.length : null,
+      source
+    });
+  } catch {}
+
   return { rules, fieldRules, source };
 }
+
 
 // ---------- schema indexes ----------
 
@@ -273,6 +305,58 @@ function __buildOptionIndex(schema) {
     byField.set(rec.id, rec);
   }
   return byField;
+}
+
+
+
+// Parse a field reference that may include an option suffix: "<fieldId>__opt__<slug>"
+// Returns a normalized descriptor or null.
+function __parseOptionFieldRef(schema, ref) {
+  const raw = String(ref ?? '').trim();
+  if (!raw) return null;
+
+  // Plain field id / label / etc. (caller may still resolve via __resolveFieldRef)
+  if (!raw.includes('__opt__')) {
+    return { kind: 'field', fieldId: raw, optionSlug: null, optionValue: null, optionLabel: null, id: raw };
+  }
+
+  const parts = raw.split('__opt__');
+  const fieldId = String(parts[0] ?? '').trim();
+  const optSlugIn = String(parts.slice(1).join('__opt__') ?? '').trim().toLowerCase();
+  const optSlug = optSlugIn ? optSlugIn : '';
+
+  const optionIndex = __buildOptionIndex(schema);
+  const rec = optionIndex.get(String(fieldId));
+
+  if (rec && Array.isArray(rec.options) && rec.options.length) {
+    const wanted = __slug(optSlug);
+    const hit = rec.options.find(o => {
+      const s1 = String(o?.slug ?? '').toLowerCase();
+      if (wanted && s1 === wanted) return true;
+      // tolerate callers that accidentally use value/label instead of slug
+      const s2 = __slug(o?.label ?? '');
+      const s3 = __slug(o?.value ?? '');
+      return (wanted && (s2 === wanted || s3 === wanted));
+    });
+
+    if (hit) {
+      const id = `${String(fieldId)}__opt__${String(hit.slug)}`;
+      try { console.log('[DBG rules-core.__parseOptionFieldRef] hit', { ref: raw, fieldId, optSlug: hit.slug, optValue: hit.value }); } catch {}
+      return {
+        kind: 'option',
+        fieldId: String(fieldId),
+        optionSlug: String(hit.slug),
+        optionValue: String(hit.value),
+        optionLabel: String(hit.label),
+        id
+      };
+    }
+  }
+
+  // Unknown option slug: keep it (do not explode), still return a stable id.
+  const id = `${String(fieldId)}__opt__${String(__slug(optSlug) || optSlug || 'unknown')}`;
+  try { console.log('[DBG rules-core.__parseOptionFieldRef] miss', { ref: raw, fieldId, optSlug }); } catch {}
+  return { kind: 'option', fieldId: String(fieldId), optionSlug: optSlug, optionValue: null, optionLabel: null, id };
 }
 
 function __coerceRuleForMultichoiceOption(schema, rule, whenField) {
@@ -1016,6 +1100,7 @@ if (typeof window !== 'undefined') {
     __buildSchemaIndex,
     __resolveFieldRef,
     __buildOptionIndex,
+    __parseOptionFieldRef,
     __coerceRuleForMultichoiceOption,
     buildHeadingTargetIndex,
     parseTargetIdx,
@@ -1027,4 +1112,6 @@ if (typeof window !== 'undefined') {
     evaluateRulesToVisibility,
     evaluateFieldRulesToVisibility
   });
+  try { window.__parseOptionFieldRef = __parseOptionFieldRef; } catch {}
+
 }

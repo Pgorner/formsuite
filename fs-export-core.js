@@ -50,6 +50,7 @@
       const safeTagMap = tagMap || {};
       const safeRules = Array.isArray(rules) ? rules : [];
       const safeFieldRules = Array.isArray(fieldRules) ? fieldRules : [];
+      try { console.log('[DBG fsExportCore.buildDoc] inputs', { debugLabel, origBytes: origU8.length, rulesLen: safeRules.length, fieldRulesLen: safeFieldRules.length, tagMapLen: Object.keys(safeTagMap||{}).length, schemaFields: (safeSchema.fields||[]).length }); } catch {}
 
       const payloadObj = {
         title: safeSchema.title || 'Form',
@@ -122,6 +123,7 @@
           headingResolver
         );
       }
+      try { const keys = Object.keys(visibilityMap||{}); console.log('[DBG fsExportCore.buildDoc] visibilityMap', { keysLen: keys.length, hideCount: keys.filter(k=>String(visibilityMap[k]).toUpperCase()==='HIDE').length, sample: keys.slice(0,8).reduce((a,k)=>{a[k]=visibilityMap[k];return a;}, {}) }); } catch {}
 
       // ---- Removal plan + applyRemovalWithBackup (your workingrmv semantics) ----
       try {

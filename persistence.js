@@ -337,6 +337,7 @@
     if (!Array.isArray(next.fieldRules)) next.fieldRules = [];
 
     mirrorPayloadOnState(next);
+    try { console.log('[DBG persist.setState] next', { docId, rulesLen: next.rules.length, fieldRulesLen: next.fieldRules.length, hasPayload: !!next.payload, hasPayloadRules: Array.isArray(next?.payload?.CRONOS_PAYLOAD?.rules) ? next.payload.CRONOS_PAYLOAD.rules.length : null }); } catch {}
 
     next.__v = (next.__v|0) + 1;
     writeJSON(keyFor(docId), next);
@@ -349,8 +350,27 @@
   }
 
   // Back-compat alias with the previous signature (async)
-  async function saveState(docId, obj) { return setState(docId, obj); }
-  async function loadState(docId)      { return getState(docId); }
+  async function saveState(docId, obj) {
+    try {
+      const rLen = Array.isArray(obj?.rules) ? obj.rules.length : ('rules' in (obj||{}) ? 0 : null);
+      const frLen = Array.isArray(obj?.fieldRules) ? obj.fieldRules.length : ('fieldRules' in (obj||{}) ? 0 : null);
+      console.log('[DBG persist.saveState] patch', { docId, keys: Object.keys(obj||{}), rulesLen: rLen, fieldRulesLen: frLen });
+    } catch {}
+    const out = setState(docId, obj);
+    try {
+      console.log('[DBG persist.saveState] stored', { docId, rulesLen: Array.isArray(out?.rules)?out.rules.length:null, fieldRulesLen: Array.isArray(out?.fieldRules)?out.fieldRules.length:null, v: out?.__v });
+    } catch {}
+    return out;
+  }
+  async function loadState(docId) {
+    const st = getState(docId);
+    try {
+      console.log('[DBG persist.loadState]', { docId, keys: Object.keys(st||{}), rulesLen: Array.isArray(st?.rules)?st.rules.length:null, fieldRulesLen: Array.isArray(st?.fieldRules)?st.fieldRules.length:null, hasPayload: !!st?.payload, v: st?.__v });
+      const pl = st?.payload?.CRONOS_PAYLOAD;
+      if (pl) console.log('[DBG persist.loadState] payload.CRONOS_PAYLOAD', { rulesLen: Array.isArray(pl?.rules)?pl.rules.length:null, fieldRulesLen: Array.isArray(pl?.fieldRules)?pl.fieldRules.length:null, hasHeadings: Array.isArray(pl?.headingsFlat) ? pl.headingsFlat.length : null });
+    } catch {}
+    return st;
+  }
   function getLastKnownValues(docId)   { try { return (getState(docId) || {}).values || {}; } catch { return {}; } }
 
   // ===== Permissions =====
