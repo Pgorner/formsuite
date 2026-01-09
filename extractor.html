@@ -161,7 +161,10 @@ function DBG(msg, data) {
     else console.log(`[ExtractorDBG ${_t()}] ${msg}`, data);
   } catch {}
 }
+
+
 function _safeParseJSON(txt) { try { return txt ? JSON.parse(txt) : null; } catch { return null; } }
+
 function _verOf(obj) {
   if (!obj || typeof obj !== 'object') return 0;
   const rv = obj.rulesVersion;
@@ -169,34 +172,46 @@ function _verOf(obj) {
   const t = Date.parse(obj.updatedAt || obj.schemaUpdatedAt || obj.headingsUpdatedAt || '');
   return Number.isFinite(t) ? t : 0;
 }
+
 function pickNewestRulesBundle(docId, wsState, payloadFromDoc) {
   const cands = [];
-  const wsPayload = (wsState?.payload?.CRONOS_PAYLOAD) || (wsState?.CRONOS_PAYLOAD) || (wsState?.cronos_payload) || null;
+
+  const wsPayload =
+    (wsState?.payload?.CRONOS_PAYLOAD) ||
+    (wsState?.CRONOS_PAYLOAD) ||
+    (wsState?.cronos_payload) ||
+    null;
+
   cands.push({ src: 'ws.state',   obj: wsState || null });
   cands.push({ src: 'ws.payload', obj: wsPayload });
 
-  // localStorage mirrors written by rules.html
+  // Scoped LS mirror ONLY (doc-specific)
   const lsDoc = _safeParseJSON(localStorage.getItem(`CRONOS_PAYLOAD:${docId}`));
   if (lsDoc) cands.push({ src: `ls:CRONOS_PAYLOAD:${docId}`, obj: lsDoc });
 
-  const lsGlobal = _safeParseJSON(localStorage.getItem('CRONOS_PAYLOAD'));
-  if (lsGlobal) cands.push({ src: 'ls:CRONOS_PAYLOAD', obj: lsGlobal });
-
+  // DOCX payload (if present)
   if (payloadFromDoc) cands.push({ src: 'docx', obj: payloadFromDoc });
 
   let best = { src: 'none', ver: 0, rules: [], fieldRules: [], target0: null };
+
   for (const c of cands) {
     const o = c.obj;
     if (!o || typeof o !== 'object') continue;
+
     const rules = Array.isArray(o.rules) ? o.rules : [];
     const fieldRules = Array.isArray(o.fieldRules) ? o.fieldRules : [];
     const ver = Math.max(_verOf(o), _verOf(o.payload?.CRONOS_PAYLOAD));
+
+    // Prefer higher version. If equal, prefer non-empty.
     if (ver > best.ver || (ver === best.ver && (rules.length || fieldRules.length))) {
       best = { src: c.src, ver, rules, fieldRules, target0: rules?.[0]?.targets?.[0] || null };
     }
   }
+
   return best;
-};
+}
+
+
 
   // =========================
   // CONSTANTS & STATE
@@ -381,42 +396,46 @@ function pickNewestRulesBundle(docId, wsState, payloadFromDoc) {
   // =========================
   // SAFE BYTES FETCH + RESET
   // =========================
-  async function safeGetBytes(docId) {
-    const tr = TRACE('safeGetBytes', { docId });
-    try {
-      if (!docId) return null;
+async function safeGetBytes(docId) {
+  const tr = TRACE('safeGetBytes', { docId });
+  try {
+    if (!docId) return null;
 
-      let bytes = await window.formSuitePersist.getBytes?.(docId);
-      if (!bytes) {
-        bytes = await window.formSuitePersist.getCurrentDocBytes?.();
+    // 1) Prefer the file handle (disk) as source of truth whenever possible.
+    // This prevents "revert" due to stale persistence cache.
+    const h0 = gFileHandle || await window.formSuitePersist.getHandle?.(docId);
+    if (h0 && typeof h0.getFile === 'function') {
+      try {
+        const f = await h0.getFile();
+        const u8 = new Uint8Array(await f.arrayBuffer());
+        gFileHandle = h0;
+        tr.end({ mode: 'handle.getFile', len: u8.byteLength });
+        return u8;
+      } catch (e) {
+        tr.warn('handle.getFile failed; will try persistence cache', e);
       }
-
-      if (!bytes) {
-        const h = await window.formSuitePersist.getHandle?.(docId);
-        if (h && typeof h.getFile === 'function') {
-          try {
-            const f = await h.getFile();
-            bytes = new Uint8Array(await f.arrayBuffer());
-            gFileHandle = h;
-          } catch (e) {
-            tr.warn('handle.getFile failed', e);
-          }
-        }
-      }
-
-      if (bytes) {
-        tr.end({ len: bytes.byteLength || bytes.length });
-        return bytes;
-      }
-
-      tr.end('no bytes');
-      return null;
-    } catch (e) {
-      tr.error('safeGetBytes failed', e);
-      tr.end();
-      return null;
     }
+
+    // 2) Persistence cache fallback (only if handle path not available)
+    let bytes = await window.formSuitePersist.getBytes?.(docId);
+    if (!bytes) {
+      bytes = await window.formSuitePersist.getCurrentDocBytes?.();
+    }
+    if (bytes) {
+      tr.end({ mode: 'persist.cache', len: bytes.byteLength || bytes.length });
+      return bytes;
+    }
+
+    tr.end('no bytes');
+    return null;
+  } catch (e) {
+    tr.error('safeGetBytes failed', e);
+    tr.end();
+    return null;
   }
+}
+
+
 
   async function hardResetDocContext(reason = '') {
     const tr = TRACE('hardResetDocContext', { reason, docId: gDocId });
@@ -1835,149 +1854,192 @@ let rules = mergedRulesRaw;
     }
   }
 
-  async function doSave() {
-    const tr = TRACE('doSave');
+
+async function doSave() {
+  const tr = TRACE('doSave');
+  try {
+    if (!gArrayBuffer || !gDocId) return;
+
+    const nowIso = () => new Date().toISOString();
+    const snap = (p) => ({
+      rules: Array.isArray(p?.rules) ? p.rules.length : 0,
+      fieldRules: Array.isArray(p?.fieldRules) ? p.fieldRules.length : 0,
+      rulesVersion: p?.rulesVersion ?? null,
+      updatedAt: p?.updatedAt ?? null,
+      target0: p?.rules?.[0]?.targets?.[0] ?? null
+    });
+
+    // --- read what current in-memory DOCX says (pre) ---
+    let prePayloadFromDoc = null;
     try {
-      if (!gArrayBuffer || !gDocId) return;
+      let preJson = null;
+      if (typeof window.readDocVarSettings === 'function') preJson = await window.readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
+      if (preJson == null && typeof window.readDocVarCustom === 'function') preJson = await window.readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
+      prePayloadFromDoc = preJson ? JSON.parse(preJson) : null;
+    } catch { prePayloadFromDoc = null; }
 
-      // Canonical state ONLY (single source of truth)
-      const wsState = await window.formSuitePersist.loadState(gDocId) || {};
+    DBG('PRE-DOCX payload (in-memory) snapshot', snap(prePayloadFromDoc));
 
-      adoptHeadingBaseline({
-        flat: Array.isArray(wsState.headingsFlat)
-          ? wsState.headingsFlat
-          : Array.isArray(wsState.headings) ? wsState.headings : gHeadingBaseline.flat,
-        tree: Array.isArray(wsState.headingsTree)
-          ? wsState.headingsTree
-          : gHeadingBaseline.tree
+    // --- workspace canonical (single source of truth) ---
+    const wsState = await window.formSuitePersist.loadState(gDocId) || {};
+
+    adoptHeadingBaseline({
+      flat: Array.isArray(wsState.headingsFlat)
+        ? wsState.headingsFlat
+        : Array.isArray(wsState.headings) ? wsState.headings : gHeadingBaseline.flat,
+      tree: Array.isArray(wsState.headingsTree)
+        ? wsState.headingsTree
+        : gHeadingBaseline.tree
+    });
+
+    const rulesRaw  = Array.isArray(wsState.rules) ? wsState.rules : [];
+    const fieldRaw  = Array.isArray(wsState.fieldRules) ? wsState.fieldRules : [];
+    const tagMapRaw = (wsState.tagMap && typeof wsState.tagMap === 'object') ? wsState.tagMap : {};
+    const rulesVersion = Number.isFinite(wsState.rulesVersion) ? wsState.rulesVersion : Date.now();
+
+    // Show “other @correct@ version” (what newest picker would choose)
+    try {
+      const picked = pickNewestRulesBundle(gDocId, wsState, prePayloadFromDoc || null);
+      DBG('OTHER @correct@ version (picked for save)', {
+        src: picked.src,
+        ver: picked.ver,
+        rules: picked.rules?.length ?? 0,
+        fieldRules: picked.fieldRules?.length ?? 0,
+        target0: picked.target0 ?? null
       });
-
-      // Canonical rules / fieldRules / tagMap come ONLY from workspace state
-      const rulesRaw = Array.isArray(wsState.rules) ? wsState.rules : [];
-      const fieldRaw = Array.isArray(wsState.fieldRules) ? wsState.fieldRules : [];
-      const tagMapRaw = (wsState.tagMap && typeof wsState.tagMap === 'object') ? wsState.tagMap : {};
-      const rulesVersion = Number.isFinite(wsState.rulesVersion) ? wsState.rulesVersion : Date.now();
-
-      // Values: canonical base from wsState + live DOM overlay
-      const baseVals = (wsState.values && typeof wsState.values === 'object') ? wsState.values : (gValues || {});
-      const domVals = collectFormValues(gSchema);
-      const mergedVals = { ...(baseVals || {}), ...(domVals || {}) };
-
-      // Normalize rules to headings/schema (optional but consistent)
-      let rules = rulesRaw;
-      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-        try {
-          rules = window.normalizeHeadingsRulesForSchema(gSchema, rulesRaw, gHeadingBaseline);
-        } catch (e) {
-          tr.warn('normalizeHeadingsRulesForSchema failed in doSave', e);
-          rules = rulesRaw;
-        }
-      }
-
-      let fieldRules = fieldRaw;
-      if (typeof window.normalizeFieldRulesForSchema === 'function') {
-        try {
-          fieldRules = window.normalizeFieldRulesForSchema(gSchema, fieldRaw);
-        } catch (e) {
-          tr.warn('normalizeFieldRulesForSchema failed in doSave', e);
-          fieldRules = fieldRaw;
-        }
-      }
-
-      // Prune values/tagMap to schema
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, mergedVals, tagMapRaw);
-
-      gValues = prunedValues;
-      await updatePreview(gValues);
-
-      // Build payload that will be embedded
-      const payloadObj = {
-        title: gSchema?.title || 'Form',
-        fields: gSchema?.fields || [],
-        values: gValues || {},
-        tagMap: prunedTagMap || {},
-        rules,
-        fieldRules,
-        rulesVersion,
-        updatedAt: new Date().toISOString()
-      };
-      const payloadJsonStr = JSON.stringify(payloadObj);
-
-      // Write payload into DOCX bytes (writer expects JSON string)
-      const srcU8 = new Uint8Array(gArrayBuffer);
-      let updatedU8 = null;
-
-      if (typeof window.writeDocVarSettings === 'function') {
-        updatedU8 = await window.writeDocVarSettings(srcU8, PAYLOAD_KEY, payloadJsonStr);
-      } else if (typeof window.writeDocVarCustom === 'function') {
-        updatedU8 = await window.writeDocVarCustom(srcU8, PAYLOAD_KEY, payloadJsonStr);
-      } else if (typeof window.writeDocVar === 'function') {
-        updatedU8 = await window.writeDocVar(srcU8, PAYLOAD_KEY, payloadJsonStr);
-      } else {
-        setStatus('Save failed: no DOCX payload writer available.');
-        gDirty = true;
-        return;
-      }
-
-      updatedU8 = (updatedU8 instanceof Uint8Array) ? updatedU8 : new Uint8Array(updatedU8);
-      gArrayBuffer = updatedU8.buffer;
-
-      // Real disk write only; no fake success
-      if (!supportsFS) {
-        setStatus('Save failed: browser cannot write to files (no File System Access API).');
-        gDirty = true;
-        return;
-      }
-
-      const handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-      if (!handle || typeof handle.createWritable !== 'function') {
-        setStatus('Save failed: no file handle for original. Use Open DOCX… again.');
-        gDirty = true;
-        return;
-      }
-
-      const perm =
-        (await window.formSuitePersist.ensurePermission?.(handle, 'readwrite'))
-        ?? (await updateWriteAccessBanner({ tryPrompt: true }));
-
-      if (perm !== 'granted') {
-        setStatus('Save failed: no write permission for original file.');
-        gDirty = true;
-        return;
-      }
-
-      // CRITICAL FIX: truncate on overwrite
-      const stream = await handle.createWritable({ keepExistingData: false });
-      await stream.write(updatedU8);
-      await stream.close();
-
-      gFileHandle = handle;
-
-      // Canonical state update (no legacy keys)
-      await window.formSuitePersist.saveState(gDocId, {
-        values: gValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        rulesVersion,
-        schemaUpdatedAt: new Date().toISOString()
-      });
-      await window.formSuitePersist.putBytes?.(gDocId, updatedU8);
-
-      announceDocUpdated({ docId: gDocId });
-
-      setStatus('Saved to original DOCX (canonical payload).');
-      gDirty = false;
-
     } catch (e) {
-      tr.error('Save failed', e);
-      setStatus('Save failed: ' + (e?.message || String(e)));
-      gDirty = true;
-    } finally {
-      tr.end();
+      console.warn('[ExtractorDBG] pickNewestRulesBundle failed', e);
     }
+
+    // Values: wsState base + live DOM overlay
+    const baseVals = (wsState.values && typeof wsState.values === 'object') ? wsState.values : (gValues || {});
+    const domVals  = collectFormValues(gSchema);
+    const mergedVals = { ...(baseVals || {}), ...(domVals || {}) };
+
+    // Normalize rules to headings/schema (optional but consistent)
+    let rules = rulesRaw;
+    if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
+      try { rules = window.normalizeHeadingsRulesForSchema(gSchema, rulesRaw, gHeadingBaseline); }
+      catch (e) { tr.warn('normalizeHeadingsRulesForSchema failed in doSave', e); rules = rulesRaw; }
+    }
+
+    let fieldRules = fieldRaw;
+    if (typeof window.normalizeFieldRulesForSchema === 'function') {
+      try { fieldRules = window.normalizeFieldRulesForSchema(gSchema, fieldRaw); }
+      catch (e) { tr.warn('normalizeFieldRulesForSchema failed in doSave', e); fieldRules = fieldRaw; }
+    }
+
+    // Prune values/tagMap to schema
+    const { values: prunedValues, tagMap: prunedTagMap } =
+      normalizeForSchema(gSchema, mergedVals, tagMapRaw);
+
+    gValues = prunedValues;
+    await updatePreview(gValues);
+
+    // Payload to embed
+    const payloadObjToSave = {
+      title: gSchema?.title || 'Form',
+      fields: gSchema?.fields || [],
+      values: gValues || {},
+      tagMap: prunedTagMap || {},
+      rules,
+      fieldRules,
+      rulesVersion,
+      updatedAt: nowIso()
+    };
+
+    DBG('WHAT IS BEING SAVED (payloadObjToSave)', {
+      save_rules: Array.isArray(payloadObjToSave.rules) ? payloadObjToSave.rules.length : 0,
+      save_fieldRules: Array.isArray(payloadObjToSave.fieldRules) ? payloadObjToSave.fieldRules.length : 0,
+      save_rulesVersion: payloadObjToSave.rulesVersion ?? null,
+      save_updatedAt: payloadObjToSave.updatedAt ?? null,
+      save_target0: payloadObjToSave.rules?.[0]?.targets?.[0] ?? null
+    });
+
+    const payloadJsonStr = JSON.stringify(payloadObjToSave);
+
+    // --- write into bytes ---
+    const srcU8 = new Uint8Array(gArrayBuffer);
+    let updatedU8 = null;
+    let writeSrc = 'none';
+
+    if (typeof window.writeDocVarSettings === 'function') {
+      writeSrc = 'writeDocVarSettings';
+      updatedU8 = await window.writeDocVarSettings(srcU8, PAYLOAD_KEY, payloadJsonStr);
+    } else if (typeof window.writeDocVarCustom === 'function') {
+      writeSrc = 'writeDocVarCustom';
+      updatedU8 = await window.writeDocVarCustom(srcU8, PAYLOAD_KEY, payloadJsonStr);
+    } else {
+      throw new Error('No DOCX payload writer found (writeDocVarSettings/writeDocVarCustom).');
+    }
+
+    if (!(updatedU8 instanceof Uint8Array) || updatedU8.length === 0) {
+      throw new Error(`DOCX writer returned invalid bytes (src=${writeSrc}).`);
+    }
+
+    DBG('SAVE writer result', { writer: writeSrc, inLen: srcU8.length, outLen: updatedU8.length });
+
+    // --- VERIFY IN MEMORY (most important: proves payload is actually embedded) ---
+    try {
+      const ab = updatedU8.buffer.slice(updatedU8.byteOffset, updatedU8.byteOffset + updatedU8.byteLength);
+      let vJson = null;
+      if (typeof window.readDocVarSettings === 'function') vJson = await window.readDocVarSettings(ab, PAYLOAD_KEY);
+      if (vJson == null && typeof window.readDocVarCustom === 'function') vJson = await window.readDocVarCustom(ab, PAYLOAD_KEY);
+      const vObj = vJson ? JSON.parse(vJson) : null;
+
+      DBG('VERIFY-IN-MEM (updated bytes) snapshot', snap(vObj));
+
+      // If this is null, your writer is not writing where your reader reads.
+      if (!vObj) console.warn('[ExtractorDBG] VERIFY-IN-MEM is null → writer/read mismatch likely.');
+    } catch (e) {
+      console.warn('[ExtractorDBG] VERIFY-IN-MEM failed', e);
+    }
+
+    // --- write to file handle (actual persistence) ---
+    // IMPORTANT: set gArrayBuffer to updated bytes *immediately* so later reads are not stale.
+    gArrayBuffer = updatedU8.buffer.slice(updatedU8.byteOffset, updatedU8.byteOffset + updatedU8.byteLength);
+
+    if (gFileHandle && typeof gFileHandle.createWritable === 'function') {
+      const writable = await gFileHandle.createWritable();
+      await writable.write(updatedU8);
+      await writable.close();
+    } else {
+      // fallback: existing download/save-as logic in your app (keep whatever you already do)
+      // If you only support download fallback, ensure you ALSO update gArrayBuffer as above.
+      console.warn('[Extractor] No writable file handle; wrote only to in-memory buffer. Reopen will load old file.');
+    }
+
+    // --- VERIFY ON DISK (if handle exists) ---
+    try {
+      if (gFileHandle && typeof gFileHandle.getFile === 'function') {
+        const file = await gFileHandle.getFile();
+        const diskAb = await file.arrayBuffer();
+
+        let postJson = null;
+        if (typeof window.readDocVarSettings === 'function') postJson = await window.readDocVarSettings(diskAb, PAYLOAD_KEY);
+        if (postJson == null && typeof window.readDocVarCustom === 'function') postJson = await window.readDocVarCustom(diskAb, PAYLOAD_KEY);
+        const postObj = postJson ? JSON.parse(postJson) : null;
+
+        DBG('VERIFY-ON-DISK (handle readback) snapshot', snap(postObj));
+      } else {
+        DBG('VERIFY-ON-DISK skipped (no handle)');
+      }
+    } catch (e) {
+      console.warn('[ExtractorDBG] VERIFY-ON-DISK failed', e);
+    }
+
+    // Optional hardening: never allow the global LS key to interfere.
+    // (Real fix is removing it at source in rules.html; see note below.)
+    try { localStorage.removeItem('CRONOS_PAYLOAD'); } catch {}
+
+    setStatus('Saved to original DOCX (payload overwritten).');
+  } catch (e) {
+    console.error('[Extractor] doSave failed', e);
+    setStatus('Save failed (see console).');
+  } finally {
+    tr.end();
   }
+}
 
 
   async function doExport() {

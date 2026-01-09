@@ -43,2546 +43,2449 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-  <script src="persistence.js"></script>
-  <script src="rules-core.js"></script>
+  <!-- <script src="persistence.js"></script> -->
+  <!-- <script src="rules-core.js"></script> -->
   <script src="docx-core.js"></script>
-  <script src="fs-active-doc.js"></script> <!-- new -->
+  <script src="fs-active-doc.js"></script>
   <script src="fs-focus-nav.js"></script>
-  <script src="fs-export-core.js"></script>
+  <!-- <script src="fs-export-core.js"></script> -->
   <script src="address-autocomplete.js"></script>
+
+  <script src="persistence.dbg.js"></script>
+<script src="rules-core.dbg.js"></script>
+<script src="fs-export-core.dbg.js"></script>
+
+
   <script>
-    const STORAGE_KEY = 'FORM_SCHEMA_V1';
-    const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
-    const supportsFS = 'showSaveFilePicker' in window;
+  'use strict';
 
-    const els = {
-      docStatus: document.getElementById('docStatus'),
-      formMount: document.getElementById('formMount'),
-      permNote:  document.getElementById('permNote'),
-      btnRegrant:document.getElementById('btnRegrant'),
+  // ============================================================
+  // Constants / DOM
+  // ============================================================
+  const STORAGE_KEY = 'FORM_SCHEMA_V1';
+  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+  const supportsFS  = 'showSaveFilePicker' in window;
+
+  const els = {
+    docStatus:  document.getElementById('docStatus'),
+    formMount:  document.getElementById('formMount'),
+    permNote:   document.getElementById('permNote'),
+    btnRegrant: document.getElementById('btnRegrant'),
+  };
+
+  // ============================================================
+  // App State (in-memory)
+  // ============================================================
+  let currentDoc = null;
+  let schema = null;
+  let values = {};
+  let fieldRules = [];      // evaluated for UI visibility
+  let btnExportMain = null;
+  let btnExportDebug = null;
+
+  let lastExportDebug = null;
+  let exportDebugEscHandler = null;
+
+  // ============================================================
+  // TRACE (simple, non-grouping console logs)
+  // ============================================================
+  (function ensureTrace() {
+    if (typeof window.TRACE === 'function') return;
+
+    const DEBUG = { on: true, seq: 0 };
+    const ts = () => new Date().toISOString().slice(11, 23);
+
+    window.TRACE = function TRACE(name, details) {
+      const id = ++DEBUG.seq;
+      const prefix = `[Form ${ts()} #${id}] ${name}`;
+      if (DEBUG.on) console.log(prefix, details ?? '');
+      const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+      return {
+        step(msg, data) { if (DEBUG.on) console.log(`${prefix}  ↳ ${msg}`, data ?? ''); },
+        warn(msg, data) { if (DEBUG.on) console.warn(`${prefix}  ⚠ ${msg}`, data ?? ''); },
+        error(msg, err) { if (DEBUG.on) console.error(`${prefix}  ✖ ${msg}`, err); },
+        end(extra) {
+          if (!DEBUG.on) return;
+          const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+          const ms = Math.round((t1 - t0) * 1000) / 1000;
+          console.log(`${prefix} done (${ms}ms)`, extra ?? '');
+        }
+      };
     };
+  })();
 
-    let currentDoc = null, schema = null, values = {}, fieldRules = [];
-    let btnExportMain = null;
-    let btnExportDebug = null;
-    let lastExportDebug = null;
-    let exportDebugEscHandler = null;
+  // ============================================================
+  // UI Helpers
+  // ============================================================
+  function setStatus(html) { els.docStatus.innerHTML = html; }
 
-
-    // =========================
-// DEBUG / TRACE (index.html)
-// =========================
-(function ensureTrace() {
-  // Do not override if another page/script already provided TRACE.
-  if (typeof window.TRACE === 'function') return;
-
-  const DEBUG = { on: true, seq: 0 };
-  const _t = () => new Date().toISOString().slice(11, 23);
-  const tagStyle = 'color:#6b7280;font-weight:600';
-
-  function tag(name) {
-    return `%c[Form ${_t()} #${++DEBUG.seq}] ${name}`;
+  function clearExportDebugPanel() {
+    if (exportDebugEscHandler) {
+      try { document.removeEventListener('keydown', exportDebugEscHandler); } catch {}
+      exportDebugEscHandler = null;
+    }
+    try {
+      const panel = document.getElementById('exportDebugPanel');
+      if (panel) panel.remove();
+    } catch {}
+    lastExportDebug = null;
   }
 
-  window.TRACE = function TRACE(name, details) {
-    const label = `${name} :: ${_t()} :: #${DEBUG.seq + 1}`;
-
-    if (DEBUG.on) {
-      try { console.groupCollapsed(tag(name), tagStyle, details ?? ''); } catch {}
-      try { console.time(label); } catch {}
+  async function hardResetOpenForm(reason = '') {
+    schema = null;
+    values = {};
+    fieldRules = [];
+    if (els.formMount) {
+      els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
     }
+    if (btnExportMain) btnExportMain.disabled = true;
+    if (btnExportDebug) btnExportDebug.disabled = true;
+    els.permNote.style.display = 'none';
+    clearExportDebugPanel();
 
-    let ended = false;
-    const safe = (fn, ...args) => { try { fn(...args); } catch {} };
+    const suffix = reason ? ` (${reason})` : '';
+    setStatus(`No active document${suffix}. Open one in the <a href="extractor.html">Extractor</a>.`);
+  }
 
-    return {
-      step(msg, data) {
-        if (!DEBUG.on) return;
-        safe(console.log, tag(`  ↳ ${msg}`), tagStyle, data ?? '');
-      },
-      warn(msg, data) {
-        if (!DEBUG.on) return;
-        safe(console.warn, tag(`  ⚠ ${msg}`), tagStyle, data ?? '');
-      },
-      error(msg, err) {
-        if (!DEBUG.on) return;
-        safe(console.error, tag(`  ✖ ${msg}`), tagStyle, err);
-      },
-      end(extra) {
-        if (ended) return;
-        ended = true;
-        if (!DEBUG.on) return;
-        if (extra) safe(console.log, tag('done'), tagStyle, extra);
-        safe(console.timeEnd, label);
-        safe(console.groupEnd);
+  // ============================================================
+  // Permission Banner
+  // ============================================================
+  async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
+    try {
+      if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; return 'unsupported'; }
+
+      const h = await window.formSuitePersist.getHandle?.(currentDoc.docId);
+      if (!h?.queryPermission) { els.permNote.style.display = 'none'; return 'no-handle'; }
+
+      let p = await h.queryPermission({ mode: 'readwrite' });
+      if (p !== 'granted' && tryPrompt) {
+        try { p = await h.requestPermission({ mode: 'readwrite' }) || p; } catch {}
       }
-    };
-  };
-})();
 
+      els.permNote.style.display = (p === 'granted') ? 'none' : 'block';
+      return p || 'denied';
+    } catch (e) {
+      console.warn('updateWriteAccessBanner failed:', e);
+      els.permNote.style.display = 'block';
+      return 'error';
+    }
+  }
 
-    function clearExportDebugPanel() {
-      if (exportDebugEscHandler) {
-        try { document.removeEventListener('keydown', exportDebugEscHandler); } catch {}
-        exportDebugEscHandler = null;
+  els.btnRegrant?.addEventListener('click', async () => {
+    const p = await updateWriteAccessBanner({ tryPrompt: true });
+    if (p === 'granted') await ensureActiveDocOrReset();
+  });
+
+  // ============================================================
+  // Robust bytes fetcher
+  // ============================================================
+  async function fetchWorkingDocBytes() {
+    try {
+      const b = await window.formSuitePersist.getCurrentDocBytes?.();
+      if (b && b.byteLength) return b;
+    } catch {}
+
+    try {
+      if (currentDoc?.docId) {
+        const b2 = await window.formSuitePersist.getBytes?.(currentDoc.docId);
+        if (b2 && b2.byteLength) return b2;
       }
-      try {
-        const panel = document.getElementById('exportDebugPanel');
-        if (panel) panel.remove();
-      } catch {}
-      lastExportDebug = null;
+    } catch {}
+
+    try {
+      const h = await window.formSuitePersist.getHandle?.(currentDoc?.docId);
+      if (h?.getFile) {
+        let p = await window.formSuitePersist.ensurePermission?.(h, 'readwrite');
+        if (p !== 'granted') p = await window.formSuitePersist.ensurePermission?.(h, 'read');
+        if (p === 'granted') {
+          const f = await h.getFile();
+          return await f.arrayBuffer();
+        }
+      }
+    } catch {}
+
+    try {
+      await window.formSuitePersist.regrantAll?.();
+      const b3 = await window.formSuitePersist.getCurrentDocBytes?.();
+      if (b3 && b3.byteLength) return b3;
+    } catch {}
+
+    return null;
+  }
+
+  // ============================================================
+  // Local schema fallback (only when no active doc)
+  // ============================================================
+  function saveLS(s) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s || {})); } catch {} }
+  function loadLS() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { return null; } }
+
+  // ============================================================
+  // Persist values (canonical)
+  // ============================================================
+  let __saveTimer = null;
+  function scheduleSaveState() {
+    clearTimeout(__saveTimer);
+    __saveTimer = setTimeout(saveState, 150);
+  }
+  function saveState() {
+    if (!currentDoc?.docId) return;
+    const cleanValues = sanitizeValues(schema, values);
+    window.formSuitePersist.saveState(currentDoc.docId, { schema, values: cleanValues });
+  }
+
+  window.addEventListener('beforeunload', () => {
+    try {
+      if (currentDoc?.docId) saveState();
+      else if (schema) saveLS(schema);
+    } catch {}
+  });
+
+  // ============================================================
+  // Payload reader (docx-core.js now handles JSZip-first docVar I/O)
+  // ============================================================
+  async function readPayloadFromDocx(bytesU8) {
+    try {
+      if (typeof window.readDocVarSettings === 'function') {
+        const raw = await window.readDocVarSettings(bytesU8, PAYLOAD_KEY);
+        if (raw) return raw;
+      }
+    } catch (e) {
+      console.warn('readDocVarSettings payload read failed (continuing):', e);
     }
 
-    // ---------- Status + Hard Reset ----------
-    function setStatus(s) { els.docStatus.innerHTML = s; }
-    async function hardResetOpenForm(reason = '') {
-      try {} catch {}
-      schema = null;
-      values = {};
-      if (els.formMount) els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-      if (btnExportMain) btnExportMain.disabled = true;
-      if (btnExportDebug) btnExportDebug.disabled = true;
-      els.permNote.style.display = 'none';
-      clearExportDebugPanel();
-      if (reason) setStatus(`No active document (${reason}). Open one in the <a href="extractor.html">Extractor</a>.`);
-      else setStatus(`No active document. Open one in the <a href="extractor.html">Extractor</a>.`);
+    try {
+      if (typeof window.readDocVarCustom === 'function') {
+        const raw = await window.readDocVarCustom(bytesU8, PAYLOAD_KEY);
+        if (raw) return raw;
+      }
+    } catch (e) {
+      console.warn('readDocVarCustom payload read failed (continuing):', e);
     }
 
-  // use shared helper
+    return null;
+  }
+
+  // ============================================================
+  // Hydrate workspace from DOCX payload if schema missing
+  // ============================================================
+  let __hydrating = false;
+  async function hydrateWorkspaceFromDocxIfEmpty() {
+    try {
+      if (__hydrating) return false;
+      if (!currentDoc?.docId) return false;
+
+      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
+      if (hasSchema) return false;
+
+      setStatus('Restoring from document…');
+      const bytes = await fetchWorkingDocBytes();
+      if (!bytes) return false;
+
+      __hydrating = true;
+
+      const payloadRaw = await readPayloadFromDocx(bytes);
+      if (!payloadRaw) return false;
+
+      let payload = null;
+      try { payload = JSON.parse(payloadRaw); } catch { payload = null; }
+
+      if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) return false;
+
+      const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
+      const cleanValues = sanitizeValues(nextSchema, payload.values || {});
+      const tagMap = payload.tagMap || {};
+
+      // Keep whatever payload had; we will normalize split below
+      const payloadRules = Array.isArray(payload.rules) ? payload.rules : (Array.isArray(payload.headingRules) ? payload.headingRules : []);
+      const payloadFieldRules = Array.isArray(payload.fieldRules) ? payload.fieldRules : (Array.isArray(payload.fieldsRules) ? payload.fieldsRules : []);
+
+      const normalized = deriveNormalizedRulesForDoc(
+        { rules: payloadRules, fieldRules: payloadFieldRules },
+        nextSchema,
+        { flat: [], tree: [] }
+      );
+
+      await window.formSuitePersist.saveState(currentDoc.docId, {
+        schema: nextSchema,
+        values: cleanValues,
+        tagMap,
+        rules: normalized.headingRules || payloadRules || [],
+        fieldRules: normalized.fieldRules || [],
+        schemaUpdatedAt: new Date().toISOString()
+      });
+
+      schema = nextSchema;
+      values = cleanValues;
+      fieldRules = normalized.fieldRules || [];
+      renderForm();
+
+      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>`);
+      return true;
+    } catch (e) {
+      console.warn('hydrateWorkspaceFromDocxIfEmpty failed:', e);
+      return false;
+    } finally {
+      __hydrating = false;
+    }
+  }
+
+  function sanitizeTagMap(tagMap, validIds) {
+    const out = {};
+    for (const [tag, fid] of Object.entries(tagMap || {})) {
+      if (validIds.has(fid)) out[tag] = fid;
+    }
+    return out;
+  }
+
+  // ============================================================
+  // Active doc boot + refresh (coalesced)
+  // ============================================================
+  let __refreshLock = false;
+  let __refreshPending = false;
+
+  async function ensureActiveDocOrReset() {
+    if (__refreshLock) { __refreshPending = true; return; }
+    __refreshLock = true;
+    try {
+      currentDoc = readActiveDocSync() || currentDoc;
+      if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
+
+      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      schema = st?.schema || null;
+      values = st?.values || {};
+
+      const baseline = {
+        flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : (Array.isArray(st?.headings) ? st.headings : []),
+        tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
+      };
+
+      const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
+      fieldRules = normalized.fieldRules || [];
+
+      if (!schema) await hydrateWorkspaceFromDocxIfEmpty();
+
+      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+      renderForm();
+      await updateWriteAccessBanner();
+    } catch (e) {
+      console.warn('ensureActiveDocOrReset failed:', e);
+    } finally {
+      __refreshLock = false;
+      if (__refreshPending) { __refreshPending = false; ensureActiveDocOrReset(); }
+    }
+  }
+
   installActiveDocListener(async (meta) => {
     currentDoc = meta;
     if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
-
-    const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-    schema = st?.schema || null;
-    values = st?.values || {};
-
-    const baseline = {
-      flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat
-        : Array.isArray(st?.headings) ? st.headings : [],
-      tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
-    };
-
-    const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
-    fieldRules = normalized.fieldRules || [];
-
-    if (!schema) {
-      await hydrateWorkspaceFromDocxIfEmpty();
-    }
-
-    setStatus(
-      `Active DOCX: <span class="kbd">${currentDoc.name}</span>` +
-      (schema ? '' : ' — <span class="muted">no schema yet</span>')
-    );
-    renderForm();
-    await updateWriteAccessBanner();
+    await ensureActiveDocOrReset();
   });
 
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible') return;
+    await ensureActiveDocOrReset();
+  });
+  window.addEventListener('focus', async () => { await ensureActiveDocOrReset(); });
 
-    // ---------- Foreground refresh (coalesced) ----------
-    let __refreshLock = false;
-    let __refreshPending = false;
+  // ============================================================
+  // Init
+  // ============================================================
+  init().catch(console.error);
 
-    async function ensureActiveDocOrReset() {
-      if (__refreshLock) { __refreshPending = true; return; }
-      __refreshLock = true;
-      try {
-        currentDoc = readActiveDocSync() || currentDoc;
-        if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
+  async function init() {
+    currentDoc = readActiveDocSync();
 
-        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        schema = st?.schema || null;
-        values = st?.values || {};
-        const baseline = {
-          flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : Array.isArray(st?.headings) ? st.headings : [],
-          tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
-        };
-        const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
-        fieldRules = normalized.fieldRules || [];
-        if (!schema) {
-          await hydrateWorkspaceFromDocxIfEmpty();
-        }
-        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-        renderForm();
-        await updateWriteAccessBanner();
-      } catch (e) {
-        console.warn('ensureActiveDocOrReset failed:', e);
-      } finally {
-        __refreshLock = false;
-        if (__refreshPending) { __refreshPending = false; ensureActiveDocOrReset(); }
-      }
+    if (currentDoc?.docId) {
+      const bytes = await fetchWorkingDocBytes();
+      if (!bytes) { await hardResetOpenForm('no bytes / no permission'); return; }
+
+      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
+      schema = st?.schema || null;
+      values = st?.values || {};
+
+      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+      await updateWriteAccessBanner();
+
+      if (!schema) await hydrateWorkspaceFromDocxIfEmpty();
+    } else {
+      schema = loadLS();
+      values = {};
     }
 
-    document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState !== 'visible') return;
-      await ensureActiveDocOrReset();
-    });
-    window.addEventListener('focus', async () => { await ensureActiveDocOrReset(); });
+    renderForm();
+  }
 
-    // ---------- Permission banner ----------
-    async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
-      try {
-        if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; return 'unsupported'; }
-        const h = await window.formSuitePersist.getHandle?.(currentDoc.docId);
-        if (!h?.queryPermission) { els.permNote.style.display = 'none'; return 'no-handle'; }
+  // ============================================================
+  // Date helpers (datediff)
+  // ============================================================
+  function diffInDays(a, b) {
+    const A = new Date(a.getFullYear(), a.getMonth(), a.getDate());
+    const B = new Date(b.getFullYear(), b.getMonth(), b.getDate());
+    return Math.floor((B - A) / (24 * 60 * 60 * 1000));
+  }
+  function diffInMonths(a, b) {
+    let months = (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
+    if (b.getDate() < a.getDate()) months -= 1;
+    return months;
+  }
+  function diffInYears(a, b) {
+    let years = b.getFullYear() - a.getFullYear();
+    const beforeAnniversary =
+      (b.getMonth() < a.getMonth()) ||
+      (b.getMonth() === a.getMonth() && b.getDate() < a.getDate());
+    if (beforeAnniversary) years -= 1;
+    return years;
+  }
 
-        let p = await h.queryPermission({ mode: 'readwrite' });
-        if (p !== 'granted' && tryPrompt) {
-          try { p = await h.requestPermission({ mode: 'readwrite' }) || p; } catch {}
-        }
-        els.permNote.style.display = (p === 'granted') ? 'none' : 'block';
-        return p || 'denied';
-      } catch (e) {
-        console.warn('updateWriteAccessBanner failed:', e);
-        els.permNote.style.display = 'block';
-        return 'error';
-      }
-    }
-    els.btnRegrant?.addEventListener('click', async () => {
-      const p = await updateWriteAccessBanner({ tryPrompt: true });
-      if (p === 'granted') {
-        await ensureActiveDocOrReset();
-      }
-    });
-
-    // ---------- Pyodide (robust) ----------;
-    // PAYLOAD_KEY is defined earlier in this script
-    // Lightweight JSZip-based payload reader (no Pyodide dependency on index)
-    async function ensureJSZip(){
-      if (window.JSZip) return;
-      await new Promise((res, rej) => {
-        const s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
-        s.onload = res; s.onerror = rej; document.head.appendChild(s);
-      });
+  function createPrettyDatepicker(input, extraOpts = {}) {
+    if (!document.getElementById('fp-zindex-fix')) {
+      const st = document.createElement('style');
+      st.id = 'fp-zindex-fix';
+      st.textContent = `
+        .flatpickr-calendar { z-index: 50; }
+        .flatpickr-wrapper { position: relative; }
+      `;
+      document.head.appendChild(st);
     }
 
-    async function readPayloadFromDocx(bytes){
-      try {
-        await ensureJSZip();
-        const zip = await window.JSZip.loadAsync(bytes);
-        // Try settings.xml → w:docVars/w:docVar
-        const settings = zip.file('word/settings.xml');
-        if (settings) {
-          const xmlText = await settings.async('string');
-          const parser = new DOMParser();
-          const xml = parser.parseFromString(xmlText, 'application/xml');
-          const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-          const docVars = xml.getElementsByTagNameNS(W_NS, 'docVars')[0];
-          if (docVars) {
-            const vars = docVars.getElementsByTagNameNS(W_NS, 'docVar');
-            for (let i = 0; i < vars.length; i++) {
-              const dv = vars[i];
-              const name = dv.getAttributeNS(W_NS, 'name') || dv.getAttribute('w:name') || dv.getAttribute('name');
-              if (name === PAYLOAD_KEY) {
-                const val = dv.getAttributeNS(W_NS, 'val') || dv.getAttribute('w:val') || dv.getAttribute('val') || '';
-                return val || null;
-              }
-            }
+    const baseOpts = {
+      dateFormat: 'Y-m-d',
+      altInput: true,
+      altFormat: 'D, j M Y',
+      allowInput: false,
+      clickOpens: true,
+      disableMobile: true,
+      static: true,
+      wrap: false,
+      monthSelectorType: 'dropdown',
+      weekNumbers: true,
+      prevArrow: '‹',
+      nextArrow: '›',
+      onReady: (_sel, _str, inst) => {
+        if (inst.altInput) {
+          inst.altInput.readOnly = true;
+          inst.altInput.tabIndex = 0;
+          inst.altInput.style.pointerEvents = 'auto';
+          const wrap = inst.altInput.parentElement;
+          if (wrap && !wrap.classList.contains('flatpickr-wrapper')) {
+            wrap.classList.add('flatpickr-wrapper');
+            if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
           }
         }
-        // Fallback: docProps/custom.xml → cp:property[name=PAYLOAD_KEY]
-        const custom = zip.file('docProps/custom.xml');
-        if (custom) {
-          const xmlText = await custom.async('string');
-          const parser = new DOMParser();
-          const xml = parser.parseFromString(xmlText, 'application/xml');
-          const props = xml.getElementsByTagName('property');
-          for (let i = 0; i < props.length; i++) {
-            const p = props[i];
-            const nm = p.getAttribute('name');
-            if (nm === PAYLOAD_KEY) {
-              const child = p.firstElementChild;
-              return child && child.textContent ? child.textContent : null;
-            }
-          }
-        }
-      } catch (e) { console.warn('readPayloadFromDocx failed', e); }
-      return null;
-    }
+      }
+    };
 
-    let __hydrating = false;
-    async function hydrateWorkspaceFromDocxIfEmpty() {
-      try {
-        if (__hydrating) return false;
-        if (!currentDoc?.docId) return false;
+    return flatpickr(input, { ...baseOpts, ...extraOpts });
+  }
 
-        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
-        if (hasSchema) return false; // nothing to do
+  function slugifyMc(s) {
+    return String(s || '')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .toLowerCase();
+  }
+  function mcExtraKey(fieldId, optionValue, extraId) {
+    return `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
+  }
 
-        setStatus('Restoring from document…');
-        const bytes = await fetchWorkingDocBytes();
-        if (!bytes) return false;
+  // ============================================================
+  // Field visibility (UI), using rules-core evaluateFieldRulesToVisibility
+  // ============================================================
+  function applyFieldVisibility() {
+    try {
+      if (!schema || !Array.isArray(schema.fields)) return;
+      const visMap = evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
 
-        __hydrating = true;
+      const clearDisabled = (el) => {
+        el.style.opacity = '';
+        el.style.pointerEvents = '';
+        el.removeAttribute('aria-disabled');
+        el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = false; } catch {} });
+      };
 
-        let payloadRaw = await readPayloadFromDocx(bytes);
-        if (!payloadRaw) return false;
+      document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
+      document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
 
-        let payload = null;
-        try { payload = JSON.parse(payloadRaw); } catch { payload = null; }
-
-        if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) return false;
-
-        // Build next schema/values
-        const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
-        const cleanValues = sanitizeValues(nextSchema, payload.values || {});
-        const tagMap = payload.tagMap || {};
-
-        // Read BOTH rule sets (be tolerant of legacy key names/typos)
-        const rules =
-          Array.isArray(payload.rules) ? payload.rules :
-          Array.isArray(payload.headingRules) ? payload.headingRules : [];
-
-        const fieldRulesRaw =
-          Array.isArray(payload.fieldRules) ? payload.fieldRules :
-          Array.isArray(payload.fieldsRules) ? payload.fieldsRules : []; // legacy guard
-
-        const normalized = deriveNormalizedRulesForDoc(
-          { rules, fieldRules: fieldRulesRaw },
-          nextSchema,
-          { flat: [], tree: [] }
+      const esc = (window.CSS && CSS.escape)
+        ? CSS.escape
+        : (s => String(s)
+          .replace(/\\/g,'\\\\')
+          .replace(/"/g,'\\"')
+          .replace(/\]/g,'\\]')
+          .replace(/\[/g,'\\[')
+          .replace(/\(/g,'\\(')
+          .replace(/\)/g,'\\)')
+          .replace(/\./g,'\\.')
         );
 
-        // Persist complete state back into workspace
-        await window.formSuitePersist.saveState(currentDoc.docId, {
-          schema: nextSchema,
-          values: cleanValues,
-          tagMap,
-          rules,
-          fieldRules: normalized.fieldRules,
-          schemaUpdatedAt: new Date().toISOString()
-        });
+      const deselectMcItem = (mcEl) => {
+        const cb = mcEl.querySelector('input[type="checkbox"][data-mc="1"]');
+        if (!cb) return;
+        const fid = cb.name;
+        const optVal = cb.value;
 
-        // refresh local variables + UI
-        schema = nextSchema;
-        values = cleanValues;
-        fieldRules = normalized.fieldRules || [];
-        renderForm();
-        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>`);
-        return true;
-      } catch (e) {
-        console.warn('hydrateWorkspaceFromDocxIfEmpty failed:', e);
-        return false;
-      } finally {
-        __hydrating = false;
-      }
-    }
+        if (cb.checked) cb.checked = false;
+        const arr = Array.isArray(values[fid]) ? values[fid].map(String) : [];
+        values[fid] = arr.filter(v => v !== String(optVal));
+        scheduleSaveState();
+      };
 
-    // ---------- Helpers: sanitize ----------
-    function sanitizeTagMap(tagMap, validIds) {
-      const out = {};
-      for (const [tag, fid] of Object.entries(tagMap || {})) {
-        if (validIds.has(fid)) out[tag] = fid;
-      }
-      return out;
-    }
+      const deselectFieldWrapper = (wrapEl) => {
+        const fid = wrapEl?.dataset?.fieldId || '';
+        if (!fid) return;
 
-    // ---------- Init ----------
-    init().catch(console.error);
+        const fld = (schema?.fields || []).find(f => String(f.id) === String(fid));
+        const t = String(fld?.type || '').toLowerCase();
 
-    async function init() {
-      currentDoc = readActiveDocSync();
-
-      if (currentDoc?.docId) {
-        const bytes = await fetchWorkingDocBytes();
-        if (!bytes) { await hardResetOpenForm('no bytes / no permission'); return; }
-
-        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        schema = st?.schema || null;
-        values = st?.values || {};
-        setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-        await updateWriteAccessBanner();
-      } else {
-        schema = loadLS();
-        values = {};
-      }
-
-      renderForm();
-    }
-
-    // ---------- Robust bytes fetcher ----------
-    async function fetchWorkingDocBytes() {
-      try { const b = await window.formSuitePersist.getCurrentDocBytes?.(); if (b && b.byteLength) return b; } catch {}
-      try { if (currentDoc?.docId) { const b2 = await window.formSuitePersist.getBytes?.(currentDoc.docId); if (b2 && b2.byteLength) return b2; } } catch {}
-      try {
-        const h = await window.formSuitePersist.getHandle?.(currentDoc?.docId);
-        if (h?.getFile) {
-          let p = await window.formSuitePersist.ensurePermission?.(h, 'readwrite');
-          if (p !== 'granted') p = await window.formSuitePersist.ensurePermission?.(h, 'read');
-          if (p === 'granted') { const f = await h.getFile(); return await f.arrayBuffer(); }
+        if (t === 'multichoice') {
+          wrapEl.querySelectorAll('input[type="checkbox"][data-mc="1"]').forEach(cb => { cb.checked = false; });
+          values[fid] = [];
+          scheduleSaveState();
+          return;
         }
-      } catch {}
-      try { await window.formSuitePersist.regrantAll?.(); const b3 = await window.formSuitePersist.getCurrentDocBytes?.(); if (b3 && b3.byteLength) return b3; } catch {}
+
+        if (t === 'select') {
+          const sel = wrapEl.querySelector('select');
+          if (sel) { sel.value = ''; values[fid] = ''; scheduleSaveState(); }
+          return;
+        }
+
+        if (t === 'text') {
+          const inp = wrapEl.querySelector('input[type="text"]:not([data-type="date"])');
+          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
+          return;
+        }
+
+        if (t === 'number') {
+          const inp = wrapEl.querySelector('input[type="number"]');
+          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
+          return;
+        }
+
+        if (t === 'date') {
+          const inp = wrapEl.querySelector('input[data-type="date"]');
+          if (inp) {
+            try { if (inp._flatpickr) inp._flatpickr.clear(); } catch {}
+            inp.value = '';
+            values[fid] = '';
+            scheduleSaveState();
+          }
+        }
+      };
+
+      for (const id of Object.keys(visMap || {})) {
+        const dir = visMap[id];
+
+        // Multi-choice option
+        if (typeof id === 'string' && id.includes('__opt__')) {
+          document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => {
+            deselectMcItem(el);
+            if (dir === 'HIDE') {
+              el.style.display = 'none';
+            } else {
+              el.style.display = '';
+              el.style.opacity = '0.5';
+              el.style.pointerEvents = 'none';
+              el.setAttribute('aria-disabled', 'true');
+              el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} });
+            }
+          });
+          continue;
+        }
+
+        // Normal field
+        document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => {
+          deselectFieldWrapper(el);
+          if (dir === 'HIDE') {
+            el.style.display = 'none';
+          } else {
+            el.style.display = '';
+            el.style.opacity = '0.5';
+            el.style.pointerEvents = 'none';
+            el.setAttribute('aria-disabled', 'true');
+            el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} });
+          }
+        });
+      }
+    } catch {
+      // keep UI resilient
+    }
+  }
+
+  // ============================================================
+  // TABLE helpers
+  // ============================================================
+  function emptyRow(field) { const r = {}; (field.columns || []).forEach(c => r[c.id] = ''); return r; }
+
+  // ============================================================
+  // Render Form (unchanged behavior; cleaned structure)
+  // ============================================================
+  function renderForm() {
+    // CSS inject (multi-choice caret)
+    (function injectMcStyles() {
+      const ID = 'mc-caret-styles';
+      if (document.getElementById(ID)) return;
+      const s = document.createElement('style');
+      s.id = ID;
+      s.textContent = `
+        .mc-item { position: relative; }
+        .mc-toggle { all: unset; position: absolute; top: 10px; right: 10px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; line-height: 1; padding: 0; margin: 0; pointer-events: auto; }
+        .mc-toggle:focus-visible { outline: 2px solid var(--focus, #2563eb); outline-offset: 2px; border-radius: 4px; }
+        .mc-caret { width: 14px; height: 14px; transition: transform .18s ease, opacity .18s ease; opacity: .85; transform: rotate(0deg); display: block; }
+        .mc-caret.open { transform: rotate(90deg); }
+        .mc-extras { display: none; height: 0; grid-template-columns: 1fr; row-gap: 8px; padding-bottom: 2px; width: 100%; }
+        .mc-option-label{ display:grid; grid-template-columns:auto 1fr; column-gap:8px; align-items:center; cursor:pointer; line-height:1.25; }
+        .mc-option-label > span{ white-space:normal; word-break:break-word; }
+        .mc-option-checkbox{ align-self:center; margin-top:0; transform:none; }
+      `;
+      document.head.appendChild(s);
+    })();
+
+    const mount = els.formMount;
+    mount.innerHTML = '';
+
+    if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
+      mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
+      if (btnExportMain) btnExportMain.disabled = true;
+      if (btnExportDebug) btnExportDebug.disabled = true;
+      return;
+    }
+
+    // Ensure tables have correct row shape
+    (schema.fields || []).forEach(f => {
+      if (f.type !== 'table') return;
+      if (!Array.isArray(values[f.id])) {
+        const min = Math.max(0, parseInt(f.minRows || 0, 10));
+        values[f.id] = Array.from({ length: min }, () => emptyRow(f));
+      } else {
+        values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
+      }
+    });
+
+    const form = document.createElement('form');
+    form.classList.add('form-grid');
+
+    if (schema.title) {
+      const h = document.createElement('h4');
+      h.textContent = schema.title;
+      h.style.gridColumn = '1 / -1';
+      form.appendChild(h);
+    }
+
+    const inputRefs = {};
+    const mcDateRefs = {};
+    const datediffRefs = [];
+    const guardPairs = [];
+
+    function setExtrasOpen(extras, caretEl, open) {
+      if (!extras) return;
+      const DURATION = 220;
+
+      if (extras._animTimer) { clearTimeout(extras._animTimer); extras._animTimer = null; }
+      if (extras._onTe) { extras.removeEventListener('transitionend', extras._onTe); extras._onTe = null; }
+
+      const onEnd = () => {
+        extras.style.transition = '';
+        extras.style.willChange = '';
+        extras.style.opacity = open ? '1' : '0';
+        extras.style.marginTop = open ? '8px' : '0px';
+        extras.style.height = open ? 'auto' : '0px';
+        extras.style.overflow = 'visible';
+        if (!open) extras.style.display = 'none';
+        if (extras._onTe) {
+          extras.removeEventListener('transitionend', extras._onTe);
+          extras._onTe = null;
+        }
+      };
+      extras._onTe = onEnd;
+      extras.addEventListener('transitionend', onEnd);
+
+      if (caretEl) caretEl.classList.toggle('open', !!open);
+
+      if (open) {
+        extras.style.display = 'grid';
+        extras.style.overflow = 'visible';
+        extras.style.willChange = 'height, opacity, margin-top';
+        extras.style.opacity = '0';
+        extras.style.marginTop = '0px';
+        extras.style.height = '0px';
+
+        requestAnimationFrame(() => {
+          const h = extras.scrollHeight;
+          extras.classList.add('open');
+          extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
+          extras.style.height = h + 'px';
+          extras.style.opacity = '1';
+          extras.style.marginTop = '8px';
+          extras._animTimer = setTimeout(onEnd, DURATION + 40);
+        });
+      } else {
+        const current = extras.offsetHeight || extras.scrollHeight || 0;
+        extras.classList.remove('open');
+        extras.style.display = 'grid';
+        extras.style.overflow = 'hidden';
+        extras.style.willChange = 'height, opacity, margin-top';
+        extras.style.transition = '';
+        extras.style.height = current + 'px';
+        extras.style.opacity = '1';
+        extras.style.marginTop = '8px';
+
+        requestAnimationFrame(() => {
+          extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
+          extras.style.height = '0px';
+          extras.style.opacity = '0';
+          extras.style.marginTop = '0px';
+          extras._animTimer = setTimeout(onEnd, DURATION + 40);
+        });
+      }
+    }
+
+    function getDateForField(fid) {
+      const el = inputRefs[fid];
+      if (!el) return null;
+      const fp = el?._flatpickr;
+      if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
+
+      const iso = values[fid];
+      if (iso) {
+        const d = (window.flatpickr && window.flatpickr.parseDate)
+          ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
+          : new Date(String(iso));
+        return (d && !isNaN(d)) ? d : null;
+      }
       return null;
     }
 
-    // ---- DATEDIFF helpers ----
-    function diffInDays(a, b) {
-      const A = new Date(a.getFullYear(), a.getMonth(), a.getDate());
-      const B = new Date(b.getFullYear(), b.getMonth(), b.getDate());
-      const ms = B - A;
-      return Math.floor(ms / (24*60*60*1000));
-    }
-    function diffInMonths(a, b) {
-      let months = (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
-      if (b.getDate() < a.getDate()) months -= 1;
-      return months;
-    }
-    function diffInYears(a, b) {
-      let years = b.getFullYear() - a.getFullYear();
-      const bBeforeAnniversary = (b.getMonth() < a.getMonth()) || (b.getMonth() === a.getMonth() && b.getDate() < a.getDate());
-      if (bBeforeAnniversary) years -= 1;
-      return years;
-    }
-
-    function createPrettyDatepicker(input, extraOpts = {}) {
-      if (!document.getElementById('fp-zindex-fix')) {
-        const st = document.createElement('style');
-        st.id = 'fp-zindex-fix';
-        st.textContent = `
-          .flatpickr-calendar { z-index: 50; }
-          .flatpickr-wrapper { position: relative; }
-        `;
-        document.head.appendChild(st);
-      }
-
-      const baseOpts = {
-        dateFormat: 'Y-m-d',
-        altInput: true,
-        altFormat: 'D, j M Y',
-        allowInput: false,
-        clickOpens: true,
-        disableMobile: true,
-        static: true,
-        wrap: false,
-        monthSelectorType: 'dropdown',
-        weekNumbers: true,
-        prevArrow: '‹',
-        nextArrow: '›',
-        onReady: (_sel, _str, inst) => {
-          if (inst.altInput) {
-            inst.altInput.readOnly = true;
-            inst.altInput.tabIndex = 0;
-            inst.altInput.style.pointerEvents = 'auto';
-            const wrap = inst.altInput.parentElement;
-            if (wrap && !wrap.classList.contains('flatpickr-wrapper')) {
-              wrap.classList.add('flatpickr-wrapper');
-              if (getComputedStyle(wrap).position === 'static') {
-                wrap.style.position = 'relative';
-              }
-            }
-          }
+    function recomputeDatediffs() {
+      datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
+        const { a, b } = resolve();
+        if (!a || !b) {
+          outEl.textContent = '—';
+          values[storeKey] = null;
+          return;
         }
-      };
-
-      return flatpickr(input, { ...baseOpts, ...extraOpts });
-    }
-
-    function slugifyMc(s) {
-      return String(s || '')
-        .normalize('NFKD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/[^a-zA-Z0-9]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .toLowerCase();
-    }
-    function mcExtraKey(fieldId, optionValue, extraId) {
-      return `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
-    }
-
-    // ---------- Render whole form ----------
-    function renderForm() {
-      (function injectMcStyles(){
-        const ID = 'mc-caret-styles';
-        if (document.getElementById(ID)) return;
-        const s = document.createElement('style');
-        s.id = ID;
-        s.textContent = `
-          .mc-item { position: relative; }
-          .mc-toggle { all: unset; position: absolute; top: 10px; right: 10px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; line-height: 1; padding: 0; margin: 0; pointer-events: auto; }
-          .mc-toggle:focus-visible { outline: 2px solid var(--focus, #2563eb); outline-offset: 2px; border-radius: 4px; }
-          .mc-caret { width: 14px; height: 14px; transition: transform .18s ease, opacity .18s ease; opacity: .85; transform: rotate(0deg); display: block; }
-          .mc-caret.open { transform: rotate(90deg); }
-          .mc-extras { display: none; height: 0; grid-template-columns: 1fr; row-gap: 8px; padding-bottom: 2px; width: 100%; }
-          .mc-option-label{ display:grid; grid-template-columns:auto 1fr; column-gap:8px; align-items:center; cursor:pointer; line-height:1.25; }
-          .mc-option-label > span{ white-space:normal; word-break:break-word; }
-          .mc-option-checkbox{ align-self:center; margin-top:0; transform:none; }
-        `;
-        document.head.appendChild(s);
-      })();
-
-      const __slugifyMc = (window.slugifyMc) ? window.slugifyMc : function (s) {
-        return String(s || '')
-          .normalize('NFKD')
-          .replace(/[\u0300-\u036f]/g, '')
-          .replace(/[^a-zA-Z0-9]+/g, '_')
-          .replace(/^_+|_+$/g, '')
-          .toLowerCase();
-      };
-      const __mcExtraKey = (window.mcExtraKey) ? window.mcExtraKey : function (fieldId, optionValue, extraId) {
-        return `${fieldId}__${__slugifyMc(optionValue)}__${__slugifyMc(extraId)}`;
-      };
-
-      const mount = els.formMount;
-      mount.innerHTML = '';
-      if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
-        mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-        if (btnExportMain) btnExportMain.disabled = true;
-        if (btnExportDebug) btnExportDebug.disabled = true;
-        return;
-      }
-
-      (schema.fields || []).forEach(f => {
-        if (f.type === 'table') {
-          if (!Array.isArray(values[f.id])) {
-            const min = Math.max(0, parseInt(f.minRows || 0, 10));
-            values[f.id] = Array.from({ length: min }, () => emptyRow(f));
-          } else {
-            values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
-          }
-        }
+        const days = diffInDays(a, b);
+        const months = diffInMonths(a, b);
+        const years = diffInYears(a, b);
+        const display = `${days}D ${months}M ${years}Y (${days} Days total)`;
+        outEl.textContent = display;
+        values[storeKey] = { days, months, years, formatted: display };
       });
+      scheduleSaveState();
+    }
+    window.recomputeDatediffs = recomputeDatediffs;
 
-      const form = document.createElement('form');
-      form.classList.add('form-grid');
+    // ---- Fields ----
+    (schema.fields || []).forEach(f => {
+      const wrap = document.createElement('div');
+      wrap.className = 'field';
+      try { wrap.dataset.fieldId = String(f.id || ''); } catch {}
 
-      if (schema.title) {
-        const h = document.createElement('h4');
-        h.textContent = schema.title;
-        h.style.gridColumn = '1 / -1';
-        form.appendChild(h);
-      }
+      if (f.type === 'address' || f.type === 'datediff') wrap.classList.add('span-2');
+      if (f.type === 'table') wrap.classList.add('full', 'field--table');
+      if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice');
+      if (f.wide === true) wrap.classList.add('span-2');
+      if (f.full === true) wrap.classList.add('full');
 
-      const inputRefs  = {};
-      const mcDateRefs = {};
-      const datediffRefs = [];
-      const guardPairs = [];
-
-      function scheduleSaveState() {
-        clearTimeout(scheduleSaveState._t);
-        scheduleSaveState._t = setTimeout(() => {
-          if (!currentDoc?.docId) return;
-          const cleanValues = sanitizeValues(schema, values);
-          window.formSuitePersist.saveState(currentDoc.docId, { schema, values: cleanValues });
-        }, 150);
-      }
-
-      function setExtrasOpen(extras, caretEl, open) {
-        if (!extras) return;
-        const DURATION = 220;
-
-        if (extras._animTimer) { clearTimeout(extras._animTimer); extras._animTimer = null; }
-        if (extras._onTe) { extras.removeEventListener('transitionend', extras._onTe); extras._onTe = null; }
-
-        const onEnd = () => {
-          extras.style.transition = '';
-          extras.style.willChange = '';
-          extras.style.opacity = open ? '1' : '0';
-          extras.style.marginTop = open ? '8px' : '0px';
-          extras.style.height = open ? 'auto' : '0px';
-          extras.style.overflow = 'visible';
-          if (!open) extras.style.display = 'none';
-          if (extras._onTe) {
-            extras.removeEventListener('transitionend', extras._onTe);
-            extras._onTe = null;
-          }
-        };
-        extras._onTe = onEnd;
-        extras.addEventListener('transitionend', onEnd);
-
-        if (caretEl) caretEl.classList.toggle('open', !!open);
-
-        if (open) {
-          extras.style.display = 'grid';
-          extras.style.overflow = 'visible';
-          extras.style.willChange = 'height, opacity, margin-top';
-          extras.style.opacity = '0';
-          extras.style.marginTop = '0px';
-          extras.style.height = '0px';
-
-          requestAnimationFrame(() => {
-            const h = extras.scrollHeight;
-            extras.classList.add('open');
-            extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
-            extras.style.height = h + 'px';
-            extras.style.opacity = '1';
-            extras.style.marginTop = '8px';
-            extras._animTimer = setTimeout(onEnd, DURATION + 40);
-          });
-        } else {
-          const current = extras.offsetHeight || extras.scrollHeight || 0;
-          extras.classList.remove('open');
-          extras.style.display = 'grid';
-          extras.style.overflow = 'hidden';
-          extras.style.willChange = 'height, opacity, margin-top';
-          extras.style.transition = '';
-          extras.style.height = current + 'px';
-          extras.style.opacity = '1';
-          extras.style.marginTop = '8px';
-
-          requestAnimationFrame(() => {
-            extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
-            extras.style.height = '0px';
-            extras.style.opacity = '0';
-            extras.style.marginTop = '0px';
-            extras._animTimer = setTimeout(onEnd, DURATION + 40);
-          });
+      if (f.type !== 'address') {
+        const label = document.createElement('label');
+        label.htmlFor = f.id;
+        label.textContent = f.label || f.id;
+        if (f.required) {
+          const star = document.createElement('span');
+          star.textContent = ' *';
+          star.style.color = '#ef4444';
+          label.appendChild(star);
         }
+        wrap.appendChild(label);
       }
 
-      (schema.fields || []).forEach(f => {
-        const wrap = document.createElement('div');
-        wrap.className = 'field';
-        try { wrap.dataset.fieldId = String(f.id || ''); } catch {}
-        if (f.type === 'address' || f.type === 'datediff') wrap.classList.add('span-2');
-        if (f.type === 'table') wrap.classList.add('full', 'field--table');
-        if (f.type === 'multichoice') wrap.classList.add('full', 'field--multichoice');
-        if (f.wide === true) wrap.classList.add('span-2');
-        if (f.full === true) wrap.classList.add('full');
+      // Text
+      if (f.type === 'text') {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = f.id; input.name = f.id; input.style.width = '100%';
+        if (f.required) input.required = true;
+        if (values[f.id] != null) input.value = values[f.id];
+        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); applyFieldVisibility(); });
+        wrap.appendChild(input);
+        inputRefs[f.id] = input;
+      }
 
-        if (f.type !== 'address') {
-          const label = document.createElement('label');
-          label.htmlFor = f.id;
-          label.textContent = f.label || f.id;
-          if (f.required) {
-            const star = document.createElement('span');
-            star.textContent = ' *';
-            star.style.color = '#ef4444';
-            label.appendChild(star);
-          }
-          wrap.appendChild(label);
-        }
+      // Number
+      else if (f.type === 'number') {
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.id = f.id; input.name = f.id; input.style.width = '100%';
+        if (f.required) input.required = true;
+        if (values[f.id] != null) input.value = values[f.id];
+        input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); applyFieldVisibility(); });
+        wrap.appendChild(input);
+        inputRefs[f.id] = input;
+      }
 
-        if (f.type === 'text') {
-          const input = document.createElement('input');
-          input.type = 'text';
-          input.id = f.id; input.name = f.id; input.style.width = '100%';
-          if (f.required) input.required = true;
-          if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); try{ applyFieldVisibility(); }catch{} });
-          wrap.appendChild(input);
-          inputRefs[f.id] = input;
+      // Select
+      else if (f.type === 'select') {
+        const input = document.createElement('select');
+        input.id = f.id; input.name = f.id; input.style.width = '100%';
+        (f.options || []).forEach(v => {
+          const o = document.createElement('option');
+          o.value = String(v); o.textContent = String(v);
+          input.appendChild(o);
+        });
+        if (f.required) input.required = true;
+        if (values[f.id] != null) input.value = values[f.id];
+        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); applyFieldVisibility(); });
+        wrap.appendChild(input);
+        inputRefs[f.id] = input;
+      }
 
-        } else if (f.type === 'number') {
-          const input = document.createElement('input');
-          input.type = 'number';
-          input.id = f.id; input.name = f.id; input.style.width = '100%';
-          if (f.required) input.required = true;
-          if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); try{ applyFieldVisibility(); }catch{} });
-          wrap.appendChild(input);
-          inputRefs[f.id] = input;
+      // Date
+      else if (f.type === 'date') {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.dataset.type = 'date';
+        input.id = f.id; input.name = f.id; input.style.width = '100%';
+        if (f.required) input.required = true;
+        wrap.appendChild(input);
 
-        } else if (f.type === 'select') {
-          const input = document.createElement('select');
-          input.id = f.id; input.name = f.id; input.style.width = '100%';
-          (f.options || []).forEach(v => {
-            const o = document.createElement('option');
-            o.value = String(v); o.textContent = String(v);
-            input.appendChild(o);
-          });
-          if (f.required) input.required = true;
-          if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); try{ applyFieldVisibility(); }catch{} });
-          wrap.appendChild(input);
-          inputRefs[f.id] = input;
+        const fp = createPrettyDatepicker(input, {
+          dateFormat: 'Y-m-d',
+          altInput: true,
+          altFormat: 'D-d-M-Y',
+          allowInput: false,
+          clickOpens: true,
+          defaultDate: values[f.id] || null,
+          onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
+          onChange: () => { values[f.id] = input.value; scheduleSaveState(); recomputeDatediffs(); applyFieldVisibility(); },
+          onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); recomputeDatediffs(); applyFieldVisibility(); }
+        });
+        fp.set('allowInput', false);
+        if (fp.altInput) fp.altInput.readOnly = true;
+        inputRefs[f.id] = input;
+      }
 
-        } else if (f.type === 'multichoice') {
-          const mcContainer = document.createElement('div');
-          mcContainer.className = 'mc-container';
-          mcContainer.style.display = 'block';
+      // Address
+      else if (f.type === 'address') {
+        const host = document.createElement('div');
+        host.className = 'addr-host';
+        wrap.appendChild(host);
 
-          const items = [];
-          if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
-            f.mc.groups.forEach(g => (g.items || []).forEach(it =>
-              items.push({
-                value: String(it.value ?? it.label ?? ''),
-                alwaysSelected: !!it.alwaysSelected,
-                preselected: !!it.preselected,
-                fields: Array.isArray(it.fields) ? it.fields : []
-              })
-            ));
-          } else if (Array.isArray(f.options)) {
-            f.options.forEach(v => {
-              if (v && typeof v === 'object') {
-                items.push({
-                  value: String(v.value ?? v.label ?? ''),
-                  alwaysSelected: !!v.alwaysSelected,
-                  preselected: !!v.preselected,
-                  fields: Array.isArray(v.fields) ? v.fields : []
-                });
-              } else {
-                items.push({ value: String(v), alwaysSelected: false, preselected: false, fields: [] });
-              }
+        const initial =
+          typeof values[f.id] === 'string'
+            ? { formatted: values[f.id] }
+            : (values[f.id] || null);
+
+        AddressAuto.mount(host, {
+          id: f.id,
+          label: f.label || 'Address',
+          required: !!f.required,
+          value: initial || null,
+          onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
+        });
+      }
+
+      // Table
+      else if (f.type === 'table') {
+        renderTableField(wrap, f);
+      }
+
+      // Datediff (top level)
+      else if (f.type === 'datediff') {
+        const fromId = f.fromId || f.from || '';
+        const toId = f.toId || f.to || '';
+
+        const out = document.createElement('div');
+        out.id = f.id;
+        out.className = 'datediff-out kbd';
+        out.setAttribute('role', 'status');
+        out.setAttribute('aria-live', 'polite');
+        out.textContent = '—';
+        wrap.appendChild(out);
+
+        datediffRefs.push({
+          storeKey: f.id,
+          outEl: out,
+          resolve: () => ({ a: getDateForField(fromId), b: getDateForField(toId) })
+        });
+
+        guardPairs.push({ fromId, toId });
+      }
+
+      // Multichoice (kept behavior; just structured)
+      else if (f.type === 'multichoice') {
+        const mcContainer = document.createElement('div');
+        mcContainer.className = 'mc-container';
+        mcContainer.style.display = 'block';
+
+        const items = [];
+        if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
+          f.mc.groups.forEach(g => (g.items || []).forEach(it => {
+            items.push({
+              value: String(it.value ?? it.label ?? ''),
+              alwaysSelected: !!it.alwaysSelected,
+              preselected: !!it.preselected,
+              fields: Array.isArray(it.fields) ? it.fields : []
             });
+          }));
+        } else if (Array.isArray(f.options)) {
+          f.options.forEach(v => {
+            if (v && typeof v === 'object') {
+              items.push({
+                value: String(v.value ?? v.label ?? ''),
+                alwaysSelected: !!v.alwaysSelected,
+                preselected: !!v.preselected,
+                fields: Array.isArray(v.fields) ? v.fields : []
+              });
+            } else {
+              items.push({ value: String(v), alwaysSelected: false, preselected: false, fields: [] });
+            }
+          });
+        }
+
+        if (!Array.isArray(values[f.id])) {
+          const initial = items.filter(it => it.alwaysSelected || it.preselected).map(it => it.value);
+          if (initial.length) values[f.id] = initial.slice();
+        }
+        const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
+
+        function persistMainSelection() {
+          const boxes = mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
+          values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
+          scheduleSaveState();
+        }
+
+        function getDateForExtraKey(key) {
+          const el = mcDateRefs[key];
+          const fp = el?._flatpickr;
+          if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
+
+          const iso = values[key];
+          if (iso) {
+            const d = (window.flatpickr && window.flatpickr.parseDate)
+              ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
+              : new Date(String(iso));
+            return (d && !isNaN(d)) ? d : null;
           }
+          return null;
+        }
 
-          if (!Array.isArray(values[f.id])) {
-            const initial = items.filter(it => it.alwaysSelected || it.preselected).map(it => it.value);
-            if (initial.length) values[f.id] = initial.slice();
-          }
-          const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
+        function drawOption(item, parentHost) {
+          const optVal = item.value;
+          const optId = `${f.id}__${slugifyMc(optVal)}`;
+          const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
 
-          function persistMainSelection() {
-            const boxes = mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
-            values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
-            scheduleSaveState();
-          }
+          const card = document.createElement('div');
+          card.className = 'mc-item';
+          try { card.dataset.optId = `${f.id}__opt__${slugifyMc(optVal)}`; } catch {}
+          card.style.position = 'relative';
+          card.style.display = 'flex';
+          card.style.flexDirection = 'column';
+          card.style.alignItems = 'stretch';
+          card.style.background = 'var(--card)';
+          card.style.border = '1px solid var(--border-strong)';
+          card.style.borderRadius = '8px';
+          card.style.padding = '10px 10px';
 
-          function drawOption(item, parentHost) {
-            const optVal = item.value;
-            const optId  = `${f.id}__${__slugifyMc(optVal)}`;
-            const hasExtras = Array.isArray(item.fields) && item.fields.length > 0;
+          const row1 = document.createElement('div');
+          row1.className = 'row';
+          row1.style.alignItems = 'center';
+          row1.style.gap = '8px';
+          row1.style.width = '100%';
 
-            const card = document.createElement('div');
-            card.className = 'mc-item';
-            try { card.dataset.optId = `${f.id}__opt__${__slugifyMc(optVal)}`; } catch {}
-            card.style.position = 'relative';
-            card.style.display = 'flex';
-            card.style.flexDirection = 'column';
-            card.style.alignItems = 'stretch';
-            card.style.background = 'var(--card)';
-            card.style.border = '1px solid var(--border-strong)';
-            card.style.borderRadius = '8px';
-            card.style.padding = '10px 10px';
+          const left = document.createElement('label');
+          left.className = 'mc-option-label';
+          left.setAttribute('for', optId);
+          left.style.flex = '1';
 
-            const row1 = document.createElement('div');
-            row1.className = 'row';
-            row1.style.alignItems = 'center';
-            row1.style.gap = '8px';
-            row1.style.width = '100%';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.dataset.mc = '1';
+          cb.name = f.id;
+          cb.id = optId;
+          cb.value = optVal;
+          cb.className = 'mc-option-checkbox';
 
-            const left = document.createElement('label');
-            left.className = 'mc-option-label';
-            left.setAttribute('for', optId);
-            left.style.flex = '1';
+          const locked = !!item.alwaysSelected;
+          const isPreselected = !!item.preselected;
+          cb.checked = locked || selected.has(optVal) || (!selected.size && isPreselected);
+          if (locked) cb.disabled = true;
 
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.dataset.mc = '1';
-            cb.name = f.id;
-            cb.id = optId;
-            cb.value = optVal;
-            cb.className = 'mc-option-checkbox';
+          const txt = document.createElement('span');
+          txt.textContent = optVal;
 
-            const locked = !!item.alwaysSelected;
-            const isPreselected = !!item.preselected;
-            cb.checked = locked || selected.has(optVal) || (!selected.size && isPreselected);
-            if (locked) cb.disabled = true;
+          left.appendChild(cb);
+          left.appendChild(txt);
+          row1.appendChild(left);
 
-            const txt = document.createElement('span');
-            txt.textContent = optVal;
+          let extrasWrap = null;
+          if (hasExtras) {
+            extrasWrap = document.createElement('div');
+            extrasWrap.className = 'mc-extras';
+            extrasWrap.style.display = 'none';
+            extrasWrap.style.height = '0px';
 
-            left.appendChild(cb);
-            left.appendChild(txt);
-            row1.appendChild(left);
+            const mountExtraFields = () => {
+              extrasWrap.innerHTML = '';
+              if (!item.fields.length) return;
 
-            let extrasWrap = null;
-            if (hasExtras) {
-              extrasWrap = document.createElement('div');
-              extrasWrap.className = 'mc-extras';
-              extrasWrap.style.display = 'none';
-              extrasWrap.style.height  = '0px';
+              item.fields.forEach(ex => {
+                const exType = String(ex?.type || 'text');
+                const exId = String(ex?.id || '');
+                if (!exId) return;
 
-              const mountExtraFields = () => {
-                extrasWrap.innerHTML = '';
-                if (!item.fields.length) return;
+                const exKey = mcExtraKey(f.id, optVal, exId);
 
-                function getDateForExtraKey(key) {
-                  const el = mcDateRefs[key];
-                  const fp = el?._flatpickr;
-                  if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
-                  const iso = values[key];
-                  if (iso) {
-                    const d = (window.flatpickr && window.flatpickr.parseDate)
-                      ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
-                      : new Date(String(iso));
-                    return (d && !isNaN(d)) ? d : null;
-                  }
-                  return null;
-                }
+                const line = document.createElement('div');
+                line.className = 'row';
+                line.style.gap = '8px';
+                line.style.alignItems = 'center';
+                line.style.marginTop = '2px';
 
-                item.fields.forEach(ex => {
-                  const exType = (ex?.type) ? String(ex.type) : 'text';
-                  const exId   = String(ex?.id || '');
-                  if (!exId) return;
-                  const exKey  = __mcExtraKey(f.id, optVal, exId);
+                const lab = document.createElement('label');
+                lab.textContent = String(ex?.label || exId);
+                lab.style.minWidth = '120px';
+                lab.style.color = 'var(--muted)';
 
-                  const line = document.createElement('div');
-                  line.className = 'row';
-                  line.style.gap = '8px';
-                  line.style.alignItems = 'center';
-                  line.style.marginTop = '2px';
-
-                  const lab = document.createElement('label');
-                  lab.textContent = String(ex?.label || exId);
-                  lab.style.minWidth = '120px';
-                  lab.style.color = 'var(--muted)';
-
-                  if (exType === 'date') {
-                    const input = document.createElement('input');
-                    input.type = 'text';
-                    input.dataset.type = 'date';
-                    input.style.minWidth = '180px';
-
-                    extrasWrap.appendChild(line);
-                    line.appendChild(lab);
-                    line.appendChild(input);
-
-                    const fp = createPrettyDatepicker(input, {
-                      dateFormat: 'Y-m-d',
-                      altInput: true,
-                      altFormat: 'D, j M Y',
-                      defaultDate: values[exKey] || null,
-                      onChange: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); },
-                      onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); }
-                    });
-                    fp.set('allowInput', false);
-                    if (fp.altInput) fp.altInput.readOnly = true;
-
-                    mcDateRefs[exKey] = input;
-                    return;
-                  }
-
-                  if (exType === 'number') {
-                    const input = document.createElement('input');
-                    input.type = 'number';
-                    input.value = values[exKey] ?? '';
-                    input.addEventListener('change', () => {
-                      values[exKey] = Number(input.value);
-                      scheduleSaveState();
-                    });
-                    extrasWrap.appendChild(line);
-                    line.appendChild(lab);
-                    line.appendChild(input);
-                    return;
-                  }
-
-                  if (exType === 'datediff') {
-                    const fromId = ex.fromId || ex.from || '';
-                    const toId   = ex.toId   || ex.to   || '';
-                    const fromKey = __mcExtraKey(f.id, optVal, fromId);
-                    const toKey   = __mcExtraKey(f.id, optVal, toId);
-
-                    const out = document.createElement('div');
-                    out.className = 'datediff-out kbd';
-                    out.setAttribute('role', 'status');
-                    out.setAttribute('aria-live', 'polite');
-                    out.textContent = '—';
-
-                    extrasWrap.appendChild(line);
-                    line.appendChild(lab);
-                    line.appendChild(out);
-
-                    datediffRefs.push({
-                      storeKey: exKey,
-                      outEl: out,
-                      resolve: () => ({ a: getDateForExtraKey(fromKey), b: getDateForExtraKey(toKey) })
-                    });
-                    return;
-                  }
-
+                // Date
+                if (exType === 'date') {
                   const input = document.createElement('input');
                   input.type = 'text';
-                  input.value = values[exKey] ?? '';
-                  input.addEventListener('change', () => {
-                    values[exKey] = input.value;
-                    scheduleSaveState();
-                  });
+                  input.dataset.type = 'date';
+                  input.style.minWidth = '180px';
+
                   extrasWrap.appendChild(line);
                   line.appendChild(lab);
                   line.appendChild(input);
-                });
-              };
-              mountExtraFields();
-            }
 
-            let caretBtn = null, caretIcon = null;
-            if (hasExtras) {
-              caretBtn = document.createElement('button');
-              caretBtn.type = 'button';
-              caretBtn.className = 'mc-toggle';
-              caretBtn.setAttribute('aria-expanded', 'false');
-              caretBtn.setAttribute('aria-label', 'Details ein-/ausklappen');
+                  const fp = createPrettyDatepicker(input, {
+                    dateFormat: 'Y-m-d',
+                    altInput: true,
+                    altFormat: 'D, j M Y',
+                    defaultDate: values[exKey] || null,
+                    onChange: () => { values[exKey] = input.value; scheduleSaveState(); recomputeDatediffs(); },
+                    onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); recomputeDatediffs(); }
+                  });
+                  fp.set('allowInput', false);
+                  if (fp.altInput) fp.altInput.readOnly = true;
 
-              const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-              svg.setAttribute('viewBox', '0 0 24 24');
-              svg.setAttribute('width', '14');
-              svg.setAttribute('height', '14');
-              svg.classList.add('mc-caret');
-              const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-              path.setAttribute('d', 'M9 18l6-6-6-6');
-              path.setAttribute('fill', 'none');
-              path.setAttribute('stroke', 'currentColor');
-              path.setAttribute('stroke-width', '2');
-              path.setAttribute('stroke-linecap', 'round');
-              path.setAttribute('stroke-linejoin', 'round');
-              svg.appendChild(path);
+                  mcDateRefs[exKey] = input;
+                  return;
+                }
 
-              caretIcon = svg;
-              caretBtn.appendChild(svg);
-              row1.appendChild(caretBtn);
+                // Number
+                if (exType === 'number') {
+                  const input = document.createElement('input');
+                  input.type = 'number';
+                  input.value = values[exKey] ?? '';
+                  input.addEventListener('change', () => { values[exKey] = Number(input.value); scheduleSaveState(); });
+                  extrasWrap.appendChild(line);
+                  line.appendChild(lab);
+                  line.appendChild(input);
+                  return;
+                }
 
-              setExtrasOpen(extrasWrap, caretIcon, false);
+                // Datediff (extra)
+                if (exType === 'datediff') {
+                  const fromId = ex.fromId || ex.from || '';
+                  const toId = ex.toId || ex.to || '';
+                  const fromKey = mcExtraKey(f.id, optVal, fromId);
+                  const toKey = mcExtraKey(f.id, optVal, toId);
 
-              caretBtn.addEventListener('click', (e) => {
-                e.preventDefault();
-                const willOpen = !extrasWrap.classList.contains('open');
-                caretBtn.setAttribute('aria-expanded', String(willOpen));
-                setExtrasOpen(extrasWrap, caretIcon, willOpen);
+                  const out = document.createElement('div');
+                  out.className = 'datediff-out kbd';
+                  out.setAttribute('role', 'status');
+                  out.setAttribute('aria-live', 'polite');
+                  out.textContent = '—';
+
+                  extrasWrap.appendChild(line);
+                  line.appendChild(lab);
+                  line.appendChild(out);
+
+                  datediffRefs.push({
+                    storeKey: exKey,
+                    outEl: out,
+                    resolve: () => ({ a: getDateForExtraKey(fromKey), b: getDateForExtraKey(toKey) })
+                  });
+                  return;
+                }
+
+                // Default text
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = values[exKey] ?? '';
+                input.addEventListener('change', () => { values[exKey] = input.value; scheduleSaveState(); });
+                extrasWrap.appendChild(line);
+                line.appendChild(lab);
+                line.appendChild(input);
               });
-            }
+            };
 
-            cb.addEventListener('change', () => {
-              if (locked) { cb.checked = true; return; }
-              persistMainSelection();
-              try { applyFieldVisibility(); } catch {}
-            });
-
-            card.appendChild(row1);
-            if (extrasWrap) card.appendChild(extrasWrap);
-            parentHost.appendChild(card);
+            mountExtraFields();
           }
 
-          if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
-            f.mc.groups.forEach(g => {
-              const section = document.createElement('div');
-              section.className = 'mc-group-section';
-              section.style.marginBottom = '10px';
+          // Toggle caret
+          let caretBtn = null, caretIcon = null;
+          if (hasExtras) {
+            caretBtn = document.createElement('button');
+            caretBtn.type = 'button';
+            caretBtn.className = 'mc-toggle';
+            caretBtn.setAttribute('aria-expanded', 'false');
+            caretBtn.setAttribute('aria-label', 'Details ein-/ausklappen');
 
-              if (g.title) {
-                const h = document.createElement('div');
-                h.className = 'mc-group-title';
-                h.textContent = String(g.title);
-                h.style.color = 'var(--muted)';
-                h.style.fontWeight = '600';
-                h.style.fontSize = '.95rem';
-                h.style.margin = '4px 0 6px';
-                section.appendChild(h);
-              }
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('viewBox', '0 0 24 24');
+            svg.setAttribute('width', '14');
+            svg.setAttribute('height', '14');
+            svg.classList.add('mc-caret');
 
-              const host = document.createElement('div');
-              host.className = 'mc-group';
-              host.style.display = 'grid';
-              host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
-              host.style.gap = '8px 16px';
-              host.style.alignItems = 'start';
-              if (Number.isFinite(+f.columns) && +f.columns > 0) {
-                host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
-              }
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', 'M9 18l6-6-6-6');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke', 'currentColor');
+            path.setAttribute('stroke-width', '2');
+            path.setAttribute('stroke-linecap', 'round');
+            path.setAttribute('stroke-linejoin', 'round');
+            svg.appendChild(path);
 
-              (g.items || []).forEach(it => drawOption({
-                value: String(it.value ?? it.label ?? ''),
-                alwaysSelected: !!it.alwaysSelected,
-                preselected: !!it.preselected,
-                fields: Array.isArray(it.fields) ? it.fields : []
-              }, host));
+            caretIcon = svg;
+            caretBtn.appendChild(svg);
+            row1.appendChild(caretBtn);
 
-              section.appendChild(host);
-              mcContainer.appendChild(section);
+            setExtrasOpen(extrasWrap, caretIcon, false);
+
+            caretBtn.addEventListener('click', (e) => {
+              e.preventDefault();
+              const willOpen = !extrasWrap.classList.contains('open');
+              caretBtn.setAttribute('aria-expanded', String(willOpen));
+              setExtrasOpen(extrasWrap, caretIcon, willOpen);
             });
-          } else {
+          }
+
+          cb.addEventListener('change', () => {
+            if (locked) { cb.checked = true; return; }
+            persistMainSelection();
+            applyFieldVisibility();
+          });
+
+          card.appendChild(row1);
+          if (extrasWrap) card.appendChild(extrasWrap);
+          parentHost.appendChild(card);
+        }
+
+        // groups layout
+        if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
+          f.mc.groups.forEach(g => {
+            const section = document.createElement('div');
+            section.className = 'mc-group-section';
+            section.style.marginBottom = '10px';
+
+            if (g.title) {
+              const h = document.createElement('div');
+              h.className = 'mc-group-title';
+              h.textContent = String(g.title);
+              h.style.color = 'var(--muted)';
+              h.style.fontWeight = '600';
+              h.style.fontSize = '.95rem';
+              h.style.margin = '4px 0 6px';
+              section.appendChild(h);
+            }
+
             const host = document.createElement('div');
             host.className = 'mc-group';
             host.style.display = 'grid';
             host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
             host.style.gap = '8px 16px';
             host.style.alignItems = 'start';
+
             if (Number.isFinite(+f.columns) && +f.columns > 0) {
               host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
             }
-            items.forEach(it => drawOption(it, host));
-            mcContainer.appendChild(host);
-          }
 
-          values[f.id] = Array.from(mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
-            .filter(b => b.checked)
-            .map(b => b.value);
-          scheduleSaveState();
+            (g.items || []).forEach(it => drawOption({
+              value: String(it.value ?? it.label ?? ''),
+              alwaysSelected: !!it.alwaysSelected,
+              preselected: !!it.preselected,
+              fields: Array.isArray(it.fields) ? it.fields : []
+            }, host));
 
-          wrap.appendChild(mcContainer);
-
-        } else if (f.type === 'date') {
-          const input = document.createElement('input');
-          input.type = 'text';
-          input.dataset.type = 'date';
-          input.id = f.id; input.name = f.id; input.style.width = '100%';
-          if (f.required) input.required = true;
-          wrap.appendChild(input);
-
-          const fp = createPrettyDatepicker(input, {
-            dateFormat: 'Y-m-d',
-            altInput: true,
-            altFormat: 'D-d-M-Y',
-            allowInput: false,
-            clickOpens: true,
-            defaultDate: values[f.id] || null,
-            onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
-            onChange: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); try{ applyFieldVisibility(); }catch{} },
-            onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); if (window.recomputeDatediffs) window.recomputeDatediffs(); try{ applyFieldVisibility(); }catch{} }
+            section.appendChild(host);
+            mcContainer.appendChild(section);
           });
-          fp.set('allowInput', false);
-          if (fp.altInput) fp.altInput.readOnly = true;
-          inputRefs[f.id] = input;
-
-        } else if (f.type === 'address') {
+        } else {
           const host = document.createElement('div');
-          host.className = 'addr-host';
-          wrap.appendChild(host);
+          host.className = 'mc-group';
+          host.style.display = 'grid';
+          host.style.gridTemplateColumns = 'repeat(auto-fill,minmax(260px,1fr))';
+          host.style.gap = '8px 16px';
+          host.style.alignItems = 'start';
 
-          const initial =
-            typeof values[f.id] === 'string'
-              ? { formatted: values[f.id] }
-              : (values[f.id] || null);
-
-          AddressAuto.mount(host, {
-            id: f.id,
-            label: f.label || 'Address',
-            required: !!f.required,
-            value: initial || null,
-            onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
-          });
-
-        } else if (f.type === 'table') {
-          renderTableField(wrap, f);
-
-        } else if (f.type === 'datediff') {
-          const fromId = f.fromId || f.from || '';
-          const toId   = f.toId   || f.to   || '';
-
-          const out = document.createElement('div');
-          out.id = f.id;
-          out.className = 'datediff-out kbd';
-          out.setAttribute('role', 'status');
-          out.setAttribute('aria-live', 'polite');
-          out.textContent = '—';
-          wrap.appendChild(out);
-
-          datediffRefs.push({
-            storeKey: f.id,
-            outEl: out,
-            resolve: () => ({ a: getDateForField(fromId), b: getDateForField(toId) })
-          });
-
-          guardPairs.push({ fromId, toId });
-
-        } else {
-          const input = document.createElement('input');
-          input.type = 'text';
-          input.id = f.id; input.name = f.id; input.style.width = '100%';
-          if (values[f.id] != null) input.value = values[f.id];
-          input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
-          wrap.appendChild(input);
-          inputRefs[f.id] = input;
-        }
-
-        form.appendChild(wrap);
-      });
-
-      const bar = document.createElement('div');
-      bar.className = 'bar';
-      bar.style.gridColumn = '1 / -1';
-      btnExportMain = document.createElement('button');
-      btnExportMain.type = 'button';
-      btnExportMain.className = 'secondary';
-      btnExportMain.textContent = 'Export…';
-      btnExportMain.disabled = !currentDoc;
-      btnExportMain.addEventListener('click', onExportFromOpenForm);
-      bar.appendChild(btnExportMain);
-
-      btnExportDebug = document.createElement('button');
-      btnExportDebug.type = 'button';
-      btnExportDebug.className = 'ghost';
-      btnExportDebug.textContent = 'Debug export…';
-      btnExportDebug.disabled = !currentDoc;
-      btnExportDebug.addEventListener('click', onExportDebugFromOpenForm);
-      bar.appendChild(btnExportDebug);
-      form.appendChild(bar);
-      form.addEventListener('change', () => { try { applyFieldVisibility(); } catch {} });
-      mount.appendChild(form);
-
-      try { applyFieldVisibility(); } catch {}
-
-      function getDateForField(fid) {
-        const el = inputRefs[fid];
-        if (!el) return null;
-        const fp = el?._flatpickr;
-        if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
-        const iso = values[fid];
-        if (iso) {
-          const d = (window.flatpickr && window.flatpickr.parseDate)
-            ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
-            : new Date(String(iso));
-          return (d && !isNaN(d)) ? d : null;
-        }
-        return null;
-      }
-
-      function recomputeDatediffs() {
-        datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
-          const { a, b } = resolve();
-          if (!a || !b) {
-            outEl.textContent = '—';
-            values[storeKey] = null;
-            return;
-          }
-          const days   = diffInDays(a, b);
-          const months = diffInMonths(a, b);
-          const years  = diffInYears(a, b);
-          const display = `${days}D ${months}M ${years}Y (${days} Days total)`;
-          outEl.textContent = display;
-          values[storeKey] = { days, months, years, formatted: display };
-        });
-        scheduleSaveState();
-      }
-      window.recomputeDatediffs = recomputeDatediffs;
-
-      (function wireTopLevelDateGuards() {
-        function nextDay(d) {
-          if (!d) return null;
-          const n = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-          n.setDate(n.getDate() + 1);
-          return n;
-        }
-        guardPairs.forEach(({ fromId, toId }) => {
-          const fromEl = inputRefs[fromId];
-          const toEl   = inputRefs[toId];
-          const fpFrom = fromEl?._flatpickr;
-          const fpTo   = toEl?._flatpickr;
-          if (!fpFrom || !fpTo) return;
-
-          fpFrom.set('allowInput', false);
-          fpTo.set('allowInput', false);
-          if (fpFrom.altInput) fpFrom.altInput.readOnly = true;
-          if (fpTo.altInput)   fpTo.altInput.readOnly   = true;
-
-          const syncToWithFrom = (opts = { snap: true, jump: true }) => {
-            const from = fpFrom.selectedDates?.[0] || null;
-            const minForTo = nextDay(from);
-            fpTo.set('minDate', minForTo || null);
-
-            const toSel = fpTo.selectedDates?.[0] || null;
-            if (!toSel && minForTo && opts.snap) fpTo.setDate(minForTo, true);
-            if (from && toSel && toSel <= from && opts.snap) fpTo.setDate(minForTo, true);
-            if (minForTo && opts.jump) { try { fpTo.jumpToDate(minForTo); } catch {} }
-
-            if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs();
-          };
-
-          syncToWithFrom({ snap: true, jump: false });
-          fpFrom.config.onChange.push(() => syncToWithFrom({ snap: true, jump: true }));
-          fpFrom.config.onValueUpdate.push(() => syncToWithFrom({ snap: true, jump: true }));
-          fpTo.config.onOpen.push(() => syncToWithFrom({ snap: false, jump: true }));
-
-          const recompute = () => { if (window.recomputeDatediffs) window.recomputeDatediffs(); };
-          fpTo.config.onChange.push(recompute);
-          fpTo.config.onValueUpdate.push(recompute);
-        });
-      })();
-
-      recomputeDatediffs();
-    }
-
-
-
-    // ----- TABLE FIELD -----
-    function renderTableField(container, field) {
-      if (!Array.isArray(values[field.id])) values[field.id] = [];
-      const data = values[field.id];
-
-      const editorWrap = document.createElement('div');
-      editorWrap.style.display = 'flex';
-      editorWrap.style.flexWrap = 'wrap';
-      editorWrap.style.gap = '10px';
-
-      const editorInputs = {};
-      let editorState = emptyRow(field);
-
-      const measurer = document.createElement('canvas').getContext('2d');
-      function textPx(str) {
-        try { measurer.font = getComputedStyle(document.body).font; } catch {}
-        return Math.ceil(measurer.measureText(String(str || '')).width);
-      }
-      function longest(arr) {
-        return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
-      }
-
-      function rowIsEmpty(row) {
-        return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
-      }
-
-      (field.columns || []).forEach(col => {
-        const pair = document.createElement('label');
-        pair.style.display = 'flex';
-        pair.style.alignItems = 'center';
-        pair.style.gap = '8px';
-
-        const lbl = document.createElement('span');
-        lbl.textContent = col.label || col.id;
-
-        let el;
-        if (col.type === 'select') {
-          el = document.createElement('select');
-          const opts = (col.options || []);
-          const empty = document.createElement('option'); empty.value = ''; empty.textContent = '— wählen —';
-          el.appendChild(empty);
-          opts.forEach(opt => {
-            const o = document.createElement('option');
-            o.value = String(opt); o.textContent = String(opt);
-            el.appendChild(o);
-          });
-          el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
-          el.addEventListener('change', () => { editorState[col.id] = el.value; });
-        } else if (col.type === 'date') {
-          el = document.createElement('input');
-          el.type = 'text';
-          el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
-          setTimeout(() => {
-            flatpickr(el, { allowInput: true, dateFormat: 'Y-m-d', onChange: () => { editorState[col.id] = el.value; } });
-          }, 0);
-          el.addEventListener('change', () => { editorState[col.id] = el.value; });
-        } else if (col.type === 'number') {
-          el = document.createElement('input');
-          el.type = 'number';
-          el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
-          el.addEventListener('change', () => { editorState[col.id] = el.value; });
-        } else {
-          el = document.createElement('input');
-          el.type = 'text';
-          el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
-          el.addEventListener('change', () => { editorState[col.id] = el.value; });
-        }
-
-        editorInputs[col.id] = el;
-        pair.appendChild(lbl);
-        pair.appendChild(el);
-        editorWrap.appendChild(pair);
-      });
-
-      const toolbar = document.createElement('div');
-      toolbar.className = 'row';
-      toolbar.style.gap = '8px';
-
-      const btnAdd = document.createElement('button');
-      btnAdd.type = 'button';
-      btnAdd.textContent = 'Zeile hinzufügen';
-
-      const btnSave = document.createElement('button');
-      btnSave.type = 'button';
-      btnSave.className = 'secondary';
-      btnSave.textContent = 'Änderungen speichern';
-
-      const btnDelete = document.createElement('button');
-      btnDelete.type = 'button';
-      btnDelete.className = 'ghost';
-      btnDelete.textContent = 'Zeile löschen';
-
-      const btnCancel = document.createElement('button');
-      btnCancel.type = 'button';
-      btnCancel.className = 'ghost';
-      btnCancel.textContent = 'Abbrechen';
-
-      toolbar.appendChild(btnAdd);
-      toolbar.appendChild(btnSave);
-      toolbar.appendChild(btnDelete);
-      toolbar.appendChild(btnCancel);
-
-      const status = document.createElement('div');
-      status.className = 'muted';
-      status.style.minHeight = '1.2em';
-
-      const tableWrap = document.createElement('div');
-      tableWrap.style.overflow = 'auto';
-      const table = document.createElement('table');
-      table.style.width = '100%';
-      const thead = document.createElement('thead');
-      const trh = document.createElement('tr');
-      thead.appendChild(trh);
-      const tbody = document.createElement('tbody');
-      table.appendChild(thead);
-      table.appendChild(tbody);
-      tableWrap.appendChild(table);
-
-      (field.columns || []).forEach(col => {
-        const th = document.createElement('th');
-        th.textContent = col.label || col.id;
-        trh.appendChild(th);
-      });
-
-      let selectedIndex = -1;
-      let visibleIndexMap = [];
-
-      function applyPreviewVisibility() {
-        const hasAnyNonEmpty = data.some(r => !rowIsEmpty(r));
-        tableWrap.style.display = hasAnyNonEmpty ? '' : 'none';
-      }
-
-      function drawTable() {
-        tbody.innerHTML = '';
-        visibleIndexMap = [];
-
-        data.forEach((row, realIdx) => {
-          if (rowIsEmpty(row)) return;
-
-          const tr = document.createElement('tr');
-          const isSel = realIdx === selectedIndex;
-
-          if (isSel) {
-            tr.style.background = '#DBEAFE';
-            tr.style.outline = '2px solid #93C5FD';
-            tr.style.outlineOffset = '-2px';
-          } else {
-            tr.style.background = '';
-            tr.style.outline = '';
-            tr.style.outlineOffset = '';
+          if (Number.isFinite(+f.columns) && +f.columns > 0) {
+            host.style.gridTemplateColumns = `repeat(${+f.columns}, minmax(220px, 1fr))`;
           }
 
-          tr.addEventListener('click', () => {
-            selectedIndex = realIdx;
-            drawTable();
-            loadIntoEditor(realIdx);
-          });
-
-          (field.columns || []).forEach(col => {
-            const td = document.createElement('td');
-            td.textContent = row[col.id] || '';
-            tr.appendChild(td);
-          });
-
-          tbody.appendChild(tr);
-          visibleIndexMap.push(realIdx);
-        });
-
-        applyPreviewVisibility();
-        updateToolbar();
-      }
-
-      function clearSelection() { selectedIndex = -1; updateToolbar(); }
-      function updateToolbar() {
-        const min = Math.max(0, parseInt(field.minRows || 0, 10));
-        const max = Math.max(0, parseInt(field.maxRows || 0, 10));
-
-        btnAdd.disabled = (max && data.length >= max);
-
-        const showEdit = selectedIndex >= 0;
-        btnSave.style.display   = showEdit ? '' : 'none';
-        btnDelete.style.display = showEdit ? '' : 'none';
-        btnCancel.style.display = showEdit ? '' : 'none';
-
-        btnSave.disabled   = !showEdit;
-        btnDelete.disabled = !showEdit || (min && data.length <= min);
-        btnCancel.disabled = !showEdit;
-      }
-
-      function loadIntoEditor(i) {
-        const rec = data[i] || emptyRow(field);
-        for (const c of (field.columns || [])) {
-          const el = editorInputs[c.id];
-          if (!el) continue;
-          el.value = rec[c.id] || '';
+          items.forEach(it => drawOption(it, host));
+          mcContainer.appendChild(host);
         }
-        editorState = { ...rec };
-        updateToolbar();
+
+        // set main values from DOM (ensures alwaysSelected is applied)
+        values[f.id] = Array.from(mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
+          .filter(b => b.checked)
+          .map(b => b.value);
+        scheduleSaveState();
+
+        wrap.appendChild(mcContainer);
       }
 
-      function resetEditor() {
-        editorState = emptyRow(field);
-        for (const c of (field.columns || [])) {
-          const el = editorInputs[c.id];
-          if (!el) continue;
-          el.value = '';
-        }
+      // Default fallback input
+      else {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = f.id; input.name = f.id; input.style.width = '100%';
+        if (values[f.id] != null) input.value = values[f.id];
+        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+        wrap.appendChild(input);
+        inputRefs[f.id] = input;
       }
 
-      if (!data.length) {
-        const min = Math.max(0, parseInt(field.minRows || 0, 10));
-        for (let i = 0; i < min; i++) data.push(emptyRow(field));
-      }
-      drawTable();
-
-      btnAdd.addEventListener('click', () => {
-        const max = Math.max(0, parseInt(field.maxRows || 0, 10));
-        if (max && data.length >= max) return;
-
-        data.push({ ...editorState });
-        drawTable();
-        scheduleSaveState();
-        status.textContent = 'Zeile hinzugefügt.';
-      });
-
-      btnSave.addEventListener('click', () => {
-        if (selectedIndex < 0 || selectedIndex >= data.length) return;
-        data[selectedIndex] = { ...editorState };
-        drawTable();
-        scheduleSaveState();
-        status.textContent = 'Änderungen gespeichert.';
-      });
-
-      btnDelete.addEventListener('click', () => {
-        const min = Math.max(0, parseInt(field.minRows || 0, 10));
-        if (selectedIndex < 0) return;
-        if (min && data.length <= min) return;
-        data.splice(selectedIndex, 1);
-        clearSelection();
-        resetEditor();
-        drawTable();
-        scheduleSaveState();
-        status.textContent = 'Zeile gelöscht.';
-      });
-
-      btnCancel.addEventListener('click', () => {
-        clearSelection();
-        resetEditor();
-        drawTable();
-        status.textContent = 'Auswahl aufgehoben.';
-      });
-
-      container.appendChild(editorWrap);
-      container.appendChild(toolbar);
-      container.appendChild(status);
-      container.appendChild(tableWrap);
-
-      applyPreviewVisibility();
-    }
-
-    function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
-
-    let __saveTimer = null;
-    function scheduleSaveState() {
-      clearTimeout(__saveTimer);
-      __saveTimer = setTimeout(saveState, 150);
-    }
-    function saveState() {
-      if (!currentDoc?.docId) return;
-      const cleanValues = sanitizeValues(schema, values);
-      window.formSuitePersist.saveState(currentDoc.docId, { schema, values: cleanValues });
-    }
-    function saveLS(s) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s||{})); } catch {} }
-    function loadLS() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)||'null'); } catch { return null; } }
-    window.addEventListener('beforeunload', () => {
-      try { if (currentDoc?.docId) saveState(); else if (schema) saveLS(schema); } catch {}
+      form.appendChild(wrap);
     });
 
-    // ---------- Export (Open Form) ----------
-    function summarizeForExportDebug(value) {
-      const seen = new WeakSet();
+    // ---- Export buttons ----
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    bar.style.gridColumn = '1 / -1';
 
-      function helper(val, depth) {
-        if (val == null) return val;
-        const t = typeof val;
-        if (t === 'number' || t === 'boolean') return val;
-        if (t === 'string') {
-          if (val.length <= 2048) return val;
-          return {
-            type: 'string',
-            length: val.length,
-            head: val.slice(0, 1024),
-            tail: val.slice(-256)
-          };
-        }
-        if (typeof Date !== 'undefined' && val instanceof Date) {
-          return { type: 'Date', value: val.toISOString() };
-        }
-        if (typeof Blob !== 'undefined' && val instanceof Blob) {
-          return { type: 'Blob', size: val.size, mime: val.type || '' };
-        }
-        if (typeof File !== 'undefined' && val instanceof File) {
-          return { type: 'File', name: val.name, size: val.size, mime: val.type || '' };
-        }
-        if (val instanceof Uint8Array) {
-          const previewLength = Math.min(32, val.length);
-          const preview = Array.from(val.slice(0, previewLength));
-          const hexPreview = preview.map(b => b.toString(16).padStart(2, '0')).join(' ');
-          return {
-            type: 'Uint8Array',
-            length: val.length,
-            previewHex: hexPreview,
-          };
-        }
-        if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) {
-          return { type: 'ArrayBuffer', byteLength: val.byteLength };
-        }
-        if (val && typeof val.byteLength === 'number' && val.buffer instanceof ArrayBuffer) {
-          return { type: val.constructor?.name || 'TypedArray', byteLength: val.byteLength };
-        }
-        if (t === 'function') {
-          return `[Function ${val.name || 'anonymous'}]`;
-        }
-        if (seen.has(val)) {
-          return '[Circular]';
-        }
-        const nextDepth = depth + 1;
-        if (nextDepth > 2) {
-          if (Array.isArray(val)) {
-            return `[Array length=${val.length}]`;
-          }
-          const keys = Object.keys(val);
-          return `[Object keys=${keys.length}]`;
-        }
-        seen.add(val);
-        try {
-          if (Array.isArray(val)) {
-            const max = nextDepth === 1 ? 20 : 10;
-            const out = val.slice(0, max).map(item => helper(item, nextDepth));
-            if (val.length > max) {
-              out.push(`… ${val.length - max} more`);
-            }
-            return out;
-          }
-          if (val instanceof Map) {
-            const entries = Array.from(val.entries());
-            const max = nextDepth === 1 ? 20 : 10;
-            const mapped = entries.slice(0, max).map(([k, v]) => [helper(k, nextDepth), helper(v, nextDepth)]);
-            if (entries.length > max) {
-              mapped.push(["__truncated__", `… ${entries.length - max} more`]);
-            }
-            return mapped;
-          }
-          const entries = Object.entries(val);
-          const max = nextDepth === 1 ? 25 : 12;
-          const out = {};
-          for (let i = 0; i < entries.length && i < max; i++) {
-            const [k, v] = entries[i];
-            out[k] = helper(v, nextDepth);
-          }
-          if (entries.length > max) {
-            out.__truncated__ = `… ${entries.length - max} more keys`;
-          }
-          return out;
-        } finally {
-          seen.delete(val);
-        }
+    btnExportMain = document.createElement('button');
+    btnExportMain.type = 'button';
+    btnExportMain.className = 'secondary';
+    btnExportMain.textContent = 'Export…';
+    btnExportMain.disabled = !currentDoc;
+    btnExportMain.addEventListener('click', onExportFromOpenForm);
+    bar.appendChild(btnExportMain);
+
+    btnExportDebug = document.createElement('button');
+    btnExportDebug.type = 'button';
+    btnExportDebug.className = 'ghost';
+    btnExportDebug.textContent = 'Debug export…';
+    btnExportDebug.disabled = !currentDoc;
+    btnExportDebug.addEventListener('click', onExportDebugFromOpenForm);
+    bar.appendChild(btnExportDebug);
+
+    form.appendChild(bar);
+    form.addEventListener('change', () => applyFieldVisibility());
+    mount.appendChild(form);
+
+    // ---- Date guards (from -> to minDate next day) ----
+    (function wireTopLevelDateGuards() {
+      function nextDay(d) {
+        if (!d) return null;
+        const n = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+        n.setDate(n.getDate() + 1);
+        return n;
       }
 
-      return helper(value, 0);
+      guardPairs.forEach(({ fromId, toId }) => {
+        const fromEl = inputRefs[fromId];
+        const toEl = inputRefs[toId];
+        const fpFrom = fromEl?._flatpickr;
+        const fpTo = toEl?._flatpickr;
+        if (!fpFrom || !fpTo) return;
+
+        fpFrom.set('allowInput', false);
+        fpTo.set('allowInput', false);
+        if (fpFrom.altInput) fpFrom.altInput.readOnly = true;
+        if (fpTo.altInput) fpTo.altInput.readOnly = true;
+
+        const syncToWithFrom = (opts = { snap: true, jump: true }) => {
+          const from = fpFrom.selectedDates?.[0] || null;
+          const minForTo = nextDay(from);
+          fpTo.set('minDate', minForTo || null);
+
+          const toSel = fpTo.selectedDates?.[0] || null;
+          if (!toSel && minForTo && opts.snap) fpTo.setDate(minForTo, true);
+          if (from && toSel && toSel <= from && opts.snap) fpTo.setDate(minForTo, true);
+          if (minForTo && opts.jump) { try { fpTo.jumpToDate(minForTo); } catch {} }
+
+          recomputeDatediffs();
+        };
+
+        syncToWithFrom({ snap: true, jump: false });
+        fpFrom.config.onChange.push(() => syncToWithFrom({ snap: true, jump: true }));
+        fpFrom.config.onValueUpdate.push(() => syncToWithFrom({ snap: true, jump: true }));
+        fpTo.config.onOpen.push(() => syncToWithFrom({ snap: false, jump: true }));
+
+        const recompute = () => recomputeDatediffs();
+        fpTo.config.onChange.push(recompute);
+        fpTo.config.onValueUpdate.push(recompute);
+      });
+    })();
+
+    recomputeDatediffs();
+    applyFieldVisibility();
+  }
+
+  // ============================================================
+  // TABLE FIELD (kept behavior)
+  // ============================================================
+  function renderTableField(container, field) {
+    if (!Array.isArray(values[field.id])) values[field.id] = [];
+    const data = values[field.id];
+
+    const editorWrap = document.createElement('div');
+    editorWrap.style.display = 'flex';
+    editorWrap.style.flexWrap = 'wrap';
+    editorWrap.style.gap = '10px';
+
+    const editorInputs = {};
+    let editorState = emptyRow(field);
+
+    const measurer = document.createElement('canvas').getContext('2d');
+    function textPx(str) {
+      try { measurer.font = getComputedStyle(document.body).font; } catch {}
+      return Math.ceil(measurer.measureText(String(str || '')).width);
+    }
+    function longest(arr) {
+      return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
     }
 
-    function buildExportDebugSnapshot(plan, context) {
-      return {
-        generatedAt: new Date().toISOString(),
-        plan,
-        context: summarizeForExportDebug(context || {}),
-      };
+    function rowIsEmpty(row) {
+      return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
     }
 
-    function stringifyExportDebugSnapshot(plan, context) {
-      try {
-        return JSON.stringify(buildExportDebugSnapshot(plan, context), null, 2);
-      } catch (err) {
-        console.warn('Failed to stringify export debug snapshot', err);
-        return JSON.stringify({
-          error: 'stringify-failed',
-          message: err?.message || String(err || 'unknown-error'),
-        }, null, 2);
+    (field.columns || []).forEach(col => {
+      const pair = document.createElement('label');
+      pair.style.display = 'flex';
+      pair.style.alignItems = 'center';
+      pair.style.gap = '8px';
+
+      const lbl = document.createElement('span');
+      lbl.textContent = col.label || col.id;
+
+      let el;
+      if (col.type === 'select') {
+        el = document.createElement('select');
+        const opts = (col.options || []);
+        const empty = document.createElement('option'); empty.value = ''; empty.textContent = '— wählen —';
+        el.appendChild(empty);
+        opts.forEach(opt => {
+          const o = document.createElement('option');
+          o.value = String(opt); o.textContent = String(opt);
+          el.appendChild(o);
+        });
+        el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
+        el.addEventListener('change', () => { editorState[col.id] = el.value; });
+      } else if (col.type === 'date') {
+        el = document.createElement('input');
+        el.type = 'text';
+        el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
+        setTimeout(() => {
+          flatpickr(el, { allowInput: true, dateFormat: 'Y-m-d', onChange: () => { editorState[col.id] = el.value; } });
+        }, 0);
+        el.addEventListener('change', () => { editorState[col.id] = el.value; });
+      } else if (col.type === 'number') {
+        el = document.createElement('input');
+        el.type = 'number';
+        el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
+        el.addEventListener('change', () => { editorState[col.id] = el.value; });
+      } else {
+        el = document.createElement('input');
+        el.type = 'text';
+        el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
+        el.addEventListener('change', () => { editorState[col.id] = el.value; });
+      }
+
+      editorInputs[col.id] = el;
+      pair.appendChild(lbl);
+      pair.appendChild(el);
+      editorWrap.appendChild(pair);
+    });
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'row';
+    toolbar.style.gap = '8px';
+
+    const btnAdd = document.createElement('button');
+    btnAdd.type = 'button';
+    btnAdd.textContent = 'Zeile hinzufügen';
+
+    const btnSave = document.createElement('button');
+    btnSave.type = 'button';
+    btnSave.className = 'secondary';
+    btnSave.textContent = 'Änderungen speichern';
+
+    const btnDelete = document.createElement('button');
+    btnDelete.type = 'button';
+    btnDelete.className = 'ghost';
+    btnDelete.textContent = 'Zeile löschen';
+
+    const btnCancel = document.createElement('button');
+    btnCancel.type = 'button';
+    btnCancel.className = 'ghost';
+    btnCancel.textContent = 'Abbrechen';
+
+    toolbar.appendChild(btnAdd);
+    toolbar.appendChild(btnSave);
+    toolbar.appendChild(btnDelete);
+    toolbar.appendChild(btnCancel);
+
+    const status = document.createElement('div');
+    status.className = 'muted';
+    status.style.minHeight = '1.2em';
+
+    const tableWrap = document.createElement('div');
+    tableWrap.style.overflow = 'auto';
+    const table = document.createElement('table');
+    table.style.width = '100%';
+    const thead = document.createElement('thead');
+    const trh = document.createElement('tr');
+    thead.appendChild(trh);
+    const tbody = document.createElement('tbody');
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+
+    (field.columns || []).forEach(col => {
+      const th = document.createElement('th');
+      th.textContent = col.label || col.id;
+      trh.appendChild(th);
+    });
+
+    let selectedIndex = -1;
+
+    function applyPreviewVisibility() {
+      const hasAnyNonEmpty = data.some(r => !rowIsEmpty(r));
+      tableWrap.style.display = hasAnyNonEmpty ? '' : 'none';
+    }
+
+    function drawTable() {
+      tbody.innerHTML = '';
+      data.forEach((row, realIdx) => {
+        if (rowIsEmpty(row)) return;
+
+        const tr = document.createElement('tr');
+        const isSel = realIdx === selectedIndex;
+
+        if (isSel) {
+          tr.style.background = '#DBEAFE';
+          tr.style.outline = '2px solid #93C5FD';
+          tr.style.outlineOffset = '-2px';
+        }
+
+        tr.addEventListener('click', () => {
+          selectedIndex = realIdx;
+          drawTable();
+          loadIntoEditor(realIdx);
+        });
+
+        (field.columns || []).forEach(col => {
+          const td = document.createElement('td');
+          td.textContent = row[col.id] || '';
+          tr.appendChild(td);
+        });
+
+        tbody.appendChild(tr);
+      });
+
+      applyPreviewVisibility();
+      updateToolbar();
+    }
+
+    function clearSelection() { selectedIndex = -1; updateToolbar(); }
+    function updateToolbar() {
+      const min = Math.max(0, parseInt(field.minRows || 0, 10));
+      const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+
+      btnAdd.disabled = (max && data.length >= max);
+
+      const showEdit = selectedIndex >= 0;
+      btnSave.style.display = showEdit ? '' : 'none';
+      btnDelete.style.display = showEdit ? '' : 'none';
+      btnCancel.style.display = showEdit ? '' : 'none';
+
+      btnSave.disabled = !showEdit;
+      btnDelete.disabled = !showEdit || (min && data.length <= min);
+      btnCancel.disabled = !showEdit;
+    }
+
+    function loadIntoEditor(i) {
+      const rec = data[i] || emptyRow(field);
+      for (const c of (field.columns || [])) {
+        const el = editorInputs[c.id];
+        if (!el) continue;
+        el.value = rec[c.id] || '';
+      }
+      editorState = { ...rec };
+      updateToolbar();
+    }
+
+    function resetEditor() {
+      editorState = emptyRow(field);
+      for (const c of (field.columns || [])) {
+        const el = editorInputs[c.id];
+        if (!el) continue;
+        el.value = '';
       }
     }
 
-    function normalizeDebugError(err) {
-      if (!err) return null;
-      if (typeof err === 'string') {
-        return { name: null, message: err, stack: null };
+    if (!data.length) {
+      const min = Math.max(0, parseInt(field.minRows || 0, 10));
+      for (let i = 0; i < min; i++) data.push(emptyRow(field));
+    }
+    drawTable();
+
+    btnAdd.addEventListener('click', () => {
+      const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+      if (max && data.length >= max) return;
+
+      data.push({ ...editorState });
+      drawTable();
+      scheduleSaveState();
+      status.textContent = 'Zeile hinzugefügt.';
+    });
+
+    btnSave.addEventListener('click', () => {
+      if (selectedIndex < 0 || selectedIndex >= data.length) return;
+      data[selectedIndex] = { ...editorState };
+      drawTable();
+      scheduleSaveState();
+      status.textContent = 'Änderungen gespeichert.';
+    });
+
+    btnDelete.addEventListener('click', () => {
+      const min = Math.max(0, parseInt(field.minRows || 0, 10));
+      if (selectedIndex < 0) return;
+      if (min && data.length <= min) return;
+
+      data.splice(selectedIndex, 1);
+      clearSelection();
+      resetEditor();
+      drawTable();
+      scheduleSaveState();
+      status.textContent = 'Zeile gelöscht.';
+    });
+
+    btnCancel.addEventListener('click', () => {
+      clearSelection();
+      resetEditor();
+      drawTable();
+      status.textContent = 'Auswahl aufgehoben.';
+    });
+
+    container.appendChild(editorWrap);
+    container.appendChild(toolbar);
+    container.appendChild(status);
+    container.appendChild(tableWrap);
+
+    applyPreviewVisibility();
+  }
+
+  // ============================================================
+  // EXPORT — Core issue fix: correctly separate heading rules vs field rules
+  // ============================================================
+
+  // --- Rule discovery: pull from common state locations (cleanly, no ad-hoc calls everywhere)
+  function pickFirstArray(obj, keys) {
+    for (const k of keys) {
+      const v = obj?.[k];
+      if (Array.isArray(v)) return { key: k, value: v };
+    }
+    return { key: null, value: [] };
+  }
+  function pickNestedArray(obj, paths) {
+    for (const path of paths) {
+      const parts = path.split('.');
+      let cur = obj;
+      let ok = true;
+      for (const p of parts) {
+        cur = cur?.[p];
+        if (cur === undefined) { ok = false; break; }
       }
-      if (typeof err === 'object') {
+      if (ok && Array.isArray(cur)) return { path, value: cur };
+    }
+    return { path: null, value: [] };
+  }
+
+  function looksLikeFieldRule(r) {
+    // field visibility rules always have fieldId and typically op/values
+    return !!(r && typeof r === 'object' && ('fieldId' in r || 'op' in r));
+  }
+
+  function looksLikeHeadingRule(r) {
+    // heading removal rules target heading identity (idx/uid/compositeKey/etc.)
+    return !!(r && typeof r === 'object' && (
+      ('idx' in r) || ('key' in r) ||
+      ('uid' in r) || ('compositeKey' in r) ||
+      ('headingId' in r) || ('headingUid' in r) ||
+      (('level' in r) && ('text' in r || 'label' in r || 'title' in r))
+    ));
+  }
+
+  function normalizeRuleSetsForExport(state) {
+    // Canonical contract across the project:
+    //   - state.rules      := "heading rules" (document section visibility / heading targets)
+    //   - state.fieldRules := "field rules"   (form field visibility / requirements)
+    //
+    // Do NOT heuristically split by presence of fieldId/op because heading rules also have conditions.
+    // Instead, rely on rules-core's resolver which already aggregates from:
+    //   workspace state, payload.CRONOS_PAYLOAD, and backward-compatible keys.
+    try {
+      if (typeof window.resolveRulesForState === 'function') {
+        const payloadOverride = state?.payload?.CRONOS_PAYLOAD || state?.CRONOS_PAYLOAD || state?.cronos_payload || null;
+        const resolved = window.resolveRulesForState(state || {}, payloadOverride);
         return {
-          name: err?.name || err?.constructor?.name || null,
-          message: err?.message || String(err || ''),
-          stack: typeof err?.stack === 'string' ? err.stack : null,
+          headingRules: Array.isArray(resolved?.rules) ? resolved.rules : [],
+          fieldRules: Array.isArray(resolved?.fieldRules) ? resolved.fieldRules : [],
+          rulesSource: resolved?.source?.rules || 'resolved',
+          fieldRulesSource: resolved?.source?.fieldRules || 'resolved',
+          contributingRules: resolved?.source?.contributingRules || [],
+          contributingFieldRules: resolved?.source?.contributingFieldRules || []
         };
       }
-      return { name: null, message: String(err), stack: null };
+    } catch (e) {
+      console.warn('[Form] normalizeRuleSetsForExport: resolveRulesForState failed, falling back.', e);
     }
 
-    function describeDebugError(err) {
-      if (!err) return '';
-      if (typeof err === 'string') return err;
-      if (typeof err === 'object') {
-        const parts = [];
-        if (err.name) parts.push(err.name);
-        if (err.message && (!parts.length || err.message !== parts[parts.length - 1])) {
-          parts.push(err.message);
+    // Conservative fallback: treat state.rules as heading rules and state.fieldRules as field rules.
+    const headingRules = Array.isArray(state?.rules) ? state.rules : (Array.isArray(state?.headingRules) ? state.headingRules : []);
+    const fieldRules   = Array.isArray(state?.fieldRules) ? state.fieldRules : [];
+    return { headingRules, fieldRules, rulesSource: 'state.rules', fieldRulesSource: 'state.fieldRules' };
+  }
+
+  function normalizeHideAction(actionLike) {
+    if (actionLike == null) return null;
+    if (typeof actionLike === 'string') {
+      const s = actionLike.trim().toUpperCase();
+      if (s === 'HIDE' || s === 'REMOVE' || s === 'TRUE') return 'HIDE';
+      if (s === 'SHOW' || s === 'KEEP' || s === 'FALSE') return 'SHOW';
+      return null;
+    }
+    if (typeof actionLike === 'boolean') return actionLike ? 'HIDE' : 'SHOW';
+    if (typeof actionLike === 'object') {
+      const a = actionLike.action ?? actionLike.visibility ?? actionLike.state ?? actionLike.mode;
+      return normalizeHideAction(a);
+    }
+    return null;
+  }
+
+  function buildHeadingLookupFromBaseline(baselineFlat) {
+    const by = {
+      idx: new Map(),
+      id: new Map(),
+      uid: new Map(),
+      compositeKey: new Map(),
+      textLevel: new Map(),
+    };
+
+    const normText = (s) => String(s || '')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+    for (const h of (baselineFlat || [])) {
+      const idx = Number(h?.idx ?? h?.key);
+      if (Number.isFinite(idx)) by.idx.set(idx, idx);
+      if (h?.id) by.id.set(String(h.id), idx);
+      if (h?.uid) by.uid.set(String(h.uid), idx);
+      if (h?.compositeKey) by.compositeKey.set(String(h.compositeKey), idx);
+
+      const key = `${Number(h?.level) || 'x'}|${normText(h?.label || h?.text || h?.title || '')}`;
+      if (key && Number.isFinite(idx) && !by.textLevel.has(key)) by.textLevel.set(key, idx);
+    }
+    return by;
+  }
+
+  function computeVisibilityMapFallback({ rules, baselineFlat }) {
+    const lookup = buildHeadingLookupFromBaseline(baselineFlat || []);
+    const vis = {};
+
+    for (const r of (rules || [])) {
+      const action = normalizeHideAction(r?.action ?? r?.visibility ?? r?.state ?? r);
+      if (!action) continue;
+
+      const rawTarget =
+        r?.idx ?? r?.key ?? r?.id ?? r?.uid ?? r?.compositeKey ?? r?.target ?? r?.headingId ?? r?.headingUid ?? null;
+
+      let idx = null;
+
+      if (rawTarget != null) {
+        const s = String(rawTarget);
+        if (/^sec_\d+$/i.test(s)) {
+          const n = Number(s.slice(4));
+          if (Number.isFinite(n)) idx = n;
+        } else {
+          const n = Number(rawTarget);
+          if (Number.isFinite(n)) idx = n;
         }
-        if (!parts.length && err.stack) return err.stack;
-        if (!parts.length) {
-          try { return JSON.stringify(err); }
-          catch { return String(err); }
+
+        if (!Number.isFinite(idx)) {
+          if (lookup.id.has(String(rawTarget))) idx = lookup.id.get(String(rawTarget));
+          else if (lookup.uid.has(String(rawTarget))) idx = lookup.uid.get(String(rawTarget));
+          else if (lookup.compositeKey.has(String(rawTarget))) idx = lookup.compositeKey.get(String(rawTarget));
         }
-        return parts.join(': ');
       }
-      return String(err);
+
+      if (!Number.isFinite(idx)) {
+        const lvl = Number(r?.level);
+        const txt = (r?.text ?? r?.label ?? r?.title ?? '');
+        const key = `${Number.isFinite(lvl) ? lvl : 'x'}|${String(txt || '')
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .toLowerCase()}`;
+        if (lookup.textLevel.has(key)) idx = lookup.textLevel.get(key);
+      }
+
+      if (!Number.isFinite(idx)) continue;
+      vis[String(idx)] = action;
     }
 
-    async function gatherExportArtifacts(canBytes) {
-      const tr = TRACE('gatherExportArtifacts');
-      try {
-        if (!currentDoc?.docId) {
-          throw new Error('No active docId for export.');
+    return vis;
+  }
+
+  function countHideActions(visMap) {
+    let n = 0;
+    try {
+      for (const k of Object.keys(visMap || {})) {
+        if (String(visMap[k] || '').toUpperCase() === 'HIDE') n++;
+      }
+    } catch {}
+    return n;
+  }
+
+  async function applyRemovalIfNeeded(baseBytesU8, visibilityMap, originalBytesU8) {
+    const hideCount = countHideActions(visibilityMap);
+    const keys = Object.keys(visibilityMap || {});
+    const sample = keys.slice(0, 12).reduce((acc, k) => (acc[k] = visibilityMap[k], acc), {});
+
+    const tr = TRACE('applyRemovalIfNeeded', {
+      hasApply: typeof window.applyRemovalWithBackup,
+      visKeys: keys.length,
+      hideCount,
+      sample
+    });
+
+    try {
+      if (!hideCount) return { bytes: baseBytesU8, applied: false };
+
+      if (typeof window.applyRemovalWithBackup === 'function') {
+        const out = await window.applyRemovalWithBackup(baseBytesU8, visibilityMap, originalBytesU8);
+        return { bytes: (out instanceof Uint8Array ? out : new Uint8Array(out)), applied: true };
+      }
+
+      if (window.fsExportCore && typeof window.fsExportCore.applyRemoval === 'function') {
+        const out = await window.fsExportCore.applyRemoval({ bytes: baseBytesU8, visibilityMap, originalBytes: originalBytesU8 });
+        const bytes = out?.bytes || out;
+        return { bytes: (bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)), applied: true };
+      }
+
+      console.warn('No removal function available. Parts will not be removed.');
+      return { bytes: baseBytesU8, applied: false };
+    } finally {
+      tr.end();
+    }
+  }
+
+  async function gatherExportArtifacts(canBytes) {
+    const tr = TRACE('gatherExportArtifacts');
+
+    try {
+      if (!currentDoc?.docId) throw new Error('No active docId for export.');
+
+      const originalBytes = canBytes
+        ? (canBytes instanceof Uint8Array ? canBytes : new Uint8Array(canBytes))
+        : new Uint8Array(await fetchWorkingDocBytes());
+
+      const state = await window.formSuitePersist.loadState(currentDoc.docId);
+      const effectiveSchema = state?.schema || schema || { title: 'Form', fields: [] };
+
+      const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
+        ? state.headingsFlat
+        : (Array.isArray(state?.headings) ? state.headings : []);
+
+      const baselineHeadingsTree = Array.isArray(state?.headingsTree) ? state.headingsTree : [];
+
+      const { headingRules: headingRulesRaw, fieldRules: fieldRulesRaw, rulesSource, fieldRulesSource } =
+        normalizeRuleSetsForExport(state);
+
+      tr.step('state rule sources', {
+        rulesSource,
+        fieldRulesSource,
+        headingRulesLen: headingRulesRaw.length,
+        fieldRulesLen: fieldRulesRaw.length
+      });
+
+      tr.step('baseline headings', { flat: baselineHeadingsFlat.length, tree: baselineHeadingsTree.length });
+
+      // Normalize via rules-core if available (keeps your existing rule system consistent)
+      let headingRules = headingRulesRaw;
+      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
+        try {
+          headingRules = window.normalizeHeadingsRulesForSchema(effectiveSchema, headingRulesRaw, {
+            flat: baselineHeadingsFlat,
+            tree: baselineHeadingsTree
+          });
+        } catch (e) {
+          tr.warn('normalizeHeadingsRulesForSchema failed (using raw)', e);
+          headingRules = headingRulesRaw;
         }
+      }
 
-        const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
-        const originalBytes = canBytes
-          ? (canBytes instanceof Uint8Array ? canBytes : new Uint8Array(canBytes))
-          : new Uint8Array(await fetchWorkingDocBytes());
+      let fieldRulesForDoc = fieldRulesRaw;
+      if (typeof window.normalizeFieldRulesForSchema === 'function') {
+        try {
+          fieldRulesForDoc = window.normalizeFieldRulesForSchema(effectiveSchema, fieldRulesRaw);
+        } catch (e) {
+          tr.warn('normalizeFieldRulesForSchema failed (using raw)', e);
+          fieldRulesForDoc = fieldRulesRaw;
+        }
+      }
 
-        const state = await window.formSuitePersist.loadState(currentDoc.docId);
-        const effectiveSchema = schema || state?.schema || { title: 'Form', fields: [] };
+      const rulesVersion = state?.rulesVersion;
 
-        const tagMapRaw =
-          (state?.payload?.CRONOS_PAYLOAD?.tagMap) ||
-          (state?.cronos_payload?.tagMap) ||
-          (state?.CRONOS_PAYLOAD?.tagMap) ||
-          (state?.tagMap) ||
-          {};
+      const valuesMaybe = state?.values
+        || state?.cronos_payload?.values
+        || state?.CRONOS_PAYLOAD?.values
+        || {};
 
-        const validIds = new Set((effectiveSchema.fields || []).map(f => f.id));
-        const safeValues = sanitizeValues(effectiveSchema, values || {});
-        const cleanTagMap = sanitizeTagMap(tagMapRaw, validIds);
+      const tagMapRaw = state?.tagMap
+        || state?.cronos_payload?.tagMap
+        || state?.CRONOS_PAYLOAD?.tagMap
+        || state?.cronos_payload?.CRONOS_PAYLOAD?.tagMap
+        || {};
 
-        const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
-          ? state.headingsFlat
-          : Array.isArray(state?.headings) ? state.headings
-          : [];
+      const validIds = new Set((effectiveSchema.fields || []).map(f => f.id));
+      const safeValues = sanitizeValues(effectiveSchema, valuesMaybe || {});
+      const cleanTagMap = sanitizeTagMap(tagMapRaw, validIds);
 
-        const baselineHeadingsTree = Array.isArray(state?.headingsTree)
-          ? state.headingsTree
-          : [];
+      const baseline = { flat: baselineHeadingsFlat, tree: baselineHeadingsTree };
 
-        const { rules, fieldRules: fieldRulesForDoc } = deriveNormalizedRulesForDoc(
-          state,
-          effectiveSchema,
-          { flat: baselineHeadingsFlat, tree: baselineHeadingsTree }
+      tr.step('calling fsExportCore.buildDoc', {
+        origBytes: originalBytes.length,
+        schemaFields: (effectiveSchema.fields || []).length,
+        headingRulesLen: headingRules.length,
+        fieldRulesLen: fieldRulesForDoc.length,
+        baselineFlat: baseline.flat.length
+      });
+
+      const buildOut = await window.fsExportCore.buildDoc({
+        originalBytes,
+        schema: effectiveSchema,
+        values: safeValues,
+        tagMap: cleanTagMap,
+        rules: headingRules,               // IMPORTANT: only heading rules here
+        fieldRules: fieldRulesForDoc,
+        headingBaseline: baseline,
+        payloadKey: PAYLOAD_KEY,
+        writerKind: 'auto',
+        debugLabel: 'index.gatherExportArtifacts'
+      });
+
+      let visibilityMap = buildOut?.visibilityMap || {};
+      let hideCount = countHideActions(visibilityMap);
+
+      tr.step('buildDoc result', {
+        hasUpdatedBytes: !!buildOut?.updatedBytes,
+        updatedBytesLen: (buildOut?.updatedBytes?.length ?? buildOut?.updatedBytes?.byteLength ?? null),
+        preRemovalLen: (buildOut?.preRemovalBytes?.length ?? buildOut?.preRemovalBytes?.byteLength ?? null),
+        visKeys: Object.keys(visibilityMap).length,
+        hideCount
+      });
+
+      // Fallback ONLY from heading rules + baseline (this is the “missing piece” previously)
+      if (!Object.keys(visibilityMap).length) {
+        const fb = computeVisibilityMapFallback({ rules: headingRules, baselineFlat: baselineHeadingsFlat });
+        const fbHide = countHideActions(fb);
+
+        tr.step('visibilityMap empty → fallback computed', {
+          fbKeys: Object.keys(fb).length,
+          fbHide
+        });
+
+        if (Object.keys(fb).length) {
+          visibilityMap = fb;
+          hideCount = fbHide;
+        }
+      }
+
+      tr.step('visibilityMap keys (sample)', Object.keys(visibilityMap || {}).slice(0, 10));
+
+      return {
+        originalBytes,
+        updatedBytes: buildOut.updatedBytes,
+        preRemovalBytes: buildOut.preRemovalBytes,
+        removalApplied: !!buildOut.removalApplied,
+        visibilityMap,
+        safeValues,
+        cleanTagMap,
+        headingRules,
+        fieldRulesForDoc,
+        rulesVersion,
+        headingResolver: buildOut.headingResolver,
+        state,
+        baselineHeadingsFlat,
+        baselineHeadingsTree,
+        payloadObj: buildOut.payload,
+        payload: JSON.stringify(buildOut.payload),
+        rawTagMap: tagMapRaw,
+        effectiveSchema
+      };
+    } finally {
+      tr.end();
+    }
+  }
+
+  // ============================================================
+  // Export Debug UI (kept behavior; uses simple logs)
+  // ============================================================
+  function summarizeForExportDebug(value) {
+    const seen = new WeakSet();
+    function helper(val, depth) {
+      if (val == null) return val;
+      const t = typeof val;
+      if (t === 'number' || t === 'boolean') return val;
+      if (t === 'string') {
+        if (val.length <= 2048) return val;
+        return { type: 'string', length: val.length, head: val.slice(0, 1024), tail: val.slice(-256) };
+      }
+      if (typeof Date !== 'undefined' && val instanceof Date) return { type: 'Date', value: val.toISOString() };
+      if (typeof Blob !== 'undefined' && val instanceof Blob) return { type: 'Blob', size: val.size, mime: val.type || '' };
+      if (typeof File !== 'undefined' && val instanceof File) return { type: 'File', name: val.name, size: val.size, mime: val.type || '' };
+      if (val instanceof Uint8Array) {
+        const previewLength = Math.min(32, val.length);
+        const preview = Array.from(val.slice(0, previewLength));
+        const hexPreview = preview.map(b => b.toString(16).padStart(2, '0')).join(' ');
+        return { type: 'Uint8Array', length: val.length, previewHex: hexPreview };
+      }
+      if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) return { type: 'ArrayBuffer', byteLength: val.byteLength };
+      if (val && typeof val.byteLength === 'number' && val.buffer instanceof ArrayBuffer) return { type: val.constructor?.name || 'TypedArray', byteLength: val.byteLength };
+      if (t === 'function') return `[Function ${val.name || 'anonymous'}]`;
+      if (seen.has(val)) return '[Circular]';
+
+      const nextDepth = depth + 1;
+      if (nextDepth > 2) {
+        if (Array.isArray(val)) return `[Array length=${val.length}]`;
+        const keys = Object.keys(val);
+        return `[Object keys=${keys.length}]`;
+      }
+
+      seen.add(val);
+      try {
+        if (Array.isArray(val)) {
+          const max = nextDepth === 1 ? 20 : 10;
+          const out = val.slice(0, max).map(item => helper(item, nextDepth));
+          if (val.length > max) out.push(`… ${val.length - max} more`);
+          return out;
+        }
+        if (val instanceof Map) {
+          const entries = Array.from(val.entries());
+          const max = nextDepth === 1 ? 20 : 10;
+          const mapped = entries.slice(0, max).map(([k, v]) => [helper(k, nextDepth), helper(v, nextDepth)]);
+          if (entries.length > max) mapped.push(["__truncated__", `… ${entries.length - max} more`]);
+          return mapped;
+        }
+        const entries = Object.entries(val);
+        const max = nextDepth === 1 ? 25 : 12;
+        const out = {};
+        for (let i = 0; i < entries.length && i < max; i++) {
+          const [k, v] = entries[i];
+          out[k] = helper(v, nextDepth);
+        }
+        if (entries.length > max) out.__truncated__ = `… ${entries.length - max} more keys`;
+        return out;
+      } finally {
+        seen.delete(val);
+      }
+    }
+    return helper(value, 0);
+  }
+
+  function buildExportDebugSnapshot(plan, context) {
+    return { generatedAt: new Date().toISOString(), plan, context: summarizeForExportDebug(context || {}) };
+  }
+  function stringifyExportDebugSnapshot(plan, context) {
+    try { return JSON.stringify(buildExportDebugSnapshot(plan, context), null, 2); }
+    catch (err) {
+      console.warn('Failed to stringify export debug snapshot', err);
+      return JSON.stringify({ error: 'stringify-failed', message: err?.message || String(err || 'unknown-error') }, null, 2);
+    }
+  }
+  function normalizeDebugError(err) {
+    if (!err) return null;
+    if (typeof err === 'string') return { name: null, message: err, stack: null };
+    if (typeof err === 'object') return {
+      name: err?.name || err?.constructor?.name || null,
+      message: err?.message || String(err || ''),
+      stack: typeof err?.stack === 'string' ? err.stack : null
+    };
+    return { name: null, message: String(err), stack: null };
+  }
+  function describeDebugError(err) {
+    if (!err) return '';
+    if (typeof err === 'string') return err;
+    if (typeof err === 'object') {
+      const parts = [];
+      if (err.name) parts.push(err.name);
+      if (err.message && (!parts.length || err.message !== parts[parts.length - 1])) parts.push(err.message);
+      if (!parts.length && err.stack) return err.stack;
+      if (!parts.length) { try { return JSON.stringify(err); } catch { return String(err); } }
+      return parts.join(': ');
+    }
+    return String(err);
+  }
+
+  function renderExportDebugPanel(plan, context = {}) {
+    if (!plan || typeof plan !== 'object') {
+      console.warn('renderExportDebugPanel: invalid plan', plan);
+      return;
+    }
+    clearExportDebugPanel();
+    lastExportDebug = { plan, context };
+    try { window.lastExportDebug = lastExportDebug; } catch {}
+
+    const overlay = document.createElement('div');
+    overlay.id = 'exportDebugPanel';
+    overlay.tabIndex = -1;
+    overlay.style.position = 'fixed';
+    overlay.style.top = '72px';
+    overlay.style.right = '24px';
+    overlay.style.maxWidth = 'min(90vw, 520px)';
+    overlay.style.maxHeight = '70vh';
+    overlay.style.overflowY = 'auto';
+    overlay.style.background = '#ffffff';
+    overlay.style.border = '1px solid rgba(15,23,42,0.12)';
+    overlay.style.boxShadow = '0 18px 45px rgba(15,23,42,0.25)';
+    overlay.style.padding = '18px';
+    overlay.style.borderRadius = '12px';
+    overlay.style.zIndex = '4000';
+    overlay.style.fontSize = '14px';
+    overlay.style.lineHeight = '1.4';
+
+    const header = document.createElement('div');
+    header.style.display = 'flex';
+    header.style.gap = '12px';
+    header.style.alignItems = 'center';
+    header.style.marginBottom = '12px';
+
+    const title = document.createElement('h3');
+    title.textContent = 'Export removal debug';
+    title.style.margin = '0';
+    title.style.fontSize = '16px';
+    title.style.fontWeight = '600';
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'ghost';
+    closeBtn.textContent = 'Close';
+    closeBtn.style.marginLeft = 'auto';
+    closeBtn.addEventListener('click', (ev) => { ev.preventDefault(); clearExportDebugPanel(); });
+
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    overlay.appendChild(header);
+
+    const summary = document.createElement('div');
+    summary.style.marginBottom = '12px';
+
+    const collectHeadingsFromPlan = (target, planLike) => {
+      if (!planLike) return;
+      (planLike.parts || []).forEach(part => {
+        (part?.headings || []).forEach(h => { target.push({ ...h, part: part?.name || '' }); });
+      });
+      if (!target.length && Array.isArray(planLike.headings)) planLike.headings.forEach(h => target.push({ ...h }));
+    };
+
+    const headings = [];
+    collectHeadingsFromPlan(headings, plan);
+    headings.sort((a, b) => a.idx - b.idx);
+
+    const removalPreview = context?.removalPreview || null;
+    const removalPreviewHeadings = [];
+    if (removalPreview?.plan) {
+      collectHeadingsFromPlan(removalPreviewHeadings, removalPreview.plan);
+      removalPreviewHeadings.sort((a, b) => a.idx - b.idx);
+    }
+
+    const unmatched = Array.isArray(plan.unmatchedActions) ? plan.unmatchedActions : [];
+
+    const summaryLines = [];
+    summaryLines.push(`<strong>${headings.length}</strong> headings detected.`);
+    summaryLines.push(`Style map entries: <strong>${plan.styleMapSize || 0}</strong> (${plan.hasStylesXml ? 'styles.xml present' : 'styles.xml missing'})`);
+    summaryLines.push(`Visibility actions: <strong>${Object.keys(context.visibilityMap || {}).length}</strong>.`);
+    const hiddenTargets = headings.filter(h => (h.action || '').toUpperCase() === 'HIDE').length;
+    summaryLines.push(`Headings flagged for removal: <strong>${hiddenTargets}</strong>.`);
+    if (removalPreviewHeadings.length) summaryLines.push(`Headings after removal preview: <strong>${removalPreviewHeadings.length}</strong>.`);
+    if (removalPreview?.bytes instanceof Uint8Array) summaryLines.push(`Removal preview DOCX size: <strong>${removalPreview.bytes.length}</strong> bytes.`);
+    if (unmatched.length) summaryLines.push(`Unmatched actions: ${unmatched.join(', ')}`);
+    if (removalPreview?.error) summaryLines.push(`Removal preview failed: ${describeDebugError(removalPreview.error)}`);
+    else if (removalPreview?.planError) summaryLines.push(`Removal preview inspection failed: ${describeDebugError(removalPreview.planError)}`);
+
+    summary.innerHTML = summaryLines.map(line => `<div>${line}</div>`).join('');
+    overlay.appendChild(summary);
+
+    const makeTable = () => {
+      const table = document.createElement('table');
+      table.style.width = '100%';
+      table.style.borderCollapse = 'collapse';
+      table.style.marginBottom = '12px';
+      table.style.fontSize = '13px';
+      return table;
+    };
+
+    const headingsWrap = document.createElement('div');
+    const headingTitle = document.createElement('h4');
+    headingTitle.textContent = 'Detected headings';
+    headingTitle.style.margin = '0 0 6px';
+    headingTitle.style.fontSize = '14px';
+    headingTitle.style.fontWeight = '600';
+    headingsWrap.appendChild(headingTitle);
+
+    if (plan.error) {
+      const err = document.createElement('div');
+      err.textContent = `Unable to analyse document (${plan.error}).`;
+      err.style.color = '#b91c1c';
+      headingsWrap.appendChild(err);
+    }
+
+    if (headings.length) {
+      const table = makeTable();
+      const thead = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+      ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
+        const th = document.createElement('th');
+        th.textContent = text;
+        th.style.textAlign = 'left';
+        th.style.padding = '4px 6px';
+        th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
+        headerRow.appendChild(th);
+      });
+      thead.appendChild(headerRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      headings.forEach(h => {
+        const row = document.createElement('tr');
+        row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
+        if (h.action === 'HIDE') row.style.background = 'rgba(239,68,68,0.08)';
+        else if (h.action === 'SHOW') row.style.background = 'rgba(34,197,94,0.1)';
+        const cells = [
+          String(h.idx),
+          String(h.level ?? ''),
+          String(h.action || ''),
+          h.detectedBy || '',
+          `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
+        ];
+        cells.forEach((value, i) => {
+          const td = document.createElement('td');
+          td.textContent = value;
+          td.style.padding = '4px 6px';
+          if (i === 2) td.style.textTransform = 'uppercase';
+          row.appendChild(td);
+        });
+        tbody.appendChild(row);
+      });
+      table.appendChild(tbody);
+      headingsWrap.appendChild(table);
+    } else if (!plan.error) {
+      const empty = document.createElement('div');
+      empty.textContent = 'No headings were detected in the document.';
+      headingsWrap.appendChild(empty);
+    }
+
+    if (unmatched.length) {
+      const warn = document.createElement('div');
+      warn.textContent = `Indices without matching headings: ${unmatched.join(', ')}`;
+      warn.style.color = '#b45309';
+      warn.style.marginBottom = '8px';
+      headingsWrap.appendChild(warn);
+    }
+
+    overlay.appendChild(headingsWrap);
+
+    const controls = document.createElement('div');
+    controls.style.display = 'flex';
+    controls.style.flexWrap = 'wrap';
+    controls.style.gap = '8px';
+    controls.style.marginTop = '12px';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'ghost';
+    copyBtn.textContent = 'Copy JSON';
+    copyBtn.addEventListener('click', async () => {
+      try {
+        const json = stringifyExportDebugSnapshot(plan, context);
+        await navigator.clipboard.writeText(json);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+      } catch {
+        copyBtn.textContent = 'Copy failed';
+        setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+      }
+    });
+    controls.appendChild(copyBtn);
+
+    const downloadBtn = document.createElement('button');
+    downloadBtn.type = 'button';
+    downloadBtn.className = 'ghost';
+    downloadBtn.textContent = 'Download JSON';
+    downloadBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      try {
+        const json = stringifyExportDebugSnapshot(plan, context);
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = (currentDoc?.name || 'document') + ' - export-debug.json';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
+      } catch (err) {
+        console.warn('Download debug JSON failed:', err);
+      }
+    });
+    controls.appendChild(downloadBtn);
+
+    overlay.appendChild(controls);
+
+    const details = document.createElement('details');
+    details.style.marginTop = '10px';
+    const summaryEl = document.createElement('summary');
+    summaryEl.textContent = 'Raw debug payload';
+    summaryEl.style.cursor = 'pointer';
+    const pre = document.createElement('pre');
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.style.fontSize = '12px';
+    pre.textContent = stringifyExportDebugSnapshot(plan, context);
+    details.appendChild(summaryEl);
+    details.appendChild(pre);
+    overlay.appendChild(details);
+
+    document.body.appendChild(overlay);
+    try { overlay.focus({ preventScroll: true }); } catch {}
+    exportDebugEscHandler = (ev) => { if (ev.key === 'Escape') clearExportDebugPanel(); };
+    document.addEventListener('keydown', exportDebugEscHandler);
+  }
+
+  async function onExportDebugFromOpenForm() {
+    if (!currentDoc?.docId) { alert('No active document. Open or pick a DOCX first.'); return; }
+
+    try {
+      if (btnExportDebug) btnExportDebug.disabled = true;
+
+      const prepared = await gatherExportArtifacts();
+      if (!prepared) { alert('Could not access the current DOCX bytes.'); return; }
+
+      const inspectionBytes = prepared.preRemovalBytes || prepared.updatedBytes;
+
+      const plan = (typeof window.inspectRemovalPlan === 'function')
+        ? await window.inspectRemovalPlan(inspectionBytes, prepared.visibilityMap)
+        : { error: 'inspectRemovalPlan not available on window' };
+
+      let removalPreview = null;
+      try {
+        const { bytes: removalBytes } = await applyRemovalIfNeeded(
+          (inspectionBytes instanceof Uint8Array ? inspectionBytes : new Uint8Array(inspectionBytes)),
+          prepared.visibilityMap || {},
+          prepared.originalBytes
         );
 
-        const baseline = {
-          flat: baselineHeadingsFlat,
-          tree: baselineHeadingsTree
-        };
-
-        const fallbackHeadingResolver = buildHeadingTargetIndex(baseline);
-
-        // Centralized export engine
-        const { updatedBytes, preRemovalBytes, payload, visibilityMap, headingResolver } =
-          await window.fsExportCore.buildDoc({
-            originalBytes,
-            schema: effectiveSchema,
-            values: safeValues,
-            tagMap: cleanTagMap,
-            rules,
-            fieldRules: fieldRulesForDoc,
-            headingBaseline: baseline,
-            payloadKey: PAYLOAD_KEY,
-            writerKind: 'auto',
-            debugLabel: 'index.gatherExportArtifacts',
-            buildHeadingResolver: async (updatedDocBytes) => {
-              const asU8 = (updatedDocBytes instanceof Uint8Array)
-                ? updatedDocBytes
-                : new Uint8Array(updatedDocBytes);
-              return await buildHeadingResolverFromDoc(asU8, {
-                fallbackResolver: fallbackHeadingResolver,
-                baselineFlat: baselineHeadingsFlat,
-                baselineTree: baselineHeadingsTree
-              });
-            }
-          });
-
-        return {
-          originalBytes,
-          updatedBytes,
-          preRemovalBytes,
-          visibilityMap,
-          safeValues,
-          cleanTagMap,
-          rules,
-          fieldRulesForDoc,
-          headingResolver,
-          state,
-          payload: JSON.stringify(payload),
-          rawTagMap: tagMapRaw
-        };
-      } finally {
-        tr.end();
-      }
-    }
-
-
-
-    function renderExportDebugPanel(plan, context = {}) {
-      if (!plan || typeof plan !== 'object') {
-        console.warn('renderExportDebugPanel: invalid plan', plan);
-        return;
-      }
-      clearExportDebugPanel();
-      lastExportDebug = { plan, context };
-      try { window.lastExportDebug = lastExportDebug; } catch {}
-
-      const overlay = document.createElement('div');
-      overlay.id = 'exportDebugPanel';
-      overlay.tabIndex = -1;
-      overlay.style.position = 'fixed';
-      overlay.style.top = '72px';
-      overlay.style.right = '24px';
-      overlay.style.maxWidth = 'min(90vw, 520px)';
-      overlay.style.maxHeight = '70vh';
-      overlay.style.overflowY = 'auto';
-      overlay.style.background = '#ffffff';
-      overlay.style.border = '1px solid rgba(15,23,42,0.12)';
-      overlay.style.boxShadow = '0 18px 45px rgba(15,23,42,0.25)';
-      overlay.style.padding = '18px';
-      overlay.style.borderRadius = '12px';
-      overlay.style.zIndex = '4000';
-      overlay.style.fontSize = '14px';
-      overlay.style.lineHeight = '1.4';
-
-      const header = document.createElement('div');
-      header.style.display = 'flex';
-      header.style.gap = '12px';
-      header.style.alignItems = 'center';
-      header.style.marginBottom = '12px';
-
-      const title = document.createElement('h3');
-      title.textContent = 'Export removal debug';
-      title.style.margin = '0';
-      title.style.fontSize = '16px';
-      title.style.fontWeight = '600';
-
-      const closeBtn = document.createElement('button');
-      closeBtn.type = 'button';
-      closeBtn.className = 'ghost';
-      closeBtn.textContent = 'Close';
-      closeBtn.style.marginLeft = 'auto';
-      closeBtn.addEventListener('click', (ev) => { ev.preventDefault(); clearExportDebugPanel(); });
-
-      header.appendChild(title);
-      header.appendChild(closeBtn);
-      overlay.appendChild(header);
-
-      const summary = document.createElement('div');
-      summary.style.marginBottom = '12px';
-
-      const collectHeadingsFromPlan = (target, planLike) => {
-        if (!planLike) return;
-        (planLike.parts || []).forEach(part => {
-          (part?.headings || []).forEach(h => {
-            target.push({ ...h, part: part?.name || '' });
-          });
-        });
-        if (!target.length && Array.isArray(planLike.headings)) {
-          planLike.headings.forEach(h => target.push({ ...h }));
-        }
-      };
-
-      const headings = [];
-      collectHeadingsFromPlan(headings, plan);
-      headings.sort((a, b) => a.idx - b.idx);
-
-      const removalPreview = context?.removalPreview || null;
-      const removalPreviewHeadings = [];
-      if (removalPreview?.plan) {
-        collectHeadingsFromPlan(removalPreviewHeadings, removalPreview.plan);
-        removalPreviewHeadings.sort((a, b) => a.idx - b.idx);
-      }
-
-      const unmatched = Array.isArray(plan.unmatchedActions) ? plan.unmatchedActions : [];
-
-      const summaryLines = [];
-      summaryLines.push(`<strong>${headings.length}</strong> headings detected.`);
-      summaryLines.push(`Style map entries: <strong>${plan.styleMapSize || 0}</strong> (${plan.hasStylesXml ? 'styles.xml present' : 'styles.xml missing'})`);
-      summaryLines.push(`Visibility actions: <strong>${Object.keys(context.visibilityMap || {}).length}</strong>.`);
-      const hiddenTargets = headings.filter(h => (h.action || '').toUpperCase() === 'HIDE').length;
-      summaryLines.push(`Headings flagged for removal: <strong>${hiddenTargets}</strong>.`);
-      if (removalPreviewHeadings.length) {
-        summaryLines.push(`Headings after removal preview: <strong>${removalPreviewHeadings.length}</strong>.`);
-      }
-      if (removalPreview?.bytes instanceof Uint8Array) {
-        summaryLines.push(`Removal preview DOCX size: <strong>${removalPreview.bytes.length}</strong> bytes.`);
-      }
-      if (unmatched.length) {
-        summaryLines.push(`Unmatched actions: ${unmatched.join(', ')}`);
-      }
-      if (removalPreview?.error) {
-        summaryLines.push(`Removal preview failed: ${describeDebugError(removalPreview.error)}`);
-      } else if (removalPreview?.planError) {
-        summaryLines.push(`Removal preview inspection failed: ${describeDebugError(removalPreview.planError)}`);
-      }
-      summary.innerHTML = summaryLines.map(line => `<div>${line}</div>`).join('');
-      overlay.appendChild(summary);
-
-      const headingResolver = context?.headingResolver;
-      const labelForHeading = (idx) => {
-        let fallback = `Heading ${idx + 1}`;
-        if (!headingResolver) return fallback;
-        let entry = null;
-        try { entry = headingResolver.resolve?.({ idx }); } catch {}
-        if (!entry) {
-          try { entry = headingResolver.resolve?.(idx); } catch {}
-        }
-        if (entry && headingResolver.buildLabel) {
-          return headingResolver.buildLabel(entry, fallback);
-        }
-        if (entry?.text) return entry.text;
-        if (headingResolver.buildLabel) {
-          return headingResolver.buildLabel(null, fallback);
-        }
-        return fallback;
-      };
-
-      const actionsEntries = Object.entries(context.visibilityMap || {}).map(([idx, action]) => {
-        const num = Number(idx);
-        return { idx: Number.isFinite(num) ? num : idx, action, label: labelForHeading(num) };
-      }).sort((a, b) => Number(a.idx) - Number(b.idx));
-
-      const makeTable = () => {
-        const table = document.createElement('table');
-        table.style.width = '100%';
-        table.style.borderCollapse = 'collapse';
-        table.style.marginBottom = '12px';
-        table.style.fontSize = '13px';
-        return table;
-      };
-
-      if (actionsEntries.length) {
-        const actionsWrap = document.createElement('div');
-        actionsWrap.style.marginBottom = '12px';
-        const heading = document.createElement('h4');
-        heading.textContent = 'Visibility map';
-        heading.style.margin = '0 0 6px';
-        heading.style.fontSize = '14px';
-        heading.style.fontWeight = '600';
-        actionsWrap.appendChild(heading);
-
-        const table = makeTable();
-        const thead = document.createElement('thead');
-        const tr = document.createElement('tr');
-        ['Idx', 'Action', 'Label'].forEach(text => {
-          const th = document.createElement('th');
-          th.textContent = text;
-          th.style.textAlign = 'left';
-          th.style.padding = '4px 6px';
-          th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
-          tr.appendChild(th);
-        });
-        thead.appendChild(tr);
-        table.appendChild(thead);
-
-        const tbody = document.createElement('tbody');
-        actionsEntries.forEach(entry => {
-          const row = document.createElement('tr');
-          row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
-          const cells = [
-            String(entry.idx),
-            String(entry.action || ''),
-            entry.label || ''
-          ];
-          cells.forEach((value, i) => {
-            const td = document.createElement('td');
-            td.textContent = value;
-            td.style.padding = '4px 6px';
-            if (i === 1) td.style.textTransform = 'uppercase';
-            row.appendChild(td);
-          });
-          tbody.appendChild(row);
-        });
-        table.appendChild(tbody);
-        actionsWrap.appendChild(table);
-        overlay.appendChild(actionsWrap);
-      }
-
-      const headingsWrap = document.createElement('div');
-      const headingTitle = document.createElement('h4');
-      headingTitle.textContent = 'Detected headings';
-      headingTitle.style.margin = '0 0 6px';
-      headingTitle.style.fontSize = '14px';
-      headingTitle.style.fontWeight = '600';
-      headingsWrap.appendChild(headingTitle);
-
-      if (plan.error) {
-        const err = document.createElement('div');
-        err.textContent = `Unable to analyse document (${plan.error}).`;
-        err.style.color = '#b91c1c';
-        headingsWrap.appendChild(err);
-      }
-
-      if (headings.length) {
-        const table = makeTable();
-        const thead = document.createElement('thead');
-        const headerRow = document.createElement('tr');
-        ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
-          const th = document.createElement('th');
-          th.textContent = text;
-          th.style.textAlign = 'left';
-          th.style.padding = '4px 6px';
-          th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
-          headerRow.appendChild(th);
-        });
-        thead.appendChild(headerRow);
-        table.appendChild(thead);
-
-        const tbody = document.createElement('tbody');
-        headings.forEach(h => {
-          const row = document.createElement('tr');
-          row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
-          if (h.action === 'HIDE') row.style.background = 'rgba(239,68,68,0.08)';
-          else if (h.action === 'SHOW') row.style.background = 'rgba(34,197,94,0.1)';
-          const cells = [
-            String(h.idx),
-            String(h.level ?? ''),
-            String(h.action || ''),
-            h.detectedBy || '',
-            `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
-          ];
-          cells.forEach((value, i) => {
-            const td = document.createElement('td');
-            td.textContent = value;
-            td.style.padding = '4px 6px';
-            if (i === 2) td.style.textTransform = 'uppercase';
-            row.appendChild(td);
-          });
-          tbody.appendChild(row);
-        });
-        table.appendChild(tbody);
-        headingsWrap.appendChild(table);
-      } else if (!plan.error) {
-        const empty = document.createElement('div');
-        empty.textContent = 'No headings were detected in the document.';
-        headingsWrap.appendChild(empty);
-      }
-
-      if (unmatched.length) {
-        const warn = document.createElement('div');
-        warn.textContent = `Indices without matching headings: ${unmatched.join(', ')}`;
-        warn.style.color = '#b45309';
-        warn.style.marginBottom = '8px';
-        headingsWrap.appendChild(warn);
-      }
-
-      overlay.appendChild(headingsWrap);
-
-      if (removalPreview) {
-        const previewWrap = document.createElement('div');
-        previewWrap.style.marginTop = '12px';
-        const previewHeading = document.createElement('h4');
-        previewHeading.textContent = 'Removal preview result';
-        previewHeading.style.margin = '0 0 6px';
-        previewHeading.style.fontSize = '14px';
-        previewHeading.style.fontWeight = '600';
-        previewWrap.appendChild(previewHeading);
-
-        if (removalPreview?.error) {
-          const err = document.createElement('div');
-          err.textContent = `Removal preview failed: ${describeDebugError(removalPreview.error)}`;
-          err.style.color = '#b91c1c';
-          err.style.marginBottom = '6px';
-          previewWrap.appendChild(err);
-        } else if (removalPreview?.planError) {
-          const err = document.createElement('div');
-          err.textContent = `Removal preview inspection failed: ${describeDebugError(removalPreview.planError)}`;
-          err.style.color = '#b45309';
-          err.style.marginBottom = '6px';
-          previewWrap.appendChild(err);
-        }
-
-        if (removalPreviewHeadings.length) {
-          const table = makeTable();
-          const thead = document.createElement('thead');
-          const headerRow = document.createElement('tr');
-          ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
-            const th = document.createElement('th');
-            th.textContent = text;
-            th.style.textAlign = 'left';
-            th.style.padding = '4px 6px';
-            th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
-            headerRow.appendChild(th);
-          });
-          thead.appendChild(headerRow);
-          table.appendChild(thead);
-
-          const tbody = document.createElement('tbody');
-          removalPreviewHeadings.forEach(h => {
-            const row = document.createElement('tr');
-            row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
-            const cells = [
-              String(h.idx),
-              String(h.level ?? ''),
-              String(h.action || ''),
-              h.detectedBy || '',
-              `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
-            ];
-            cells.forEach((value, i) => {
-              const td = document.createElement('td');
-              td.textContent = value;
-              td.style.padding = '4px 6px';
-              if (i === 2) td.style.textTransform = 'uppercase';
-              row.appendChild(td);
-            });
-            tbody.appendChild(row);
-          });
-          table.appendChild(tbody);
-          previewWrap.appendChild(table);
-        } else if (!removalPreview?.error) {
-          const empty = document.createElement('div');
-          empty.textContent = 'No headings were detected after running the removal preview.';
-          previewWrap.appendChild(empty);
-        }
-
-        const previewUnmatched = Array.isArray(removalPreview?.plan?.unmatchedActions)
-          ? removalPreview.plan.unmatchedActions
-          : [];
-        if (previewUnmatched.length) {
-          const warn = document.createElement('div');
-          warn.textContent = `Post-removal unmatched indices: ${previewUnmatched.join(', ')}`;
-          warn.style.color = '#b45309';
-          previewWrap.appendChild(warn);
-        }
-
-        overlay.appendChild(previewWrap);
-      }
-
-      const controls = document.createElement('div');
-      controls.style.display = 'flex';
-      controls.style.flexWrap = 'wrap';
-      controls.style.gap = '8px';
-      controls.style.marginTop = '12px';
-
-      const appendDocDownloadButton = (bytes, label, suffix) => {
-        if (!(bytes instanceof Uint8Array) || !bytes.length) return;
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'ghost';
-        btn.textContent = label;
-        btn.addEventListener('click', (ev) => {
-          ev.preventDefault();
-          try {
-            const blob = new Blob([bytes], {
-              type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            });
-            const safeSuffix = (suffix || '').replace(/[^a-z0-9\-_. ]+/gi, '-').trim();
-            const base = (currentDoc?.name || 'document').replace(/\.docx$/i, '').trim() || 'document';
-            const suffixPart = safeSuffix ? ` - ${safeSuffix}` : '';
-            const filename = `${base}${suffixPart}`.replace(/\s+/g, ' ').trim() + '.docx';
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 750);
-          } catch (err) {
-            console.warn('Failed to download DOCX snapshot', err);
-          }
-        });
-        controls.appendChild(btn);
-      };
-
-      const copyBtn = document.createElement('button');
-      copyBtn.type = 'button';
-      copyBtn.className = 'ghost';
-      copyBtn.textContent = 'Copy JSON';
-      copyBtn.addEventListener('click', async () => {
+        let previewPlan = null;
+        let previewPlanError = null;
         try {
-          const json = stringifyExportDebugSnapshot(plan, context);
-          await navigator.clipboard.writeText(json);
-          copyBtn.textContent = 'Copied!';
-          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
-        } catch (err) {
-          copyBtn.textContent = 'Copy failed';
-          setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
+          previewPlan = (typeof window.inspectRemovalPlan === 'function')
+            ? await window.inspectRemovalPlan(removalBytes, {})
+            : { error: 'inspectRemovalPlan not available on window' };
+        } catch (planErr) {
+          previewPlanError = normalizeDebugError(planErr);
         }
-      });
-      controls.appendChild(copyBtn);
 
-      const downloadBtn = document.createElement('button');
-      downloadBtn.type = 'button';
-      downloadBtn.className = 'ghost';
-      downloadBtn.textContent = 'Download JSON';
-      downloadBtn.addEventListener('click', (ev) => {
-        ev.preventDefault();
-        try {
-          const json = stringifyExportDebugSnapshot(plan, context);
-          const blob = new Blob([json], { type: 'application/json' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = (currentDoc?.name || 'document') + ' - export-debug.json';
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
-        } catch (err) {
-          console.warn('Download debug JSON failed:', err);
-        }
-      });
-      controls.appendChild(downloadBtn);
-
-      appendDocDownloadButton(context?.originalBytes, 'Download original DOCX snapshot', 'original-snapshot');
-      appendDocDownloadButton(context?.preRemovalBytes || context?.updatedBytes, 'Download DOCX before removal', 'pre-removal');
-      appendDocDownloadButton(removalPreview?.bytes, 'Download removal preview DOCX', 'post-removal-preview');
-
-      overlay.appendChild(controls);
-
-      const details = document.createElement('details');
-      details.style.marginTop = '10px';
-      const summaryEl = document.createElement('summary');
-      summaryEl.textContent = 'Raw debug payload';
-      summaryEl.style.cursor = 'pointer';
-      const pre = document.createElement('pre');
-      pre.style.whiteSpace = 'pre-wrap';
-      pre.style.fontSize = '12px';
-      pre.textContent = stringifyExportDebugSnapshot(plan, context);
-      details.appendChild(summaryEl);
-      details.appendChild(pre);
-      overlay.appendChild(details);
-
-      document.body.appendChild(overlay);
-      try { overlay.focus({ preventScroll: true }); } catch {}
-      exportDebugEscHandler = (ev) => { if (ev.key === 'Escape') { clearExportDebugPanel(); } };
-      document.addEventListener('keydown', exportDebugEscHandler);
-    }
-
-    async function onExportDebugFromOpenForm() {
-      if (!currentDoc?.docId) {
-        alert('No active document. Open or pick a DOCX first.');
-        return;
+        removalPreview = {
+          bytes: removalBytes,
+          plan: previewPlan,
+          planError: previewPlanError || (previewPlan?.error || null),
+        };
+      } catch (removalErr) {
+        removalPreview = { error: normalizeDebugError(removalErr) };
       }
+
+      const debugContext = { ...prepared, removalPreview };
+
+      // Keep logs simple (no groups)
+      console.log('[ExportDebug] visibilityMap', prepared.visibilityMap);
+      console.log('[ExportDebug] plan (before)', plan);
+      console.log('[ExportDebug] removalPreview', removalPreview);
+
+      renderExportDebugPanel(plan, debugContext);
+    } catch (e) {
+      console.error('Export debug failed:', e);
+      alert('Export debug failed: ' + (e?.message || e));
+    } finally {
+      if (btnExportDebug) btnExportDebug.disabled = !currentDoc;
+    }
+  }
+
+  async function onExportFromOpenForm() {
+    if (!currentDoc?.docId) { alert('No active document. Open or pick a DOCX first.'); return; }
+
+    const canBytes = await fetchWorkingDocBytes();
+    if (!canBytes) { await hardResetOpenForm('no bytes / no permission'); return; }
+
+    let fileHandle = null;
+    let skipPickerReason = '';
+
+    if (supportsFS && window.showSaveFilePicker) {
       try {
-        if (btnExportDebug) btnExportDebug.disabled = true;
-        await ensurePy();
-        const prepared = await gatherExportArtifacts();
-        if (!prepared) {
-          alert('Could not access the current DOCX bytes.');
+        const suggested = (currentDoc.name?.replace(/\.docx$/i, '') || 'document') + ' (export).docx';
+        fileHandle = await showSaveFilePicker({
+          suggestedName: suggested,
+          types: [{
+            description: 'Word document',
+            accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
+          }]
+        });
+      } catch (e) {
+        const msg = String(e?.message || '');
+        if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
+        if (e?.name === 'SecurityError' || e?.name === 'NotAllowedError' || /Must be handling a user gesture/i.test(msg)) {
+          skipPickerReason = e?.name || 'SecurityError';
+        } else {
+          console.error('Save picker failed:', e);
+          alert('Export failed: ' + (e?.message || e));
           return;
         }
-        const inspectionBytes = prepared.preRemovalBytes || prepared.updatedBytes;
-        const plan = await inspectRemovalPlan(inspectionBytes, prepared.visibilityMap);
-        let removalPreview = null;
-        try {
-          const removalBytes = await applyRemovalWithBackup(inspectionBytes, prepared.visibilityMap, prepared.originalBytes);
-          let previewPlan = null;
-          let previewPlanError = null;
-          try {
-            previewPlan = await inspectRemovalPlan(removalBytes, {});
-          } catch (planErr) {
-            previewPlanError = normalizeDebugError(planErr);
-          }
-          removalPreview = {
-            bytes: removalBytes,
-            plan: previewPlan,
-            planError: previewPlanError || (previewPlan?.error || null),
-          };
-        } catch (removalErr) {
-          removalPreview = { error: normalizeDebugError(removalErr) };
-        }
-
-        const debugContext = { ...prepared, removalPreview };
-
-        console.groupCollapsed('Export removal debug');
-        console.log('Visibility map', prepared.visibilityMap);
-        console.log('Removal plan (before applying actions)', plan);
-        if (removalPreview) {
-          console.log('Removal preview bytes length', removalPreview?.bytes?.length || 0);
-          if (removalPreview?.plan) {
-            console.log('Removal preview plan (after applying actions)', removalPreview.plan);
-          }
-          if (removalPreview?.planError) {
-            console.log('Removal preview plan error', removalPreview.planError);
-          }
-          if (removalPreview?.error) {
-            console.log('Removal preview error', removalPreview.error);
-          }
-        }
-        console.groupEnd();
-        renderExportDebugPanel(plan, debugContext);
-      } catch (e) {
-        console.error('Export debug failed:', e);
-        alert('Export debug failed: ' + (e?.message || e));
-      } finally {
-        if (btnExportDebug) btnExportDebug.disabled = !currentDoc;
       }
     }
 
-    async function onExportFromOpenForm() {
-      if (!currentDoc?.docId) {
-        alert('No active document. Open or pick a DOCX first.');
-        return;
+    const attempt = async () => {
+      setStatus('Exporting…');
+
+      const prepared = await gatherExportArtifacts(canBytes);
+      if (!prepared) { await hardResetOpenForm('no bytes / no permission'); return; }
+
+      const docId = currentDoc.docId;
+
+      const inspectionBytes = prepared.preRemovalBytes || prepared.updatedBytes;
+      const baseU8 = (inspectionBytes instanceof Uint8Array) ? inspectionBytes : new Uint8Array(inspectionBytes);
+
+      // Apply removal to exported bytes (critical)
+      const { bytes: finalBytesU8, applied: removalAppliedNow } = await applyRemovalIfNeeded(
+        baseU8,
+        prepared.visibilityMap || {},
+        prepared.originalBytes
+      );
+
+      // Persist state + cache bytes (final)
+      try {
+        const payloadObj = prepared.payloadObj || (prepared.payload ? JSON.parse(prepared.payload) : null);
+
+        const nextState = {
+          schema: prepared.effectiveSchema || schema,
+          values: prepared.safeValues || {},
+          tagMap: prepared.cleanTagMap || {},
+          rules: prepared.headingRules || [],
+          fieldRules: prepared.fieldRulesForDoc || [],
+          rulesVersion: prepared.rulesVersion,
+          headingsFlat: prepared.baselineHeadingsFlat || [],
+          headingsTree: prepared.baselineHeadingsTree || [],
+          schemaUpdatedAt: new Date().toISOString(),
+          cronos_payload: payloadObj || undefined,
+          CRONOS_PAYLOAD: payloadObj || undefined,
+          lastExport: {
+            ts: Date.now(),
+            removalApplied: !!(prepared.removalApplied || removalAppliedNow),
+            visibilityKeys: prepared.visibilityMap ? Object.keys(prepared.visibilityMap).length : 0,
+            hideCount: countHideActions(prepared.visibilityMap || {})
+          },
+          lastVisibilityMap: prepared.visibilityMap || {}
+        };
+
+        await window.formSuitePersist.saveState(docId, nextState);
+      } catch (e) {
+        console.warn('Export: state persistence failed (continuing):', e);
       }
 
-      const canBytes = await fetchWorkingDocBytes();
-      if (!canBytes) { await hardResetOpenForm('no bytes / no permission'); return; }
+      try { await window.formSuitePersist.putBytes?.(docId, finalBytesU8); }
+      catch (e) { console.warn('Export: putBytes failed:', e); }
 
-      let fileHandle = null;
-      let skipPickerReason = '';
-      if (supportsFS && window.showSaveFilePicker) {
+      // Keep pre-removal copy for debugging
+      try {
+        const pre = (prepared.preRemovalBytes || prepared.updatedBytes);
+        const preU8 = pre instanceof Uint8Array ? pre : new Uint8Array(pre);
+        await window.formSuitePersist.putBytes?.(docId + '::preRemoval', preU8);
+      } catch (e) {
+        console.warn('Export: preRemoval cache failed (continuing):', e);
+      }
+
+      try { window.broadcastStateUpdated && window.broadcastStateUpdated(docId); } catch {}
+      try { window.broadcastSchemaUpdated && window.broadcastSchemaUpdated(docId); } catch {}
+
+      // Output: write to handle or download
+      let saved = false;
+
+      if (fileHandle) {
         try {
-          const suggested = (currentDoc.name?.replace(/\.docx$/i, '') || 'document') + ' (export).docx';
-          fileHandle = await showSaveFilePicker({
-            suggestedName: suggested,
-            types: [{
-              description: 'Word document',
-              accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
-            }]
-          });
+          const stream = await fileHandle.createWritable();
+          await stream.write(finalBytesU8);
+          await stream.close();
+          saved = true;
         } catch (e) {
           const msg = String(e?.message || '');
           if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
-          if (e?.name === 'SecurityError' || e?.name === 'NotAllowedError' || /Must be handling a user gesture/i.test(msg)) {
-            skipPickerReason = e?.name || 'SecurityError';
-          } else {
-            console.error('Save picker failed:', e);
-            alert('Export failed: ' + (e?.message || e));
-            return;
-          }
+          console.warn('Writing to handle failed, falling back to download:', e);
         }
       }
 
-      const attempt = async () => {
-        await ensurePy();
-
-        const prepared = await gatherExportArtifacts(canBytes);
-        if (!prepared) { await hardResetOpenForm('no bytes / no permission'); return; }
-
-        const updatedFinal = prepared.updatedBytes;
-
-        await window.formSuitePersist.putBytes?.(currentDoc.docId, updatedFinal);
-
-        let saved = false;
-        if (fileHandle) {
-          try {
-            const stream = await fileHandle.createWritable();
-            await stream.write(updatedFinal);
-            await stream.close();
-            saved = true;
-          } catch (e) {
-            const msg = String(e?.message || '');
-            if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
-            console.warn('Writing to handle failed, falling back to download:', e);
-          }
-        }
-
-        if (!saved) {
-          if (skipPickerReason) {
-            console.info(`Falling back to download due to: ${skipPickerReason}`);
-          }
-          const blob = new Blob([updatedFinal], {
-            type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-          });
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = (currentDoc?.name || 'document').replace(/\.docx$/i, ' (export).docx');
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
-        }
-      };
-
-      try {
-        await attempt();
-      } catch (e) {
-        const msg = String(e?.message || e || '');
-        if (msg.includes('already been destroyed') || msg.includes('proxy has been destroyed')) {
-          await ensurePy(true);
-          try { await attempt(); return; } catch (e2) {
-            const m2 = String(e2?.message || '');
-            if (e2?.name === 'AbortError' || /export canceled/i.test(m2)) return;
-            console.error('Export failed after retry:', e2);
-            alert('Export failed: ' + (e2?.message || e2));
-            return;
-          }
-        }
-        if (e?.name === 'AbortError' || /export canceled/i.test(msg.toLowerCase())) return;
-        console.error('Export failed (Open Form):', e);
-        alert('Export failed: ' + (e?.message || e));
-      }
-    }
-
-    // ---------- Rules: normalization + resolution ----------
-
-    function mergeHeadingMetadataFromBaseline(liveFlat, baselineFlat) {
-      if (!Array.isArray(liveFlat) || !liveFlat.length) return;
-      if (!Array.isArray(baselineFlat) || !baselineFlat.length) return;
-
-      const normalizeText = (value) => {
-        if (!value && value !== 0) return '';
-        let out = String(value);
-        try { out = out.normalize('NFKD'); } catch {}
-        out = out.replace(/[\u0300-\u036f]/g, '');
-        return out.replace(/\s+/g, ' ').trim().toLowerCase();
-      };
-
-      const copyMetadata = (target, source) => {
-        if (!target || !source) return;
-        const copyIfMissing = (fromKey, toKey = fromKey) => {
-          const val = source[fromKey];
-          if (val == null || val === '') return;
-          if (target[toKey] == null || target[toKey] === '') target[toKey] = val;
-        };
-        copyIfMissing('uid');
-        copyIfMissing('compositeKey');
-        copyIfMissing('number');
-        copyIfMissing('num', 'number');
-        copyIfMissing('part');
-        const lbl = source.label || source.title;
-        if (lbl && (!target.label || target.label === target.text)) target.label = lbl;
-      };
-
-      const baselineMeta = baselineFlat.map((entry, order) => ({
-        entry,
-        order,
-        idx: Number(entry?.idx ?? entry?.key),
-        level: Number(entry?.level),
-        norm: normalizeText(entry?.label || entry?.text || entry?.title || ''),
-      })).filter(meta => meta.entry);
-      if (!baselineMeta.length) return;
-
-      const liveMeta = liveFlat.map((entry, order) => ({
-        entry,
-        order,
-        idx: Number(entry?.idx ?? entry?.key),
-        level: Number(entry?.level),
-        norm: normalizeText(entry?.text || entry?.label || ''),
-      }));
-
-      const baselineByIdx = new Map();
-      const baselineByLevelText = new Map();
-      const baselineByText = new Map();
-      const pushToMap = (map, key, value) => {
-        if (!key && key !== 0) return;
-        if (!map.has(key)) map.set(key, []);
-        map.get(key).push(value);
-      };
-
-      baselineMeta.forEach((meta) => {
-        if (Number.isFinite(meta.idx) && !baselineByIdx.has(meta.idx)) baselineByIdx.set(meta.idx, meta);
-        if (meta.norm) {
-          const lvlKey = `${Number.isFinite(meta.level) ? meta.level : 'x'}|${meta.norm}`;
-          pushToMap(baselineByLevelText, lvlKey, meta);
-          pushToMap(baselineByText, meta.norm, meta);
-        }
-      });
-
-      const takeMatch = (collection, key) => {
-        if (!collection) return null;
-        const arr = Array.isArray(collection) ? collection : collection.get?.(key);
-        if (!arr) return null;
-        while (arr.length) {
-          const cand = arr.shift();
-          if (cand && !cand._used) return cand;
-        }
-        return null;
-      };
-
-      const matchIdx = () => {
-        for (const live of liveMeta) {
-          if (!Number.isFinite(live.idx)) continue;
-          const cand = baselineByIdx.get(live.idx);
-          if (cand && !cand._used) {
-            cand._used = true;
-            live._matched = true;
-            copyMetadata(live.entry, cand.entry);
-          }
-        }
-      };
-
-      const matchLevelAndText = () => {
-        for (const live of liveMeta) {
-          if (live._matched) continue;
-          if (!live.norm) continue;
-          const key = `${Number.isFinite(live.level) ? live.level : 'x'}|${live.norm}`;
-          const cand = takeMatch(baselineByLevelText, key);
-          if (cand) {
-            cand._used = true;
-            live._matched = true;
-            copyMetadata(live.entry, cand.entry);
-          }
-        }
-      };
-
-      const matchTextOnly = () => {
-        for (const live of liveMeta) {
-          if (live._matched) continue;
-          if (!live.norm) continue;
-          const cand = takeMatch(baselineByText, live.norm);
-          if (cand) {
-            cand._used = true;
-            live._matched = true;
-            copyMetadata(live.entry, cand.entry);
-          }
-        }
-      };
-
-      const matchByOrder = () => {
-        for (let i = 0; i < liveMeta.length; i++) {
-          const live = liveMeta[i];
-          if (live._matched) continue;
-          const cand = baselineMeta[i];
-          if (cand && !cand._used) {
-            cand._used = true;
-            live._matched = true;
-            copyMetadata(live.entry, cand.entry);
-          }
-        }
-      };
-
-      matchIdx();
-      matchLevelAndText();
-      matchTextOnly();
-      if (liveMeta.length === baselineMeta.length) matchByOrder();
-    }
-
-    async function buildHeadingResolverFromDoc(bytesU8, options = null) {
-      let fallback = null;
-      let baselineFlat = [];
-      if (options && typeof options === 'object' && !Array.isArray(options)) {
-        if (typeof options.resolve === 'function' || typeof options.resolveIdx === 'function' || typeof options.normalizeTarget === 'function') {
-          fallback = options;
-        } else {
-          fallback = options.fallbackResolver || null;
-        }
-        if (Array.isArray(options.baselineFlat)) baselineFlat = options.baselineFlat;
-      } else {
-        fallback = options || null;
-      }
-      let normalized = null;
-      if (bytesU8 instanceof Uint8Array) normalized = bytesU8;
-      else if (bytesU8) {
-        try { normalized = new Uint8Array(bytesU8); }
-        catch { normalized = null; }
-      }
-      if (!normalized || !normalized.length) return fallback;
-
-      try {
-        const plan = await inspectRemovalPlan(normalized, {});
-        const parts = Array.isArray(plan?.parts) ? plan.parts : [];
-        const seen = new Set();
-        const liveFlat = [];
-
-        for (const part of parts) {
-          const headings = Array.isArray(part?.headings) ? part.headings : [];
-          for (const heading of headings) {
-            const idx = Number(heading?.idx);
-            if (!Number.isFinite(idx) || seen.has(idx)) continue;
-            seen.add(idx);
-            const text = String(heading?.text || '').trim();
-            const lvl = Number(heading?.level);
-            const entry = {
-              idx,
-              key: idx,
-              id: idx,
-              text,
-              title: text,
-              label: text,
-            };
-            if (Number.isFinite(lvl)) entry.level = lvl;
-            const number = heading?.number ?? heading?.num;
-            if (number != null && number !== '') entry.number = String(number);
-            liveFlat.push(entry);
-          }
-        }
-
-        if (liveFlat.length) {
-          liveFlat.sort((a, b) => a.idx - b.idx);
-          mergeHeadingMetadataFromBaseline(liveFlat, baselineFlat);
-          return buildHeadingTargetIndex({ flat: liveFlat, tree: [] });
-        }
-      } catch (err) {
-        console.warn('Failed to rebuild heading resolver from DOCX before export', err);
-      }
-
-      return fallback;
-    }
-
-    function applyFieldVisibility() {
-      try {
-        if (!schema || !Array.isArray(schema.fields)) return;
-        const visMap = evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
-        const clearDisabled = (el) => {
-          el.style.opacity = '';
-          el.style.pointerEvents = '';
-          el.removeAttribute('aria-disabled');
-          el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = false; } catch {} });
-        };
-        document.querySelectorAll('.field[data-field-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
-        document.querySelectorAll('.mc-item[data-opt-id]').forEach(node => { node.style.display = ''; clearDisabled(node); });
-
-        const esc = (window.CSS && CSS.escape)
-          ? CSS.escape
-          : (s => String(s)
-              .replace(/\\/g,'\\\\')
-              .replace(/"/g,'\\"')
-              .replace(/\]/g,'\\]')
-              .replace(/\[/g,'\\[')
-              .replace(/\(/g,'\\(')
-              .replace(/\)/g,'\\)')
-              .replace(/\./g,'\\.')
-            );
-
-
-        const deselectMcItem = (mcEl) => {
-          const cb = mcEl.querySelector('input[type="checkbox"][data-mc="1"]');
-          if (!cb) return;
-          const fid = cb.name;
-          const optVal = cb.value;
-          if (cb.checked) cb.checked = false;
-          const arr = Array.isArray(values[fid]) ? values[fid].map(String) : [];
-          const next = arr.filter(v => v !== String(optVal));
-          values[fid] = next;
-          scheduleSaveState();
-        };
-        const deselectFieldWrapper = (wrapEl) => {
-          const fid = wrapEl?.dataset?.fieldId || '';
-          if (!fid) return;
-          const fld = (schema?.fields || []).find(f => String(f.id) === String(fid));
-          const t = String(fld?.type || '').toLowerCase();
-          if (t === 'multichoice') {
-            wrapEl.querySelectorAll('input[type="checkbox"][data-mc="1"]').forEach(cb => { cb.checked = false; });
-            values[fid] = [];
-            scheduleSaveState();
-          } else if (t === 'select') {
-            const sel = wrapEl.querySelector('select');
-            if (sel) { sel.value = ''; values[fid] = ''; scheduleSaveState(); }
-          } else if (t === 'text') {
-            const inp = wrapEl.querySelector('input[type="text"]:not([data-type="date"])');
-            if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
-          } else if (t === 'number') {
-            const inp = wrapEl.querySelector('input[type="number"]');
-            if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
-          } else if (t === 'date') {
-            const inp = wrapEl.querySelector('input[data-type="date"]');
-            if (inp) {
-              try { if (inp._flatpickr) inp._flatpickr.clear(); } catch {}
-              inp.value = '';
-              values[fid] = '';
-              scheduleSaveState();
-            }
-          }
-        };
-
-        Object.keys(visMap || {}).forEach(id => {
-          const dir = visMap[id];
-          if (typeof id === 'string' && id.includes('__opt__')) {
-            document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => {
-              deselectMcItem(el);
-              if (dir === 'HIDE') el.style.display = 'none';
-              else { el.style.display=''; el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; el.setAttribute('aria-disabled','true'); el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} }); }
-            });
-          } else {
-            document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => {
-              deselectFieldWrapper(el);
-              if (dir === 'HIDE') el.style.display = 'none';
-              else { el.style.display=''; el.style.opacity = '0.5'; el.style.pointerEvents = 'none'; el.setAttribute('aria-disabled','true'); el.querySelectorAll('input,select,textarea,button').forEach(i => { try { i.disabled = true; } catch {} }); }
-            });
-          }
+      if (!saved) {
+        if (skipPickerReason) console.info(`Falling back to download due to: ${skipPickerReason}`);
+        const blob = new Blob([finalBytesU8], {
+          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         });
-      } catch (e) { /* no-op */ }
-    }
+        const a = document.createElement('a');
+        const safeName = (currentDoc.name?.replace(/\.docx$/i, '') || 'document') + ' (export).docx';
+        a.href = URL.createObjectURL(blob);
+        a.download = safeName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          try { URL.revokeObjectURL(a.href); } catch {}
+          try { a.remove(); } catch {}
+        }, 1000);
+      }
 
-    // Expose for cross-callbacks
+      const hc = countHideActions(prepared.visibilityMap || {});
+      setStatus(`Export complete.${hc ? (removalAppliedNow ? '' : ' (no remover available)') : ''}`);
+    };
+
     try {
-      window.applyFieldVisibility = applyFieldVisibility;
-      window.restoreDocxFromBackup = restoreDocxFromBackup;
-      window.inspectExportRemovalPlan = inspectRemovalPlan;
-      window.renderExportDebugPanel = renderExportDebugPanel;
-    } catch {}
+      await attempt();
+    } catch (e) {
+      const msg = String(e?.message || '');
+      if (e?.name === 'AbortError' || /export canceled/i.test(msg.toLowerCase())) return;
+      console.error('Export failed (Open Form):', e);
+      alert('Export failed: ' + (e?.message || e));
+      setStatus('Export failed — see console.');
+    }
+  }
 
-    installLogoFocusNav();
+  // ============================================================
+  // Expose for cross-callbacks
+  // ============================================================
+  try {
+    window.applyFieldVisibility = applyFieldVisibility;
+    if (typeof window.inspectRemovalPlan === 'function') window.inspectExportRemovalPlan = window.inspectRemovalPlan;
+    window.renderExportDebugPanel = renderExportDebugPanel;
+  } catch {}
+
+  installLogoFocusNav();
   </script>
 </body>
 </html>

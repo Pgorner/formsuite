@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="style.css">
   <script src="persistence.js"></script>
 </head>
+
 <body class="rules">
 <header>
   <div class="row">
@@ -30,15 +31,18 @@
   <section class="panel">
     <div class="row" style="justify-content:space-between; align-items:center">
       <h2 style="margin:0">Rules</h2>
+
       <div id="rulesTabs" class="row" style="margin-left:8px; gap:6px;">
         <button id="tabHeadings" class="btn btn-secondary" aria-pressed="true">Headings</button>
         <button id="tabFields" class="btn btn-ghost" aria-pressed="false">Fields</button>
       </div>
+
       <div class="row">
         <span id="status" class="muted" style="margin-right:10px"></span>
         <button id="btnAddRule" class="btn btn-primary">Add rule</button>
       </div>
     </div>
+
     <div class="muted-note" id="rulesHint" style="margin-top:6px">
       SHOW or HIDE specific headings/subheaders or form fields based on a field’s value(s).
     </div>
@@ -58,80 +62,99 @@
 
 <script>
 /* ------------------------------------------------------------------ *
- * Bulletproof Rules editor
+ * Bulletproof Rules editor (drop-in)
  * ------------------------------------------------------------------ */
 
 const nowt = () => new Date().toISOString().slice(11,23);
-const ACTIVE_LS_KEY= "FS_ACTIVE_DOC_META";
+const ACTIVE_LS_KEY = "FS_ACTIVE_DOC_META";
 
 const els = {
-  status: document.getElementById("status"),
-  btnAddRule: document.getElementById("btnAddRule"),
+  status:      document.getElementById("status"),
+  btnAddRule:  document.getElementById("btnAddRule"),
   editorMount: document.getElementById("editorMount"),
-  rulesList: document.getElementById("rulesList"),
+  rulesList:   document.getElementById("rulesList"),
   tabHeadings: document.getElementById("tabHeadings"),
-  tabFields: document.getElementById("tabFields"),
-  rulesHint: document.getElementById("rulesHint"),
+  tabFields:   document.getElementById("tabFields"),
+  rulesHint:   document.getElementById("rulesHint"),
 };
 
-const bcCanon   = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-active-doc")   : null;
-const bcLegacy  = ("BroadcastChannel" in window) ? new BroadcastChannel("form-suite-doc")  : null;
+const bcCanon  = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-active-doc")  : null;
+const bcLegacy = ("BroadcastChannel" in window) ? new BroadcastChannel("form-suite-doc") : null;
 
-// ---- DEBUG: pretty payload logger ----
-async function debugLogPayload(where) {
-  try {
-    const st = await window.formSuitePersist.loadState(gDocId) || {};
-    const payload = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
-    const wsRules      = Array.isArray(st.rules) ? st.rules : [];
-    const wsFieldRules = Array.isArray(st.fieldRules) ? st.fieldRules : [];
-
-    console.groupCollapsed(`[rules][${where}] docId=${gDocId}`);
-    console.log('workspace.rules        (%d):', wsRules.length, wsRules);
-    console.log('workspace.fieldRules   (%d):', wsFieldRules.length, wsFieldRules);
-    console.log('workspace.rulesVersion :', st.rulesVersion);
-    console.log('payload.rules          (%d):', Array.isArray(payload.rules) ? payload.rules.length : 0, payload.rules || []);
-    console.log('payload.fieldRules     (%d):', Array.isArray(payload.fieldRules) ? payload.fieldRules.length : 0, payload.fieldRules || []);
-    console.log('payload.rulesVersion   :', payload.rulesVersion);
-    console.log('payload.updatedAt      :', payload.updatedAt);
-    try {
-      const lsScoped = localStorage.getItem(`CRONOS_PAYLOAD:${gDocId}`);
-      const lsParsed = lsScoped ? JSON.parse(lsScoped) : null;
-      console.log('localStorage(scoped)   :', !!lsScoped, lsParsed?.rules?.length ?? 0, lsParsed?.fieldRules?.length ?? 0, lsParsed?.rulesVersion ?? null);
-    } catch (e) {
-      console.warn('localStorage parse fail:', e);
-    }
-    console.groupEnd();
-  } catch (e) {
-    console.error('[rules][debugLogPayload] failed', e);
-  }
-}
-
-
-// app state
-let gDocId   = null;
-let gSchema  = { title:"Form", fields:[] };
-let gHeadingsTree = [];
-let gHeadingsFlat = [];
-let gMode    = 'headings'; // 'headings' | 'fields'
-let gRulesHeadings = [];   // persisted
-let gRulesFields   = [];   // persisted
-let gRules   = [];         // current list in view
-let gEditingId = null;     // current editor
-let gDraft   = null;
-
-// UI helpers
 const setStatus = (s) => { try { els.status.textContent = s || ""; } catch {} };
-const slugify = (s)=> String(s||"").normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-zA-Z0-9]+/g,'_').replace(/^_+|_+$/g,'').toLowerCase();
-const ACTIONS = new Set(["SHOW","HIDE"]);
 const debounce = (fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
-const valueToSlug = (v)=> slugify(String(v));
 
-// ---- unified type helpers ----
+const slugify = (s)=> String(s||"")
+  .normalize('NFKD')
+  .replace(/[\u0300-\u036f]/g,'')
+  .replace(/[^a-zA-Z0-9]+/g,'_')
+  .replace(/^_+|_+$/g,'')
+  .toLowerCase();
+
+const valueToSlug = (v)=> slugify(String(v));
+const ACTIONS = new Set(["SHOW","HIDE"]);
+
 const isMultiOption = (t) => ['multichoice','multiselect'].includes(t);
 const isSelectLike  = (t) => ['select','dropdown','singlechoice','choice','single','combobox','list'].includes(t);
 const isNumericLike = (t) => ['datediff','duration','number'].includes(t);
 
-// schema/headings helpers
+// app state
+let gDocId = null;
+let gSchema = { title:"Form", fields:[] };
+let gHeadingsTree = [];
+let gHeadingsFlat = [];
+let gMode = 'headings'; // 'headings' | 'fields'
+let gRulesHeadings = [];
+let gRulesFields   = [];
+let gRules = [];
+let gEditingId = null;
+let gDraft = null;
+
+/* ------------------------- small utils ------------------------- */
+
+function safeArr(x){ return Array.isArray(x) ? x : []; }
+
+function deepClone(x){
+  try { return JSON.parse(JSON.stringify(x)); } catch { return x; }
+}
+
+function readScopedPayloadLS(docId){
+  try {
+    const s = localStorage.getItem(`CRONOS_PAYLOAD:${docId}`);
+    return s ? JSON.parse(s) : null;
+  } catch { return null; }
+}
+
+function readGlobalPayloadLS(){
+  try {
+    const s = localStorage.getItem('CRONOS_PAYLOAD');
+    return s ? JSON.parse(s) : null;
+  } catch { return null; }
+}
+
+function parseStamp(v){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function stampOf(payloadOrState){
+  if (!payloadOrState) return 0;
+  const v = payloadOrState.rulesVersion ?? payloadOrState.updatedAt ?? payloadOrState.ts ?? payloadOrState.stamp;
+  if (typeof v === 'number') return parseStamp(v);
+  if (typeof v === 'string') {
+    const asNum = parseStamp(v);
+    if (asNum) return asNum;
+    const d = Date.parse(v);
+    return Number.isFinite(d) ? d : 0;
+  }
+  return 0;
+}
+
+function getFieldLabelById(id){
+  const f = (gSchema.fields||[]).find(x => String(x.id)===String(id));
+  return f?.label || f?.name || f?.id || String(id);
+}
+
 function normOptions(field){
   const raw = field && field.options || [];
   return raw.map(o => {
@@ -143,10 +166,40 @@ function normOptions(field){
     return { value:String(o), label:String(o) };
   });
 }
-function getFieldLabelById(id){
-  const f = (gSchema.fields||[]).find(x => String(x.id)===String(id));
-  return f?.label || f?.name || f?.id || String(id);
+
+/* ------------------------- DEBUG logger ------------------------- */
+async function debugLogPayload(where) {
+  try {
+    const st = await window.formSuitePersist.loadState(gDocId) || {};
+    const payload =
+        (st?.payload?.CRONOS_PAYLOAD)
+     || (st?.CRONOS_PAYLOAD)
+     || (st?.cronos_payload)
+     || {};
+    const wsRules      = safeArr(st.rules);
+    const wsFieldRules = safeArr(st.fieldRules);
+
+    console.groupCollapsed(`[rules][${where}] docId=${gDocId}`);
+    console.log('workspace.rules        (%d):', wsRules.length, wsRules);
+    console.log('workspace.fieldRules   (%d):', wsFieldRules.length, wsFieldRules);
+    console.log('workspace.rulesVersion :', st.rulesVersion);
+    console.log('payload.rules          (%d):', safeArr(payload.rules).length, payload.rules || []);
+    console.log('payload.fieldRules     (%d):', safeArr(payload.fieldRules).length, payload.fieldRules || []);
+    console.log('payload.rulesVersion   :', payload.rulesVersion);
+    console.log('payload.updatedAt      :', payload.updatedAt);
+
+    const lsScoped = readScopedPayloadLS(gDocId);
+    const lsGlobal = readGlobalPayloadLS();
+    console.log('localStorage(scoped)   :', !!lsScoped, safeArr(lsScoped?.rules).length, safeArr(lsScoped?.fieldRules).length, lsScoped?.rulesVersion ?? null);
+    console.log('localStorage(global)   :', !!lsGlobal, safeArr(lsGlobal?.rules).length, safeArr(lsGlobal?.fieldRules).length, lsGlobal?.rulesVersion ?? null);
+    console.groupEnd();
+  } catch (e) {
+    console.error('[rules][debugLogPayload] failed', e);
+  }
 }
+
+/* ------------------------- heading helpers ------------------------- */
+
 function flattenWithNumbers(tree){
   const out=[], counters=[];
   function walk(nodes, depth){
@@ -169,6 +222,7 @@ function flattenWithNumbers(tree){
   return out;
 }
 
+// same resolver logic you already had (kept)
 function buildHeadingTargetIndex(baseline) {
   const flat = Array.isArray(baseline?.flat)
     ? baseline.flat
@@ -221,22 +275,6 @@ function buildHeadingTargetIndex(baseline) {
   };
   walk(tree);
 
-  const parseLegacyIdx = (target) => {
-    const raw = (target && typeof target === 'object')
-      ? (target.key ?? target.idx ?? target.id ?? target.number ?? target.uid ?? null)
-      : target;
-    if (raw == null) return NaN;
-    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : NaN;
-    const str = String(raw).trim();
-    if (!str) return NaN;
-    if (/^\d+$/.test(str)) return Number(str);
-    if (str.includes('|')) {
-      const head = str.split('|', 1)[0];
-      if (/^\d+$/.test(head)) return Number(head);
-    }
-    return NaN;
-  };
-
   const resolve = (target) => {
     if (target && typeof target === 'object') {
       if (target.uid && byUid.has(String(target.uid))) return byUid.get(String(target.uid));
@@ -245,10 +283,7 @@ function buildHeadingTargetIndex(baseline) {
         if (Number.isFinite(idx)) {
           if (byIdx.has(idx)) return byIdx.get(idx);
           const legacy = idx - 1;
-          if (byIdx.has(legacy)) {
-            const maybe = byIdx.get(legacy);
-            if (maybe && idx === Number(maybe.idx) + 1) return maybe;
-          }
+          if (byIdx.has(legacy)) return byIdx.get(legacy);
         }
       }
       if (target.key != null) {
@@ -256,10 +291,7 @@ function buildHeadingTargetIndex(baseline) {
         if (Number.isFinite(idx)) {
           if (byIdx.has(idx)) return byIdx.get(idx);
           const legacy = idx - 1;
-          if (byIdx.has(legacy)) {
-            const maybe = byIdx.get(legacy);
-            if (maybe && idx === Number(maybe.idx) + 1) return maybe;
-          }
+          if (byIdx.has(legacy)) return byIdx.get(legacy);
         }
         const keyStr = String(target.key);
         if (byComposite.has(keyStr)) return byComposite.get(keyStr);
@@ -280,27 +312,11 @@ function buildHeadingTargetIndex(baseline) {
       if (byComposite.has(rawStr)) return byComposite.get(rawStr);
       if (byUid.has(rawStr)) return byUid.get(rawStr);
       if (byNumber.has(rawStr)) return byNumber.get(rawStr);
-      if (rawStr.includes('|')) {
-        const head = rawStr.split('|', 1)[0];
-        if (byNumber.has(head)) return byNumber.get(head);
-        const num = Number(head);
-        if (Number.isFinite(num)) {
-          if (byIdx.has(num)) return byIdx.get(num);
-          const legacy = num - 1;
-          if (byIdx.has(legacy)) {
-            const maybe = byIdx.get(legacy);
-            if (maybe && num === Number(maybe.idx) + 1) return maybe;
-          }
-        }
-      }
-      const num = Number(rawStr);
+      const num = Number(rawStr.includes('|') ? rawStr.split('|',1)[0] : rawStr);
       if (Number.isFinite(num)) {
         if (byIdx.has(num)) return byIdx.get(num);
         const legacy = num - 1;
-        if (byIdx.has(legacy)) {
-          const maybe = byIdx.get(legacy);
-          if (maybe && num === Number(maybe.idx) + 1) return maybe;
-        }
+        if (byIdx.has(legacy)) return byIdx.get(legacy);
       }
     }
     return null;
@@ -309,17 +325,11 @@ function buildHeadingTargetIndex(baseline) {
   const resolveIdx = (target) => {
     const entry = resolve(target);
     if (entry && Number.isFinite(Number(entry.idx))) return Number(entry.idx);
-    const legacy = parseLegacyIdx(target);
-    if (Number.isFinite(legacy)) {
-      if (byIdx.has(legacy)) return legacy;
-      const fallback = legacy - 1;
-      if (byIdx.has(fallback)) {
-        const maybe = byIdx.get(fallback);
-        if (maybe && legacy === Number(maybe.idx) + 1) return Number(maybe.idx);
-      }
-      return legacy;
-    }
-    return NaN;
+    const raw = (target && typeof target === 'object')
+      ? (target.key ?? target.idx ?? target.id ?? target.number ?? target.uid ?? null)
+      : target;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : NaN;
   };
 
   const buildLabel = (entry, fallback) => {
@@ -336,28 +346,17 @@ function buildHeadingTargetIndex(baseline) {
     let idx = entry ? Number(entry.idx) : resolveIdx(target);
     if (!Number.isFinite(idx)) return null;
 
-    if (!entry && target && typeof target === 'object') {
-      const rawIdx = Number(target.idx ?? target.key);
-      if (Number.isFinite(rawIdx)) {
-        const legacy = rawIdx - 1;
-        if (byIdx.has(legacy)) {
-          const maybe = byIdx.get(legacy);
-          if (maybe && rawIdx === Number(maybe.idx) + 1) {
-            idx = Number(maybe.idx);
-          }
-        }
-      }
-    }
-
     const normalized = { key: idx, idx };
     if (entry?.uid) normalized.uid = entry.uid;
     else if (target && typeof target === 'object' && target.uid) normalized.uid = target.uid;
+
     const fallbackLabel = (target && typeof target === 'object') ? target.label : null;
     const label = buildLabel(entry, fallbackLabel) || `Heading ${idx + 1}`;
     normalized.label = label;
+
     const number = entry?.number || entry?.num;
-    if (number) normalized.number = number;
-    else normalized.number = String(idx + 1);
+    normalized.number = number ? String(number) : String(idx + 1);
+
     return normalized;
   };
 
@@ -367,21 +366,15 @@ function buildHeadingTargetIndex(baseline) {
 function currentHeadingIndex() {
   return buildHeadingTargetIndex({ flat: gHeadingsFlat, tree: gHeadingsTree });
 }
-function toCompositeKeyFromFlat(h){
-  if (!h) return '';
-  const raw = String(h.key ?? '');
-  if (raw.includes('|')) return raw;
-  return `${h.number}|${h.titleOnly || ''}`.trim();
-}
+
 function getHeadingLabelFromKey(key){
   if (!key) return '';
-  if (key.includes('|')) return key.split('|').slice(1).join('|');
+  if (String(key).includes('|')) return String(key).split('|').slice(1).join('|');
   const flat = flattenWithNumbers(gHeadingsTree);
-  const hit = flat.find(h => h.number === key);
-  return hit?.titleOnly || key;
+  const hit = flat.find(h => h.number === String(key));
+  return hit?.titleOnly || String(key);
 }
 
-// target normalization
 function normalizeHeadingsRuleTargetsInPlace(rule){
   if (!rule || !Array.isArray(rule.targets)) return {changed:false};
   const idx = currentHeadingIndex();
@@ -401,7 +394,6 @@ function normalizeHeadingsRuleTargetsInPlace(rule){
   return {changed};
 }
 
-// keep option labels for child targets
 function normalizeFieldTargetsInPlace(rule){
   if (!rule || !Array.isArray(rule.targets)) return {changed:false};
   const fieldLabel = new Map((gSchema.fields||[]).map(f=>[String(f.id), f.label||f.name||f.id]));
@@ -434,15 +426,13 @@ function normalizeFieldTargetsInPlace(rule){
 
   return {changed};
 }
+
 function normalizeAllTargets(){
-  let cH=0, cF=0;
-  (gRulesHeadings||[]).forEach(r=>{ if (normalizeHeadingsRuleTargetsInPlace(r).changed) cH++; });
-  (gRulesFields||[]).forEach(r=>{ if (normalizeFieldTargetsInPlace(r).changed) cF++; });
-  if (cH) console.log(`[${nowt()}] normalized ${cH} heading rule(s)`);
-  if (cF) console.log(`[${nowt()}] normalized ${cF} field rule(s)`);
+  (gRulesHeadings||[]).forEach(r=> normalizeHeadingsRuleTargetsInPlace(r));
+  (gRulesFields||[]).forEach(r=> normalizeFieldTargetsInPlace(r));
 }
 
-// condition sources + validation
+/* ------------------------- condition sources ------------------------- */
 function buildConditionSources(schema){
   const out=[]; const seen=new Set();
   for (const f of (schema?.fields||[])){
@@ -462,7 +452,9 @@ function buildConditionSources(schema){
         const rawV = it && typeof it==='object' ? (it.value ?? it.label ?? it.text ?? it.name ?? '') : it;
         const rawL = it && typeof it==='object' ? (it.label ?? it.text ?? it.name ?? rawV) : rawV;
         const v=String(rawV||'').trim(); const l=String(rawL||'').trim(); const sl=slugify(v);
-        if (!v||!sl) return; const optId = `${id}__opt__${sl}`; if (seen.has(optId)) return;
+        if (!v||!sl) return;
+        const optId = `${id}__opt__${sl}`;
+        if (seen.has(optId)) return;
         seen.add(optId); out.push({id:optId, label:`${label}: ${l}`, type:'boolean'});
       });
       continue;
@@ -471,7 +463,13 @@ function buildConditionSources(schema){
     if (t==='date'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'date'});} continue; }
     if (isNumericLike(t)){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'number'});} continue; }
     if (isSelectLike(t)){
-      if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'select', options:(f.options||[]).map(o=> (o&&typeof o==='object')? String(o.value??o.label??o) : String(o))});}
+      if(!seen.has(id)){
+        seen.add(id);
+        out.push({
+          id,label,type:'select',
+          options:(f.options||[]).map(o=> (o&&typeof o==='object')? String(o.value??o.label??o) : String(o))
+        });
+      }
       continue;
     }
     if (t==='text'||t==='string'||t==='textarea'){ if(!seen.has(id)){ seen.add(id); out.push({id,label,type:'text'});} continue; }
@@ -480,12 +478,32 @@ function buildConditionSources(schema){
   return out;
 }
 
-// ---------- TREE-/F STYLE LIST RENDERER (single-line ASCII, always expanded)
+function isRuleValid(rule){
+  if (!rule || !ACTIONS.has(rule.action)) return false;
+  const srcs = buildConditionSources(gSchema);
+  const src = srcs.find(s=>String(s.id)===String(rule.fieldId));
+  if (!src) return false;
+
+  const allowed = (src.type==='boolean')?['equals']
+                : (src.type==='date')?['before','equals','after']
+                : (src.type==='text')?['equals','notEquals','contains']
+                : (src.type==='number')?['equals','notEquals']
+                : (src.type==='select')?['equals','notEquals']
+                : ['equals'];
+
+  if (!allowed.includes(rule.op)) return false;
+  if (!Array.isArray(rule.values)) return false;
+  if (!Array.isArray(rule.targets) || rule.targets.length===0) return false;
+  return true;
+}
+
+/* ------------------------- pickers (same UI logic) ------------------------- */
+
 function flattenTreeLines(nodes, prefixBag=[], out=[]){
-  nodes.forEach((node, idx) => {
+  (nodes||[]).forEach((node, idx) => {
     const isLast = idx === nodes.length - 1;
     const prefix = prefixBag.map(last => last ? '   ' : '│  ').join('') + (prefixBag.length ? (isLast ? '└─ ' : '├─ ') : '');
-    out.push({ id: String(node.id), text: prefix + (node.label || node.id), isLast });
+    out.push({ id: String(node.id), text: prefix + (node.label || node.id) });
     if (node.children && node.children.length){
       flattenTreeLines(node.children, [...prefixBag, isLast], out);
     }
@@ -535,14 +553,12 @@ function renderTreeMenu(container, nodes, { currentId=null, onPick, disableIds=n
     if (!disableIds.has(id)){
       row.addEventListener('click', ()=> onPick && onPick(id));
     }
-
     list.appendChild(row);
   });
 
   container.appendChild(list);
 }
 
-// ---- Build trees for pickers
 function buildConditionTree(schema){
   const flat = buildConditionSources(schema) || [];
   const byId = new Map();
@@ -566,7 +582,6 @@ function buildConditionTree(schema){
   return roots;
 }
 
-// Headings tree with numbering in labels
 function buildHeadingsTreeNodes(){
   function walk(nodes, depth, counters){
     const out = [];
@@ -576,8 +591,6 @@ function buildHeadingsTreeNodes(){
       counters[depth]++;
       const number = counters.slice(0, depth + 1).join('.');
       const title  = (n.label?.trim?.() ? n.label : n.text) || '';
-
-      // IMPORTANT: use real paragraph idx as node id
       const idx = Number(n.idx);
       const id  = Number.isFinite(idx) ? String(idx) : `${number}|${title}`;
 
@@ -593,7 +606,6 @@ function buildHeadingsTreeNodes(){
   return walk(gHeadingsTree || [], 0, []);
 }
 
-// Field targets tree — parent = field, children = options (selectable)
 function buildFieldTargetsTree(){
   const nodes=[];
   for (const f of (gSchema.fields||[])){
@@ -603,14 +615,19 @@ function buildFieldTargetsTree(){
 
     if (isMultiOption(type) || isSelectLike(type)){
       const opts = normOptions(f);
-      node.children = opts.map(o => ({ id: `${id}__opt__${valueToSlug(o.value)}`, value:String(o.value), label: String(o.label), children: [] }));
+      node.children = opts.map(o => ({
+        id: `${id}__opt__${valueToSlug(o.value)}`,
+        value:String(o.value),
+        label: String(o.label),
+        children: []
+      }));
     }
     nodes.push(node);
   }
   return nodes;
 }
 
-// ---------- helper: selection logic for Fields targets ----------
+/* ------------------------- field target toggles ------------------------- */
 function hasParentTarget(rule, fieldId){
   return (rule.targets||[]).some(t => t && typeof t==='object' && String(t.id)===String(fieldId) && !('optionValue' in t));
 }
@@ -655,63 +672,68 @@ function removeOneChildAndParent(rule, fieldId, optionValue){
   removeParent(rule, fieldId);
 }
 
-function isRuleValid(rule){
-  if (!rule || !ACTIONS.has(rule.action)) return false;
-  const srcs = buildConditionSources(gSchema);
-  const src = srcs.find(s=>String(s.id)===String(rule.fieldId));
-  if (!src) return false;
-  const allowed = (src.type==='boolean')?['equals']
-                : (src.type==='date')?['before','equals','after']
-                : (src.type==='text')?['equals','notEquals','contains']
-                : (src.type==='number')?['equals','notEquals']
-                : (src.type==='select')?['equals','notEquals']
-                : ['equals'];
-  if (!allowed.includes(rule.op)) return false;
-  if (!Array.isArray(rule.values)) return false;
-  if (!Array.isArray(rule.targets) || rule.targets.length===0) return false;
-  return true;
-}
+/* ------------------------- CANONICAL persistence ------------------------- */
 
-// ----------------------------- PERSISTENCE ------------------------------
-async function persistRules(reason) {
-  if (!gDocId) return;
-  normalizeAllTargets();
-
-  const rules      = (gRulesHeadings || []).map(x => JSON.parse(JSON.stringify(x)));
-  const fieldRules = (gRulesFields   || []).map(x => JSON.parse(JSON.stringify(x)));
-  const stamp = Date.now();
-
-  console.log(`[${nowt()}] WRITE (${reason}) rules=${rules.length}, fieldRules=${fieldRules.length}`);
-
-  const st0 = await window.formSuitePersist.loadState(gDocId) || {};
+function computeCanonicalFromCurrent(st0, rules, fieldRules, stamp){
   const basePayload =
       (st0?.payload?.CRONOS_PAYLOAD)
    || (st0?.CRONOS_PAYLOAD)
    || (st0?.cronos_payload)
    || {};
 
-  const canonical = {
+  return {
     ...basePayload,
-    rules,
-    fieldRules,
+    rules: safeArr(rules),
+    fieldRules: safeArr(fieldRules),
     rulesVersion: stamp,
-    updatedAt: new Date(stamp).toISOString()
+    updatedAt: new Date(stamp).toISOString(),
   };
+}
+
+async function persistRules(reason) {
+  if (!gDocId) return;
+
+  normalizeAllTargets();
+
+  const rules      = deepClone(gRulesHeadings || []);
+  const fieldRules = deepClone(gRulesFields   || []);
+  const stamp = Date.now();
+
+  // Single-line debug summary (keep extremely compact)
+  try {
+    const r0 = rules[0] || null;
+    const f0 = fieldRules[0] || null;
+    const r0t = (r0 && Array.isArray(r0.targets) && r0.targets[0]) ? r0.targets[0] : null;
+    const f0t = (f0 && Array.isArray(f0.targets) && f0.targets[0]) ? f0.targets[0] : null;
+    console.log(`[DBG rules.persistRules] ${nowt()} reason=${reason} mode=${gMode} rules=${rules.length} fieldRules=${fieldRules.length} r0.id=${r0?.id||''} r0.t=${r0t?JSON.stringify(r0t):''} f0.id=${f0?.id||''} f0.t=${f0t?JSON.stringify(f0t):''}`);
+  } catch {}
+
+  console.log(`[${nowt()}] WRITE (${reason}) rules=${rules.length}, fieldRules=${fieldRules.length}`);
+
+  const st0 = await window.formSuitePersist.loadState(gDocId) || {};
+  const canonical = computeCanonicalFromCurrent(st0, rules, fieldRules, stamp);
 
   try {
     if (window.formSuitePersist?.setState) {
       await window.formSuitePersist.setState(gDocId, {
-        rules, fieldRules, rulesVersion: stamp,
-        payload:        { CRONOS_PAYLOAD: canonical },
-        CRONOS_PAYLOAD:  canonical,
-        cronos_payload:  canonical
+        rules,
+        fieldRules,
+        rulesVersion: stamp,
+
+        // canonical payload mirrors
+        payload:        { ...(st0.payload || {}), CRONOS_PAYLOAD: canonical },
+        CRONOS_PAYLOAD: canonical,
+        cronos_payload: canonical,
       });
     } else {
       await window.formSuitePersist.saveState(gDocId, {
-        rules, fieldRules, rulesVersion: stamp,
+        rules,
+        fieldRules,
+        rulesVersion: stamp,
+
         payload:        { ...(st0.payload || {}), CRONOS_PAYLOAD: canonical },
-        CRONOS_PAYLOAD:  canonical,
-        cronos_payload:  canonical
+        CRONOS_PAYLOAD: canonical,
+        cronos_payload: canonical,
       });
     }
   } catch (e) {
@@ -719,45 +741,125 @@ async function persistRules(reason) {
     throw e;
   }
 
+  // LS mirrors
   try {
-    localStorage.setItem('CRONOS_PAYLOAD', JSON.stringify(canonical));
     localStorage.setItem(`CRONOS_PAYLOAD:${gDocId}`, JSON.stringify(canonical));
     localStorage.setItem(`FS_RULES_STAMP:${gDocId}`, String(stamp));
   } catch (e) {
     console.warn('[rules] localStorage mirror failed', e);
   }
 
+  // Broadcast
+  try { bcCanon?.postMessage({  type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+  try { bcLegacy?.postMessage({ type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+  try { bcCanon?.postMessage({  type: 'active:updated', docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+  try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
+
+  // Verify
   try {
     const st1 = await window.formSuitePersist.loadState(gDocId) || {};
     const p1  = st1?.payload?.CRONOS_PAYLOAD || st1?.CRONOS_PAYLOAD || st1?.cronos_payload || {};
-    const ok  = Array.isArray(st1.rules) && Array.isArray(st1.fieldRules)
-             && JSON.stringify(p1.rules||[]) === JSON.stringify(rules)
-             && JSON.stringify(p1.fieldRules||[]) === JSON.stringify(fieldRules)
+    const ok  = safeArr(st1.rules).length === rules.length
+             && safeArr(st1.fieldRules).length === fieldRules.length
+             && safeArr(p1.rules).length === rules.length
+             && safeArr(p1.fieldRules).length === fieldRules.length
              && (p1.rulesVersion === stamp || st1.rulesVersion === stamp);
 
     console.log(
-      `[${nowt()}] VERIFY after persist → ` +
-      `workspace: r=${(st1.rules||[]).length}/${rules.length}, fr=${(st1.fieldRules||[]).length}/${fieldRules.length}; ` +
-      `payload: r=${(p1.rules||[]).length}/${rules.length}, fr=${(p1.fieldRules||[]).length}/${fieldRules.length}; ` +
+      `[${nowt()}] VERIFY after persist → workspace: r=${safeArr(st1.rules).length}/${rules.length}, fr=${safeArr(st1.fieldRules).length}/${fieldRules.length}; ` +
+      `payload: r=${safeArr(p1.rules).length}/${rules.length}, fr=${safeArr(p1.fieldRules).length}/${fieldRules.length}; ` +
       `stamp=${stamp} ok=${ok}`
     );
   } catch (e) {
     console.warn('[rules] read-back verification failed', e);
   }
 
-  try { bcCanon?.postMessage({  type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-  try { bcLegacy?.postMessage({ type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-  try { bcCanon?.postMessage({  type: 'active:updated', docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-  try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-
-  console.log(`[${nowt()}] AFTER persist → workspace + all payload mirrors + LS updated; broadcast sent`);
   await debugLogPayload(`persist:${reason}`);
 }
 
-// ------------------------------- RENDERING ------------------------------
+/* ------------------------- BULLETPROOF reconcile/restore ------------------------- */
+
+async function reconcileAndAutoRestoreIfNeeded(reason){
+  if (!gDocId) return;
+
+  const st = await window.formSuitePersist.loadState(gDocId) || {};
+  const wsRules      = safeArr(st.rules);
+  const wsFieldRules = safeArr(st.fieldRules);
+  const wsStamp      = stampOf(st);
+
+  const payload = (st?.payload?.CRONOS_PAYLOAD) || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
+  const plRules      = safeArr(payload.rules);
+  const plFieldRules = safeArr(payload.fieldRules);
+  const plStamp      = stampOf(payload);
+
+  const lsScoped = readScopedPayloadLS(gDocId);
+  const lsRules      = safeArr(lsScoped?.rules);
+  const lsFieldRules = safeArr(lsScoped?.fieldRules);
+  const lsStamp      = stampOf(lsScoped);
+
+  // Choose best (newest stamp). If equal stamps, prefer workspace.
+  let best = { src:'workspace', stamp: wsStamp, rules: wsRules, fieldRules: wsFieldRules };
+
+  if (plStamp > best.stamp) best = { src:'payload', stamp: plStamp, rules: plRules, fieldRules: plFieldRules };
+  if (lsStamp > best.stamp) best = { src:'localStorage', stamp: lsStamp, rules: lsRules, fieldRules: lsFieldRules };
+
+  // Special case: workspace exists but is empty (clobbered) while payload/LS has non-empty even at same stamp.
+  if (best.src === 'workspace' && wsRules.length === 0) {
+    if (plRules.length && plStamp >= wsStamp) best = { src:'payload', stamp: plStamp, rules: plRules, fieldRules: plFieldRules };
+    if (lsRules.length && lsStamp >= best.stamp) best = { src:'localStorage', stamp: lsStamp, rules: lsRules, fieldRules: lsFieldRules };
+  }
+
+  const shouldRestore =
+      (best.src !== 'workspace')
+   && (wsRules.length === 0 || wsStamp < best.stamp);
+
+  if (shouldRestore) {
+    console.warn(`[rules] AUTO-RESTORE (${reason}) from ${best.src} stamp=${best.stamp} → workspace was r=${wsRules.length},fr=${wsFieldRules.length},stamp=${wsStamp}`);
+
+    const canonical = computeCanonicalFromCurrent(st, best.rules, best.fieldRules, best.stamp || Date.now());
+
+    try {
+      if (window.formSuitePersist?.setState) {
+        await window.formSuitePersist.setState(gDocId, {
+          rules: best.rules,
+          fieldRules: best.fieldRules,
+          rulesVersion: canonical.rulesVersion,
+          payload:        { ...(st.payload || {}), CRONOS_PAYLOAD: canonical },
+          CRONOS_PAYLOAD: canonical,
+          cronos_payload: canonical,
+        });
+      } else {
+        await window.formSuitePersist.saveState(gDocId, {
+          rules: best.rules,
+          fieldRules: best.fieldRules,
+          rulesVersion: canonical.rulesVersion,
+          payload:        { ...(st.payload || {}), CRONOS_PAYLOAD: canonical },
+          CRONOS_PAYLOAD: canonical,
+          cronos_payload: canonical,
+        });
+      }
+    } catch (e) {
+      console.error('[rules] AUTO-RESTORE write failed', e);
+    }
+  }
+}
+
+/* ------------------------- UI + rendering ------------------------- */
+
+function applyTabUI(){
+  const isHead=gMode==='headings';
+  els.tabHeadings.setAttribute('aria-pressed', String(isHead));
+  els.tabHeadings.className = 'btn ' + (isHead ? 'btn-secondary' : 'btn-ghost');
+  els.tabFields.setAttribute('aria-pressed', String(!isHead));
+  els.tabFields.className   = 'btn ' + (!isHead ? 'btn-secondary' : 'btn-ghost');
+  els.rulesHint.textContent = isHead
+    ? 'SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).'
+    : 'SHOW or HIDE specific form fields based on another field’s selected value(s).';
+}
+
 function summarizeCondition(rule){
   const srcs = buildConditionSources(gSchema);
-  let src = srcs.find(s=>String(s.id)===String(rule.fieldId));
+  const src = srcs.find(s=>String(s.id)===String(rule.fieldId));
   const srcLabel = src?.label || getFieldLabelById(rule.fieldId) || String(rule.fieldId);
   const op = rule.op || 'equals';
   const v0 = Array.isArray(rule.values) ? rule.values[0] : rule.values;
@@ -808,9 +910,8 @@ function renderList(){
       const arr = (gMode==='headings') ? gRulesHeadings : gRulesFields;
       const idx = arr.findIndex(x=>x.id===r.id);
       if (idx>=0) arr.splice(idx,1);
-      if (gMode==='headings') gRules = gRulesHeadings.slice(); else gRules = gRulesFields.slice();
+      gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
       if (gEditingId === r.id) gEditingId = null;
-      console.log(`[${nowt()}] DELETE id=${r.id}`);
       await persistRules('delete');
       renderEditor(); renderList();
     });
@@ -819,6 +920,12 @@ function renderList(){
     row.appendChild(left); row.appendChild(right);
     els.rulesList.appendChild(row);
   });
+}
+
+function currentEditorRule(){
+  if (gDraft) return gDraft;
+  if (gEditingId) return (gRules||[]).find(r=>r.id===gEditingId) || null;
+  return null;
 }
 
 function getMultiOptionHeaderIdsForConditions(){
@@ -830,7 +937,7 @@ function getMultiOptionHeaderIdsForConditions(){
   return ids;
 }
 
-function currentEditorRule(){ if (gDraft) return gDraft; if (gEditingId) return (gRules||[]).find(r=>r.id===gEditingId) || null; return null; }
+/* ------------------------- editor (kept, minimal edits) ------------------------- */
 
 function renderEditor(){
   const mount = els.editorMount;
@@ -838,13 +945,11 @@ function renderEditor(){
   const rule = currentEditorRule();
   if (!rule){ mount.innerHTML = '<div class="empty">No rules yet — click “Add rule”.</div>'; return; }
 
-  // Normalize targets for display
   if (gMode==='headings') normalizeHeadingsRuleTargetsInPlace(rule);
   else normalizeFieldTargetsInPlace(rule);
 
   const card = document.createElement('div'); card.className='rule-card'; card.dataset.id = rule.id || 'draft';
 
-  // Save/Cancel for draft
   if (gDraft){
     const top = document.createElement('div'); top.className='row'; top.style.justifyContent='flex-end'; top.style.gap='8px';
     const btnCancel = document.createElement('button'); btnCancel.className='btn btn-ghost'; btnCancel.textContent='Cancel';
@@ -856,19 +961,18 @@ function renderEditor(){
       if (!isRuleValid(rule)){ alert('Please complete the rule.'); return; }
       rule.id = "r_"+Math.random().toString(36).slice(2,8);
       if (gMode==='headings') gRulesHeadings.push(rule); else gRulesFields.push(rule);
-      gDraft=null; gRules = (gMode==='headings')? gRulesHeadings.slice() : gRulesFields.slice();
+      gDraft=null;
+      gRules = (gMode==='headings')? gRulesHeadings.slice() : gRulesFields.slice();
       console.log(`[${nowt()}] CREATE ${JSON.stringify(rule)}`);
       await persistRules('create');
       renderEditor(); renderList();
     });
 
-    const updateSaveState = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule()); };
-    card._updateSave = updateSaveState;
+    card._updateSave = ()=> { btnSave.disabled = !isRuleValid(currentEditorRule()); };
 
     top.appendChild(btnCancel); top.appendChild(btnSave); card.appendChild(top);
   }
 
-  // Row 1: Action + Effect + When
   const row1 = document.createElement('div'); row1.className='rule-row';
 
   // Action
@@ -877,7 +981,10 @@ function renderEditor(){
   const selA = document.createElement('select');
   const defAct = document.createElement('option'); defAct.value=''; defAct.textContent='Select…';
   if (gDraft && !rule.action) selA.appendChild(defAct);
-  ['SHOW','HIDE'].forEach(a=>{ const o=document.createElement('option'); o.value=a; o.textContent=a; if(rule.action===a) o.selected=true; selA.appendChild(o);});
+  ['SHOW','HIDE'].forEach(a=>{
+    const o=document.createElement('option'); o.value=a; o.textContent=a;
+    if(rule.action===a) o.selected=true; selA.appendChild(o);
+  });
   selA.addEventListener('change', async ()=>{
     rule.action = selA.value || null;
     if (!gDraft){ await persistRules('change:action'); renderList(); }
@@ -887,19 +994,23 @@ function renderEditor(){
   row1.appendChild(pAction);
 
   // Effect (fields only)
-  const pEffect = document.createElement('div'); pEffect.className='pair';
-  const lblE = document.createElement('label'); lblE.textContent='Effect';
-  const selE = document.createElement('select');
-  ;[{v:'hide',t:'hide (remove)'},{v:'disable',t:'disable (greyed)'}].forEach(({v,t})=>{
-    const o=document.createElement('option'); o.value=v; o.textContent=t; if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o);
-  });
-  selE.addEventListener('change', async ()=>{
-    rule.hideMode = selE.value || 'hide';
-    if (!gDraft){ await persistRules('change:hideMode'); renderList(); }
-  });
-  if (gMode==='fields'){ pEffect.appendChild(lblE); pEffect.appendChild(selE); row1.appendChild(pEffect); }
+  if (gMode==='fields'){
+    const pEffect = document.createElement('div'); pEffect.className='pair';
+    const lblE = document.createElement('label'); lblE.textContent='Effect';
+    const selE = document.createElement('select');
+    ;[{v:'hide',t:'hide (remove)'},{v:'disable',t:'disable (greyed)'}].forEach(({v,t})=>{
+      const o=document.createElement('option'); o.value=v; o.textContent=t;
+      if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o);
+    });
+    selE.addEventListener('change', async ()=>{
+      rule.hideMode = selE.value || 'hide';
+      if (!gDraft){ await persistRules('change:hideMode'); renderList(); }
+    });
+    pEffect.appendChild(lblE); pEffect.appendChild(selE);
+    row1.appendChild(pEffect);
+  }
 
-  // When (source) — TREE/F SINGLE-LINE PICKER
+  // When picker
   const pField = document.createElement('div'); pField.className='pair';
   const lblF = document.createElement('label'); lblF.textContent='When';
 
@@ -910,11 +1021,12 @@ function renderEditor(){
   const btnPick = document.createElement('button');
   btnPick.type = 'button';
   btnPick.className = 'btn';
-  btnPick.textContent = (function(){
+  btnPick.textContent = (() => {
     const srcsFlat = buildConditionSources(gSchema);
     const cur = srcsFlat.find(s => String(s.id) === String(rule.fieldId));
     return cur ? cur.label : 'Select source…';
   })();
+
   pickWrap.appendChild(btnPick);
 
   const pop = document.createElement('div');
@@ -929,16 +1041,15 @@ function renderEditor(){
   function closePop(){ pop.style.display='none'; document.removeEventListener('click', outsideClose); }
   function outsideClose(e){ if (!pickWrap.contains(e.target)) closePop(); }
 
-  // Open the condition (source) picker — only here are some IDs disabled (multi-option parents)
   btnPick.addEventListener('click', (e) => {
     e.stopPropagation();
     if (pop.style.display === 'none') {
-      const disabledIds2 = getMultiOptionHeaderIdsForConditions(); // parents of multichoice/multiselect
+      const disabledIds2 = getMultiOptionHeaderIdsForConditions();
       renderTreeMenu(pop, buildConditionTree(gSchema), {
         currentId: rule.fieldId,
         disableIds: disabledIds2,
         onPick: async (pickedId)=>{
-          if (disabledIds2.has(String(pickedId))) return; // hard guard
+          if (disabledIds2.has(String(pickedId))) return;
 
           rule.fieldId = pickedId || '';
           const srcs = buildConditionSources(gSchema);
@@ -971,14 +1082,15 @@ function renderEditor(){
 
   card.appendChild(row1);
 
-  // Row 2: condition controls
+  // condition controls
   const chosenSource = buildConditionSources(gSchema).find(s=>String(s.id)===String(rule.fieldId));
   if (chosenSource){
     const row2 = document.createElement('div'); row2.className='rule-row';
     const pCond = document.createElement('div'); pCond.className='pair';
     const lblC = document.createElement('label'); lblC.textContent='Condition'; pCond.appendChild(lblC);
 
-    const src = chosenSource; if (!Array.isArray(rule.values)) rule.values = [];
+    const src = chosenSource;
+    if (!Array.isArray(rule.values)) rule.values = [];
     const schedulePersist = debounce(()=>persistRules('typing:value'), 150);
 
     if (src.type!=='boolean'){
@@ -987,21 +1099,41 @@ function renderEditor(){
                 : (src.type==='text')? ['equals','notEquals','contains']
                 : (src.type==='number'||src.type==='select')? ['equals','notEquals']
                 : ['equals'];
-      ops.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; if(rule.op===v) o.selected=true; opSel.appendChild(o); });
-      opSel.addEventListener('change', async ()=>{ rule.op = opSel.value; if(!gDraft){ await persistRules('change:op'); renderList(); } card._updateSave?.(); });
+      ops.forEach(v=>{
+        const o=document.createElement('option'); o.value=v; o.textContent=v;
+        if(rule.op===v) o.selected=true;
+        opSel.appendChild(o);
+      });
+      opSel.addEventListener('change', async ()=>{
+        rule.op = opSel.value;
+        if(!gDraft){ await persistRules('change:op'); renderList(); }
+        card._updateSave?.();
+      });
       pCond.appendChild(opSel);
     } else {
-      const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='is'; pCond.appendChild(spanIs);
+      const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='is';
+      pCond.appendChild(spanIs);
       rule.op = 'equals';
     }
 
     if (src.type==='boolean'){
       const sel=document.createElement('select');
-      ;[{v:true,l:'true'},{v:false,l:'false'}].forEach(({v,l})=>{ const o=document.createElement('option'); o.value=String(v); o.textContent=l; if(String(rule.values?.[0])===String(v)) o.selected=true; sel.appendChild(o); });
-      sel.addEventListener('change', async ()=>{ rule.values=[sel.value==='true']; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); });
+      ;[{v:true,l:'true'},{v:false,l:'false'}].forEach(({v,l})=>{
+        const o=document.createElement('option'); o.value=String(v); o.textContent=l;
+        if(String(rule.values?.[0])===String(v)) o.selected=true;
+        sel.appendChild(o);
+      });
+      sel.addEventListener('change', async ()=>{
+        rule.values=[sel.value==='true'];
+        if(!gDraft){ await persistRules('change:value'); renderList(); }
+        card._updateSave?.();
+      });
       pCond.appendChild(sel);
     } else if (src.type==='date'){
-      const inp=document.createElement('input'); inp.type='text'; inp.placeholder='YYYY-MM-DD'; inp.style.minWidth='140px'; inp.value=String(rule.values?.[0]||'');
+      const inp=document.createElement('input');
+      inp.type='text'; inp.placeholder='YYYY-MM-DD';
+      inp.style.minWidth='140px';
+      inp.value=String(rule.values?.[0]||'');
       setTimeout(()=>{ try{ flatpickr(inp,{ allowInput:true, dateFormat:'Y-m-d', onChange:async()=>{ rule.values=[inp.value]; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); } }); }catch{} },0);
       inp.addEventListener('input', ()=>{ rule.values=[inp.value]; schedulePersist(); card._updateSave?.(); });
       pCond.appendChild(inp);
@@ -1018,8 +1150,16 @@ function renderEditor(){
       const def=document.createElement('option'); def.value=''; def.textContent='Select value…'; sel.appendChild(def);
       const base=(gSchema.fields||[]).find(ff=>String(ff.id)===String(src.id));
       const opts = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
-      opts.forEach(opt=>{ const o=document.createElement('option'); o.value=String(opt.value); o.textContent=String(opt.label); if(String(rule.values?.[0])===String(opt.value)) o.selected=true; sel.appendChild(o); });
-      sel.addEventListener('change', async ()=>{ rule.values = sel.value ? [sel.value] : ['']; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); });
+      opts.forEach(opt=>{
+        const o=document.createElement('option'); o.value=String(opt.value); o.textContent=String(opt.label);
+        if(String(rule.values?.[0])===String(opt.value)) o.selected=true;
+        sel.appendChild(o);
+      });
+      sel.addEventListener('change', async ()=>{
+        rule.values = sel.value ? [sel.value] : [''];
+        if(!gDraft){ await persistRules('change:value'); renderList(); }
+        card._updateSave?.();
+      });
       pCond.appendChild(sel);
     } else {
       const inp=document.createElement('input'); inp.type='text'; inp.value=String(rule.values?.[0]||'');
@@ -1031,13 +1171,12 @@ function renderEditor(){
     card.appendChild(row2);
   }
 
-  // Row 3: targets — both modes use TREE/F PICKERS
+  // Targets
   if (gMode==='headings'){
     const row3=document.createElement('div'); row3.className='rule-row';
     const pair=document.createElement('div'); pair.className='pair';
     const lbl=document.createElement('label'); lbl.textContent='Add heading';
     const wrap=document.createElement('div'); wrap.style.position='relative'; wrap.style.display='inline-block';
-
     const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Open headings…';
     wrap.appendChild(btn);
 
@@ -1053,20 +1192,15 @@ function renderEditor(){
       e.stopPropagation();
       if (pop.style.display==='none'){
         const nodes = buildHeadingsTreeNodes();
-        // No greying/disable here — all headings/selectable
         renderTreeMenu(pop, nodes, {
           disableIds: new Set(),
           onPick: async (id) => {
-            // id should now be the paragraph idx string
             const idx = Number(id);
             if (!Number.isFinite(idx)) return;
 
-            const already = (rule.targets || []).some(t =>
-              Number(t.idx ?? t.key) === idx
-            );
+            const already = (rule.targets || []).some(t => Number(t.idx ?? t.key) === idx);
             if (already) return;
 
-            // Build label from the canonical index resolver (works off flat + tree)
             const hIdx = currentHeadingIndex();
             const entry = hIdx.resolve({ idx }) || null;
             const label = hIdx.buildLabel(entry, `Heading ${idx + 1}`);
@@ -1085,9 +1219,7 @@ function renderEditor(){
     });
 
     pair.appendChild(lbl); pair.appendChild(wrap); row3.appendChild(pair); card.appendChild(row3);
-
   } else {
-    // FIELDS PICKER (toggleable)
     const row3=document.createElement('div'); row3.className='rule-row';
     const pair=document.createElement('div'); pair.className='pair';
     const lbl=document.createElement('label'); lbl.textContent='Add field';
@@ -1108,13 +1240,10 @@ function renderEditor(){
       e.stopPropagation();
       if (pop.style.display==='none'){
         const nodes = buildFieldTargetsTree();
-
-        // No disabling: every row is clickable (toggle add/remove)
         renderTreeMenu(pop, nodes, {
           disableIds: new Set(),
           onPick: async (pickedId)=>{
             if (pickedId.includes('__opt__')){
-              // option node toggle
               const [fieldId, optSlug] = pickedId.split('__opt__');
               const f = (gSchema.fields||[]).find(x=> String(x.id)===String(fieldId));
               if (!f) return;
@@ -1123,7 +1252,6 @@ function renderEditor(){
               if (!hit) return;
 
               if (hasOptionTarget(rule, fieldId, hit.value)){
-                // remove child + drop parent if ends up orphaned
                 removeOneChildAndParent(rule, fieldId, String(hit.value));
                 await persistRules('toggle:removeFieldOption'); renderEditor(); renderList();
               } else {
@@ -1140,7 +1268,6 @@ function renderEditor(){
               return;
             }
 
-            // parent node toggle
             const fieldId = pickedId;
             if (hasParentTarget(rule, fieldId)){
               removeAllChildren(rule, fieldId);
@@ -1160,10 +1287,12 @@ function renderEditor(){
     pair.appendChild(lbl); pair.appendChild(wrap); row3.appendChild(pair); card.appendChild(row3);
   }
 
-  // Row 4: selected target pills (with cascade remove rules)
+  // Selected pills
   const row4=document.createElement('div'); row4.className='rule-row';
-  const lblSel=document.createElement('div'); lblSel.className='muted'; lblSel.textContent=(gMode==='headings'?'Selected headings:':'Selected fields:');
+  const lblSel=document.createElement('div'); lblSel.className='muted';
+  lblSel.textContent=(gMode==='headings'?'Selected headings:':'Selected fields:');
   const pills=document.createElement('div'); pills.className='pills';
+
   (rule.targets||[]).forEach(t=>{
     const isHead = (gMode==='headings');
     let uniqId, labelText, isParent=false, fieldId=null, optValue=null;
@@ -1200,42 +1329,50 @@ function renderEditor(){
       } else {
         removeOneChildAndParent(rule, fieldId, optValue);
       }
-      await persistRules('change:removeTarget'); renderEditor(); renderList();
+      await persistRules('change:removeTarget');
+      renderEditor(); renderList();
     });
-    pill.appendChild(txt); pill.appendChild(x); pills.appendChild(pill);
+    pill.appendChild(txt); pill.appendChild(x);
+    pills.appendChild(pill);
   });
-  if (!pills.children.length){ const none=document.createElement('span'); none.className='empty'; none.textContent='(none)'; pills.appendChild(none); }
-  row4.appendChild(lblSel); row4.appendChild(pills); card.appendChild(row4);
+
+  if (!pills.children.length){
+    const none=document.createElement('span'); none.className='empty'; none.textContent='(none)';
+    pills.appendChild(none);
+  }
+
+  row4.appendChild(lblSel); row4.appendChild(pills);
+  card.appendChild(row4);
 
   mount.appendChild(card);
   if (gDraft) card._updateSave?.();
 }
 
-// ------------------------------ RELOAD/SYNC -----------------------------
-function applyTabUI(){
-  const isHead=gMode==='headings';
-  els.tabHeadings.setAttribute('aria-pressed', String(isHead));
-  els.tabHeadings.className = 'btn ' + (isHead ? 'btn-secondary' : 'btn-ghost');
-  els.tabFields.setAttribute('aria-pressed', String(!isHead));
-  els.tabFields.className   = 'btn ' + (!isHead ? 'btn-secondary' : 'btn-ghost');
-  els.rulesHint.textContent = isHead
-    ? 'SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).'
-    : 'SHOW or HIDE specific form fields based on another field’s selected value(s).';
-}
+/* ------------------------- reload/sync ------------------------- */
 
-// NOTE: we never import rules from payload here; workspace is authoritative.
 async function reloadState(reason){
   if (!gDocId) return;
-  const st = await window.formSuitePersist.loadState(gDocId) || {};
-  if (st.schema) gSchema = st.schema;
-  if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
-  else gHeadingsTree = Array.isArray(st.headings) ? [] : gHeadingsTree;
-  if (Array.isArray(st.headingsFlat)) gHeadingsFlat = st.headingsFlat;
-  else if (Array.isArray(st.headings)) gHeadingsFlat = st.headings.slice();
-  else gHeadingsFlat = Array.isArray(gHeadingsTree) ? flattenWithNumbers(gHeadingsTree) : [];
 
-  gRulesHeadings = Array.isArray(st.rules) ? st.rules.slice() : [];
-  gRulesFields   = Array.isArray(st.fieldRules) ? st.fieldRules.slice() : [];
+  await reconcileAndAutoRestoreIfNeeded(reason);
+
+  const st = await window.formSuitePersist.loadState(gDocId) || {};
+
+  if (st.schema) gSchema = st.schema;
+
+  if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
+  if (Array.isArray(st.headingsFlat)) gHeadingsFlat = st.headingsFlat;
+  if (!Array.isArray(gHeadingsFlat) || !gHeadingsFlat.length) gHeadingsFlat = flattenWithNumbers(gHeadingsTree);
+
+  gRulesHeadings = safeArr(st.rules).slice();
+  gRulesFields   = safeArr(st.fieldRules).slice();
+
+  // Single-line debug: where did the rules come from, and what is mirrored in payload?
+  try {
+    const pl = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || (st?.cronos_payload) || null;
+    const plRulesLen = Array.isArray(pl?.rules) ? pl.rules.length : (Array.isArray(pl?.headingRules) ? pl.headingRules.length : 0);
+    const plFieldLen = Array.isArray(pl?.fieldRules) ? pl.fieldRules.length : (Array.isArray(pl?.fieldsRules) ? pl.fieldsRules.length : 0);
+    console.log(`[DBG rules.reloadState] ${nowt()} reason=${reason} st.rules=${gRulesHeadings.length} st.fieldRules=${gRulesFields.length} payload.rules=${plRulesLen} payload.fieldRules=${plFieldLen}`);
+  } catch {}
 
   normalizeAllTargets();
 
@@ -1248,17 +1385,20 @@ async function reloadState(reason){
   await debugLogPayload(`reload:${reason}`);
 }
 
-// tab switches
+/* ------------------------- tab switches + add ------------------------- */
+
 els.tabHeadings?.addEventListener('click', async ()=>{
   if (gMode==='headings') return;
-  gMode='headings'; gDraft=null; gEditingId=null; applyTabUI(); await reloadState('tab:headings');
-});
-els.tabFields?.addEventListener('click', async ()=>{
-  if (gMode==='fields') return;
-  gMode='fields'; gDraft=null; gEditingId=null; applyTabUI(); await reloadState('tab:fields');
+  gMode='headings'; gDraft=null; gEditingId=null; applyTabUI();
+  await reloadState('tab:headings');
 });
 
-// add rule
+els.tabFields?.addEventListener('click', async ()=>{
+  if (gMode==='fields') return;
+  gMode='fields'; gDraft=null; gEditingId=null; applyTabUI();
+  await reloadState('tab:fields');
+});
+
 els.btnAddRule.addEventListener("click", ()=>{
   gEditingId = null;
   gDraft = { id:null, action:null, fieldId:"", op:null, values:[], targets:[], ...(gMode==='fields'? {hideMode:'hide'} : {}) };
@@ -1266,18 +1406,18 @@ els.btnAddRule.addEventListener("click", ()=>{
   els.editorMount.scrollIntoView({behavior:"smooth", block:"start"});
 });
 
-// quick diagnostics (F9)
+// F9 diagnostic
 window.addEventListener('keydown', async (e) => {
   if (e.key === 'F9') {
     const st = await window.formSuitePersist.loadState(gDocId) || {};
     const p  = st?.payload?.CRONOS_PAYLOAD || st?.CRONOS_PAYLOAD || st?.cronos_payload || {};
     console.log('[rules][F9] dump]', {
       docId: gDocId,
-      ws_rules: st.rules?.length || 0,
-      ws_fieldRules: st.fieldRules?.length || 0,
+      ws_rules: safeArr(st.rules).length,
+      ws_fieldRules: safeArr(st.fieldRules).length,
       ws_rulesVersion: st.rulesVersion || null,
-      pl_rules: p.rules?.length || 0,
-      pl_fieldRules: p.fieldRules?.length || 0,
+      pl_rules: safeArr(p.rules).length,
+      pl_fieldRules: safeArr(p.fieldRules).length,
       pl_rulesVersion: p.rulesVersion || null,
       ls_has_plain: !!localStorage.getItem('CRONOS_PAYLOAD'),
       ls_has_scoped: !!localStorage.getItem(`CRONOS_PAYLOAD:${gDocId}`),
@@ -1286,18 +1426,38 @@ window.addEventListener('keydown', async (e) => {
   }
 });
 
-// boot
+/* ------------------------- boot ------------------------- */
+
+function getActiveDocMeta(){
+  try {
+    // prefer official API
+    const meta =
+      window.formSuitePersist?.getActiveDoc?.sync?.()
+      || window.formSuitePersist?.getCurrentDocMeta?.()
+      || window.readActiveDocSync?.()
+      || null;
+    if (meta?.docId) return meta;
+  } catch {}
+
+  // fallback localStorage
+  try {
+    const v=localStorage.getItem(ACTIVE_LS_KEY);
+    return v ? JSON.parse(v) : null;
+  } catch { return null; }
+}
+
 (function boot(){
   try{
     try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
-    const meta = window.formSuitePersist?.getActiveDoc?.sync?.()
-              || window.formSuitePersist?.getCurrentDocMeta?.()
-              || (function(){ try{ const v=localStorage.getItem(ACTIVE_LS_KEY); return v? JSON.parse(v):null; } catch { return null; } })();
+    const meta = getActiveDocMeta();
     if (!meta?.docId){ setStatus("No active document. Open one first."); return; }
     gDocId = meta.docId;
     applyTabUI();
     reloadState("boot");
-  } catch(e){ console.error("boot failed:", e); setStatus("Failed to load state."); }
+  } catch(e){
+    console.error("boot failed:", e);
+    setStatus("Failed to load state.");
+  }
 })();
 </script>
 </body>
