@@ -29,6 +29,8 @@ async function ensureJSZip() {
     }
     const s = document.createElement('script');
     s.dataset.fsJszip = '1';
+    s.dataset.fsJszip = '1';
+    s.setAttribute('data-fs-jszip','1');
     s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
     s.onload = () => res();
     s.onerror = () => rej(new Error('Failed to load JSZip'));
@@ -46,7 +48,10 @@ function _xmlParse(xmlText) {
   const dp = new DOMParser();
   const doc = dp.parseFromString(xmlText, 'application/xml');
   const pe = doc.getElementsByTagName('parsererror');
-  if (pe && pe.length) throw new Error('XML parse error');
+  if (pe && pe.length) {
+    const msg = (pe[0].textContent || '').slice(0, 400);
+    throw new Error('XML parse error: ' + msg);
+  }
   return doc;
 }
 function _xmlSerialize(doc) {
@@ -55,6 +60,7 @@ function _xmlSerialize(doc) {
 
 function _getAttr(node, attrName) {
   if (!node) return null;
+  // try explicit, then without prefix
   return node.getAttribute(attrName) ?? node.getAttribute(attrName.replace(/^.*:/, '')) ?? null;
 }
 function _firstNS(node, localName) {
@@ -65,20 +71,10 @@ function _firstNS(node, localName) {
       return (els && els.length) ? els[0] : null;
     }
   } catch {}
+  // prefix fallback (common)
   const els2 = node.getElementsByTagName('w:' + localName);
   return (els2 && els2.length) ? els2[0] : null;
 }
-function _first(node, ...tags) {
-  let cur = node;
-  for (const t of tags) {
-    if (!cur) return null;
-    const els = cur.getElementsByTagName(t);
-    if (!els || !els.length) return null;
-    cur = els[0];
-  }
-  return cur;
-}
-
 function _normalizeText(s) {
   return String(s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -124,9 +120,9 @@ function _headingLevelFromOutline(pNode) {
 // styles.xml -> styleId => heading level
 // ------------------------------
 function _styleOutlineLevel(styleEl) {
-  const pPr = _firstNS(styleEl, 'pPr') || _first(styleEl, 'w:pPr');
+  const pPr = _firstNS(styleEl, 'pPr') || styleEl.getElementsByTagName('w:pPr')?.[0] || null;
   if (!pPr) return null;
-  const ol = _firstNS(pPr, 'outlineLvl') || _first(pPr, 'w:outlineLvl');
+  const ol = _firstNS(pPr, 'outlineLvl') || pPr.getElementsByTagName('w:outlineLvl')?.[0] || null;
   if (!ol) return null;
   const v = _getAttr(ol, 'w:val');
   if (v == null) return null;
@@ -136,15 +132,17 @@ function _styleOutlineLevel(styleEl) {
   if (lvl < 1 || lvl > 9) return null;
   return lvl;
 }
+
 function _inferHeadingLevelFromStyleToken(styleId, styleName) {
   const s = `${styleId || ''} ${styleName || ''}`.toLowerCase();
-  const tokens = ['heading','überschrift','uberschrift','ueberschrift','titre','título','titulo','titolo','rubrik','section'];
+  const tokens = ['heading','überschrift','uberschrift','ueberschrift','titre','título','titulo','titolo','rubrik','section','zagolovok','заголовок'];
   if (!tokens.some(t => s.includes(t))) return null;
   const m = s.match(/(?:^|[^0-9])([1-9])(?:[^0-9]|$)/);
   if (!m) return null;
   const lvl = Number(m[1]);
   return (lvl >= 1 && lvl <= 9) ? lvl : null;
 }
+
 function _buildStyleHeadingLevelMap(stylesDom) {
   const styles = Array.from(
     stylesDom.getElementsByTagNameNS
@@ -159,10 +157,10 @@ function _buildStyleHeadingLevelMap(stylesDom) {
     const styleId = _getAttr(st, 'w:styleId');
     if (!styleId) continue;
 
-    const nameEl = _firstNS(st, 'name') || _first(st, 'w:name');
+    const nameEl = _firstNS(st, 'name') || st.getElementsByTagName('w:name')?.[0] || null;
     const name = nameEl ? (_getAttr(nameEl, 'w:val') || '') : '';
 
-    const basedOnEl = _firstNS(st, 'basedOn') || _first(st, 'w:basedOn');
+    const basedOnEl = _firstNS(st, 'basedOn') || st.getElementsByTagName('w:basedOn')?.[0] || null;
     const basedOn = basedOnEl ? (_getAttr(basedOnEl, 'w:val') || '') : '';
 
     const outlineLvl = _styleOutlineLevel(st);
@@ -206,8 +204,8 @@ function _buildStyleHeadingLevelMap(stylesDom) {
 function _detectHeadingLevel(p, styleLevelMap) {
   let level = null;
 
-  const pPr = _firstNS(p, 'pPr') || _first(p, 'w:pPr');
-  const pStyle = pPr ? (_firstNS(pPr, 'pStyle') || _first(pPr, 'w:pStyle')) : null;
+  const pPr = _firstNS(p, 'pPr') || p.getElementsByTagName('w:pPr')?.[0] || null;
+  const pStyle = pPr ? (_firstNS(pPr, 'pStyle') || pPr.getElementsByTagName('w:pStyle')?.[0] || null) : null;
   if (pStyle) {
     const styleId = _getAttr(pStyle, 'w:val');
     if (styleId) {
@@ -220,14 +218,59 @@ function _detectHeadingLevel(p, styleLevelMap) {
 }
 
 // ------------------------------
-// Baseline-first plan inspector
+// Paragraph traversal (bulletproof, doc-order)
+// ------------------------------
+function _isElement(n) { return n && n.nodeType === 1; }
+function _isParaEl(n) {
+  if (!_isElement(n)) return false;
+  // Namespace-aware primary
+  if (n.namespaceURI === _DOCX_W_NS && n.localName === 'p') return true;
+  // Prefix fallback (w:p, w14:p, etc.)
+  const tn = (n.tagName || '').toLowerCase();
+  if (tn.endsWith(':p')) return true;
+  return false;
+}
+function _isBodyEl(n) {
+  if (!_isElement(n)) return false;
+  if (n.namespaceURI === _DOCX_W_NS && n.localName === 'body') return true;
+  const tn = (n.tagName || '').toLowerCase();
+  return tn === 'w:body' || tn.endsWith(':body');
+}
+
+/** Returns all paragraphs in document order under <w:body> (including inside tables/SDTs). */
+function _getBodyParagraphs(dom) {
+  // Prefer NS lookup
+  let body = null;
+  try {
+    const b0 = dom.getElementsByTagNameNS?.(_DOCX_W_NS, 'body');
+    if (b0 && b0.length) body = b0[0];
+  } catch {}
+  if (!body) {
+    // fallback: any *:body
+    const all = Array.from(dom.getElementsByTagName('*') || []);
+    body = all.find(_isBodyEl) || null;
+  }
+  if (!body) return [];
+
+  const out = [];
+  // DFS pre-order to preserve doc order
+  (function walk(node) {
+    for (let c = node.firstChild; c; c = c.nextSibling) {
+      if (_isParaEl(c)) out.push(c);
+      if (c && c.firstChild) walk(c);
+    }
+  })(body);
+
+  return out;
+}
+
+// ------------------------------
+// Baseline-first plan inspector (used by UI / debugging)
 // ------------------------------
 async function inspectRemovalPlan_JS(bytesU8 /* Uint8Array */) {
   const JSZip = await ensureJSZip();
   const input = (bytesU8 instanceof Uint8Array) ? bytesU8 : new Uint8Array(bytesU8 || []);
-  const buf = new Uint8Array(input);
-
-  const zip = await JSZip.loadAsync(buf);
+  const zip = await JSZip.loadAsync(new Uint8Array(input));
 
   // Prefer baseline if present
   let docXml = null;
@@ -254,11 +297,7 @@ async function inspectRemovalPlan_JS(bytesU8 /* Uint8Array */) {
   }
 
   const docDom = _xmlParse(docXml);
-  const paras = Array.from(
-    docDom.getElementsByTagNameNS
-      ? docDom.getElementsByTagNameNS(_DOCX_W_NS, 'p')
-      : docDom.getElementsByTagName('w:p')
-  );
+  const paras = _getBodyParagraphs(docDom);
 
   const headings = [];
   for (let i = 0; i < paras.length; i++) {
@@ -286,7 +325,7 @@ async function inspectRemovalPlan_JS(bytesU8 /* Uint8Array */) {
     cur.endIdx = endIdx;
   }
 
-  return { parts: [{ name: (_BASE_PATH ? _BASE_PATH : 'word/document.xml'), headings, paraCount: paras.length }] };
+  return { parts: [{ name: (baseFile ? _BASE_PATH : 'word/document.xml'), headings, paraCount: paras.length }] };
 }
 
 // ------------------------------
@@ -324,6 +363,7 @@ function _hasPageBreakBefore(p) {
 function _pruneEmptySDTs(doc) {
   const sdts = Array.from(doc.getElementsByTagNameNS(_DOCX_W_NS,'sdt'));
   for (const sdt of sdts) {
+    // If it contains any table, keep; otherwise check for any meaningful content
     if (sdt.getElementsByTagNameNS(_DOCX_W_NS,'tbl').length > 0) continue;
     const ps = sdt.getElementsByTagNameNS(_DOCX_W_NS,'p');
     let hasMeaning = false;
@@ -377,55 +417,7 @@ function _compactWhitespace(doc) {
 }
 
 // ------------------------------
-// Visibility map -> baseline ranges
-// ------------------------------
-function _visKeyToIdx(k) {
-  if (k == null) return NaN;
-  const s = String(k);
-  if (s.startsWith('sec_')) {
-    const n = Number(s.slice(4));
-    return Number.isFinite(n) ? n : NaN;
-  }
-  const n = Number(s);
-  return Number.isFinite(n) ? n : NaN;
-}
-function _computeHiddenRangesFromPlan(plan, visibilityMap) {
-  const headings = plan?.parts?.[0]?.headings || [];
-  if (!headings.length) return [];
-
-  const hideIdx = new Set();
-  if (visibilityMap && typeof visibilityMap === 'object') {
-    for (const [k, v] of Object.entries(visibilityMap)) {
-      if (String(v).toUpperCase() !== 'HIDE') continue;
-      const idx = _visKeyToIdx(k);
-      if (Number.isFinite(idx)) hideIdx.add(idx);
-    }
-  }
-  if (!hideIdx.size) return [];
-
-  const ranges = [];
-  for (const h of headings) {
-    if (!hideIdx.has(Number(h.idx))) continue;
-    const s = Number(h.startIdx);
-    const e = Number(h.endIdx);
-    if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
-    ranges.push([Math.min(s, e), Math.max(s, e)]);
-  }
-  if (!ranges.length) return [];
-
-  // merge overlaps
-  ranges.sort((a,b)=>a[0]-b[0]);
-  const merged = [];
-  for (const r of ranges) {
-    const last = merged[merged.length - 1];
-    if (!last || r[0] > last[1] + 1) merged.push(r.slice());
-    else last[1] = Math.max(last[1], r[1]);
-  }
-  return merged;
-}
-
-// ------------------------------
-// Baseline embedding helper
+// Baseline embedding helper (bulletproof)
 // ------------------------------
 async function _ensureBaselineInZip(zip, originalBytesU8) {
   if (zip.file(_BASE_PATH)) return;
@@ -457,58 +449,190 @@ async function _ensureBaselineInZip(zip, originalBytesU8) {
 }
 
 // ------------------------------
-// Removal: baseline-first (THIS is the important behavioral change)
+// Hidden heading idx -> paragraph ranges (baseline headings only)
+// ------------------------------
+function _computeHiddenRangesFromHeadingIdxs(hideIdxs, headings, paraCount) {
+  // headings: [{idx, level, ...}] sorted or unsorted
+  const hs = Array.isArray(headings) ? headings.slice() : [];
+  hs.sort((a,b)=>Number(a.idx)-Number(b.idx));
+  const uniqHide = Array.from(new Set((hideIdxs || []).filter(Number.isFinite))).sort((a,b)=>a-b);
+
+  if (!uniqHide.length) return [];
+
+  // map idx->heading
+  const byIdx = new Map();
+  for (const h of hs) {
+    const i = Number(h.idx);
+    const lvl = Number(h.level);
+    if (Number.isFinite(i) && Number.isFinite(lvl)) byIdx.set(i, { idx: i, level: lvl });
+  }
+
+  const ranges = [];
+  for (const hIdx of uniqHide) {
+    const start = Math.max(0, Math.min(paraCount - 1, Number(hIdx)));
+    const h = byIdx.get(start);
+
+    // Determine end: next heading with level <= current level (section boundary)
+    let end = paraCount - 1;
+
+    if (h) {
+      const L = h.level;
+      for (const nx of hs) {
+        const ni = Number(nx.idx);
+        const nL = Number(nx.level);
+        if (!Number.isFinite(ni) || !Number.isFinite(nL)) continue;
+        if (ni > start && nL <= L) { end = ni - 1; break; }
+      }
+    } else {
+      // Fallback: next heading regardless of level
+      for (const nx of hs) {
+        const ni = Number(nx.idx);
+        if (Number.isFinite(ni) && ni > start) { end = ni - 1; break; }
+      }
+    }
+
+    if (end < start) end = start;
+    ranges.push([start, end]);
+  }
+
+  // Merge overlaps
+  ranges.sort((a,b)=>a[0]-b[0]);
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (!last || r[0] > last[1] + 1) merged.push(r.slice());
+    else last[1] = Math.max(last[1], r[1]);
+  }
+  return merged;
+}
+
+// ------------------------------
+// Removal: baseline-first (bulletproof)
 // ------------------------------
 async function applyRemovalWithBackup_JS(bytesU8, visibilityMap, originalBytesU8) {
   const JSZip = await ensureJSZip();
   const input = (bytesU8 instanceof Uint8Array) ? bytesU8 : new Uint8Array(bytesU8 || []);
-  const buf = new Uint8Array(input);
+  const zip = await JSZip.loadAsync(new Uint8Array(input));
 
-  const zip = await JSZip.loadAsync(buf);
-
-  // Ensure baseline is embedded
+  // 1) Ensure baseline exists inside the zip (stable reference for idx)
   await _ensureBaselineInZip(zip, originalBytesU8);
 
-  // If no baseline could be created, do nothing
   const baseFile = zip.file(_BASE_PATH);
-  if (!baseFile) return await zip.generateAsync({ type: 'uint8array' });
-
-  // Compute plan from BASELINE (not from current/mutated doc)
-  const plan = await inspectRemovalPlan_JS(buf);
-  const mergedRanges = _computeHiddenRangesFromPlan(plan, visibilityMap);
-
-  if (!mergedRanges.length) {
-    // still return the zip (baseline might have just been embedded)
+  if (!baseFile) {
+    console.warn('[DOCX] applyRemovalWithBackup: no baseline found; skipping removal.');
     return await zip.generateAsync({ type: 'uint8array' });
   }
 
-  // Parse baseline doc and remove there
+  // 2) Load baseline + current document.xml
   const baseXml = await baseFile.async('string');
-  const baseDom = _xmlParse(baseXml);
+  const curFile = zip.file('word/document.xml');
+  if (!curFile) {
+    console.warn('[DOCX] applyRemovalWithBackup: missing word/document.xml; skipping removal.');
+    return await zip.generateAsync({ type: 'uint8array' });
+  }
+  const curXml = await curFile.async('string');
 
-  const paras = Array.from(
-    baseDom.getElementsByTagNameNS
-      ? baseDom.getElementsByTagNameNS(_DOCX_W_NS, 'p')
-      : baseDom.getElementsByTagName('w:p')
-  );
-
-  // Remove bottom->top so indices remain valid
-  mergedRanges.sort((a,b)=>b[0]-a[0]);
-  for (const [startIdx, endIdx] of mergedRanges) {
-    for (let i = endIdx; i >= startIdx; i--) {
-      const p = paras[i];
-      if (p && p.parentNode) p.parentNode.removeChild(p);
+  // 3) Build style map once (from current zip)
+  let styleLevelMap = new Map();
+  const stylesFile = zip.file('word/styles.xml');
+  if (stylesFile) {
+    try {
+      const stylesXml = await stylesFile.async('string');
+      const stylesDom = _xmlParse(stylesXml);
+      styleLevelMap = _buildStyleHeadingLevelMap(stylesDom);
+    } catch (e) {
+      styleLevelMap = new Map();
     }
   }
 
-  // Deep cleanup to avoid “table skeletons / SDT shells / empty paras”
-  _pruneEmptySDTs(baseDom);
-  _pruneDeadTables(baseDom);
-  _compactWhitespace(baseDom);
+  const baseDom = _xmlParse(baseXml);
+  const curDom  = _xmlParse(curXml);
 
-  // Write result into the *current export zip* as word/document.xml
-  zip.file('word/document.xml', _xmlSerialize(baseDom));
+  // 4) Collect paragraphs from both
+  const baseParas = _getBodyParagraphs(baseDom);
+  const curParas  = _getBodyParagraphs(curDom);
 
+  const baseCount = baseParas.length;
+  const curCount  = curParas.length;
+
+  // 5) Compute baseline headings using robust detection (style map + outlineLvl)
+  const headings = [];
+  for (let i = 0; i < baseParas.length; i++) {
+    const p = baseParas[i];
+    const lvl = _detectHeadingLevel(p, styleLevelMap);
+    if (!lvl) continue;
+    const t = _extractParagraphText(p);
+    if (!t) continue;
+    headings.push({ idx: i, level: lvl, text: _stripLeadingNumber(t), rawText: t });
+  }
+  headings.sort((a,b)=>a.idx-b.idx);
+//  Determine which idxs to HIDE
+  const hideIdxs = [];
+  if (visibilityMap && typeof visibilityMap === 'object') {
+    for (const [k, v] of Object.entries(visibilityMap)) {
+      if (String(v).toUpperCase() === 'HIDE') {
+        const n = Number(k);
+        if (Number.isFinite(n)) hideIdxs.push(n);
+      }
+    }
+  }
+  hideIdxs.sort((a,b)=>a-b);
+
+  // DBG
+  try {
+    console.log('[DOCX] applyRemovalWithBackup: counts', {
+      baseParas: baseCount,
+      curParas: curCount,
+      headings: headings.length,
+      hideIdxsLen: hideIdxs.length,
+      hideIdxsSample: hideIdxs.slice(0, 10),
+    });
+  } catch {}
+
+  if (!hideIdxs.length) {
+    return await zip.generateAsync({ type: 'uint8array' });
+  }
+
+  // 7) Compute removal ranges against BASELINE heading boundaries
+  const ranges = _computeHiddenRangesFromHeadingIdxs(hideIdxs, headings, baseCount);
+
+  try {
+    console.log('[DOCX] applyRemovalWithBackup: ranges', { rangesLen: ranges.length, sample: ranges.slice(0, 5) });
+  } catch {}
+
+  // 8) Apply ranges to CURRENT doc paragraphs (descending)
+  let removed = 0;
+  const toRemove = [];
+  for (const [start, end] of ranges) {
+    const s = Math.max(0, Math.min(curCount - 1, start));
+    const e = Math.max(0, Math.min(curCount - 1, end));
+    for (let i = s; i <= e; i++) toRemove.push(i);
+  }
+  const uniqRemove = Array.from(new Set(toRemove)).sort((a,b)=>b-a);
+
+  for (const idx of uniqRemove) {
+    const p = curParas[idx];
+    if (p && p.parentNode) {
+      p.parentNode.removeChild(p);
+      removed++;
+    }
+  }
+
+  // 9) Cleanup
+  _pruneEmptySDTs(curDom);
+  _pruneDeadTables(curDom);
+  _compactWhitespace(curDom);
+
+  try {
+    console.log('[DOCX] applyRemovalWithBackup: removed', {
+      removedParas: removed,
+      curParasBefore: curCount,
+      curParasAfter: _getBodyParagraphs(curDom).length
+    });
+  } catch {}
+
+  // 10) Write back
+  zip.file('word/document.xml', _xmlSerialize(curDom));
   return await zip.generateAsync({ type: 'uint8array' });
 }
 
@@ -594,7 +718,6 @@ function _ensureContentTypesOverride(ctDoc, partName, contentType) {
   const part = '/' + String(partName).replace(/^\//, '');
   const found = overrides.find(o => (o.getAttribute('PartName') || '') === part);
   if (found) {
-    // Ensure correct ContentType (idempotent)
     if (contentType) found.setAttribute('ContentType', contentType);
     return ctDoc;
   }
@@ -608,7 +731,7 @@ function _ensureContentTypesOverride(ctDoc, partName, contentType) {
 
 async function _ensureContentTypes(zip, partName, contentType) {
   const f = zip.file(_CT_PATH);
-  if (!f) return; // extremely rare; most DOCX have it
+  if (!f) return;
   const xmlText = await f.async('string');
   const ctDoc = _xmlParse(xmlText);
   _ensureContentTypesOverride(ctDoc, partName, contentType);
@@ -644,7 +767,6 @@ function _setAttrAny(el, ns, local, qname, value) {
 }
 
 async function readDocVarSettings(bytesU8, key) {
-  // JSZip-first (no Pyodide required)
   try {
     const zip = await _loadZip(bytesU8);
     const f = zip.file(_SETTINGS_PATH);
@@ -668,7 +790,6 @@ async function readDocVarSettings(bytesU8, key) {
     }
     return null;
   } catch (jsErr) {
-    // Optional Py fallback (only if function exists)
     try {
       await ensurePy();
       const fn = py?.globals?.get?.('read_docvar_settings');
@@ -724,13 +845,9 @@ async function writeDocVarSettings(bytesU8, key, jsonStr) {
     _setAttrAny(target, _DOCX_W_NS, 'val', 'w:val', jsonStr);
 
     zip.file(_SETTINGS_PATH, _xmlSerialize(doc));
-
-    // Ensure content type override exists
     await _ensureContentTypes(zip, _SETTINGS_PATH, 'application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml');
-
     return await _zipToU8(zip);
   } catch (jsErr) {
-    // Optional Py fallback
     try {
       await ensurePy();
       const fn = py?.globals?.get?.('write_docvar_settings');
@@ -764,20 +881,17 @@ async function readDocVarCustom(bytesU8, key) {
     const props = doc.documentElement;
     if (!props) return null;
 
-    // property elements in CP namespace; name attr is un-namespaced
     const nodes = Array.from(props.getElementsByTagNameNS(_CP_NS, 'property'));
     for (const p of nodes) {
       const name = p.getAttribute('name') || '';
       if (name !== key) continue;
 
-      // Find first vt:* child
       const vtChild = Array.from(p.childNodes || []).find(n => n.nodeType === 1 && n.namespaceURI === _VT_NS);
       if (!vtChild) return '';
       return String(vtChild.textContent || '');
     }
     return null;
   } catch (jsErr) {
-    // Optional Py fallback
     try {
       await ensurePy();
       const fn = py?.globals?.get?.('read_docvar_custom');
@@ -817,7 +931,6 @@ async function writeDocVarCustom(bytesU8, key, jsonStr) {
     const props = doc.documentElement;
     if (!props) throw new Error('Failed to parse/create docProps/custom.xml');
 
-    // Find property by name or create
     let prop = null;
     const nodes = Array.from(props.getElementsByTagNameNS(_CP_NS, 'property'));
     for (const p of nodes) {
@@ -837,22 +950,17 @@ async function writeDocVarCustom(bytesU8, key, jsonStr) {
       prop.setAttribute('name', key);
       props.appendChild(prop);
     } else {
-      // Clear existing children
       while (prop.firstChild) prop.removeChild(prop.firstChild);
     }
 
-    // Store as vt:lpwstr (string)
     const v = doc.createElementNS(_VT_NS, 'vt:lpwstr');
     v.textContent = String(jsonStr ?? '');
     prop.appendChild(v);
 
     zip.file(_CUSTOMPROPS_PATH, _xmlSerialize(doc));
-
     await _ensureContentTypes(zip, _CUSTOMPROPS_PATH, 'application/vnd.openxmlformats-officedocument.custom-properties+xml');
-
     return await _zipToU8(zip);
   } catch (jsErr) {
-    // Optional Py fallback
     try {
       await ensurePy();
       const fn = py?.globals?.get?.('write_docvar_custom');
@@ -882,6 +990,7 @@ async function writeDocVar(bytesU8, key, jsonStr) {
     return await writeDocVarCustom(bytesU8, key, jsonStr);
   }
 }
+
 // ---- SDT writing ----
 async function writeSDTs(bytesU8, tagToTextMap) {
   await ensurePy();
@@ -950,7 +1059,6 @@ async function inspectRemovalPlan(bytesU8, visibilityMap) {
   try {
     return await inspectRemovalPlan_JS(bytesU8, visibilityMap);
   } catch (e) {
-    // Py fallback
     try {
       await ensurePy();
       const fn = py.globals.get('inspect_export_removal_plan');
@@ -978,11 +1086,9 @@ async function inspectRemovalPlan(bytesU8, visibilityMap) {
 }
 
 async function applyRemovalWithBackup(bytesU8, visibilityMap, originalBytesU8) {
-  // JSZip-first baseline removal
   try {
     return await applyRemovalWithBackup_JS(bytesU8, visibilityMap, originalBytesU8);
   } catch (jsErr) {
-    // Py fallback as last resort
     try {
       await ensurePy();
       const fn = py.globals.get('apply_removal_with_backup');
@@ -1004,7 +1110,6 @@ async function applyRemovalWithBackup(bytesU8, visibilityMap, originalBytesU8) {
 }
 
 async function restoreDocxFromBackup(bytesU8) {
-  // JSZip-first restore from customXml/originalDocument.xml
   try {
     const restored = await restoreDocxFromBackup_JS(bytesU8);
     if (restored instanceof Uint8Array && restored.length) return restored;
@@ -1058,4 +1163,3 @@ if (typeof window !== 'undefined') {
   });
 }
 // ------------------------------
-

@@ -100,14 +100,10 @@ function extractRulesFromState(state) {
   function addSource(name, obj) {
     if (!obj || typeof obj !== 'object') return;
     if (obj.rules) {
-      const arr = normalizeRuleCollection(obj.rules);
-      ruleSources.push([name, arr]);
-      try { console.log('[DBG rules-core.extractRulesFromState] saw rules', { source: name, len: arr.length }); } catch {}
+      ruleSources.push([name, normalizeRuleCollection(obj.rules)]);
     }
     if (obj.fieldRules) {
-      const arr = normalizeRuleCollection(obj.fieldRules);
-      fieldRuleSources.push([name, arr]);
-      try { console.log('[DBG rules-core.extractRulesFromState] saw fieldRules', { source: name, len: arr.length }); } catch {}
+      fieldRuleSources.push([name, normalizeRuleCollection(obj.fieldRules)]);
     }
   }
 
@@ -136,29 +132,11 @@ function extractRulesFromState(state) {
     .filter(([, arr]) => arr.length > 0)
     .map(([name]) => name);
 
-  try {
-    console.log('[DBG rules-core.extractRulesFromState] aggregated', {
-      outRulesLen: out.rules.length,
-      outFieldRulesLen: out.fieldRules.length,
-      rulesSources: out.meta.rulesSources,
-      fieldRuleSources: out.meta.fieldRuleSources
-    });
-  } catch {}
-
   return out;
 }
 
-
 function resolveRulesForState(state, payloadOverride) {
   const view = state && typeof state === 'object' ? { ...state } : {};
-
-  // DBG: show what keys we got (without dumping huge payloads)
-  try {
-    const keys = Object.keys(view || {});
-    const rLen = Array.isArray(view.rules) ? view.rules.length : null;
-    const frLen = Array.isArray(view.fieldRules) ? view.fieldRules.length : null;
-    console.log('[DBG rules-core.resolveRulesForState] input', { keys, hasRules: hasOwn(view,'rules'), rulesLen: rLen, hasFieldRules: hasOwn(view,'fieldRules'), fieldRulesLen: frLen, hasPayloadOverride: !!payloadOverride });
-  } catch {}
 
   if (payloadOverride) {
     view.payload = {
@@ -193,18 +171,8 @@ function resolveRulesForState(state, payloadOverride) {
     contributingFieldRules: aggregated.meta?.fieldRuleSources || []
   };
 
-  // DBG: show what we resolved and why
-  try {
-    console.log('[DBG rules-core.resolveRulesForState] resolved', {
-      outRulesLen: Array.isArray(rules) ? rules.length : null,
-      outFieldRulesLen: Array.isArray(fieldRules) ? fieldRules.length : null,
-      source
-    });
-  } catch {}
-
   return { rules, fieldRules, source };
 }
-
 
 // ---------- schema indexes ----------
 
@@ -307,23 +275,25 @@ function __buildOptionIndex(schema) {
   return byField;
 }
 
-
-
 // Parse a field reference that may include an option suffix: "<fieldId>__opt__<slug>"
 // Returns a normalized descriptor or null.
 function __parseOptionFieldRef(schema, ref) {
   const raw = String(ref ?? '').trim();
   if (!raw) return null;
 
-  // Plain field id / label / etc. (caller may still resolve via __resolveFieldRef)
+  // Plain field id / label / etc.
   if (!raw.includes('__opt__')) {
     return { kind: 'field', fieldId: raw, optionSlug: null, optionValue: null, optionLabel: null, id: raw };
   }
 
   const parts = raw.split('__opt__');
-  const fieldId = String(parts[0] ?? '').trim();
+  let fieldId = String(parts[0] ?? '').trim();
   const optSlugIn = String(parts.slice(1).join('__opt__') ?? '').trim().toLowerCase();
   const optSlug = optSlugIn ? optSlugIn : '';
+
+  // If fieldId isn't an actual id, try resolving by label/name.
+  const resolvedField = __resolveFieldRef(schema, fieldId);
+  if (resolvedField && resolvedField.id != null) fieldId = String(resolvedField.id);
 
   const optionIndex = __buildOptionIndex(schema);
   const rec = optionIndex.get(String(fieldId));
@@ -357,6 +327,58 @@ function __parseOptionFieldRef(schema, ref) {
   const id = `${String(fieldId)}__opt__${String(__slug(optSlug) || optSlug || 'unknown')}`;
   try { console.log('[DBG rules-core.__parseOptionFieldRef] miss', { ref: raw, fieldId, optSlug }); } catch {}
   return { kind: 'option', fieldId: String(fieldId), optionSlug: optSlug, optionValue: null, optionLabel: null, id };
+}
+
+// Normalize rule conditions where the WHEN/fieldId references an option (e.g. "field__opt__slug").
+// This converts it into a condition on the parent field with a value comparison that can actually match.
+function __normalizeWhenOptionRefAgainstSchema(schema, rule) {
+  if (!rule || typeof rule !== 'object') return rule;
+
+  const ref =
+    rule.fieldId ?? rule.field ?? rule.whenField ??
+    (rule.conditions && rule.conditions[0] && (rule.conditions[0].fieldId ?? rule.conditions[0].leftFieldId));
+
+  if (!ref || typeof ref !== 'string' || !ref.includes('__opt__')) return rule;
+
+  const parsed = __parseOptionFieldRef(schema, ref);
+  if (!parsed || parsed.kind !== 'option') return rule;
+
+  const parentId = String(parsed.fieldId || '');
+  if (!parentId) return rule;
+
+  const fld = (schema?.fields || []).find(f => String(f.id) === parentId);
+  const t = String(fld?.type || '').toLowerCase();
+
+  const r = { ...rule };
+
+  // Preserve original for debugging
+  if (!r.__whenOptionRef) r.__whenOptionRef = String(ref);
+  if (!r.__whenOptionId) r.__whenOptionId = String(parsed.id);
+
+  // Set the actual field to evaluate
+  r.fieldId = parentId;
+  if (r.field != null) r.field = parentId;
+  if (r.whenField != null) r.whenField = parentId;
+
+  // Force expected values to the option value if we have it (most robust)
+  if (parsed.optionValue != null) {
+    if (t === 'multichoice') {
+      r.op = 'anyOf';
+      r.values = [String(parsed.optionValue)];
+    } else if (t === 'select') {
+      r.op = 'equals';
+      r.values = [String(parsed.optionValue)];
+    } else {
+      // fallback: treat as equals on string value
+      r.op = r.op || 'equals';
+      r.values = [String(parsed.optionValue)];
+    }
+  } else {
+    // Unknown option value: keep op/values but still normalize fieldId
+    r.op = r.op || r.operator || 'equals';
+  }
+
+  return r;
 }
 
 function __coerceRuleForMultichoiceOption(schema, rule, whenField) {
@@ -727,7 +749,8 @@ function normalizeHeadingsRulesForSchema(schema, rulesIn, headingBaseline) {
     const resolvedField = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
     if (!resolvedField) continue;
 
-    const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, resolvedField);
+    let r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, resolvedField);
+    r0 = __normalizeWhenOptionRefAgainstSchema(schema, r0) || r0;
 
     const refAfterCoerce = r0?.fieldId ?? r0?.field ?? r0?.whenField;
     if (!__resolveFieldRef(schema, refAfterCoerce)) {
@@ -779,7 +802,8 @@ function normalizeFieldRulesForSchema(schema, rulesIn) {
     const resolvedField = __resolveFieldRef(schema, raw.fieldId ?? raw.field ?? raw.whenField);
     if (!resolvedField) continue;
 
-    const r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, resolvedField);
+    let r0 = __coerceRuleForMultichoiceOption(schema, { ...raw }, resolvedField);
+    r0 = __normalizeWhenOptionRefAgainstSchema(schema, r0) || r0;
 
     const refAfterCoerce = r0?.fieldId ?? r0?.field ?? r0?.whenField;
     if (!__resolveFieldRef(schema, refAfterCoerce)) {
@@ -931,6 +955,49 @@ function evaluateRulesToVisibility(schema, values, rules, headingResolver) {
   const cleanVals = sanitizeValues(schema, values || {});
   const getVal = (fid) => cleanVals[fid];
 
+  // Resolve a rule "field reference" which may be a plain field id OR an option ref ("<fieldId>__opt__<slug>").
+  // For option refs we synthesize a boolean actual value ("true"/"false") representing selection state.
+  function resolveRefActualAndType(ref) {
+    const parsed = (typeof __parseOptionFieldRef === 'function') ? __parseOptionFieldRef(schema, ref) : null;
+    const raw = String(ref ?? '');
+    if (parsed && parsed.kind === 'option') {
+      const baseId = String(parsed.fieldId || raw.split('__opt__')[0] || '');
+      const fld = (schema?.fields || []).find(f => String(f.id) === baseId);
+      const ft = String(fld?.type || '').toLowerCase();
+      const av = getVal(baseId);
+
+      // Determine whether this option is selected in the current values.
+      const wantVal = (parsed.optionValue != null) ? String(parsed.optionValue) : null;
+      const wantSlug = (parsed.optionSlug != null) ? String(parsed.optionSlug) : null;
+
+      let selected = false;
+      if (ft === 'multichoice') {
+        const arr = Array.isArray(av) ? av.map(String) : (av != null && av !== '' ? [String(av)] : []);
+        if (wantVal != null) selected = arr.includes(wantVal);
+        if (!selected && wantSlug) {
+          const slugs = arr.map(v => __slug(v));
+          selected = slugs.includes(__slug(wantSlug));
+        }
+      } else if (ft === 'select') {
+        const s = (av == null) ? '' : String(av);
+        if (wantVal != null) selected = (s === wantVal);
+        if (!selected && wantSlug) selected = (__slug(s) === __slug(wantSlug));
+      } else {
+        // If a schema isn't marked select/mc but rule references an option, treat as string equality against stored value.
+        const s = (av == null) ? '' : String(av);
+        if (wantVal != null) selected = (s === wantVal);
+        if (!selected && wantSlug) selected = (__slug(s) === __slug(wantSlug));
+      }
+
+      return { actual: selected ? 'true' : 'false', type: 'boolean', baseId, parsed };
+    }
+
+    // Plain field
+    const baseId = String(ref ?? '');
+    const fld = (schema?.fields || []).find(f => String(f.id) === baseId);
+    return { actual: getVal(baseId), type: String(fld?.type || '').toLowerCase(), baseId, parsed: null };
+  }
+
   for (const r of rules) {
     if (!r) continue;
 
@@ -939,17 +1006,13 @@ function evaluateRulesToVisibility(schema, values, rules, headingResolver) {
                 : null;
     if (!action) continue;
 
-    const fieldId = r.fieldId || r.field || r.whenField;
+    const fieldRef = r.fieldId || r.field || r.whenField;
     const op      = r.op || r.operator || 'equals';
     const exp     = r.values ?? r.value ?? r.expected;
     const targets = Array.isArray(r.targets) ? r.targets : [];
+    if (!fieldRef) continue;
 
-    if (!fieldId) continue;
-
-    const fld = (schema?.fields || []).find(f => String(f.id) === String(fieldId));
-    const t   = String(fld?.type || '').toLowerCase();
-    const actual = getVal(String(fieldId));
-
+    const { actual, type: t } = resolveRefActualAndType(fieldRef);
     let match = false;
 
     if (t === 'date') {
@@ -977,9 +1040,7 @@ function evaluateRulesToVisibility(schema, values, rules, headingResolver) {
       for (const c of r.conditions) {
         const cid = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
         if (!cid) { match = false; break; }
-        const cfld = (schema?.fields || []).find(f => String(f.id) === String(cid));
-        const ct   = String(cfld?.type || '').toLowerCase();
-        const cav  = getVal(String(cid));
+        const { actual: cav, type: ct } = resolveRefActualAndType(cid);
         const cop  = c.op || c.operator || 'equals';
         const cexp = c.values ?? c.value ?? c.expected;
         if (!ruleMatchesValue(cop, cexp, cav, ct)) {
@@ -1012,6 +1073,44 @@ function evaluateFieldRulesToVisibility(schema, values, rules) {
   const cleanVals = sanitizeValues(schema, values || {});
   const getVal = (fid) => cleanVals[fid];
 
+  function resolveRefActualAndType(ref) {
+    const parsed = (typeof __parseOptionFieldRef === 'function') ? __parseOptionFieldRef(schema, ref) : null;
+    const raw = String(ref ?? '');
+    if (parsed && parsed.kind === 'option') {
+      const baseId = String(parsed.fieldId || raw.split('__opt__')[0] || '');
+      const fld = (schema?.fields || []).find(f => String(f.id) === baseId);
+      const ft = String(fld?.type || '').toLowerCase();
+      const av = getVal(baseId);
+
+      const wantVal = (parsed.optionValue != null) ? String(parsed.optionValue) : null;
+      const wantSlug = (parsed.optionSlug != null) ? String(parsed.optionSlug) : null;
+
+      let selected = false;
+      if (ft === 'multichoice') {
+        const arr = Array.isArray(av) ? av.map(String) : (av != null && av !== '' ? [String(av)] : []);
+        if (wantVal != null) selected = arr.includes(wantVal);
+        if (!selected && wantSlug) {
+          const slugs = arr.map(v => __slug(v));
+          selected = slugs.includes(__slug(wantSlug));
+        }
+      } else if (ft === 'select') {
+        const s = (av == null) ? '' : String(av);
+        if (wantVal != null) selected = (s === wantVal);
+        if (!selected && wantSlug) selected = (__slug(s) === __slug(wantSlug));
+      } else {
+        const s = (av == null) ? '' : String(av);
+        if (wantVal != null) selected = (s === wantVal);
+        if (!selected && wantSlug) selected = (__slug(s) === __slug(wantSlug));
+      }
+
+      return { actual: selected ? 'true' : 'false', type: 'boolean', baseId, parsed };
+    }
+
+    const baseId = String(ref ?? '');
+    const fld = (schema?.fields || []).find(f => String(f.id) === baseId);
+    return { actual: getVal(baseId), type: String(fld?.type || '').toLowerCase(), baseId, parsed: null };
+  }
+
   for (const r of rules) {
     if (!r) continue;
 
@@ -1020,17 +1119,15 @@ function evaluateFieldRulesToVisibility(schema, values, rules) {
                 : null;
     if (!action) continue;
 
-    const fieldId = r.fieldId || r.field || r.whenField;
+    const fieldRef = r.fieldId || r.field || r.whenField;
     const op      = r.op || r.operator || 'equals';
     const exp     = r.values ?? r.value ?? r.expected;
     const targets = Array.isArray(r.targets) ? r.targets : [];
     const effect  = (String(r.hideMode || 'hide').toLowerCase() === 'disable') ? 'DISABLE' : 'HIDE';
 
-    if (!fieldId) continue;
+    if (!fieldRef) continue;
 
-    const fld = (schema?.fields || []).find(f => String(f.id) === String(fieldId));
-    const t   = String(fld?.type || '').toLowerCase();
-    const actual = getVal(String(fieldId));
+    const { actual, type: t } = resolveRefActualAndType(fieldRef);
 
     let match = false;
 
@@ -1059,9 +1156,7 @@ function evaluateFieldRulesToVisibility(schema, values, rules) {
       for (const c of r.conditions) {
         const cid = c?.fieldId ?? c?.leftFieldId ?? c?.rightFieldId;
         if (!cid) { match = false; break; }
-        const cfld = (schema?.fields || []).find(f => String(f.id) === String(cid));
-        const ct   = String(cfld?.type || '').toLowerCase();
-        const cav  = getVal(String(cid));
+        const { actual: cav, type: ct } = resolveRefActualAndType(cid);
         const cop  = c.op || c.operator || 'equals';
         const cexp = c.values ?? c.value ?? c.expected;
         if (!ruleMatchesValue(cop, cexp, cav, ct)) {
@@ -1101,6 +1196,7 @@ if (typeof window !== 'undefined') {
     __resolveFieldRef,
     __buildOptionIndex,
     __parseOptionFieldRef,
+    __normalizeWhenOptionRefAgainstSchema,
     __coerceRuleForMultichoiceOption,
     buildHeadingTargetIndex,
     parseTargetIdx,
@@ -1113,5 +1209,6 @@ if (typeof window !== 'undefined') {
     evaluateFieldRulesToVisibility
   });
   try { window.__parseOptionFieldRef = __parseOptionFieldRef; } catch {}
+  try { window.__normalizeWhenOptionRefAgainstSchema = __normalizeWhenOptionRefAgainstSchema; } catch {}
 
 }
