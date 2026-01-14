@@ -9,7 +9,6 @@
 
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css">
-  <!-- flatpickr JS (date inputs) -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
 
   <!-- JSZip for SDT scanning -->
@@ -21,8 +20,6 @@
   <script src="docx-core.js"></script>
   <script src="fs-active-doc.js"></script>
   <script src="fs-focus-nav.js"></script>
-  <script src="fs-export-core.js"></script>
-
 
   <!-- Address autocomplete widget -->
   <script src="address-autocomplete.js"></script>
@@ -48,11 +45,9 @@
     <div class="row" style="gap:8px;flex-wrap:wrap">
       <button id="btnOpen">Open DOCX…</button>
       <button id="btnSave" disabled>Save (payload only)</button>
-      <button id="btnExport" disabled>Export (payload + apply rules)</button>
       <span class="muted" id="status" style="margin-left:auto">Idle</span>
     </div>
 
-    <!-- Restored banner -->
     <div id="permNote" class="note warn" style="display:none;margin-top:10px">
       This DOCX was opened via picker but I don’t have write permission to the original file.
       Clicking <em>Save</em> will write to a copy instead of the original.
@@ -109,2255 +104,1481 @@
 </main>
 
 <script>
-  // =========================
-  // DEBUG / TRACE
-  // =========================
+'use strict';
+
+/* ============================================================
+   TRACE (exactly one tracing primitive; used everywhere)
+   ============================================================ */
+(function ensureTrace() {
+  if (typeof window.TRACE === 'function') return;
+
   const DEBUG = { on: true, seq: 0 };
-  const _t = () => new Date().toISOString().slice(11, 23);
-  const tag = (name) => `%c[Extractor ${_t()} #${++DEBUG.seq}] ${name}`;
-  const tagStyle = 'color:#6b7280;font-weight:600';
+  const ts = () => new Date().toISOString().slice(11, 23);
 
-  function TRACE(name, details) {
-    const label = `${name} :: ${_t()} :: #${DEBUG.seq + 1}`;
-    try { console.groupCollapsed(tag(name), tagStyle, details ?? ''); } catch {}
-    try { console.time(label); } catch {}
-    let ended = false;
+  window.TRACE = function TRACE(name, details) {
+    const id = ++DEBUG.seq;
+    const prefix = `[Extractor ${ts()} #${id}] ${name}`;
+    if (DEBUG.on) console.log(prefix, details ?? '');
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
     return {
-      step(msg, data) { console.log(tag(`  ↳ ${msg}`), tagStyle, data ?? ''); },
-      warn(msg, data) { console.warn(tag(`  ⚠ ${msg}`), tagStyle, data ?? ''); },
-      error(msg, err) { console.error(tag(`  ✖ ${msg}`), tagStyle, err); },
+      step(msg, data) { if (DEBUG.on) console.log(`${prefix}  ↳ ${msg}`, data ?? ''); },
+      warn(msg, data) { if (DEBUG.on) console.warn(`${prefix}  ⚠ ${msg}`, data ?? ''); },
+      error(msg, err) { if (DEBUG.on) console.error(`${prefix}  ✖ ${msg}`, err); },
       end(extra) {
-        if (ended) return;
-        ended = true;
-        if (extra) console.log(tag('done'), tagStyle, extra);
-        try { console.timeEnd(label); } catch {}
-        try { console.groupEnd(); } catch {}
+        if (!DEBUG.on) return;
+        const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        const ms = Math.round((t1 - t0) * 1000) / 1000;
+        console.log(`${prefix} done (${ms}ms)`, extra ?? '');
       }
     };
-  }
-
-  window.addEventListener('error', (e) => {
-    console.error(tag('window.error'), tagStyle, {
-      message: e.message,
-      filename: e.filename,
-      lineno: e.lineno,
-      colno: e.colno,
-      error: e.error
-    });
-  });
-  window.addEventListener('unhandledrejection', (e) => {
-    console.error(tag('window.unhandledrejection'), tagStyle, e.reason);
-
-  });
-
-// =========================
-// ONE-LINE DEBUG PRINTS (bulletproof tracing)
-// =========================
-const DBG_ON = true;
-function DBG(msg, data) {
-  if (!DBG_ON) return;
-  try {
-    if (typeof data === 'undefined') console.log(`[ExtractorDBG ${_t()}] ${msg}`);
-    else console.log(`[ExtractorDBG ${_t()}] ${msg}`, data);
-  } catch {}
-}
-
-
-function _safeParseJSON(txt) { try { return txt ? JSON.parse(txt) : null; } catch { return null; } }
-
-function _verOf(obj) {
-  if (!obj || typeof obj !== 'object') return 0;
-  const rv = obj.rulesVersion;
-  if (Number.isFinite(rv)) return rv;
-  const t = Date.parse(obj.updatedAt || obj.schemaUpdatedAt || obj.headingsUpdatedAt || '');
-  return Number.isFinite(t) ? t : 0;
-}
-
-function pickNewestRulesBundle(docId, wsState, payloadFromDoc) {
-  const cands = [];
-
-  const wsPayload =
-    (wsState?.payload?.CRONOS_PAYLOAD) ||
-    (wsState?.CRONOS_PAYLOAD) ||
-    (wsState?.cronos_payload) ||
-    null;
-
-  cands.push({ src: 'ws.state',   obj: wsState || null });
-  cands.push({ src: 'ws.payload', obj: wsPayload });
-
-  // Scoped LS mirror ONLY (doc-specific)
-  const lsDoc = _safeParseJSON(localStorage.getItem(`CRONOS_PAYLOAD:${docId}`));
-  if (lsDoc) cands.push({ src: `ls:CRONOS_PAYLOAD:${docId}`, obj: lsDoc });
-
-  // DOCX payload (if present)
-  if (payloadFromDoc) cands.push({ src: 'docx', obj: payloadFromDoc });
-
-  let best = { src: 'none', ver: 0, rules: [], fieldRules: [], target0: null };
-
-  for (const c of cands) {
-    const o = c.obj;
-    if (!o || typeof o !== 'object') continue;
-
-    const rules = Array.isArray(o.rules) ? o.rules : [];
-    const fieldRules = Array.isArray(o.fieldRules) ? o.fieldRules : [];
-    const ver = Math.max(_verOf(o), _verOf(o.payload?.CRONOS_PAYLOAD));
-
-    // Prefer higher version. If equal, prefer non-empty.
-    if (ver > best.ver || (ver === best.ver && (rules.length || fieldRules.length))) {
-      best = { src: c.src, ver, rules, fieldRules, target0: rules?.[0]?.targets?.[0] || null };
-    }
-  }
-
-  return best;
-}
-
-
-
-  // =========================
-  // CONSTANTS & STATE
-  // =========================
-  const STORAGE_KEY   = 'FORM_SCHEMA_V1';
-  const PAYLOAD_KEY   = 'CRONOS_PAYLOAD';
-  const ACTIVE_LS_KEY = 'FS_ACTIVE_DOC_META';
-  const META_LS_KEY   = 'FS_CURRENT_DOC_META';
-  const supportsFS    = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
-
-  const DOCX_NS = window.DOCX_W_NS || window.W_NS || "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-  let gArrayBuffer   = null;
-  let gFileName      = null;       // basename (no extension)
-  let gFileExt       = 'docx';
-  let gFileHandle    = null;
-  let gDocId         = null;
-  let gSchema        = { title: 'Form', fields: [] };
-  let gValues        = {};
-  let gSDTs          = [];
-  let gHeadingBaseline = { flat: [], tree: [] };
-  let gDirty         = false;
-
-  // Structured address field backing store
-  const __addressValues = Object.create(null);
-
-  // UI refs
-  const btnOpen   = document.getElementById('btnOpen');
-  const btnSave   = document.getElementById('btnSave');
-  const btnExport = document.getElementById('btnExport');
-  const statusEl  = document.getElementById('status');
-  const permNote  = document.getElementById('permNote');
-  const payloadEl = document.getElementById('payloadPreview');
-  const formMount = document.getElementById('formMount');
-  const tableBody = document.getElementById('sdt-tbody');
-  const btnRegrant = document.getElementById('btnRegrant');
-  const btnSaveFromPreview = document.getElementById('btnSaveFromPreview');
-  const previewStatus = document.getElementById('previewStatus');
-  const headersTreeEl = document.getElementById('headersTree');
-
-  // Broadcast channels
-  const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-  const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
-
-  // =========================
-  // UTILS
-  // =========================
-  function splitNameAndExt(fileName) {
-    const m = String(fileName).match(/\.(docx|docm|dotx|dotm)$/i);
-    return {
-      base: String(fileName).replace(/\.(docx|docm|dotx|dotm)$/i, ''),
-      ext:  (m ? m[1] : 'docx').toLowerCase()
-    };
-  }
-
-  async function sha256Hex(bufOrU8) {
-    const tr = TRACE('sha256Hex', { type: bufOrU8?.constructor?.name, len: bufOrU8?.byteLength || bufOrU8?.length });
-    try {
-      const ab = (bufOrU8 instanceof ArrayBuffer)
-        ? bufOrU8
-        : (bufOrU8?.buffer instanceof ArrayBuffer)
-          ? bufOrU8.buffer
-          : new Uint8Array(bufOrU8 || []).buffer;
-      const d = await crypto.subtle.digest('SHA-256', ab);
-      const hex = [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
-      tr.end({ hex });
-      return hex;
-    } catch (e) {
-      tr.error('sha failed', e);
-      tr.end();
-      return '(hash-error)';
-    }
-  }
-
-  const setStatus = (m) => {
-    const tr = TRACE('setStatus', { text: m });
-    try { statusEl.textContent = m; } finally { tr.end(); }
   };
+})();
 
-  function adoptHeadingBaseline(baseline) {
-    const flat = baseline?.flat
-      ? (Array.isArray(baseline.flat) ? baseline.flat.slice() : [])
-      : (Array.isArray(baseline?.headings) ? baseline.headings.slice() : []);
-    const tree = baseline?.tree
-      ? (Array.isArray(baseline.tree) ? baseline.tree.slice() : [])
-      : (Array.isArray(baseline?.headingsTree) ? baseline.headingsTree.slice() : []);
-    gHeadingBaseline = { flat, tree };
-  }
+window.addEventListener('error', (e) => {
+  console.error('[Extractor window.error]', {
+    message: e.message,
+    filename: e.filename,
+    lineno: e.lineno,
+    colno: e.colno,
+    error: e.error
+  });
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('[Extractor window.unhandledrejection]', e.reason);
+});
 
-  function loadSchemaFromLocalStorage() {
-    const tr = TRACE('loadSchemaFromLocalStorage');
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) { tr.end('none'); return null; }
-      const s = JSON.parse(raw);
-      tr.end({ fields: s?.fields?.length || 0 });
-      return s;
-    } catch (e) {
-      tr.error('parse fail', e);
-      tr.end();
-      return null;
-    }
-  }
+/* ============================================================
+   Single coordination layer: fs-active-doc + formSuitePersist
+   Single broadcast: BroadcastChannel("fs-active-doc")
+   Single payload mirror: workspace state payload.CRONOS_PAYLOAD
+   ============================================================ */
 
-  function clearUiForNewDoc(message = 'Loading new document…') {
-    const tr = TRACE('clearUiForNewDoc', { message });
-    try {
-      tableBody.innerHTML = '<tr><td colspan="5" class="empty">No document loaded.</td></tr>';
-      formMount.innerHTML = '<div class="empty">No schema found.</div>';
-      payloadEl.value = '';
-      previewStatus.textContent = '';
-      if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
-      btnSave.disabled = true;
-      btnExport.disabled = true;
-      if (btnSaveFromPreview) btnSaveFromPreview.disabled = true;
-      permNote.style.display = 'none';
-      setStatus(message);
-    } catch (e) {
-      tr.warn('DOM reset failed', e);
-    } finally {
-      tr.end();
-    }
-  }
+const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+const supportsFS  = ('showOpenFilePicker' in window) && ('showSaveFilePicker' in window);
 
-  function persistActiveMeta(meta) {
-    if (!meta || !meta.docId) return;
-    const compact = { docId: meta.docId, name: meta.name || meta.fileName || 'document.docx' };
-    try { localStorage.setItem(ACTIVE_LS_KEY, JSON.stringify(compact)); } catch {}
-    try { localStorage.setItem(META_LS_KEY, JSON.stringify(compact)); } catch {}
-    try { if (typeof window.setActiveDocMeta === 'function') window.setActiveDocMeta(compact); } catch {}
-  }
+const els = {
+  btnOpen: document.getElementById('btnOpen'),
+  btnSave: document.getElementById('btnSave'),
+  status: document.getElementById('status'),
+  permNote: document.getElementById('permNote'),
+  btnRegrant: document.getElementById('btnRegrant'),
+  payloadPreview: document.getElementById('payloadPreview'),
+  btnSaveFromPreview: document.getElementById('btnSaveFromPreview'),
+  previewStatus: document.getElementById('previewStatus'),
+  formMount: document.getElementById('formMount'),
+  tableBody: document.getElementById('sdt-tbody'),
+  headersTree: document.getElementById('headersTree'),
+};
 
-  function announceDocUpdated(meta) {
-    const docId = meta?.docId || gDocId;
-    if (!docId) return;
-    try { bcCanon?.postMessage({ type: 'active:updated', docId }); } catch {}
-    try { bcLegacy?.postMessage({ type: 'doc-updated', docId }); } catch {}
-  }
+const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
 
-  // =========================
-  // PERSISTENCE SHIM (fallback)
-  // =========================
-  (function ensurePersist() {
-    const tr = TRACE('ensurePersist');
-    try {
-      if (window.formSuitePersist) { tr.step('already present'); return; }
-      tr.step('installing shim');
-      const _state = {};
-      let _meta = null;
-
-      window.formSuitePersist = {
-        getCurrentDocMeta() { return _meta; },
-        async setCurrentDoc({ bytes, handle, name }) {
-          _meta = { docId: 'inline-' + Date.now(), name: name || 'document.docx' };
-          return _meta;
-        },
-        async setCurrentDocFromBytes(bytes, meta) {
-          _meta = { docId: 'inline-' + Date.now(), name: meta?.name || 'document.docx' };
-          return _meta;
-        },
-        async getCurrentDocBytes() { return null; },
-        async getBytes(docId) { return null; },
-        async getHandle(docId) { return null; },
-        async saveState(docId, obj) {
-          _state[docId] = { ...(_state[docId] || {}), ...(obj || {}) };
-        },
-        async loadState(docId) {
-          return _state[docId] || {};
-        },
-        async putBytes(docId, bytes) {
-          // noop in shim
-        },
-        async ensurePermission(handle, mode) {
-          return 'granted';
-        }
-      };
-    } finally {
-      tr.end();
-    }
-  })();
-
-  // =========================
-  // SAFE BYTES FETCH + RESET
-  // =========================
-async function safeGetBytes(docId) {
-  const tr = TRACE('safeGetBytes', { docId });
-  try {
-    if (!docId) return null;
-
-    // 1) Prefer the file handle (disk) as source of truth whenever possible.
-    // This prevents "revert" due to stale persistence cache.
-    const h0 = gFileHandle || await window.formSuitePersist.getHandle?.(docId);
-    if (h0 && typeof h0.getFile === 'function') {
-      try {
-        const f = await h0.getFile();
-        const u8 = new Uint8Array(await f.arrayBuffer());
-        gFileHandle = h0;
-        tr.end({ mode: 'handle.getFile', len: u8.byteLength });
-        return u8;
-      } catch (e) {
-        tr.warn('handle.getFile failed; will try persistence cache', e);
-      }
-    }
-
-    // 2) Persistence cache fallback (only if handle path not available)
-    let bytes = await window.formSuitePersist.getBytes?.(docId);
-    if (!bytes) {
-      bytes = await window.formSuitePersist.getCurrentDocBytes?.();
-    }
-    if (bytes) {
-      tr.end({ mode: 'persist.cache', len: bytes.byteLength || bytes.length });
-      return bytes;
-    }
-
-    tr.end('no bytes');
-    return null;
-  } catch (e) {
-    tr.error('safeGetBytes failed', e);
-    tr.end();
-    return null;
-  }
+function setStatus(text) {
+  const tr = TRACE('setStatus', { text });
+  try { els.status.textContent = String(text || ''); }
+  finally { tr.end(); }
 }
 
-
-
-  async function hardResetDocContext(reason = '') {
-    const tr = TRACE('hardResetDocContext', { reason, docId: gDocId });
-    try {
-      gArrayBuffer = null;
-      gFileHandle  = null;
-      gFileName    = null;
-      gFileExt     = 'docx';
-      gDocId       = null;
-      gSchema      = { title: 'Form', fields: [] };
-      gValues      = {};
-      gSDTs        = [];
-      gHeadingBaseline = { flat: [], tree: [] };
-      clearUiForNewDoc(reason ? `Cleared: ${reason}` : 'Cleared.');
-    } finally {
-      tr.end('reset complete');
-    }
-  }
-
-  let __fgRefreshLock = false;
-  async function rehydrateOnForeground(source) {
-    const tr = TRACE('rehydrateOnForeground', { source, docId: gDocId, locked: __fgRefreshLock });
-    if (__fgRefreshLock) { tr.end('locked'); return; }
-    __fgRefreshLock = true;
-    try {
-      if (!gDocId) { tr.end('no docId'); return; }
-
-      await new Promise(r => setTimeout(r, 120));
-      let bytes = await safeGetBytes(gDocId);
-      if (!bytes) {
-        await new Promise(r => setTimeout(r, 150));
-        bytes = await safeGetBytes(gDocId);
-      }
-      if (!bytes) {
-        tr.end('no bytes; keeping current buffer');
-        return;
-      }
-
-      gArrayBuffer = bytes.buffer ?? bytes;
-      await renderFromCurrentBytes(`(${source} refreshed) `);
-      await updateWriteAccessBanner();
-      tr.end('refreshed');
-    } catch (e) {
-      tr.error('rehydrate failed', e);
-    } finally {
-      __fgRefreshLock = false;
-    }
-  }
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') rehydrateOnForeground('visible');
-  });
-  window.addEventListener('focus', () => {
-    rehydrateOnForeground('focus');
-  });
-
-  // =========================
-  // WRITE ACCESS BANNER
-  // =========================
-  async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
-    const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: gDocId, supportsFS });
-    try {
-      if (!supportsFS || !gDocId) {
-        permNote.style.display = 'none';
-        tr.end('unsupported/no-doc');
-        return 'unsupported';
-      }
-
-      let handle = gFileHandle || await window.formSuitePersist.getHandle?.(gDocId);
-      if (!handle || typeof handle.queryPermission !== 'function') {
-        permNote.style.display = 'none';
-        tr.end('no-handle');
-        return 'no-handle';
-      }
-
-      let p = await handle.queryPermission({ mode: 'readwrite' });
-      tr.step('queryPermission', p);
-
-      if (p !== 'granted' && tryPrompt && typeof handle.requestPermission === 'function') {
-        try {
-          const r = await handle.requestPermission({ mode: 'readwrite' });
-          p = r || p;
-          tr.step('requestPermission', r);
-        } catch (e) {
-          tr.warn('requestPermission failed', e);
-        }
-      }
-
-      permNote.style.display = (p === 'granted') ? 'none' : 'block';
-      if (p === 'granted') gFileHandle = handle;
-      tr.end({ final: p });
-      return p || 'denied';
-    } catch (e) {
-      tr.error('updateWriteAccessBanner failed', e);
-      permNote.style.display = 'block';
-      return 'error';
-    }
-  }
-
-  // =========================
-  // CROSS-TAB MESSAGES
-  // =========================
-  async function switchToDoc(docId, name) {
-    const tr = TRACE('switchToDoc', { docId, name });
-    try {
-      if (!docId) return;
-      if (docId === gDocId && gArrayBuffer) { tr.end('already active'); return; }
-
-      clearUiForNewDoc('Switching to another document…');
-      const bytes = await safeGetBytes(docId);
-      if (!bytes) {
-        await hardResetDocContext('no bytes / no permission');
-        return;
-      }
-
-      gDocId = docId;
-      const nm = name || 'document.docx';
-      const { base, ext } = splitNameAndExt(nm);
-      gFileName = base || 'document';
-      gFileExt  = ext || 'docx';
-      gArrayBuffer = bytes.buffer ?? bytes;
-
-      await renderFromCurrentBytes('(switched by other tab) ');
-      await updateWriteAccessBanner();
-    } finally {
-      tr.end();
-    }
-  }
-
-  bcLegacy?.addEventListener('message', async (ev) => {
-    const tr = TRACE('BroadcastChannel(legacy):message', ev?.data);
-    try {
-      const m = ev.data || {};
-      if (!m || typeof m !== 'object') return;
-
-      if (m.type === 'doc-switched' && m.docId && m.docId !== gDocId) {
-        await switchToDoc(m.docId, m.name);
-      }
-
-      if (m.type === 'doc-updated' && m.docId && m.docId === gDocId) {
-        const bytes = await safeGetBytes(gDocId);
-        if (!bytes) {
-          await hardResetDocContext('no bytes / no permission');
-          return;
-        }
-        gArrayBuffer = bytes.buffer ?? bytes;
-        await renderFromCurrentBytes('(updated by other tab) ');
-        await updateWriteAccessBanner();
-      }
-
-      if (m.type === 'doc-cleared') {
-        await hardResetDocContext('cleared by another tab');
-      }
-
-      if (m.type === 'schema-updated' && m.docId && m.docId === gDocId) {
-        const st = await window.formSuitePersist.loadState(gDocId);
-        if (st?.schema) {
-          adoptHeadingBaseline({
-            flat: Array.isArray(st.headingsFlat) ? st.headingsFlat : Array.isArray(st.headings) ? st.headings : [],
-            tree: Array.isArray(st.headingsTree) ? st.headingsTree : gHeadingBaseline.tree
-          });
-          gSchema = st.schema;
-          gValues = st.values || {};
-          buildForm(formMount, gSchema, gValues);
-          await updatePreview(gValues);
-          setStatus('Schema updated from Builder/Rules.');
-        }
-      }
-
-      if (m.type === 'rules-updated' && (!m.docId || m.docId === gDocId)) {
-        await updatePreview(collectFormValues(gSchema));
-        setStatus('Rules updated (BC legacy).');
-      }
-    } finally {
-      tr.end();
-    }
-  });
-
-  bcCanon?.addEventListener('message', async (ev) => {
-    const tr = TRACE('BroadcastChannel(canon):message', ev?.data);
-    try {
-      const m = ev.data || {};
-      if (!m || typeof m !== 'object') return;
-
-      if (m.type === 'active:set' && m.docId && m.docId !== gDocId) {
-        await switchToDoc(m.docId, m.name);
-      }
-
-      if (m.type === 'active:updated' && m.docId && m.docId === gDocId) {
-        const bytes = await safeGetBytes(gDocId);
-        if (!bytes) return;
-        gArrayBuffer = bytes.buffer ?? bytes;
-        await renderFromCurrentBytes('(updated by other tab) ');
-      }
-
-      if (m.type === 'active:clear') {
-        await hardResetDocContext('cleared by another tab');
-      }
-
-      if (m.type === 'rules-updated' && (!m.docId || m.docId === gDocId)) {
-        await updatePreview(collectFormValues(gSchema));
-        setStatus('Rules updated (BC canon).');
-      }
-    } finally {
-      tr.end();
-    }
-  });
-
-  window.addEventListener('storage', async (e) => {
-    const tr = TRACE('storage:event', { key: e.key, hasNew: !!e.newValue });
-    try {
-      if (e.key === ACTIVE_LS_KEY && e.newValue) {
-        try {
-          const meta = JSON.parse(e.newValue);
-          if (meta?.docId && meta.docId !== gDocId) {
-            await switchToDoc(meta.docId, meta.name);
-          }
-        } catch (err) {
-          tr.warn('parse active meta failed', err);
-        }
-      }
-    } finally {
-      tr.end();
-    }
-  });
-
-  // =========================
-  // RULES WATCHDOG (polling)
-  // =========================
-  (function setupRulesWatchdog() {
-    const tr = TRACE('setupRulesWatchdog');
-    let lastRV = null;
-
-    async function tick() {
-      if (!gDocId) return;
-      try {
-        const st = await window.formSuitePersist.loadState(gDocId);
-        const rv = st?.rulesVersion
-          ?? st?.payload?.CRONOS_PAYLOAD?.rulesVersion
-          ?? st?.CRONOS_PAYLOAD?.rulesVersion
-          ?? st?.cronos_payload?.rulesVersion
-          ?? null;
-
-        if (rv !== lastRV) {
-          const ttr = TRACE('rulesWatchdog:change', { prev: lastRV, next: rv });
-          lastRV = rv;
-          await updatePreview(collectFormValues(gSchema));
-          setStatus('Rules updated (poll).');
-          ttr.end();
-        }
-      } catch (e) {
-        console.warn('[Extractor][Watchdog] tick failed', e);
-      }
-    }
-
-    setInterval(tick, 1500);
-    tr.end('installed');
-  })();
-
-  // =========================
-  // NORMALIZATION HELPERS
-  // =========================
-  function normalizeForSchema(schema, values, tagMap) {
-    const fieldIds = new Set((schema?.fields || []).map(f => String(f.id)));
-    const prunedValues = {};
-    for (const [k, v] of Object.entries(values || {})) {
-      if (fieldIds.has(String(k))) prunedValues[k] = v;
-    }
-    const prunedTagMap = {};
-    for (const [tag, fieldId] of Object.entries(tagMap || {})) {
-      if (fieldIds.has(String(fieldId))) prunedTagMap[tag] = fieldId;
-    }
-    return { values: prunedValues, tagMap: prunedTagMap };
-  }
-
-  async function getTagMapFor(docId) {
-    try {
-      if (!docId) return {};
-      const st = await window.formSuitePersist.loadState(docId);
-      const tagMap =
-        st?.payload?.CRONOS_PAYLOAD?.tagMap ||
-        st?.CRONOS_PAYLOAD?.tagMap ||
-        st?.cronos_payload?.tagMap ||
-        st?.tagMap ||
-        {};
-      return tagMap;
-    } catch {
-      return {};
-    }
-  }
-
-  function collectFormValues(schema) {
-    const form = document.getElementById('liveForm');
-    const out = {};
-    if (!form || !schema) return out;
-
-    for (const f of (schema.fields || [])) {
-      if (f.type === 'multichoice') {
-        const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
-        out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
-        continue;
-      }
-      if (f.type === 'address') {
-        out[f.id] = __addressValues[f.id] ?? null;
-        continue;
-      }
-      const el = form.elements[f.id];
-      out[f.id] = el ? el.value : null;
-    }
-    return out;
-  }
-
-  // =========================
-  // FORM RENDERING
-  // =========================
-  let previewTimer = null;
-  function schedulePreviewUpdate() {
-    clearTimeout(previewTimer);
-    previewTimer = setTimeout(async () => {
-      const vals = collectFormValues(gSchema);
-      if (gDocId) {
-        await window.formSuitePersist.saveState(gDocId, { schema: gSchema, values: vals });
-      }
-      await updatePreview(vals);
-      gDirty = true;
-      setStatus('Unsaved changes — press Save to update DOCX.');
-    }, 250);
-  }
-
-  function buildForm(container, schema, values) {
-    const tr = TRACE('buildForm', { fields: schema?.fields?.length || 0 });
-    try {
-      container.innerHTML = '';
-      if (!schema || !Array.isArray(schema.fields) || schema.fields.length === 0) {
-        container.innerHTML = '<div class="empty">No manual schema. Create one in the Builder, or load a DOCX that already contains a payload schema.</div>';
-        tr.end('empty schema');
-        return;
-      }
-
-      const form = document.createElement('form');
-      form.id = 'liveForm';
-      form.noValidate = true;
-      form.style.display = 'grid';
-      form.style.gap = '12px';
-
-      if (schema.title) {
-        const h = document.createElement('h4');
-        h.textContent = schema.title;
-        h.style.margin = '0 0 6px';
-        form.appendChild(h);
-      }
-
-      for (const f of schema.fields) {
-        const tf = TRACE('buildForm:field', { id: f.id, type: f.type });
-        const wrap = document.createElement('div');
-        wrap.className = 'field';
-
-        const label = document.createElement('label');
-        label.htmlFor = f.id;
-        label.style.display = 'flex';
-        label.style.justifyContent = 'space-between';
-        label.style.alignItems = 'center';
-
-        const labelText = document.createElement('span');
-        labelText.textContent = f.label || f.id || '(field)';
-        label.appendChild(labelText);
-
-        if (f.required) {
-          const star = document.createElement('span');
-          star.textContent = '•';
-          star.title = 'Required';
-          star.style.fontWeight = '600';
-          star.style.color = '#ef4444';
-          label.appendChild(star);
-        }
-
-        wrap.appendChild(label);
-
-        let input;
-
-        if (f.type === 'multichoice') {
-          const box = document.createElement('div');
-          box.style.display = 'grid';
-          box.style.gap = '6px';
-          (f.options || []).forEach(opt => {
-            const id = `${f.id}__${String(opt?.value ?? opt).replace(/\s+/g, '_')}`;
-            const row = document.createElement('label');
-            row.style.display = 'flex';
-            row.style.gap = '8px';
-            row.style.alignItems = 'center';
-
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.name = f.id;
-            cb.id = id;
-            cb.value = String(opt?.value ?? opt);
-
-            if (Array.isArray(values?.[f.id]) && values[f.id].includes(cb.value)) {
-              cb.checked = true;
-            }
-
-            const span = document.createElement('span');
-            span.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
-
-            row.appendChild(cb);
-            row.appendChild(span);
-            box.appendChild(row);
-          });
-
-          wrap.appendChild(box);
-          box.addEventListener('change', schedulePreviewUpdate);
-          form.appendChild(wrap);
-          tf.end();
-          continue;
-        }
-
-        if (f.type === 'select') {
-          input = document.createElement('select');
-          (f.options || []).forEach(opt => {
-            const o = document.createElement('option');
-            o.value = String(opt?.value ?? opt?.id ?? opt);
-            o.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
-            input.appendChild(o);
-          });
-        } else if (f.type === 'date') {
-          input = document.createElement('input');
-          input.type = 'text';
-          input.dataset.type = 'date';
-          input.dataset.format = f.dateFormat || 'Y-m-d';
-        } else if (f.type === 'address') {
-          const mountDiv = document.createElement('div');
-          mountDiv.className = 'address-field';
-          wrap.appendChild(mountDiv);
-
-          const initial =
-            typeof values?.[f.id] === 'string'
-              ? { formatted: values[f.id] }
-              : (values?.[f.id] || null);
-
-          __addressValues[f.id] = initial || null;
-
-          try {
-            if (window.AddressAuto && typeof window.AddressAuto.mount === 'function') {
-              window.AddressAuto.mount(mountDiv, {
-                id: f.id,
-                label: f.label || 'Address',
-                required: !!f.required,
-                value: initial || null,
-                onChange: (val) => {
-                  __addressValues[f.id] = val;
-                  schedulePreviewUpdate();
-                }
-              });
-            } else {
-              throw new Error('AddressAuto not available');
-            }
-          } catch (err) {
-            const fallback = document.createElement('input');
-            fallback.type = 'text';
-            fallback.id = f.id;
-            fallback.name = f.id;
-            fallback.placeholder = 'Address';
-            if (initial?.formatted) fallback.value = initial.formatted;
-            fallback.addEventListener('input', () => {
-              __addressValues[f.id] = { formatted: fallback.value };
-              schedulePreviewUpdate();
-            });
-            mountDiv.appendChild(fallback);
-          }
-
-          form.appendChild(wrap);
-          tf.end();
-          continue;
-        } else {
-          input = document.createElement('input');
-          input.type = 'text';
-        }
-
-        input.id = f.id;
-        input.name = f.id;
-        if (f.required) input.required = true;
-        if (values && values[f.id] != null) input.value = values[f.id];
-
-        input.addEventListener('change', schedulePreviewUpdate);
-        input.addEventListener('input', schedulePreviewUpdate);
-
-        wrap.appendChild(input);
-
-        if (f.type === 'date') {
-          setTimeout(() => {
-            const tt = TRACE('flatpickr:init', { id: input.id, format: input.dataset.format });
-            try {
-              if (window.flatpickr && typeof window.flatpickr === 'function') {
-                window.flatpickr(input, {
-                  dateFormat: input.dataset.format || 'Y-m-d',
-                  allowInput: true,
-                  onChange: schedulePreviewUpdate,
-                  onValueUpdate: schedulePreviewUpdate
-                });
-              }
-            } finally {
-              tt.end();
-            }
-          }, 0);
-        }
-
-        form.appendChild(wrap);
-        tf.end();
-      }
-
-      container.appendChild(form);
-      tr.end('form built');
-    } catch (e) {
-      tr.error('buildForm failed', e);
-      tr.end();
-    }
-  }
-
-  // =========================
-  // SDT PARSING
-  // =========================
-  function xmlText(el) {
-    let s = '';
-    const rec = n => {
-      if (!n) return;
-      if (n.nodeType === 3) { s += n.nodeValue; return; }
-      if (n.nodeType === 1) {
-        const ln = n.localName;
-        if (ln === 'p' || ln === 'cr' || ln === 'br') s += '\n';
-        for (const ch of n.childNodes) rec(ch);
-      }
-    };
-    rec(el);
-    return s.replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  }
-
-  async function parseSDTs_JS(arrayBuffer) {
-    const tr = TRACE('parseSDTs_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
-    try {
-      if (!arrayBuffer) return { sdts: [], scan: [], total: 0 };
-      const zip = await JSZip.loadAsync(arrayBuffer);
-      const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
-      tr.step('parts', parts.map(p => p.name));
-      const parser = new DOMParser();
-      const sdts = [];
-      const scan = [];
-
-      for (const f of parts) {
-        const pf = TRACE('parseSDTs_JS:file', f.name);
-        const xmlTextContent = await f.async('string');
-        let err = null;
-        const countBefore = sdts.length;
-        try {
-          const xml = parser.parseFromString(xmlTextContent, "application/xml");
-          const found = Array.from(xml.getElementsByTagNameNS(DOCX_NS, 'sdt'));
-          for (const sdt of found) {
-            const pr = sdt.getElementsByTagNameNS(DOCX_NS, 'sdtPr')[0];
-            const content = sdt.getElementsByTagNameNS(DOCX_NS, 'sdtContent')[0] || sdt;
-            let tagVal = '';
-            let alias = '';
-
-            if (pr) {
-              const tEl = pr.getElementsByTagNameNS(DOCX_NS, 'tag')[0];
-              if (tEl) tagVal = tEl.getAttributeNS(DOCX_NS, 'val') || tEl.getAttribute('w:val') || '';
-              const aEl = pr.getElementsByTagNameNS(DOCX_NS, 'alias')[0];
-              if (aEl) alias = aEl.getAttributeNS(DOCX_NS, 'val') || aEl.getAttribute('w:val') || '';
-            }
-
-            sdts.push({
-              part: f.name.split('/').pop().replace('.xml', ''),
-              tag: tagVal,
-              alias,
-              text: xmlText(content)
-            });
-          }
-        } catch (e) {
-          err = e?.message || String(e);
-          pf.warn('xml parse error', e);
-        }
-        scan.push({
-          path: f.name,
-          part: f.name.split('/').pop().replace('.xml', ''),
-          size: xmlTextContent.length,
-          sdt_count: sdts.length - countBefore,
-          error: err
-        });
-        pf.end({ added: sdts.length - countBefore, error: err });
-      }
-
-      tr.end({ total: sdts.length, scanned: scan.length });
-      return { sdts, scan, total: sdts.length };
-    } catch (e) {
-      tr.error('parseSDTs_JS failed', e);
-      tr.end();
-      return { sdts: [], scan: [], total: 0 };
-    }
-  }
-
-  function renderSDTsView(parsed) {
-    const tr = TRACE('renderSDTsView', { total: parsed?.total, rows: parsed?.sdts?.length });
-    try {
-      tableBody.innerHTML = '';
-      const sdts = parsed?.sdts || [];
-      if (!sdts.length) {
-        const trEl = document.createElement('tr');
-        const td = document.createElement('td');
-        td.colSpan = 5;
-        td.className = 'empty';
-        td.textContent = 'No SDTs found in this document.';
-        trEl.appendChild(td);
-        tableBody.appendChild(trEl);
-      } else {
-        sdts.forEach((row, i) => {
-          const trEl = document.createElement('tr');
-          const tdIdx = document.createElement('td');
-          tdIdx.textContent = String(i + 1);
-          trEl.appendChild(tdIdx);
-
-          const tdPart = document.createElement('td');
-          tdPart.textContent = row.part || '';
-          trEl.appendChild(tdPart);
-
-          const tdTag = document.createElement('td');
-          tdTag.textContent = row.tag || '';
-          trEl.appendChild(tdTag);
-
-          const tdAlias = document.createElement('td');
-          tdAlias.textContent = row.alias || '';
-          trEl.appendChild(tdAlias);
-
-          const tdText = document.createElement('td');
-          tdText.textContent = row.text || '';
-          trEl.appendChild(tdText);
-
-          tableBody.appendChild(trEl);
-        });
-      }
-    } finally {
-      tr.end();
-    }
-  }
-
-  // =========================
-  // HEADINGS PARSING + TREE
-  // =========================
-  function buildHeadingTree(list) {
-    const root = [];
-    const stack = [];
-    for (const h of (list || [])) {
-      const node = {
-        level: h.level,
-        text: h.text,
-        part: h.part || 'document',
-        idx: h.idx,
-        uid: h.uid,
-        paraIndex: h.paraIndex,
-        start: h.start,
-        end: h.end,
-        label: h.label || h.text,
-        children: []
-      };
-      while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
-      if (!stack.length) {
-        root.push(node);
-      } else {
-        stack[stack.length - 1].children.push(node);
-      }
-      stack.push(node);
-    }
-    return root;
-  }
-
-  function renderHeadingsTreeView(tree) {
-    const tr = TRACE('renderHeadingsTreeView', { nodes: tree?.length || 0 });
-    try {
-      if (!headersTreeEl) return;
-      headersTreeEl.innerHTML = '';
-
-      if (!tree || !tree.length) {
-        headersTreeEl.innerHTML = '<div class="empty">No headings found (no paragraphs styled as headings).</div>';
-        tr.end('empty');
-        return;
-      }
-
-      if (typeof window.numberHeadingsTree === 'function') {
-        try { window.numberHeadingsTree(tree); } catch (e) { tr.warn('numberHeadingsTree failed', e); }
-      }
-
-      const mk = (nodes) => {
-        const ul = document.createElement('ul');
-        ul.style.margin = '0 0 0 1rem';
-        ul.style.padding = '0.1rem 0 0.1rem 0.6rem';
-        for (const n of nodes) {
-          const li = document.createElement('li');
-          li.style.listStyle = 'none';
-
-          const line = document.createElement('div');
-          line.style.display = 'flex';
-          line.style.gap = '6px';
-          line.style.alignItems = 'baseline';
-
-          const num = document.createElement('span');
-          num.textContent = n.num || '';
-          num.style.minWidth = '4ch';
-          num.style.textAlign = 'right';
-          num.style.fontVariantNumeric = 'tabular-nums';
-          num.style.opacity = '0.9';
-          num.style.fontWeight = n.level <= 2 ? '700' : '600';
-
-          const text = document.createElement('span');
-          text.textContent = n.text;
-          text.title = `${n.part} · H${n.level}`;
-          text.style.fontWeight = n.level <= 2 ? '600' : '400';
-
-          const part = document.createElement('span');
-          part.textContent = `· ${n.part}`;
-          part.className = 'muted';
-          part.style.fontSize = '0.75rem';
-
-          line.appendChild(num);
-          line.appendChild(text);
-          line.appendChild(part);
-          li.appendChild(line);
-
-          if (n.children?.length) li.appendChild(mk(n.children));
-          ul.appendChild(li);
-        }
-        return ul;
-      };
-
-      headersTreeEl.appendChild(mk(tree));
-      tr.end('rendered');
-    } catch (e) {
-      tr.error('renderHeadingsTreeView failed', e);
-      tr.end();
-    }
-  }
-
-  async function parseHeadings_JS(arrayBuffer) {
-    const tr = TRACE('parseHeadings_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
-    try {
-      if (!arrayBuffer) return { flat: [], tree: [], count: 0 };
-
-      const bytes = (arrayBuffer instanceof Uint8Array) ? arrayBuffer : new Uint8Array(arrayBuffer);
-
-      // -----------------------------
-      // 1) Preferred path: inspectRemovalPlan
-      // -----------------------------
-      let plan = { parts: [] };
-      let flat = [];
-      try {
-        if (typeof window.inspectRemovalPlan === 'function') {
-          plan = await window.inspectRemovalPlan(bytes, {}) || { parts: [] };
-        } else if (window.docxCore && typeof window.docxCore.inspectRemovalPlan === 'function') {
-          plan = await window.docxCore.inspectRemovalPlan(bytes, {}) || { parts: [] };
-        }
-      } catch (e) {
-        tr.warn('inspectRemovalPlan call failed; will try fallback heading scan', e);
-      }
-
-      const parts = Array.isArray(plan?.parts) ? plan.parts : [];
-      if (parts.length) {
-        const seen = new Set();
-        for (const part of parts) {
-          const headings = Array.isArray(part?.headings) ? part.headings : [];
-          for (const heading of headings) {
-            const idx = Number(heading?.idx);
-            const dedupeKey = `${part?.name || part?.part || 'document'}:${idx}`;
-            if (!Number.isFinite(idx) || seen.has(dedupeKey)) continue;
-            seen.add(dedupeKey);
-
-            const text = String(heading?.text || '').trim();
-            const lvl = Number(heading?.level);
-
-            const entry = {
-              idx,
-              key: (heading?.id || `sec_${String(idx).padStart(6, '0')}`),
-              id:  (heading?.id || `sec_${String(idx).padStart(6, '0')}`),
-              text,
-              title: text,
-              label: text,
-              part: heading?.part || part?.name || 'document',
-              startIdx: Number.isFinite(Number(heading?.startIdx)) ? Number(heading.startIdx) : idx,
-              endIdx:   Number.isFinite(Number(heading?.endIdx)) ? Number(heading.endIdx) : null
-            };
-            if (Number.isFinite(lvl)) entry.level = lvl;
-
-            const number = heading?.number ?? heading?.num;
-            if (number != null && number !== '') entry.number = String(number);
-
-            flat.push(entry);
-          }
-        }
-      }
-
-      // If we got headings from inspectRemovalPlan, use them.
-      if (flat.length) {
-        flat.sort((a, b) => a.idx - b.idx);
-        const tree = buildHeadingTree(flat);
-
-        if (typeof window.numberHeadingsTree === 'function') {
-          try { window.numberHeadingsTree(tree); } catch (e) { tr.warn('numberHeadingsTree failed', e); }
-        }
-
-        tr.end({ count: flat.length, mode: 'inspectRemovalPlan' });
-        return { flat, tree, count: flat.length };
-      }
-
-      // -----------------------------
-      // 2) Fallback path: direct DOCX scan (workingrmv-style)
-      // -----------------------------
-      tr.step('No headings from inspectRemovalPlan; using fallback scan');
-
-      const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-
-      const normalizeText = (s) => String(s || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
-
-      const levelFromStyleHint = (str) => {
-        if (!str) return 0;
-        const s = String(str).trim().toLowerCase();
-        const ps = [
-          /heading\s*([1-9])/,
-          /überschrift\s*([1-9])/,
-          /titre\s*([1-9])/,
-          /t[ií]tulo\s*([1-9])/,
-          /encabezado\s*([1-9])/,
-          /rubrik\s*([1-9])/,
-          /zagolovok\s*([1-9])/,
-          /заголовок\s*([1-9])/
-        ];
-        for (const re of ps) {
-          const m = s.match(re);
-          if (m) return +m[1];
-        }
-        const m2 = s.match(/^heading([1-9])$/i);
-        return m2 ? +m2[1] : 0;
-      };
-
-      const buildStyleMap = async (zip) => {
-        const f = zip.file('word/styles.xml');
-        if (!f) return {};
-        const xml = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
-        const byId = {};
-        const styles = xml.getElementsByTagNameNS(W_NS, 'style');
-
-        for (let i = 0; i < styles.length; i++) {
-          const st = styles[i];
-          const type = st.getAttributeNS(W_NS, 'type') || st.getAttribute('w:type');
-          if (type !== 'paragraph') continue;
-
-          const id = st.getAttributeNS(W_NS, 'styleId') || st.getAttribute('w:styleId') || '';
-          if (!id) continue;
-
-          const nameEl = st.getElementsByTagNameNS(W_NS, 'name')[0];
-          const name = nameEl ? (nameEl.getAttributeNS(W_NS, 'val') || nameEl.getAttribute('w:val') || '') : '';
-
-          const basedEl = st.getElementsByTagNameNS(W_NS, 'basedOn')[0];
-          const basedOn = basedEl
-            ? (basedEl.getAttributeNS?.(W_NS, 'val') || basedEl.getAttribute?.('w:val') || '')
-            : '';
-
-          let lvl = 0;
-          const pPr = st.getElementsByTagNameNS(W_NS, 'pPr')[0];
-          if (pPr) {
-            const ol = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
-            if (ol) {
-              const v = ol.getAttributeNS(W_NS, 'val') || ol.getAttribute('w:val');
-              if (v != null && v !== '') {
-                const n = +v;
-                if (Number.isFinite(n)) lvl = Math.max(1, Math.min(9, n + 1));
-              }
-            }
-          }
-          if (!lvl) lvl = levelFromStyleHint(id) || levelFromStyleHint(name) || 0;
-
-          byId[id] = { basedOn, rawLevel: lvl };
-        }
-
-        const resolved = {};
-        const resolve = (id, d = 0) => {
-          if (!id || !byId[id] || d > 12) return 0;
-          if (resolved[id] != null) return resolved[id];
-          const info = byId[id];
-          if (info.rawLevel) return (resolved[id] = info.rawLevel);
-          return (resolved[id] = resolve(info.basedOn, d + 1) || 0);
-        };
-
-        Object.keys(byId).forEach((id) => resolve(id));
-        return resolved;
-      };
-
-      const textOfPara = (p) => {
-        const ts = p.getElementsByTagNameNS(W_NS, 't');
-        let s = '';
-        for (let i = 0; i < ts.length; i++) s += ts[i].textContent;
-        return normalizeText(s);
-      };
-
-      const detectHeadingLevel = (p, styleMap) => {
-        const pPr = p.getElementsByTagNameNS(W_NS, 'pPr')[0];
-        if (pPr) {
-          const ol = pPr.getElementsByTagNameNS(W_NS, 'outlineLvl')[0];
-          if (ol) {
-            const v = ol.getAttributeNS(W_NS, 'val') || ol.getAttribute('w:val');
-            if (v != null && v !== '') {
-              const n = +v;
-              if (Number.isFinite(n)) return Math.max(1, Math.min(9, n + 1));
-            }
-          }
-          const pStyle = pPr.getElementsByTagNameNS(W_NS, 'pStyle')[0];
-          if (pStyle) {
-            const id = pStyle.getAttributeNS(W_NS, 'val') || pStyle.getAttribute('w:val') || '';
-            const lvl = styleMap?.[id];
-            if (lvl) return lvl;
-          }
-        }
-        return 0;
-      };
-
-      // Load DOCX parts
-      const zip = await window.JSZip.loadAsync(bytes);
-      const styleMap = await buildStyleMap(zip);
-
-      const docXml = await zip.file('word/document.xml')?.async('string');
-      if (!docXml) {
-        tr.end({ count: 0, mode: 'fallback', reason: 'missing word/document.xml' });
-        return { flat: [], tree: [], count: 0 };
-      }
-      const doc = new DOMParser().parseFromString(docXml, 'application/xml');
-      const paras = Array.from(doc.getElementsByTagNameNS(W_NS, 'p'));
-
-      // Build flat headings list
-      const fallbackFlat = [];
-      for (let i = 0; i < paras.length; i++) {
-        const p = paras[i];
-        const lvl = detectHeadingLevel(p, styleMap);
-        if (!lvl) continue;
-        const t = textOfPara(p);
-        if (!t) continue;
-        fallbackFlat.push({
-          idx: i,
-          id: `sec_${String(i).padStart(6, '0')}`,
-          key: `sec_${String(i).padStart(6, '0')}`,
-          level: lvl,
-          text: t,
-          title: t,
-          label: t,
-          part: 'document',
-          startIdx: i,
-          endIdx: null
-        });
-      }
-
-      // Compute endIdx similarly to workingrmv (next heading with level <= current)
-      for (let i = 0; i < fallbackFlat.length; i++) {
-        const cur = fallbackFlat[i];
-        let end = paras.length;
-        for (let j = i + 1; j < fallbackFlat.length; j++) {
-          if (fallbackFlat[j].level <= cur.level) { end = fallbackFlat[j].idx; break; }
-        }
-        cur.endIdx = end;
-      }
-
-      if (!fallbackFlat.length) {
-        tr.end({ count: 0, mode: 'fallback', reason: 'no-headings' });
-        return { flat: [], tree: [], count: 0 };
-      }
-
-      fallbackFlat.sort((a, b) => a.idx - b.idx);
-      const tree = buildHeadingTree(fallbackFlat);
-
-      if (typeof window.numberHeadingsTree === 'function') {
-        try { window.numberHeadingsTree(tree); } catch (e) { tr.warn('numberHeadingsTree failed', e); }
-      }
-
-      tr.end({ count: fallbackFlat.length, mode: 'fallback-scan' });
-      return { flat: fallbackFlat, tree, count: fallbackFlat.length };
-
-    } catch (e) {
-      tr.error('parseHeadings_JS failed', e);
-      tr.end();
-      return { flat: [], tree: [], count: 0 };
-    }
-  }
-
-
-  // =========================
-  // PAYLOAD PREVIEW
-  // =========================
-  async function updatePreview(values) {
-    const tr = TRACE('updatePreview');
-    try {
-      if (!payloadEl) return;
-
-      const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId) || {}) : {};
-
-      adoptHeadingBaseline({
-        flat: Array.isArray(wsState.headingsFlat)
-          ? wsState.headingsFlat
-          : Array.isArray(wsState.headings) ? wsState.headings : gHeadingBaseline.flat,
-        tree: Array.isArray(wsState.headingsTree)
-          ? wsState.headingsTree
-          : gHeadingBaseline.tree
-      });
-
-      const payloadObj =
-        wsState.payload?.CRONOS_PAYLOAD ||
-        wsState.CRONOS_PAYLOAD ||
-        wsState.cronos_payload ||
-        {};
-
-      let mergedRulesRaw = [];
-      let mergedFieldRaw = [];
-      try {
-        if (typeof window.resolveRulesForState === 'function') {
-          const resolved = window.resolveRulesForState(wsState, payloadObj);
-          mergedRulesRaw = Array.isArray(resolved.rules) ? resolved.rules : [];
-          mergedFieldRaw = Array.isArray(resolved.fieldRules) ? resolved.fieldRules : [];
-        } else {
-          mergedRulesRaw = Array.isArray(payloadObj.rules) ? payloadObj.rules : [];
-          mergedFieldRaw = Array.isArray(payloadObj.fieldRules) ? payloadObj.fieldRules : [];
-        }
-      } catch (e) {
-        tr.warn('resolveRulesForState failed in updatePreview; payload-only rules', e);
-        mergedRulesRaw = Array.isArray(payloadObj.rules) ? payloadObj.rules : [];
-        mergedFieldRaw = Array.isArray(payloadObj.fieldRules) ? payloadObj.fieldRules : [];
-      }
-
-      let rules = mergedRulesRaw;
-      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-        try {
-          rules = window.normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
-        } catch (e) {
-          tr.warn('normalizeHeadingsRulesForSchema failed in updatePreview', e);
-          rules = mergedRulesRaw;
-        }
-      }
-
-      let fieldRules = mergedFieldRaw;
-      if (typeof window.normalizeFieldRulesForSchema === 'function') {
-        try {
-          fieldRules = window.normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
-        } catch (e) {
-          tr.warn('normalizeFieldRulesForSchema failed in updatePreview', e);
-          fieldRules = mergedFieldRaw;
-        }
-      }
-
-      const tagMapRaw = wsState.tagMap || payloadObj.tagMap || {};
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, values || {}, tagMapRaw);
-
-      const previewObj = {
-        title: gSchema?.title || 'Form',
-        fields: gSchema?.fields || [],
-        values: prunedValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules
-      };
-
-      payloadEl.value = JSON.stringify(previewObj, null, 2);
-    } catch (e) {
-      tr.error('updatePreview failed', e);
-    } finally {
-      tr.end();
-    }
-  }
-
-  // =========================
-  // RENDER FROM BYTES
-  // =========================
-  async function renderFromCurrentBytes(prefix = '') {
-    const tr = TRACE('renderFromCurrentBytes', { prefix, docId: gDocId });
-    try {
-      if (!gArrayBuffer) {
-        setStatus('No DOCX loaded.');
-        return;
-      }
-
-      setStatus((prefix || '') + 'Parsing…');
-
-      // 1) SDTs
-      const parsedSDTs = await parseSDTs_JS(gArrayBuffer);
-      gSDTs = parsedSDTs.sdts || [];
-      renderSDTsView(parsedSDTs);
-
-      // 2) Headings
-      let headingsParsed = { flat: [], tree: [], count: 0 };
-      try {
-        headingsParsed = await parseHeadings_JS(gArrayBuffer);
-        renderHeadingsTreeView(headingsParsed.tree);
-        adoptHeadingBaseline(headingsParsed);
-      } catch (e) {
-        console.warn('[Extractor] headings parse failed', e);
-        if (headersTreeEl) headersTreeEl.innerHTML = '<div class="empty">No headings.</div>';
-        adoptHeadingBaseline({ flat: [], tree: [] });
-      }
-
-      // 3) Payload from DOCX
-      let payloadJson = null;
-      try {
-        if (typeof window.readDocVarSettings === 'function') {
-          payloadJson = await window.readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
-        }
-        if (payloadJson == null && typeof window.readDocVarCustom === 'function') {
-          payloadJson = await window.readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
-        }
-      } catch (e) {
-        tr.warn('readDocVarSettings/readDocVarCustom failed', e);
-      }
-
-      let payloadFromDoc = null;
-      try { payloadFromDoc = payloadJson ? JSON.parse(payloadJson) : null; }
-      catch { payloadFromDoc = null; }
-
-      DBG('docx payload target0', payloadFromDoc?.rules?.[0]?.targets?.[0] || null);
-      DBG('docx payload rulesVersion', payloadFromDoc?.rulesVersion || payloadFromDoc?.updatedAt || null);
-
-      const wsState = gDocId ? (await window.formSuitePersist.loadState(gDocId) || {}) : {};
-
-      const asTs = (x) => {
-        const t = Date.parse(x || '');
-        return Number.isFinite(t) ? t : 0;
-      };
-
-      const wsSchema  = wsState.schema;
-      const wsSchemaTs = asTs(wsState.schemaUpdatedAt);
-      const docHasSchema = Array.isArray(payloadFromDoc?.fields) && payloadFromDoc.fields.length > 0;
-      const docSchemaTs  = asTs(payloadFromDoc?.updatedAt);
-
-      let chosenSchema;
-      if (wsSchema && wsSchemaTs >= docSchemaTs) {
-        chosenSchema = wsSchema;
-      } else if (docHasSchema) {
-        chosenSchema = {
-          title: payloadFromDoc.title || 'Form',
-          fields: payloadFromDoc.fields
-        };
-      } else {
-        chosenSchema = loadSchemaFromLocalStorage() || { title: 'Form', fields: [] };
-      }
-
-      const mergedValues = Object.assign(
-        {},
-        payloadFromDoc?.values || {},
-        wsState.values || {}
-      );
-      const mergedTagMap = Object.assign(
-        {},
-        payloadFromDoc?.tagMap || {},
-        wsState.tagMap || {}
-      );
-
-      // Rules selection (bulletproof): pick newest from ws / LS mirrors / docx by rulesVersion/updatedAt
-const pickedRules = pickNewestRulesBundle(gDocId, wsState, payloadFromDoc || null);
-let mergedRulesRaw = Array.isArray(pickedRules.rules) ? pickedRules.rules : [];
-let mergedFieldRaw = Array.isArray(pickedRules.fieldRules) ? pickedRules.fieldRules : [];
-DBG(`render rulesPick src=${pickedRules.src} ver=${pickedRules.ver}`, pickedRules.target0);
-
-let rules = mergedRulesRaw;
-      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-        try {
-          rules = window.normalizeHeadingsRulesForSchema(chosenSchema, mergedRulesRaw, headingsParsed);
-        } catch (e) {
-          tr.warn('normalizeHeadingsRulesForSchema failed in renderFromCurrentBytes', e);
-          rules = mergedRulesRaw;
-        }
-      }
-
-      let fieldRules = mergedFieldRaw;
-      if (typeof window.normalizeFieldRulesForSchema === 'function') {
-        try {
-          fieldRules = window.normalizeFieldRulesForSchema(chosenSchema, mergedFieldRaw);
-        } catch (e) {
-          tr.warn('normalizeFieldRulesForSchema failed in renderFromCurrentBytes', e);
-          fieldRules = mergedFieldRaw;
-        }
-      }
-
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(chosenSchema, mergedValues, mergedTagMap);
-
-      gSchema = chosenSchema;
-      gValues = prunedValues;
-
-      // Persist canonical view into workspace for other tabs
-      if (gDocId) {
-        const canonical = {
-          title: gSchema.title,
-          fields: gSchema.fields,
-          values: gValues,
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules,
-          headingsFlat: headingsParsed.flat,
-          headingsTree: headingsParsed.tree,
-          updatedAt: new Date().toISOString()
-        };
-
-        await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema,
-          values: gValues,
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules,
-          payload: { CRONOS_PAYLOAD: canonical },
-          CRONOS_PAYLOAD: canonical,
-          cronos_payload: canonical,
-          headingsFlat: headingsParsed.flat,
-          headings: headingsParsed.flat,
-          headingsTree: headingsParsed.tree,
-          headingsUpdatedAt: new Date().toISOString(),
-          schemaUpdatedAt: new Date().toISOString()
-        });
-      }
-
-      buildForm(formMount, gSchema, gValues);
-      await updatePreview(gValues);
-
-      btnSave.disabled = false;
-      btnExport.disabled = false;
-      if (btnSaveFromPreview) btnSaveFromPreview.disabled = false;
-
-      setStatus('Ready.');
-    } catch (e) {
-      tr.error('renderFromCurrentBytes failed', e);
-      const msg = (e && e.message) ? e.message : String(e ?? 'Unknown error');
-      setStatus('Error while parsing: ' + msg);
-    } finally {
-      tr.end();
-    }
-  }
-
-  // =========================
-  // APPLY PAYLOAD FROM PREVIEW JSON
-  // =========================
-  async function applyPayloadObject(obj, { broadcast = true, save = true } = {}) {
-    const tr = TRACE('applyPayloadObject');
-    try {
-      if (!obj || typeof obj !== 'object') return;
-
-      const nextSchema = {
-        title: obj.title || 'Form',
-        fields: Array.isArray(obj.fields) ? obj.fields : []
-      };
-      const rawValues = (obj.values && typeof obj.values === 'object') ? obj.values : {};
-      const rawTagMap = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
-      const rawRules  = Array.isArray(obj.rules) ? obj.rules : [];
-      const rawFieldR = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
-
-      let rules = rawRules;
-      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-        try {
-          rules = window.normalizeHeadingsRulesForSchema(nextSchema, rawRules, gHeadingBaseline);
-        } catch (e) {
-          tr.warn('normalizeHeadingsRulesForSchema failed in applyPayloadObject', e);
-          rules = rawRules;
-        }
-      }
-
-      let fieldRules = rawFieldR;
-      if (typeof window.normalizeFieldRulesForSchema === 'function') {
-        try {
-          fieldRules = window.normalizeFieldRulesForSchema(nextSchema, rawFieldR);
-        } catch (e) {
-          tr.warn('normalizeFieldRulesForSchema failed in applyPayloadObject', e);
-          fieldRules = rawFieldR;
-        }
-      }
-
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(nextSchema, rawValues, rawTagMap);
-
-      gSchema = nextSchema;
-      gValues = prunedValues;
-
-      const payloadObj = {
-        title: gSchema.title,
-        fields: gSchema.fields,
-        values: gValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        updatedAt: new Date().toISOString()
-      };
-
-      if (gDocId && save) {
-        await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema,
-          values: gValues,
-          tagMap: prunedTagMap,
-          rules,
-          fieldRules,
-          payload: { CRONOS_PAYLOAD: payloadObj },
-          CRONOS_PAYLOAD: payloadObj,
-          cronos_payload: payloadObj,
-          schemaUpdatedAt: new Date().toISOString()
-        });
-      } else {
-        try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify({ title: gSchema.title, fields: gSchema.fields }));
-        } catch {}
-      }
-
-      buildForm(formMount, gSchema, gValues);
-      await updatePreview(gValues);
-
-      gDirty = true;
-      setStatus('Payload applied (from preview). Not yet saved to DOCX.');
-      if (previewStatus) {
-        previewStatus.textContent = 'Applied';
-        setTimeout(() => { previewStatus.textContent = ''; }, 900);
-      }
-
-      if (broadcast) {
-        try { bcLegacy?.postMessage({ type: 'schema-updated', docId: gDocId, ts: Date.now() }); } catch {}
-        try { bcCanon?.postMessage({ type: 'schema-updated',  docId: gDocId, ts: Date.now() }); } catch {}
-      }
-    } finally {
-      tr.end();
-    }
-  }
-
-  if (payloadEl) {
-    let __payloadApplyTimer = null;
-    let __payloadEditBusy = false;
-
-    payloadEl.addEventListener('input', () => {
-      const tr = TRACE('payloadEl:input');
-      try {
-        clearTimeout(__payloadApplyTimer);
-        __payloadApplyTimer = setTimeout(async () => {
-          const tr2 = TRACE('payloadEl:debouncedApply');
-          if (__payloadEditBusy) { tr2.end('busy'); return; }
-          try {
-            const txt = payloadEl.value;
-            const obj = JSON.parse(txt);
-            __payloadEditBusy = true;
-            await applyPayloadObject(obj, { broadcast: true, save: true });
-          } catch (e) {
-            if (previewStatus) previewStatus.textContent = 'Invalid JSON';
-            tr2.warn('invalid JSON', e);
-          } finally {
-            __payloadEditBusy = false;
-            tr2.end();
-          }
-        }, 350);
-      } finally {
-        tr.end();
-      }
-    });
-  }
-
-  // =========================
-  // FILE OPEN / SAVE / EXPORT
-  // =========================
-  async function doOpen() {
-    const tr = TRACE('doOpen');
-    try {
-      if (!supportsFS) {
-        alert('This browser does not support the File System Access API. Please use the main Form tab to open documents.');
-        return;
-      }
-
-      clearUiForNewDoc('Opening…');
-
-      const [handle] = await showOpenFilePicker({
-        multiple: false,
-        excludeAcceptAllOption: true,
-        types: [{
-          description: 'Word document',
-          accept: {
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm', '.dotx', '.dotm']
-          }
-        }]
-      });
-
-      const file = await handle.getFile();
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const { base, ext } = splitNameAndExt(file.name || 'document.docx');
-
-      gFileHandle = handle;
-      gFileName   = base || 'document';
-      gFileExt    = ext || 'docx';
-
-      const meta = await window.formSuitePersist.setCurrentDoc({
-        bytes,
-        handle,
-        name: `${gFileName}.${gFileExt}`
-      });
-
-      gDocId       = meta.docId;
-      gArrayBuffer = bytes.buffer;
-
-      persistActiveMeta(meta);
-      try { bcCanon?.postMessage({ type: 'active:set', docId: meta.docId, name: meta.name }); } catch {}
-      try { bcLegacy?.postMessage({ type: 'doc-switched', docId: meta.docId, name: meta.name }); } catch {}
-
-      DBG('opened doc', { docId: gDocId, name: meta.name, len: bytes.byteLength });
-            tr.step('opened', { docId: gDocId, name: meta.name, len: bytes.byteLength, sha: await sha256Hex(bytes) });
-
-      await renderFromCurrentBytes();
-      await updateWriteAccessBanner({ tryPrompt: true });
-
-    } catch (e) {
-      if (e?.name === 'AbortError') {
-        tr.step('user canceled');
-        setStatus('Idle');
-        return;
-      }
-      tr.error('open failed', e);
-      setStatus('Error opening file: ' + (e.message || e));
-    } finally {
-      tr.end();
-    }
-  }
-
-
-async function doSave() {
-  const tr = TRACE('doSave');
+function assertDeps() {
+  const tr = TRACE('assertDeps');
   try {
-    if (!gArrayBuffer || !gDocId) return;
-
-    const nowIso = () => new Date().toISOString();
-    const snap = (p) => ({
-      rules: Array.isArray(p?.rules) ? p.rules.length : 0,
-      fieldRules: Array.isArray(p?.fieldRules) ? p.fieldRules.length : 0,
-      rulesVersion: p?.rulesVersion ?? null,
-      updatedAt: p?.updatedAt ?? null,
-      target0: p?.rules?.[0]?.targets?.[0] ?? null
-    });
-
-    // --- read what current in-memory DOCX says (pre) ---
-    let prePayloadFromDoc = null;
-    try {
-      let preJson = null;
-      if (typeof window.readDocVarSettings === 'function') preJson = await window.readDocVarSettings(gArrayBuffer, PAYLOAD_KEY);
-      if (preJson == null && typeof window.readDocVarCustom === 'function') preJson = await window.readDocVarCustom(gArrayBuffer, PAYLOAD_KEY);
-      prePayloadFromDoc = preJson ? JSON.parse(preJson) : null;
-    } catch { prePayloadFromDoc = null; }
-
-    DBG('PRE-DOCX payload (in-memory) snapshot', snap(prePayloadFromDoc));
-
-    // --- workspace canonical (single source of truth) ---
-    const wsState = await window.formSuitePersist.loadState(gDocId) || {};
-
-    adoptHeadingBaseline({
-      flat: Array.isArray(wsState.headingsFlat)
-        ? wsState.headingsFlat
-        : Array.isArray(wsState.headings) ? wsState.headings : gHeadingBaseline.flat,
-      tree: Array.isArray(wsState.headingsTree)
-        ? wsState.headingsTree
-        : gHeadingBaseline.tree
-    });
-
-    const rulesRaw  = Array.isArray(wsState.rules) ? wsState.rules : [];
-    const fieldRaw  = Array.isArray(wsState.fieldRules) ? wsState.fieldRules : [];
-    const tagMapRaw = (wsState.tagMap && typeof wsState.tagMap === 'object') ? wsState.tagMap : {};
-    const rulesVersion = Number.isFinite(wsState.rulesVersion) ? wsState.rulesVersion : Date.now();
-
-    // Show “other @correct@ version” (what newest picker would choose)
-    try {
-      const picked = pickNewestRulesBundle(gDocId, wsState, prePayloadFromDoc || null);
-      DBG('OTHER @correct@ version (picked for save)', {
-        src: picked.src,
-        ver: picked.ver,
-        rules: picked.rules?.length ?? 0,
-        fieldRules: picked.fieldRules?.length ?? 0,
-        target0: picked.target0 ?? null
-      });
-    } catch (e) {
-      console.warn('[ExtractorDBG] pickNewestRulesBundle failed', e);
+    const miss = [];
+    if (!window.formSuitePersist) miss.push('window.formSuitePersist (persistence.js)');
+    if (typeof window.readActiveDocSync !== 'function') miss.push('readActiveDocSync (fs-active-doc.js)');
+    if (typeof window.installActiveDocListener !== 'function') miss.push('installActiveDocListener (fs-active-doc.js)');
+    if (miss.length) {
+      console.error('[Extractor] Missing deps:', miss);
+      setStatus('Error: missing core dependencies (see console).');
+      return false;
     }
-
-    // Values: wsState base + live DOM overlay
-    const baseVals = (wsState.values && typeof wsState.values === 'object') ? wsState.values : (gValues || {});
-    const domVals  = collectFormValues(gSchema);
-    const mergedVals = { ...(baseVals || {}), ...(domVals || {}) };
-
-    // Normalize rules to headings/schema (optional but consistent)
-    let rules = rulesRaw;
-    if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-      try { rules = window.normalizeHeadingsRulesForSchema(gSchema, rulesRaw, gHeadingBaseline); }
-      catch (e) { tr.warn('normalizeHeadingsRulesForSchema failed in doSave', e); rules = rulesRaw; }
-    }
-
-    let fieldRules = fieldRaw;
-    if (typeof window.normalizeFieldRulesForSchema === 'function') {
-      try { fieldRules = window.normalizeFieldRulesForSchema(gSchema, fieldRaw); }
-      catch (e) { tr.warn('normalizeFieldRulesForSchema failed in doSave', e); fieldRules = fieldRaw; }
-    }
-
-    // Prune values/tagMap to schema
-    const { values: prunedValues, tagMap: prunedTagMap } =
-      normalizeForSchema(gSchema, mergedVals, tagMapRaw);
-
-    gValues = prunedValues;
-    await updatePreview(gValues);
-
-    // Payload to embed
-    const payloadObjToSave = {
-      title: gSchema?.title || 'Form',
-      fields: gSchema?.fields || [],
-      values: gValues || {},
-      tagMap: prunedTagMap || {},
-      rules,
-      fieldRules,
-      rulesVersion,
-      updatedAt: nowIso()
-    };
-
-    DBG('WHAT IS BEING SAVED (payloadObjToSave)', {
-      save_rules: Array.isArray(payloadObjToSave.rules) ? payloadObjToSave.rules.length : 0,
-      save_fieldRules: Array.isArray(payloadObjToSave.fieldRules) ? payloadObjToSave.fieldRules.length : 0,
-      save_rulesVersion: payloadObjToSave.rulesVersion ?? null,
-      save_updatedAt: payloadObjToSave.updatedAt ?? null,
-      save_target0: payloadObjToSave.rules?.[0]?.targets?.[0] ?? null
-    });
-
-    const payloadJsonStr = JSON.stringify(payloadObjToSave);
-
-    // --- write into bytes ---
-    const srcU8 = new Uint8Array(gArrayBuffer);
-    let updatedU8 = null;
-    let writeSrc = 'none';
-
-    if (typeof window.writeDocVarSettings === 'function') {
-      writeSrc = 'writeDocVarSettings';
-      updatedU8 = await window.writeDocVarSettings(srcU8, PAYLOAD_KEY, payloadJsonStr);
-    } else if (typeof window.writeDocVarCustom === 'function') {
-      writeSrc = 'writeDocVarCustom';
-      updatedU8 = await window.writeDocVarCustom(srcU8, PAYLOAD_KEY, payloadJsonStr);
-    } else {
-      throw new Error('No DOCX payload writer found (writeDocVarSettings/writeDocVarCustom).');
-    }
-
-    if (!(updatedU8 instanceof Uint8Array) || updatedU8.length === 0) {
-      throw new Error(`DOCX writer returned invalid bytes (src=${writeSrc}).`);
-    }
-
-    DBG('SAVE writer result', { writer: writeSrc, inLen: srcU8.length, outLen: updatedU8.length });
-
-    // --- VERIFY IN MEMORY (most important: proves payload is actually embedded) ---
-    try {
-      const ab = updatedU8.buffer.slice(updatedU8.byteOffset, updatedU8.byteOffset + updatedU8.byteLength);
-      let vJson = null;
-      if (typeof window.readDocVarSettings === 'function') vJson = await window.readDocVarSettings(ab, PAYLOAD_KEY);
-      if (vJson == null && typeof window.readDocVarCustom === 'function') vJson = await window.readDocVarCustom(ab, PAYLOAD_KEY);
-      const vObj = vJson ? JSON.parse(vJson) : null;
-
-      DBG('VERIFY-IN-MEM (updated bytes) snapshot', snap(vObj));
-
-      // If this is null, your writer is not writing where your reader reads.
-      if (!vObj) console.warn('[ExtractorDBG] VERIFY-IN-MEM is null → writer/read mismatch likely.');
-    } catch (e) {
-      console.warn('[ExtractorDBG] VERIFY-IN-MEM failed', e);
-    }
-
-    // --- write to file handle (actual persistence) ---
-    // IMPORTANT: set gArrayBuffer to updated bytes *immediately* so later reads are not stale.
-    gArrayBuffer = updatedU8.buffer.slice(updatedU8.byteOffset, updatedU8.byteOffset + updatedU8.byteLength);
-
-    if (gFileHandle && typeof gFileHandle.createWritable === 'function') {
-      const writable = await gFileHandle.createWritable();
-      await writable.write(updatedU8);
-      await writable.close();
-    } else {
-      // fallback: existing download/save-as logic in your app (keep whatever you already do)
-      // If you only support download fallback, ensure you ALSO update gArrayBuffer as above.
-      console.warn('[Extractor] No writable file handle; wrote only to in-memory buffer. Reopen will load old file.');
-    }
-
-    // --- VERIFY ON DISK (if handle exists) ---
-    try {
-      if (gFileHandle && typeof gFileHandle.getFile === 'function') {
-        const file = await gFileHandle.getFile();
-        const diskAb = await file.arrayBuffer();
-
-        let postJson = null;
-        if (typeof window.readDocVarSettings === 'function') postJson = await window.readDocVarSettings(diskAb, PAYLOAD_KEY);
-        if (postJson == null && typeof window.readDocVarCustom === 'function') postJson = await window.readDocVarCustom(diskAb, PAYLOAD_KEY);
-        const postObj = postJson ? JSON.parse(postJson) : null;
-
-        DBG('VERIFY-ON-DISK (handle readback) snapshot', snap(postObj));
-      } else {
-        DBG('VERIFY-ON-DISK skipped (no handle)');
-      }
-    } catch (e) {
-      console.warn('[ExtractorDBG] VERIFY-ON-DISK failed', e);
-    }
-
-    // Optional hardening: never allow the global LS key to interfere.
-    // (Real fix is removing it at source in rules.html; see note below.)
-    try { localStorage.removeItem('CRONOS_PAYLOAD'); } catch {}
-
-    setStatus('Saved to original DOCX (payload overwritten).');
-  } catch (e) {
-    console.error('[Extractor] doSave failed', e);
-    setStatus('Save failed (see console).');
+    return true;
   } finally {
     tr.end();
   }
 }
 
+function splitNameAndExt(fileName) {
+  const m = String(fileName || '').match(/\.(docx|docm|dotx|dotm)$/i);
+  return {
+    base: String(fileName || 'document.docx').replace(/\.(docx|docm|dotx|dotm)$/i, ''),
+    ext:  (m ? m[1] : 'docx').toLowerCase()
+  };
+}
 
-  async function doExport() {
-    const tr = TRACE('doExport');
-    try {
-      if (!gArrayBuffer) {
-        alert('No DOCX loaded.');
-        return;
-      }
-      if (!gSchema) {
-        alert('No schema available — parse or hydrate first.');
-        return;
-      }
-      if (!window.fsExportCore || typeof window.fsExportCore.buildDoc !== 'function') {
-        alert('Export module (fs-export-core.js) is not available. You can still use Save (payload only).');
-        return;
-      }
-
-      setStatus('Preparing export…');
-      const originalBytes = new Uint8Array(gArrayBuffer);
-
-      const restored = gDocId ? (await window.formSuitePersist.loadState(gDocId) || {}) : {};
-
-      adoptHeadingBaseline({
-        flat: Array.isArray(restored.headingsFlat)
-          ? restored.headingsFlat
-          : Array.isArray(restored.headings) ? restored.headings : gHeadingBaseline.flat,
-        tree: Array.isArray(restored.headingsTree)
-          ? restored.headingsTree
-          : gHeadingBaseline.tree
-      });
-
-      if (restored.schema) gSchema = restored.schema;
-
-      const domVals  = collectFormValues(gSchema);
-      const baseVals = restored.values || {};
-
-      const payloadSnapshot =
-        restored.payload?.CRONOS_PAYLOAD ||
-        restored.CRONOS_PAYLOAD ||
-        restored.cronos_payload ||
-        {};
-
-      const tagMapRaw = restored.tagMap || payloadSnapshot.tagMap || await getTagMapFor(gDocId);
-
-      let mergedRulesRaw = [];
-      let mergedFieldRaw = [];
-      try {
-        if (typeof window.resolveRulesForState === 'function') {
-          const resolved = window.resolveRulesForState(restored, payloadSnapshot);
-          mergedRulesRaw = Array.isArray(resolved.rules) ? resolved.rules : [];
-          mergedFieldRaw = Array.isArray(resolved.fieldRules) ? resolved.fieldRules : [];
-        } else {
-          mergedRulesRaw = Array.isArray(payloadSnapshot.rules) ? payloadSnapshot.rules : [];
-          mergedFieldRaw = Array.isArray(payloadSnapshot.fieldRules) ? payloadSnapshot.fieldRules : [];
-        }
-      } catch (e) {
-        tr.warn('resolveRulesForState failed in doExport; payload-only rules', e);
-        mergedRulesRaw = Array.isArray(payloadSnapshot.rules) ? payloadSnapshot.rules : [];
-        mergedFieldRaw = Array.isArray(payloadSnapshot.fieldRules) ? payloadSnapshot.fieldRules : [];
-      }
-
-      let rules = mergedRulesRaw;
-      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-        try {
-          rules = window.normalizeHeadingsRulesForSchema(gSchema, mergedRulesRaw, gHeadingBaseline);
-        } catch (e) {
-          tr.warn('normalizeHeadingsRulesForSchema failed in doExport', e);
-          rules = mergedRulesRaw;
-        }
-      }
-
-      let fieldRules = mergedFieldRaw;
-      if (typeof window.normalizeFieldRulesForSchema === 'function') {
-        try {
-          fieldRules = window.normalizeFieldRulesForSchema(gSchema, mergedFieldRaw);
-        } catch (e) {
-          tr.warn('normalizeFieldRulesForSchema failed in doExport', e);
-          fieldRules = mergedFieldRaw;
-        }
-      }
-
-      const { values: prunedValues, tagMap: prunedTagMap } =
-        normalizeForSchema(gSchema, { ...baseVals, ...domVals }, tagMapRaw);
-
-      gValues = prunedValues;
-      await updatePreview(gValues);
-
-      const baseline = (gHeadingBaseline && (gHeadingBaseline.flat?.length || gHeadingBaseline.tree?.length))
-        ? gHeadingBaseline
-        : { flat: [], tree: [] };
-
-      setStatus('Writing payload & applying rules…');
-
-      const exportResult = await window.fsExportCore.buildDoc({
-        originalBytes,
-        schema: gSchema,
-        values: gValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        headingBaseline: baseline,
-        payloadKey: PAYLOAD_KEY,
-        writerKind: 'settings',
-        debugLabel: 'extractor.doExport',
-        buildHeadingResolver: async () => {
-          if (typeof window.buildHeadingTargetIndex === 'function') {
-            return window.buildHeadingTargetIndex(baseline);
-          }
-          return null;
-        }
-      });
-
-      const updatedU8 = exportResult.updatedBytes instanceof Uint8Array
-        ? exportResult.updatedBytes
-        : new Uint8Array(exportResult.updatedBytes);
-
-      gArrayBuffer = updatedU8.buffer;
-
-      const payloadObj = exportResult.payload || {
-        title: gSchema.title || 'Form',
-        fields: gSchema.fields || [],
-        values: gValues,
-        tagMap: prunedTagMap,
-        rules,
-        fieldRules,
-        updatedAt: new Date().toISOString()
-      };
-
-      if (gDocId) {
-        const stamp = Date.now();
-        await window.formSuitePersist.saveState(gDocId, {
-          schema: gSchema,
-          values: gValues,
-          rules,
-          fieldRules,
-          tagMap: prunedTagMap,
-          payload: { CRONOS_PAYLOAD: payloadObj },
-          CRONOS_PAYLOAD: payloadObj,
-          cronos_payload: payloadObj,
-          rulesVersion: stamp,
-          headingsFlat: baseline.flat || [],
-          headings: baseline.flat || [],
-          headingsTree: baseline.tree || [],
-          headingsUpdatedAt: new Date().toISOString(),
-          schemaUpdatedAt: new Date().toISOString()
-        });
-        await window.formSuitePersist.putBytes?.(gDocId, updatedU8);
-      }
-
-      announceDocUpdated({ docId: gDocId });
-
-      const outName = (gFileName || 'document').replace(/\.docx$/i, '') + ' (export).docx';
-
-      if (window.showSaveFilePicker && typeof window.showSaveFilePicker === 'function') {
-        try {
-          const handle = await window.showSaveFilePicker({
-            suggestedName: outName,
-            types: [{
-              description: 'Word Document',
-              accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
-            }]
-          });
-          if (handle && typeof handle.createWritable === 'function') {
-            const stream = await handle.createWritable();
-            await stream.write(updatedU8);
-            await stream.close();
-            setStatus('Exported & saved.');
-            return;
-          }
-        } catch (e) {
-          tr.warn('SaveFilePicker canceled/failed; falling back to download link.', e);
-        }
-      }
-
-      const blob = new Blob([updatedU8], {
-        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-      });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = outName;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-        a.remove();
-      }, 4000);
-
-      setStatus('Exported (download started).');
-    } catch (e) {
-      tr.error('doExport failed', e);
-      setStatus('Export failed — see console for details: ' + (e.message || e));
-    } finally {
-      tr.end();
-    }
-  }
-
-  // =========================
-  // BOOT (auto-restore)
-  // =========================
-  (async function boot() {
-    const tr = TRACE('boot');
-    try {
-      let meta = (typeof window.readActiveDocSync === 'function') ? window.readActiveDocSync() : null;
-      tr.step('readActiveDocSync', meta);
-      if (!meta?.docId && window.formSuitePersist && typeof window.formSuitePersist.getCurrentDocMeta === 'function') {
-        meta = window.formSuitePersist.getCurrentDocMeta();
-        tr.step('getCurrentDocMeta', meta);
-      }
-      if (!meta?.docId) {
-        tr.end('no meta; idle');
-        return;
-      }
-
-      clearUiForNewDoc('Restoring document…');
-
-      let bytes = await window.formSuitePersist.getBytes?.(meta.docId)
-        || await window.formSuitePersist.getCurrentDocBytes?.();
-
-      if (!bytes && supportsFS && window.formSuitePersist && typeof window.formSuitePersist.getHandle === 'function') {
-        try {
-          const h = await window.formSuitePersist.getHandle(meta.docId);
-          if (h && typeof h.getFile === 'function') {
-            try { await window.formSuitePersist.ensurePermission?.(h, 'read'); } catch {}
-            const f = await h.getFile();
-            bytes = new Uint8Array(await f.arrayBuffer());
-            gFileHandle = h;
-            const { base, ext } = splitNameAndExt(f.name || meta.name || 'document.docx');
-            gFileName = base || 'document';
-            gFileExt  = ext  || 'docx';
-          }
-        } catch (e) {
-          tr.warn('handle fallback failed', e);
-        }
-      }
-
-      if (!bytes) {
-        await hardResetDocContext('no bytes / no permission');
-        tr.end('no bytes');
-        return;
-      }
-
-      gArrayBuffer = bytes.buffer ?? bytes;
-
-      if (!gFileName) {
-        const { base, ext } = splitNameAndExt(meta.name || 'document.docx');
-        gFileName = base || 'document';
-        gFileExt  = ext || 'docx';
-      }
-      gDocId = meta.docId;
-
-      tr.step('restored', {
-        docId: gDocId,
-        name: `${gFileName}.${gFileExt}`,
-        len: gArrayBuffer.byteLength,
-        sha: await sha256Hex(gArrayBuffer)
-      });
-
-      await renderFromCurrentBytes();
-      await updateWriteAccessBanner();
-    } catch (e) {
-      tr.error('boot failed', e);
-    } finally {
-      tr.end();
-    }
-  })();
-
-  // =========================
-  // EVENT WIRING
-  // =========================
-  btnOpen.addEventListener('click', doOpen);
-  btnSave.addEventListener('click', doSave);
-  btnExport.addEventListener('click', doExport);
-
-  if (btnSaveFromPreview) {
-    btnSaveFromPreview.addEventListener('click', doSave);
-  }
-
-  btnRegrant.addEventListener('click', async () => {
-    const tr = TRACE('btnRegrant:click');
-    try {
-      await updateWriteAccessBanner({ tryPrompt: true });
-    } catch (e) {
-      tr.error('regrant failed', e);
-      permNote.style.display = 'block';
-    } finally {
-      tr.end();
-    }
-  });
-
-  window.addEventListener('beforeunload', async () => {
-    const tr = TRACE('beforeunload');
-    try {
-      if (!gDocId) { tr.end('no docId'); return; }
-      const vals = collectFormValues(gSchema);
-      await window.formSuitePersist.saveState(gDocId, {
-        schema: gSchema,
-        values: { ...(gValues || {}), ...vals }
-      });
-      persistActiveMeta({ docId: gDocId, name: gFileName ? `${gFileName}.${gFileExt}` : 'document.docx' });
-    } catch (e) {
-      tr.warn('beforeunload failed', e);
-    } finally {
-      tr.end();
-    }
-  });
-
-  // =========================
-  // LOGO NAV (triple-click)
-  // =========================
+async function sha256Hex(bufOrU8) {
+  const tr = TRACE('sha256Hex', { type: bufOrU8?.constructor?.name, len: bufOrU8?.byteLength || bufOrU8?.length });
   try {
-    if (typeof window.installLogoFocusNav === 'function') {
-      window.installLogoFocusNav();
+    const ab = (bufOrU8 instanceof ArrayBuffer)
+      ? bufOrU8
+      : (bufOrU8?.buffer instanceof ArrayBuffer)
+        ? bufOrU8.buffer
+        : new Uint8Array(bufOrU8 || []).buffer;
+    const d = await crypto.subtle.digest('SHA-256', ab);
+    const hex = [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+    tr.end({ hex: hex.slice(0, 12) });
+    return hex;
+  } catch (e) {
+    tr.error('sha failed', e);
+    tr.end();
+    return '(hash-error)';
+  }
+}
+
+/* ============================================================
+   In-memory state (Extractor)
+   ============================================================ */
+let currentDoc = null;           // {docId, name}
+let currentHandle = null;        // FileSystemFileHandle (best-effort cache)
+let currentBytesU8 = null;       // Uint8Array (best-effort cache)
+
+let schema = { title: 'Form', fields: [] };
+let values = {};
+let tagMap = {};
+let headingsBaseline = { flat: [], tree: [] };
+let lastParsedHeadings = { flat: [], tree: [] };
+
+let __hydrating = false;
+let __fgRefreshLock = false;
+
+// Address widget store
+const __addressValues = Object.create(null);
+
+/* ============================================================
+   Canonical byte access workflow (one function)
+   ============================================================ */
+async function getWorkingDocBytesU8() {
+  const tr = TRACE('getWorkingDocBytesU8', { docId: currentDoc?.docId, hasHandle: !!currentHandle });
+  try {
+    // 1) Prefer persistence "current bytes" (already includes in-memory writes)
+    try {
+      const b0 = await window.formSuitePersist.getCurrentDocBytes?.();
+      if (b0 && (b0.byteLength || b0.length)) {
+        const u8 = (b0 instanceof Uint8Array) ? b0 : new Uint8Array(b0);
+        tr.end({ mode: 'persist.getCurrentDocBytes', len: u8.byteLength });
+        return u8;
+      }
+    } catch (e) { tr.warn('getCurrentDocBytes failed', e); }
+
+    // 2) Per-doc cache
+    try {
+      if (currentDoc?.docId) {
+        const b1 = await window.formSuitePersist.getBytes?.(currentDoc.docId);
+        if (b1 && (b1.byteLength || b1.length)) {
+          const u8 = (b1 instanceof Uint8Array) ? b1 : new Uint8Array(b1);
+          tr.end({ mode: 'persist.getBytes', len: u8.byteLength });
+          return u8;
+        }
+      }
+    } catch (e) { tr.warn('getBytes failed', e); }
+
+    // 3) Handle fallback
+    try {
+      const h = currentHandle || (currentDoc?.docId ? await window.formSuitePersist.getHandle?.(currentDoc.docId) : null);
+      if (h?.getFile) {
+        const p = await window.formSuitePersist.ensurePermission?.(h, 'read') || 'granted';
+        if (p === 'granted') {
+          const f = await h.getFile();
+          const u8 = new Uint8Array(await f.arrayBuffer());
+          currentHandle = h;
+          tr.end({ mode: 'handle.getFile', len: u8.byteLength });
+          return u8;
+        }
+      }
+    } catch (e) { tr.warn('handle.getFile failed', e); }
+
+    tr.end({ mode: 'none' });
+    return null;
+  } catch (e) {
+    tr.error('getWorkingDocBytesU8 failed', e);
+    tr.end();
+    return null;
+  }
+}
+
+/* ============================================================
+   Single write access banner workflow
+   ============================================================ */
+async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
+  const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: currentDoc?.docId, supportsFS });
+  try {
+    if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; return 'unsupported'; }
+
+    const h = currentHandle || await window.formSuitePersist.getHandle?.(currentDoc.docId);
+    if (!h?.queryPermission) { els.permNote.style.display = 'none'; return 'no-handle'; }
+
+    let p = await h.queryPermission({ mode: 'readwrite' });
+    tr.step('queryPermission', p);
+
+    if (p !== 'granted' && tryPrompt && h.requestPermission) {
+      try { p = await h.requestPermission({ mode: 'readwrite' }) || p; }
+      catch (e) { tr.warn('requestPermission failed', e); }
+    }
+
+    els.permNote.style.display = (p === 'granted') ? 'none' : 'block';
+    if (p === 'granted') currentHandle = h;
+    tr.end({ final: p });
+    return p || 'denied';
+  } catch (e) {
+    tr.error('updateWriteAccessBanner failed', e);
+    els.permNote.style.display = 'block';
+    return 'error';
+  }
+}
+
+/* ============================================================
+   UI reset
+   ============================================================ */
+function clearUi(message = 'Idle') {
+  const tr = TRACE('clearUi', { message });
+  try {
+    els.tableBody.innerHTML = '<tr><td colspan="5" class="empty">No document loaded.</td></tr>';
+    els.formMount.innerHTML = '<div class="empty">No schema found.</div>';
+    els.payloadPreview.value = '';
+    els.previewStatus.textContent = '';
+    if (els.headersTree) els.headersTree.innerHTML = '<div class="empty">No headings.</div>';
+    els.btnSave.disabled = true;
+    els.btnSaveFromPreview.disabled = true;
+    els.permNote.style.display = 'none';
+    setStatus(message);
+  } finally { tr.end(); }
+}
+
+/* ============================================================
+   DOCX reads/writes (payload only) — docx-core.js is canonical
+   ============================================================ */
+async function readPayloadFromDocx(bytesU8) {
+  const tr = TRACE('readPayloadFromDocx', { len: bytesU8?.byteLength });
+  try {
+    if (!bytesU8?.byteLength) return null;
+
+    let raw = null;
+    try {
+      if (typeof window.readDocVarSettings === 'function') {
+        raw = await window.readDocVarSettings(bytesU8, PAYLOAD_KEY);
+      }
+    } catch (e) { tr.warn('readDocVarSettings failed', e); }
+
+    if (raw == null) {
+      try {
+        if (typeof window.readDocVarCustom === 'function') {
+          raw = await window.readDocVarCustom(bytesU8, PAYLOAD_KEY);
+        }
+      } catch (e) { tr.warn('readDocVarCustom failed', e); }
+    }
+
+    tr.end({ has: !!raw, len: raw ? String(raw).length : 0 });
+    return raw;
+  } catch (e) {
+    tr.error('readPayloadFromDocx failed', e);
+    tr.end();
+    return null;
+  }
+}
+
+async function writePayloadToDocx(bytesU8, payloadObj) {
+  const tr = TRACE('writePayloadToDocx', { inLen: bytesU8?.byteLength });
+  try {
+    if (!bytesU8?.byteLength) throw new Error('No bytes to write');
+    const json = JSON.stringify(payloadObj || {}, null, 0);
+
+    let out = null;
+    try {
+      if (typeof window.writeDocVarSettings === 'function') {
+        out = await window.writeDocVarSettings(bytesU8, PAYLOAD_KEY, json);
+      }
+    } catch (e) { tr.warn('writeDocVarSettings failed', e); }
+
+    if (!out) {
+      try {
+        if (typeof window.writeDocVarCustom === 'function') {
+          out = await window.writeDocVarCustom(bytesU8, PAYLOAD_KEY, json);
+        }
+      } catch (e) { tr.warn('writeDocVarCustom failed', e); }
+    }
+
+    if (!out) throw new Error('No docx writer available (writeDocVarSettings/writeDocVarCustom missing).');
+
+    const outU8 = (out instanceof Uint8Array) ? out : new Uint8Array(out);
+    tr.end({ outLen: outU8.byteLength });
+    return outU8;
+  } catch (e) {
+    tr.error('writePayloadToDocx failed', e);
+    tr.end();
+    throw e;
+  }
+}
+
+/* ============================================================
+   Rules + payload normalization (single workflow via deriveNormalizedRulesForDoc)
+   ============================================================ */
+function makeBaselineFromParsed(parsed) {
+  return {
+    flat: Array.isArray(parsed?.flat) ? parsed.flat : [],
+    tree: Array.isArray(parsed?.tree) ? parsed.tree : []
+  };
+}
+
+function normalizeAllForDoc(wsState, nextSchema, baseline) {
+  const tr = TRACE('normalizeAllForDoc', {
+    hasSchema: !!nextSchema,
+    fields: nextSchema?.fields?.length || 0,
+    baselineFlat: baseline?.flat?.length || 0
+  });
+  try {
+    const normalized = (typeof window.deriveNormalizedRulesForDoc === 'function')
+      ? window.deriveNormalizedRulesForDoc(wsState || {}, nextSchema || null, baseline || { flat: [], tree: [] })
+      : { headingRules: (wsState?.rules || []), fieldRules: (wsState?.fieldRules || []) };
+
+    const headingRules = Array.isArray(normalized?.headingRules) ? normalized.headingRules : (Array.isArray(wsState?.rules) ? wsState.rules : []);
+    const fieldRules   = Array.isArray(normalized?.fieldRules) ? normalized.fieldRules : (Array.isArray(wsState?.fieldRules) ? wsState.fieldRules : []);
+
+    tr.end({ headingRules: headingRules.length, fieldRules: fieldRules.length });
+    return { headingRules, fieldRules };
+  } catch (e) {
+    tr.error('normalizeAllForDoc failed', e);
+    tr.end();
+    return { headingRules: Array.isArray(wsState?.rules) ? wsState.rules : [], fieldRules: Array.isArray(wsState?.fieldRules) ? wsState.fieldRules : [] };
+  }
+}
+
+function pruneBySchema(nextSchema, nextValues, nextTagMap) {
+  const fieldIds = new Set((nextSchema?.fields || []).map(f => String(f.id)));
+  const prunedValues = {};
+  for (const [k, v] of Object.entries(nextValues || {})) {
+    if (fieldIds.has(String(k))) prunedValues[k] = v;
+  }
+  const prunedTagMap = {};
+  for (const [tag, fid] of Object.entries(nextTagMap || {})) {
+    if (fieldIds.has(String(fid))) prunedTagMap[tag] = fid;
+  }
+  return { values: prunedValues, tagMap: prunedTagMap };
+}
+
+async function saveWorkspaceMirror(docId, payloadObj, { baseline } = {}) {
+  const tr = TRACE('saveWorkspaceMirror', { docId, fields: payloadObj?.fields?.length || 0 });
+  try {
+    if (!docId) return;
+
+    // Single mirror location: payload.CRONOS_PAYLOAD
+    const patch = {
+      schema: { title: payloadObj.title || 'Form', fields: Array.isArray(payloadObj.fields) ? payloadObj.fields : [] },
+      values: payloadObj.values || {},
+      tagMap: payloadObj.tagMap || {},
+      rules: Array.isArray(payloadObj.rules) ? payloadObj.rules : [],
+      fieldRules: Array.isArray(payloadObj.fieldRules) ? payloadObj.fieldRules : [],
+      payload: { CRONOS_PAYLOAD: payloadObj },
+      schemaUpdatedAt: new Date().toISOString(),
+      headingsUpdatedAt: new Date().toISOString(),
+    };
+
+    if (baseline?.flat) patch.headingsFlat = baseline.flat;
+    if (baseline?.tree) patch.headingsTree = baseline.tree;
+
+    await window.formSuitePersist.saveState(docId, patch);
+    tr.end({ ok: true });
+  } catch (e) {
+    tr.error('saveWorkspaceMirror failed', e);
+    tr.end();
+  }
+}
+
+/* ============================================================
+   SDT parsing
+   ============================================================ */
+const DOCX_NS = window.DOCX_W_NS || window.W_NS || "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+function xmlText(el) {
+  let s = '';
+  const rec = n => {
+    if (!n) return;
+    if (n.nodeType === 3) { s += n.nodeValue; return; }
+    if (n.nodeType === 1) {
+      const ln = n.localName;
+      if (ln === 'p' || ln === 'cr' || ln === 'br') s += '\n';
+      for (const ch of n.childNodes) rec(ch);
+    }
+  };
+  rec(el);
+  return s.replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function parseSDTs_JS(arrayBuffer) {
+  const tr = TRACE('parseSDTs_JS', { hasBuffer: !!arrayBuffer, len: arrayBuffer?.byteLength });
+  try {
+    if (!arrayBuffer) return { sdts: [], total: 0 };
+    const zip = await JSZip.loadAsync(arrayBuffer);
+    const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i) || [];
+    const parser = new DOMParser();
+    const sdts = [];
+
+    for (const f of parts) {
+      const pf = TRACE('parseSDTs_JS:file', { name: f.name });
+      try {
+        const xmlTextContent = await f.async('string');
+        const xml = parser.parseFromString(xmlTextContent, "application/xml");
+        const found = Array.from(xml.getElementsByTagNameNS(DOCX_NS, 'sdt'));
+        for (const sdt of found) {
+          const pr = sdt.getElementsByTagNameNS(DOCX_NS, 'sdtPr')[0];
+          const content = sdt.getElementsByTagNameNS(DOCX_NS, 'sdtContent')[0] || sdt;
+          let tagVal = '';
+          let alias = '';
+
+          if (pr) {
+            const tEl = pr.getElementsByTagNameNS(DOCX_NS, 'tag')[0];
+            if (tEl) tagVal = tEl.getAttributeNS(DOCX_NS, 'val') || tEl.getAttribute('w:val') || '';
+            const aEl = pr.getElementsByTagNameNS(DOCX_NS, 'alias')[0];
+            if (aEl) alias = aEl.getAttributeNS(DOCX_NS, 'val') || aEl.getAttribute('w:val') || '';
+          }
+
+          sdts.push({
+            part: f.name.split('/').pop().replace('.xml', ''),
+            tag: tagVal,
+            alias,
+            text: xmlText(content)
+          });
+        }
+        pf.end({ added: found.length });
+      } catch (e) {
+        pf.warn('xml parse failed', e);
+        pf.end({ error: true });
+      }
+    }
+
+    tr.end({ total: sdts.length });
+    return { sdts, total: sdts.length };
+  } catch (e) {
+    tr.error('parseSDTs_JS failed', e);
+    tr.end();
+    return { sdts: [], total: 0 };
+  }
+}
+
+function renderSDTsView(parsed) {
+  const tr = TRACE('renderSDTsView', { total: parsed?.total });
+  try {
+    els.tableBody.innerHTML = '';
+    const sdts = parsed?.sdts || [];
+    if (!sdts.length) {
+      const trEl = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 5;
+      td.className = 'empty';
+      td.textContent = 'No SDTs found in this document.';
+      trEl.appendChild(td);
+      els.tableBody.appendChild(trEl);
+      return;
+    }
+
+    sdts.forEach((row, i) => {
+      const trEl = document.createElement('tr');
+
+      const tdIdx = document.createElement('td'); tdIdx.textContent = String(i + 1);
+      const tdPart = document.createElement('td'); tdPart.textContent = row.part || '';
+      const tdTag = document.createElement('td'); tdTag.textContent = row.tag || '';
+      const tdAlias = document.createElement('td'); tdAlias.textContent = row.alias || '';
+      const tdText = document.createElement('td'); tdText.textContent = row.text || '';
+
+      trEl.appendChild(tdIdx);
+      trEl.appendChild(tdPart);
+      trEl.appendChild(tdTag);
+      trEl.appendChild(tdAlias);
+      trEl.appendChild(tdText);
+
+      els.tableBody.appendChild(trEl);
+    });
+  } finally {
+    tr.end();
+  }
+}
+
+/* ============================================================
+   Headings: keep using your existing implementation if present.
+   If none exists, we degrade gracefully to "no headings".
+   ============================================================ */
+async function parseHeadings_JS(arrayBuffer) {
+  const tr = TRACE('parseHeadings_JS', { len: arrayBuffer?.byteLength });
+  try {
+    // If your docx-core already provides a parser, prefer it:
+    if (typeof window.parseHeadings_JS === 'function' && window.parseHeadings_JS !== parseHeadings_JS) {
+      const out = await window.parseHeadings_JS(arrayBuffer);
+      tr.end({ mode: 'window.parseHeadings_JS', flat: out?.flat?.length || 0 });
+      return out;
+    }
+    // Otherwise: no-op (stable)
+    const out = { flat: [], tree: [], count: 0 };
+    tr.end({ mode: 'noop', flat: 0 });
+    return out;
+  } catch (e) {
+    tr.error('parseHeadings_JS failed', e);
+    tr.end();
+    return { flat: [], tree: [], count: 0 };
+  }
+}
+
+function buildHeadingTree(list) {
+  const root = [];
+  const stack = [];
+  for (const h of (list || [])) {
+    const node = {
+      level: h.level,
+      text: h.text,
+      part: h.part || 'document',
+      idx: h.idx,
+      uid: h.uid,
+      paraIndex: h.paraIndex,
+      start: h.start,
+      end: h.end,
+      label: h.label || h.text,
+      children: []
+    };
+    while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
+    if (!stack.length) root.push(node);
+    else stack[stack.length - 1].children.push(node);
+    stack.push(node);
+  }
+  return root;
+}
+
+function renderHeadingsTreeView(tree) {
+  const tr = TRACE('renderHeadingsTreeView', { nodes: tree?.length || 0 });
+  try {
+    if (!els.headersTree) return;
+    els.headersTree.innerHTML = '';
+
+    if (!tree || !tree.length) {
+      els.headersTree.innerHTML = '<div class="empty">No headings found (no paragraphs styled as headings).</div>';
+      tr.end('empty');
+      return;
+    }
+
+    if (typeof window.numberHeadingsTree === 'function') {
+      try { window.numberHeadingsTree(tree); } catch (e) { tr.warn('numberHeadingsTree failed', e); }
+    }
+
+    const mk = (nodes) => {
+      const ul = document.createElement('ul');
+      ul.style.margin = '0 0 0 1rem';
+      ul.style.padding = '0.1rem 0 0.1rem 0.6rem';
+      for (const n of nodes) {
+        const li = document.createElement('li');
+        li.style.listStyle = 'none';
+
+        const line = document.createElement('div');
+        line.style.display = 'flex';
+        line.style.gap = '6px';
+        line.style.alignItems = 'baseline';
+
+        const num = document.createElement('span');
+        num.textContent = n.num || '';
+        num.style.minWidth = '4ch';
+        num.style.textAlign = 'right';
+        num.style.fontVariantNumeric = 'tabular-nums';
+        num.style.opacity = '0.9';
+        num.style.fontWeight = n.level <= 2 ? '700' : '600';
+
+        const text = document.createElement('span');
+        text.textContent = n.text;
+        text.title = `${n.part} · H${n.level}`;
+        text.style.fontWeight = n.level <= 2 ? '600' : '400';
+
+        const part = document.createElement('span');
+        part.textContent = `· ${n.part}`;
+        part.className = 'muted';
+        part.style.fontSize = '0.75rem';
+
+        line.appendChild(num);
+        line.appendChild(text);
+        line.appendChild(part);
+        li.appendChild(line);
+
+        if (n.children?.length) li.appendChild(mk(n.children));
+        ul.appendChild(li);
+      }
+      return ul;
+    };
+
+    els.headersTree.appendChild(mk(tree));
+    tr.end('rendered');
+  } catch (e) {
+    tr.error('renderHeadingsTreeView failed', e);
+    tr.end();
+  }
+}
+
+/* ============================================================
+   Preview + form rendering (Extractor live form)
+   ============================================================ */
+function collectFormValues(schema) {
+  const form = document.getElementById('liveForm');
+  const out = {};
+  if (!form || !schema) return out;
+
+  for (const f of (schema.fields || [])) {
+    if (f.type === 'multichoice') {
+      const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
+      out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
+      continue;
+    }
+    if (f.type === 'address') {
+      out[f.id] = __addressValues[f.id] ?? null;
+      continue;
+    }
+    const el = form.elements[f.id];
+    out[f.id] = el ? el.value : null;
+  }
+  return out;
+}
+
+let previewTimer = null;
+function schedulePreviewUpdate() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(async () => {
+    const tr = TRACE('schedulePreviewUpdate:tick');
+    try {
+      const vals = collectFormValues(schema);
+      values = { ...(values || {}), ...(vals || {}) };
+
+      if (currentDoc?.docId) {
+        await window.formSuitePersist.saveState(currentDoc.docId, { schema, values });
+        bc?.postMessage({ type: 'state:changed', docId: currentDoc.docId, ts: Date.now() });
+      }
+
+      await updatePreview();
+      setStatus('Unsaved changes — press Save to update DOCX.');
+    } catch (e) {
+      tr.error('preview tick failed', e);
+    } finally {
+      tr.end();
+    }
+  }, 250);
+}
+
+function buildForm(container, schema, values) {
+  const tr = TRACE('buildForm', { fields: schema?.fields?.length || 0 });
+  try {
+    container.innerHTML = '';
+    if (!schema || !Array.isArray(schema.fields) || schema.fields.length === 0) {
+      container.innerHTML = '<div class="empty">No manual schema. Create one in the Builder, or load a DOCX that already contains a payload schema.</div>';
+      tr.end('empty schema');
+      return;
+    }
+
+    const form = document.createElement('form');
+    form.id = 'liveForm';
+    form.noValidate = true;
+    form.style.display = 'grid';
+    form.style.gap = '12px';
+
+    if (schema.title) {
+      const h = document.createElement('h4');
+      h.textContent = schema.title;
+      h.style.margin = '0 0 6px';
+      form.appendChild(h);
+    }
+
+    for (const f of schema.fields) {
+      const tf = TRACE('buildForm:field', { id: f.id, type: f.type });
+      const wrap = document.createElement('div');
+      wrap.className = 'field';
+
+      const label = document.createElement('label');
+      label.htmlFor = f.id;
+      label.style.display = 'flex';
+      label.style.justifyContent = 'space-between';
+      label.style.alignItems = 'center';
+
+      const labelText = document.createElement('span');
+      labelText.textContent = f.label || f.id || '(field)';
+      label.appendChild(labelText);
+
+      if (f.required) {
+        const star = document.createElement('span');
+        star.textContent = '•';
+        star.title = 'Required';
+        star.style.fontWeight = '600';
+        star.style.color = '#ef4444';
+        label.appendChild(star);
+      }
+
+      wrap.appendChild(label);
+
+      let input;
+
+      if (f.type === 'multichoice') {
+        const box = document.createElement('div');
+        box.style.display = 'grid';
+        box.style.gap = '6px';
+
+        (f.options || []).forEach(opt => {
+          const v = String(opt?.value ?? opt);
+          const id = `${f.id}__${v.replace(/\s+/g, '_')}`;
+          const row = document.createElement('label');
+          row.style.display = 'flex';
+          row.style.gap = '8px';
+          row.style.alignItems = 'center';
+
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.name = f.id;
+          cb.id = id;
+          cb.value = v;
+
+          if (Array.isArray(values?.[f.id]) && values[f.id].map(String).includes(v)) cb.checked = true;
+
+          const span = document.createElement('span');
+          span.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
+
+          row.appendChild(cb);
+          row.appendChild(span);
+          box.appendChild(row);
+        });
+
+        wrap.appendChild(box);
+        box.addEventListener('change', schedulePreviewUpdate);
+        form.appendChild(wrap);
+        tf.end();
+        continue;
+      }
+
+      if (f.type === 'select') {
+        input = document.createElement('select');
+        (f.options || []).forEach(opt => {
+          const o = document.createElement('option');
+          o.value = String(opt?.value ?? opt?.id ?? opt);
+          o.textContent = String(opt?.label ?? opt?.text ?? opt?.value ?? opt);
+          input.appendChild(o);
+        });
+      } else if (f.type === 'date') {
+        input = document.createElement('input');
+        input.type = 'text';
+        input.dataset.type = 'date';
+        input.dataset.format = f.dateFormat || 'Y-m-d';
+      } else if (f.type === 'address') {
+        const mountDiv = document.createElement('div');
+        mountDiv.className = 'address-field';
+        wrap.appendChild(mountDiv);
+
+        const initial =
+          typeof values?.[f.id] === 'string'
+            ? { formatted: values[f.id] }
+            : (values?.[f.id] || null);
+
+        __addressValues[f.id] = initial || null;
+
+        try {
+          if (window.AddressAuto && typeof window.AddressAuto.mount === 'function') {
+            window.AddressAuto.mount(mountDiv, {
+              id: f.id,
+              label: f.label || 'Address',
+              required: !!f.required,
+              value: initial || null,
+              onChange: (val) => { __addressValues[f.id] = val; schedulePreviewUpdate(); }
+            });
+          } else {
+            throw new Error('AddressAuto not available');
+          }
+        } catch (err) {
+          const fallback = document.createElement('input');
+          fallback.type = 'text';
+          fallback.id = f.id;
+          fallback.name = f.id;
+          fallback.placeholder = 'Address';
+          if (initial?.formatted) fallback.value = initial.formatted;
+          fallback.addEventListener('input', () => {
+            __addressValues[f.id] = { formatted: fallback.value };
+            schedulePreviewUpdate();
+          });
+          mountDiv.appendChild(fallback);
+        }
+
+        form.appendChild(wrap);
+        tf.end();
+        continue;
+      } else {
+        input = document.createElement('input');
+        input.type = 'text';
+      }
+
+      input.id = f.id;
+      input.name = f.id;
+      if (f.required) input.required = true;
+      if (values && values[f.id] != null) input.value = values[f.id];
+
+      input.addEventListener('change', schedulePreviewUpdate);
+      input.addEventListener('input', schedulePreviewUpdate);
+
+      wrap.appendChild(input);
+
+      if (f.type === 'date') {
+        setTimeout(() => {
+          const tt = TRACE('flatpickr:init', { id: input.id, format: input.dataset.format });
+          try {
+            if (window.flatpickr && typeof window.flatpickr === 'function') {
+              window.flatpickr(input, {
+                dateFormat: input.dataset.format || 'Y-m-d',
+                allowInput: true,
+                onChange: schedulePreviewUpdate,
+                onValueUpdate: schedulePreviewUpdate
+              });
+            }
+          } finally { tt.end(); }
+        }, 0);
+      }
+
+      form.appendChild(wrap);
+      tf.end();
+    }
+
+    container.appendChild(form);
+    tr.end('form built');
+  } catch (e) {
+    tr.error('buildForm failed', e);
+    tr.end();
+  }
+}
+
+async function updatePreview() {
+  const tr = TRACE('updatePreview', { docId: currentDoc?.docId });
+  try {
+    if (!els.payloadPreview) return;
+
+    const docId = currentDoc?.docId;
+    const st = docId ? (await window.formSuitePersist.loadState(docId) || {}) : {};
+
+    // Adopt best-known headings baseline for normalization
+    const baseline = {
+      flat: Array.isArray(st.headingsFlat) ? st.headingsFlat : (Array.isArray(lastParsedHeadings.flat) ? lastParsedHeadings.flat : []),
+      tree: Array.isArray(st.headingsTree) ? st.headingsTree : (Array.isArray(lastParsedHeadings.tree) ? lastParsedHeadings.tree : []),
+    };
+    headingsBaseline = baseline;
+
+    // Single mirror is payload.CRONOS_PAYLOAD; fall back to raw state fields
+    const payload = st.payload?.CRONOS_PAYLOAD || null;
+
+    const effectiveSchema = payload?.fields?.length
+      ? { title: payload.title || 'Form', fields: payload.fields }
+      : (st.schema?.fields?.length ? st.schema : schema);
+
+    const effectiveValues = payload?.values ? payload.values : (st.values || values || {});
+    const effectiveTagMap = payload?.tagMap ? payload.tagMap : (st.tagMap || tagMap || {});
+
+    const { headingRules, fieldRules } = normalizeAllForDoc(st, effectiveSchema, baseline);
+
+    const pruned = pruneBySchema(effectiveSchema, effectiveValues, effectiveTagMap);
+
+    const previewObj = {
+      title: effectiveSchema?.title || 'Form',
+      fields: effectiveSchema?.fields || [],
+      values: pruned.values,
+      tagMap: pruned.tagMap,
+      rules: headingRules,
+      fieldRules: fieldRules,
+      updatedAt: new Date().toISOString()
+    };
+
+    els.payloadPreview.value = JSON.stringify(previewObj, null, 2);
+    tr.end({ fields: previewObj.fields.length, rules: previewObj.rules.length, fieldRules: previewObj.fieldRules.length });
+  } catch (e) {
+    tr.error('updatePreview failed', e);
+    tr.end();
+  }
+}
+
+/* ============================================================
+   Render pipeline: bytes -> SDTs/headings/payload -> workspace mirror
+   ============================================================ */
+async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
+  const tr = TRACE('renderFromBytes', { prefix, len: bytesU8?.byteLength, docId: currentDoc?.docId });
+  try {
+    if (!bytesU8?.byteLength) { setStatus('No DOCX loaded.'); return; }
+
+    setStatus((prefix || '') + 'Parsing…');
+
+    // SDTs
+    const parsedSDTs = await parseSDTs_JS(bytesU8.buffer);
+    renderSDTsView(parsedSDTs);
+
+    // Headings (best effort)
+    const headingsParsed = await parseHeadings_JS(bytesU8.buffer);
+    lastParsedHeadings = {
+      flat: Array.isArray(headingsParsed?.flat) ? headingsParsed.flat : [],
+      tree: Array.isArray(headingsParsed?.tree) ? headingsParsed.tree : []
+    };
+
+    const tree = (Array.isArray(headingsParsed?.tree) && headingsParsed.tree.length)
+      ? headingsParsed.tree
+      : buildHeadingTree(lastParsedHeadings.flat);
+
+    renderHeadingsTreeView(tree);
+
+    // Payload from DOCX (optional)
+    const payloadRaw = await readPayloadFromDocx(bytesU8);
+    let payloadFromDoc = null;
+    try { payloadFromDoc = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payloadFromDoc = null; }
+
+    // Workspace state
+    const docId = currentDoc?.docId;
+    const st = docId ? (await window.formSuitePersist.loadState(docId) || {}) : {};
+
+    // Choose schema:
+    // - Prefer workspace schema if present (it represents your "working set")
+    // - Otherwise use doc payload schema if present
+    // - Otherwise empty schema
+    const wsSchema = st.schema;
+    const docSchema = (Array.isArray(payloadFromDoc?.fields) && payloadFromDoc.fields.length)
+      ? { title: payloadFromDoc.title || 'Form', fields: payloadFromDoc.fields }
+      : null;
+
+    const chosenSchema = (wsSchema?.fields?.length ? wsSchema : (docSchema || { title: 'Form', fields: [] }));
+
+    // Values/tagMap: workspace overrides doc (working set wins)
+    const mergedValues = Object.assign({}, payloadFromDoc?.values || {}, st.values || {});
+    const mergedTagMap = Object.assign({}, payloadFromDoc?.tagMap || {}, st.tagMap || {});
+
+    const baseline = makeBaselineFromParsed({ flat: lastParsedHeadings.flat, tree });
+    const normalized = normalizeAllForDoc(st, chosenSchema, baseline);
+
+    const pruned = pruneBySchema(chosenSchema, mergedValues, mergedTagMap);
+
+    // Update in-memory
+    schema = chosenSchema;
+    values = pruned.values;
+    tagMap = pruned.tagMap;
+    headingsBaseline = baseline;
+
+    // Build canonical payload mirror and write into workspace ONLY (no duplication)
+    const payloadObj = {
+      title: schema.title || 'Form',
+      fields: schema.fields || [],
+      values,
+      tagMap,
+      rules: normalized.headingRules,
+      fieldRules: normalized.fieldRules,
+      updatedAt: new Date().toISOString()
+    };
+
+    if (docId) await saveWorkspaceMirror(docId, payloadObj, { baseline });
+
+    buildForm(els.formMount, schema, values);
+    await updatePreview();
+
+    els.btnSave.disabled = !docId;
+    els.btnSaveFromPreview.disabled = !docId;
+
+    setStatus('Ready.');
+    tr.end({ fields: schema?.fields?.length || 0 });
+  } catch (e) {
+    tr.error('renderFromBytes failed', e);
+    setStatus('Error while parsing (see console).');
+    tr.end();
+  }
+}
+
+/* ============================================================
+   Hydrate / refresh from workspace (override-safe)
+   - ONLY re-renders UI from latest bytes/state
+   - DOES NOT overwrite state unless we successfully parsed bytes
+   ============================================================ */
+async function rehydrateOnForeground(source) {
+  const tr = TRACE('rehydrateOnForeground', { source, locked: __fgRefreshLock, docId: currentDoc?.docId });
+  if (__fgRefreshLock) { tr.end('locked'); return; }
+  __fgRefreshLock = true;
+  try {
+    if (!currentDoc?.docId) { tr.end('no doc'); return; }
+
+    // small debounce to allow other tabs to finish writing
+    await new Promise(r => setTimeout(r, 120));
+
+    const bytes = await getWorkingDocBytesU8();
+    if (!bytes) { tr.end('no bytes'); return; }
+
+    currentBytesU8 = bytes;
+    await renderFromBytes(bytes, { prefix: `(${source} refreshed) ` });
+    await updateWriteAccessBanner();
+    tr.end('refreshed');
+  } catch (e) {
+    tr.error('rehydrateOnForeground failed', e);
+    tr.end();
+  } finally {
+    __fgRefreshLock = false;
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') rehydrateOnForeground('visible');
+});
+window.addEventListener('focus', () => rehydrateOnForeground('focus'));
+
+/* ============================================================
+   Apply payload JSON from preview (single normalization + mirror update)
+   ============================================================ */
+async function applyPayloadObject(obj) {
+  const tr = TRACE('applyPayloadObject', { hasObj: !!obj });
+  try {
+    if (!obj || typeof obj !== 'object') return false;
+
+    const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
+    const rawValues  = (obj.values && typeof obj.values === 'object') ? obj.values : {};
+    const rawTagMap  = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
+    const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
+    const rawFieldR  = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
+
+    // Normalize using deriveNormalizedRulesForDoc by building a temp wsState shape
+    const tmpState = { rules: rawRules, fieldRules: rawFieldR };
+    const baseline = headingsBaseline || { flat: [], tree: [] };
+    const normalized = normalizeAllForDoc(tmpState, nextSchema, baseline);
+
+    const pruned = pruneBySchema(nextSchema, rawValues, rawTagMap);
+
+    schema = nextSchema;
+    values = pruned.values;
+    tagMap = pruned.tagMap;
+
+    const payloadObj = {
+      title: schema.title || 'Form',
+      fields: schema.fields || [],
+      values,
+      tagMap,
+      rules: normalized.headingRules,
+      fieldRules: normalized.fieldRules,
+      updatedAt: new Date().toISOString()
+    };
+
+    if (currentDoc?.docId) {
+      await saveWorkspaceMirror(currentDoc.docId, payloadObj, { baseline });
+      bc?.postMessage({ type: 'state:changed', docId: currentDoc.docId, ts: Date.now() });
+    }
+
+    buildForm(els.formMount, schema, values);
+    await updatePreview();
+
+    if (els.previewStatus) {
+      els.previewStatus.textContent = 'Applied';
+      setTimeout(() => { els.previewStatus.textContent = ''; }, 900);
+    }
+
+    tr.end({ ok: true, fields: schema.fields.length });
+    return true;
+  } catch (e) {
+    tr.error('applyPayloadObject failed', e);
+    if (els.previewStatus) els.previewStatus.textContent = 'Apply failed (see console)';
+    tr.end({ ok: false });
+    return false;
+  }
+}
+
+/* ============================================================
+   Save: payload-only write into DOCX, then update workspace + broadcast
+   ============================================================ */
+async function doSave() {
+  const tr = TRACE('doSave', { docId: currentDoc?.docId });
+  try {
+    if (!currentDoc?.docId) { setStatus('No active document.'); return; }
+
+    const docId = currentDoc.docId;
+    const st = await window.formSuitePersist.loadState(docId) || {};
+    const baseline = {
+      flat: Array.isArray(st.headingsFlat) ? st.headingsFlat : (lastParsedHeadings.flat || []),
+      tree: Array.isArray(st.headingsTree) ? st.headingsTree : (lastParsedHeadings.tree || [])
+    };
+
+    // Ensure current UI values are included
+    const liveVals = collectFormValues(schema);
+    values = { ...(values || {}), ...(liveVals || {}) };
+
+    // Normalize rules one time, and build canonical payload object
+    const normalized = normalizeAllForDoc(st, schema, baseline);
+    const pruned = pruneBySchema(schema, values, tagMap);
+
+    const payloadObj = {
+      title: schema.title || 'Form',
+      fields: schema.fields || [],
+      values: pruned.values,
+      tagMap: pruned.tagMap,
+      rules: normalized.headingRules,
+      fieldRules: normalized.fieldRules,
+      updatedAt: new Date().toISOString()
+    };
+
+    // Get bytes and write payload
+    const inBytes = await getWorkingDocBytesU8();
+    if (!inBytes) {
+      setStatus('No bytes / no permission (cannot save).');
+      tr.end('no-bytes');
+      return;
+    }
+
+    const outBytes = await writePayloadToDocx(inBytes, payloadObj);
+
+    // Write back:
+    // 1) If we have write permission on original handle -> overwrite original
+    // 2) Else -> Save As copy, and switch active doc to new handle/meta
+    let wroteToOriginal = false;
+
+    const h = currentHandle || await window.formSuitePersist.getHandle?.(docId);
+    const p = h?.queryPermission ? await h.queryPermission({ mode: 'readwrite' }) : 'denied';
+
+    if (h?.createWritable && p === 'granted') {
+      const wt = TRACE('doSave:writeOriginal');
+      try {
+        const w = await h.createWritable();
+        await w.write(outBytes);
+        await w.close();
+        currentHandle = h;
+        wroteToOriginal = true;
+        wt.end({ ok: true, len: outBytes.byteLength, sha: (await sha256Hex(outBytes)).slice(0, 12) });
+      } catch (e) {
+        wt.error('writeOriginal failed', e);
+        wt.end({ ok: false });
+        wroteToOriginal = false;
+      }
+    }
+
+    if (!wroteToOriginal) {
+      const wt = TRACE('doSave:saveAsCopy');
+      try {
+        if (!supportsFS) throw new Error('File System Access API not supported');
+
+        const suggested = (currentDoc?.name ? splitNameAndExt(currentDoc.name).base : 'document') + '.docx';
+
+        const saveHandle = await showSaveFilePicker({
+          suggestedName: suggested,
+          excludeAcceptAllOption: true,
+          types: [{
+            description: 'Word document',
+            accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
+          }]
+        });
+
+        const w = await saveHandle.createWritable();
+        await w.write(outBytes);
+        await w.close();
+
+        // Switch the active doc to the copy (future-proof: treat it as new doc)
+        const file = await saveHandle.getFile();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const meta = await window.formSuitePersist.setCurrentDoc({
+          bytes,
+          handle: saveHandle,
+          name: file.name || 'document.docx'
+        });
+
+        currentDoc = meta;
+        currentHandle = saveHandle;
+        currentBytesU8 = bytes;
+
+        try { if (typeof window.setActiveDocMeta === 'function') window.setActiveDocMeta({ docId: meta.docId, name: meta.name }); } catch {}
+        bc?.postMessage({ type: 'active:set', docId: meta.docId, name: meta.name, ts: Date.now() });
+
+        wt.end({ ok: true, newDocId: meta.docId, name: meta.name });
+      } catch (e) {
+        wt.error('saveAsCopy failed', e);
+        setStatus('Save failed (no permission). See console.');
+        wt.end({ ok: false });
+        return;
+      }
+    }
+
+    // Update workspace mirror (single) and broadcast update
+    await saveWorkspaceMirror(currentDoc.docId, payloadObj, { baseline });
+    bc?.postMessage({ type: 'active:updated', docId: currentDoc.docId, ts: Date.now() });
+
+    await updateWriteAccessBanner();
+    await updatePreview();
+
+    setStatus('Saved payload to DOCX.');
+    tr.end({ ok: true });
+  } catch (e) {
+    tr.error('doSave failed', e);
+    setStatus('Save failed (see console).');
+    tr.end({ ok: false });
+  }
+}
+
+/* ============================================================
+   Open / switch document
+   ============================================================ */
+async function doOpen() {
+  const tr = TRACE('doOpen');
+  try {
+    if (!supportsFS) {
+      alert('This browser does not support the File System Access API.');
+      tr.end('unsupported');
+      return;
+    }
+
+    clearUi('Opening…');
+
+    const [handle] = await showOpenFilePicker({
+      multiple: false,
+      excludeAcceptAllOption: true,
+      types: [{
+        description: 'Word document',
+        accept: {
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm', '.dotx', '.dotm']
+        }
+      }]
+    });
+
+    const file = await handle.getFile();
+    const bytes = new Uint8Array(await file.arrayBuffer());
+
+    const meta = await window.formSuitePersist.setCurrentDoc({
+      bytes,
+      handle,
+      name: file.name || 'document.docx'
+    });
+
+    currentDoc = meta;
+    currentHandle = handle;
+    currentBytesU8 = bytes;
+
+    try { if (typeof window.setActiveDocMeta === 'function') window.setActiveDocMeta({ docId: meta.docId, name: meta.name }); } catch {}
+    bc?.postMessage({ type: 'active:set', docId: meta.docId, name: meta.name, ts: Date.now() });
+
+    tr.step('opened', { docId: meta.docId, name: meta.name, len: bytes.byteLength, sha: (await sha256Hex(bytes)).slice(0, 12) });
+
+    await renderFromBytes(bytes, { prefix: '' });
+    await updateWriteAccessBanner({ tryPrompt: true });
+
+    els.btnSave.disabled = false;
+    els.btnSaveFromPreview.disabled = false;
+
+    tr.end({ ok: true });
+  } catch (e) {
+    if (e?.name === 'AbortError') { setStatus('Idle'); tr.end('canceled'); return; }
+    tr.error('doOpen failed', e);
+    setStatus('Error opening file (see console).');
+    tr.end({ ok: false });
+  }
+}
+
+async function switchToDoc(meta) {
+  const tr = TRACE('switchToDoc', meta);
+  try {
+    if (!meta?.docId) return;
+    if (currentDoc?.docId === meta.docId && currentBytesU8?.byteLength) { tr.end('already active'); return; }
+
+    clearUi('Switching document…');
+
+    currentDoc = meta;
+    currentHandle = null;
+    currentBytesU8 = null;
+
+    const bytes = await getWorkingDocBytesU8();
+    if (!bytes) {
+      clearUi('No bytes / no permission.');
+      tr.end('no-bytes');
+      return;
+    }
+
+    currentBytesU8 = bytes;
+    await renderFromBytes(bytes, { prefix: '(switched) ' });
+    await updateWriteAccessBanner();
+    els.btnSave.disabled = false;
+    els.btnSaveFromPreview.disabled = false;
+
+    tr.end({ ok: true });
+  } catch (e) {
+    tr.error('switchToDoc failed', e);
+    setStatus('Switch failed (see console).');
+    tr.end({ ok: false });
+  }
+}
+
+/* ============================================================
+   One broadcast handler (only fs-active-doc)
+   ============================================================ */
+bc?.addEventListener('message', async (ev) => {
+  const tr = TRACE('BroadcastChannel:message', ev?.data);
+  try {
+    const m = ev.data || {};
+    if (!m || typeof m !== 'object') return;
+
+    if (m.type === 'active:set') {
+      if (m.docId && m.docId !== currentDoc?.docId) {
+        await switchToDoc({ docId: m.docId, name: m.name || 'document.docx' });
+      }
+      return;
+    }
+
+    if (m.type === 'active:updated') {
+      if (m.docId && m.docId === currentDoc?.docId) {
+        await rehydrateOnForeground('active:updated');
+      }
+      return;
+    }
+
+    if (m.type === 'active:clear') {
+      currentDoc = null;
+      currentHandle = null;
+      currentBytesU8 = null;
+      schema = { title: 'Form', fields: [] };
+      values = {};
+      tagMap = {};
+      clearUi('Cleared.');
+      return;
+    }
+
+    if (m.type === 'state:changed') {
+      if (!m.docId || m.docId === currentDoc?.docId) {
+        // override-safe: re-render only from workspace state/bytes
+        await updatePreview();
+      }
+      return;
     }
   } catch (e) {
-    console.warn('[Extractor] installLogoFocusNav failed', e);
+    tr.error('BC handler failed', e);
+  } finally {
+    tr.end();
   }
+});
+
+/* ============================================================
+   Active-doc listener (single coordination layer)
+   ============================================================ */
+installActiveDocListener(async (meta) => {
+  const tr = TRACE('installActiveDocListener:cb', meta);
+  try {
+    if (!meta?.docId) {
+      currentDoc = null;
+      clearUi('No active document. Open one.');
+      tr.end('cleared');
+      return;
+    }
+    currentDoc = meta;
+    await switchToDoc(meta);
+  } catch (e) {
+    tr.error('active doc listener failed', e);
+  } finally {
+    tr.end();
+  }
+});
+
+/* ============================================================
+   Preview textarea: validate + apply (manual apply via button)
+   - We do NOT auto-save on every keystroke into DOCX.
+   - Button "Apply JSON & Save" applies to workspace + triggers doSave().
+   ============================================================ */
+function tryParseJSON(txt) { try { return JSON.parse(txt); } catch { return null; } }
+
+let __previewDirty = false;
+els.payloadPreview?.addEventListener('input', () => {
+  __previewDirty = true;
+  if (!els.previewStatus) return;
+  const obj = tryParseJSON(els.payloadPreview.value);
+  els.previewStatus.textContent = obj ? 'JSON ok' : 'Invalid JSON';
+});
+
+els.btnSaveFromPreview?.addEventListener('click', async () => {
+  const tr = TRACE('btnSaveFromPreview:click', { dirty: __previewDirty });
+  try {
+    const obj = tryParseJSON(els.payloadPreview.value);
+    if (!obj) {
+      if (els.previewStatus) els.previewStatus.textContent = 'Invalid JSON';
+      tr.end('invalid-json');
+      return;
+    }
+    await applyPayloadObject(obj);
+    await doSave();
+    __previewDirty = false;
+  } catch (e) {
+    tr.error('Apply+Save failed', e);
+  } finally {
+    tr.end();
+  }
+});
+
+/* ============================================================
+   Wiring
+   ============================================================ */
+els.btnOpen.addEventListener('click', doOpen);
+els.btnSave.addEventListener('click', doSave);
+
+els.btnRegrant?.addEventListener('click', async () => {
+  const tr = TRACE('btnRegrant:click');
+  try {
+    await updateWriteAccessBanner({ tryPrompt: true });
+  } catch (e) {
+    tr.error('regrant failed', e);
+    els.permNote.style.display = 'block';
+  } finally {
+    tr.end();
+  }
+});
+
+window.addEventListener('beforeunload', async () => {
+  const tr = TRACE('beforeunload');
+  try {
+    if (!currentDoc?.docId) { tr.end('no doc'); return; }
+    const vals = collectFormValues(schema);
+    await window.formSuitePersist.saveState(currentDoc.docId, {
+      schema,
+      values: { ...(values || {}), ...(vals || {}) }
+    });
+    try { if (typeof window.setActiveDocMeta === 'function') window.setActiveDocMeta({ docId: currentDoc.docId, name: currentDoc.name }); } catch {}
+  } catch (e) {
+    tr.warn('beforeunload failed', e);
+  } finally {
+    tr.end();
+  }
+});
+
+/* ============================================================
+   Boot
+   ============================================================ */
+(async function boot() {
+  const tr = TRACE('boot');
+  try {
+    if (!assertDeps()) { tr.end('deps-missing'); return; }
+
+    const meta = (typeof window.readActiveDocSync === 'function') ? window.readActiveDocSync() : null;
+    tr.step('readActiveDocSync', meta);
+
+    if (!meta?.docId) {
+      clearUi('Idle');
+      tr.end('no-meta');
+      return;
+    }
+
+    currentDoc = meta;
+    clearUi('Restoring document…');
+
+    const bytes = await getWorkingDocBytesU8();
+    if (!bytes) {
+      clearUi('No bytes / no permission.');
+      tr.end('no-bytes');
+      return;
+    }
+
+    currentBytesU8 = bytes;
+
+    tr.step('restored', {
+      docId: meta.docId,
+      name: meta.name,
+      len: bytes.byteLength,
+      sha: (await sha256Hex(bytes)).slice(0, 12)
+    });
+
+    await renderFromBytes(bytes, { prefix: '(restored) ' });
+    await updateWriteAccessBanner();
+
+    els.btnSave.disabled = false;
+    els.btnSaveFromPreview.disabled = false;
+
+    tr.end('ok');
+  } catch (e) {
+    tr.error('boot failed', e);
+    clearUi('Boot failed (see console).');
+    tr.end('fail');
+  }
+})();
+
+/* ============================================================
+   Logo nav (triple-click)
+   ============================================================ */
+try { window.installLogoFocusNav?.(); } catch (e) { console.warn('[Extractor] installLogoFocusNav failed', e); }
+
 </script>
 </body>
 </html>
