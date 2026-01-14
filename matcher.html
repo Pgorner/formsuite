@@ -7,9 +7,14 @@
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="stylesheet" href="style.css">
-  <!-- Tiny helpers that don't affect page width -->
+
+  <!-- SDT scan -->
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+  <!-- Canonical app plumbing -->
   <script src="persistence.js"></script>
+  <script src="fs-active-doc.js"></script>
+  <script src="fs-focus-nav.js"></script>
 </head>
 <body>
   <header>
@@ -39,6 +44,7 @@
           <span id="doc-pill" class="pill">—</span>
         </div>
       </div>
+
       <div id="permNote" class="warn" style="margin-top:8px; display:none;">
         Permission to the original file isn’t granted. You can still work from the cached copy.
         <button id="btnRegrant" class="ghost" style="margin-left:8px;">Re-grant file access</button>
@@ -68,55 +74,88 @@
   </main>
 
   <script>
-    const $ = sel => document.querySelector(sel);
-    const supportsFS = 'showOpenFilePicker' in window && 'showSaveFilePicker' in window;
+    const $ = (sel) => document.querySelector(sel);
+    const supportsFS = ('showOpenFilePicker' in window) && ('showSaveFilePicker' in window);
 
-    // === DEBUG helpers ===
+    // ========= DEBUG =========
     const _ts = () => new Date().toISOString().slice(11, 23);
     const DBG = (...a) => console.log(`[Matcher ${_ts()}]`, ...a);
+    const WARN = (...a) => console.warn(`[Matcher ${_ts()}]`, ...a);
+
     async function sha256Hex(bufOrU8) {
       const ab = (bufOrU8 instanceof ArrayBuffer) ? bufOrU8
-                : (bufOrU8?.buffer instanceof ArrayBuffer) ? bufOrU8.buffer
-                : new Uint8Array(bufOrU8 || []).buffer;
+        : (bufOrU8?.buffer instanceof ArrayBuffer) ? bufOrU8.buffer
+        : new Uint8Array(bufOrU8 || []).buffer;
       const d = await crypto.subtle.digest('SHA-256', ab);
       return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // ---- File-Guard: clear UI to avoid stale data ----
-    async function hardResetMatcher(reason = '') {
-      try {} catch {}
+    // ========= Canonical channels =========
+    const bcPayload = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-payload-v1') : null;
+
+    // ========= Page state =========
+    let gDoc = null;        // { docId, name, ... }
+    let gDocId = null;
+    let gSDTs = [];         // cached parsed SDTs
+    let gBytesSha12 = '';   // detect when DOCX changed
+
+    let __refreshBusy = false;
+    let __refreshPending = false;
+    let __suppressNextPayloadRefresh = false; // used after we write tagMap
+
+    // ========= UI resets =========
+    function renderDocPill(meta) {
+      $('#doc-pill').textContent = meta?.name || meta?.docTitle || '—';
+    }
+    function renderSchemaPill(info) {
+      $('#schema-pill').textContent = `${info.title} · ${info.count} ${info.count === 1 ? 'field' : 'fields'}`;
+      $('#schema-pill').classList.toggle('muted', !(info.count >= 0));
+    }
+
+    function resetTableNoDoc() {
       const tb = $('#tbody');
-      if (tb) {
-        tb.innerHTML = '';
-        const tr = document.createElement('tr');
-        const td = document.createElement('td');
-        td.colSpan = 5;
-        td.className = 'empty';
-        td.innerHTML = 'No document loaded. Open a DOCX in <strong>Extractor</strong> first.';
-        tr.appendChild(td);
-        tb.appendChild(tr);
-      }
+      tb.innerHTML = '';
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 5;
+      td.className = 'empty';
+      td.innerHTML = 'No document loaded. Open a DOCX in <strong>Extractor</strong> first.';
+      tr.appendChild(td);
+      tb.appendChild(tr);
+    }
+
+    async function hardResetMatcher(reason = '') {
+      resetTableNoDoc();
       $('#schema-pill').textContent = '—';
       $('#schema-pill').classList.add('muted');
       $('#doc-pill').textContent = '—';
       $('#permNote').style.display = 'none';
+
+      gDoc = null;
       gDocId = null;
       gSDTs = [];
-      DBG('hardResetMatcher:', reason || '(no reason)');
+      gBytesSha12 = '';
+
+      DBG('hardResetMatcher', { reason: reason || '(no reason)' });
     }
 
-    // ---- Bytes fetch (OPFS → currentDocBytes → handle) ----
+    // ========= Bytes (canonical preference order) =========
     async function getWorkingBytes(docId) {
+      // 1) OPFS bytes (best: always works without re-grant)
       try {
-        const opfs = await window.formSuitePersist.getBytes(docId);
+        const opfs = await window.formSuitePersist?.getBytes?.(docId);
         if (opfs && opfs.byteLength) return opfs;
-      } catch {}
+      } catch (e) { /* ignore */ }
+
+      // 2) In-memory current bytes (Extractor may set/update)
       try {
-        const cur = await window.formSuitePersist.getCurrentDocBytes();
+        const cur = await window.formSuitePersist?.getCurrentDocBytes?.();
         if (cur && cur.byteLength) return cur;
-      } catch {}
+      } catch (e) { /* ignore */ }
+
+      // 3) Original handle (needs permission)
       try {
-        const h = await window.formSuitePersist.getHandle(docId);
+        const h = await window.formSuitePersist?.getHandle?.(docId);
         if (h?.getFile) {
           let perm = await h.queryPermission?.({ mode: 'readwrite' });
           if (perm !== 'granted') {
@@ -127,13 +166,29 @@
             return await file.arrayBuffer();
           }
         }
-      } catch {}
+      } catch (e) { /* ignore */ }
+
       return null;
     }
 
+    async function updatePermissionBanner(docId) {
+      try {
+        const h = await window.formSuitePersist?.getHandle?.(docId);
+        if (!supportsFS || !h) { $('#permNote').style.display = 'none'; return; }
+        let perm = await h.queryPermission?.({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          try { perm = await h.queryPermission?.({ mode: 'read' }); } catch {}
+        }
+        $('#permNote').style.display = (perm === 'granted') ? 'none' : 'block';
+      } catch {
+        $('#permNote').style.display = 'none';
+      }
+    }
+
+    // ========= SDT parsing =========
     function xmlText(el) {
       let s = '';
-      const rec = n => {
+      const rec = (n) => {
         if (n.nodeType === 3) { s += n.nodeValue; return; }
         if (n.nodeType === 1) {
           if (n.localName === 'p' || n.localName === 'cr' || n.localName === 'br') s += '\n';
@@ -141,19 +196,25 @@
         }
       };
       rec(el);
-      return s.replace(/\s+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+      return s.replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     }
 
     async function readSDTsFromDocx(docBytes) {
       if (!docBytes) { DBG('readSDTsFromDocx: no bytes'); return []; }
-      DBG('readSDTsFromDocx: bytes=', docBytes.byteLength, 'sha=', await sha256Hex(docBytes));
+
+      const sha = await sha256Hex(docBytes);
+      DBG('readSDTsFromDocx', { bytes: docBytes.byteLength, sha12: sha.slice(0, 12) });
+
       const zip = await JSZip.loadAsync(docBytes);
       const parts = zip.file(/^word\/(?!_rels\/|theme\/|fontTable\.xml|styles\.xml|numbering\.xml|settings\.xml|webSettings\.xml).*\.xml$/i);
-      DBG('Parts to scan:', parts.map(p => p.name));
+
+      DBG('Parts to scan', parts.map(p => p.name));
       if (!parts.length) return [];
+
       const parser = new DOMParser();
       const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
       const rows = [];
+
       let totalSeen = 0, totalKept = 0;
 
       for (const f of parts) {
@@ -165,12 +226,14 @@
         sdts.forEach((sdt) => {
           const pr = sdt.getElementsByTagNameNS(W_NS, 'sdtPr')[0];
           const content = sdt.getElementsByTagNameNS(W_NS, 'sdtContent')[0] || sdt;
+
           let tag = '', alias = '';
           const tEl = pr ? pr.getElementsByTagNameNS(W_NS, 'tag')[0] : null;
           if (tEl) tag = tEl.getAttributeNS(W_NS, 'val') || tEl.getAttribute('w:val') || '';
           const aEl = pr ? pr.getElementsByTagNameNS(W_NS, 'alias')[0] : null;
           if (aEl) alias = aEl.getAttributeNS(W_NS, 'val') || aEl.getAttribute('w:val') || '';
-          // keep SDTs that have BOTH tag and alias (as before)
+
+          // Keep SDTs that have BOTH tag and alias (as before)
           if (tag && alias) {
             totalKept++;
             rows.push({
@@ -182,24 +245,26 @@
           }
         });
       }
-      DBG('Total SDTs seen:', totalSeen, ' · kept (tag+alias):', totalKept);
+
+      DBG('SDT scan summary', { totalSeen, totalKept });
       return rows;
     }
 
+    // ========= Schema + options =========
     function deriveSchemaInfo(state) {
       const schemaObj = state?.schema && typeof state.schema === 'object' ? state.schema : null;
       const fieldsArr = Array.isArray(schemaObj?.fields) ? schemaObj.fields
-                        : Array.isArray(state?.schema) ? state.schema : [];
+        : Array.isArray(state?.schema) ? state.schema : [];
       const title = schemaObj?.title || state?.schemaTitle || state?.title || 'Schema';
 
-      // local helpers (match other pages)
       const slugifyMc = (s) => String(s || '')
         .normalize('NFKD')
         .replace(/[\u0300-\u036f]/g, '')
         .replace(/[^a-zA-Z0-9]+/g, '_')
         .replace(/^_+|_+$/g, '')
         .toLowerCase();
-      const mcExtraKey = (fieldId, optionValue, extraId) => `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
+      const mcExtraKey = (fieldId, optionValue, extraId) =>
+        `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
 
       const uniq = new Map(); // key -> { type, label }
       const addField = (k, t, label) => {
@@ -224,36 +289,30 @@
                 if (!exId && String(ex?.type) === 'datediff') {
                   const fromId = String(ex?.fromId || '').trim();
                   const toId   = String(ex?.toId   || '').trim();
-                  if (fromId || toId) exId = `datediff_${fromId}_${toId}`.replace(/__+/g,'_').replace(/^_|_$/g,'');
+                  if (fromId || toId) exId = `datediff_${fromId}_${toId}`.replace(/__+/g, '_').replace(/^_|_$/g, '');
                 }
                 if (!exId) continue;
                 const k = mcExtraKey(f.id, optVal, exId);
-                // Label = just the subfield id (clearer for users)
                 addField(k, ex?.type || 'text', exId);
               }
             }
           }
         }
       }
+
       const fields = Array.from(uniq.entries()).map(([key, v]) => ({ key, type: v.type, label: v.label }));
       return { title, fields, count: fields.length };
     }
 
-    function renderSchemaPill(info) {
-      $('#schema-pill').textContent = `${info.title} · ${info.count} ${info.count===1?'field':'fields'}`;
-      $('#schema-pill').classList.toggle('muted', !(info.count >= 0));
-    }
-    function renderDocPill(meta) {
-      $('#doc-pill').textContent = meta?.name || '—';
-    }
-
     function buildFieldOptions(fields) {
       const frag = document.createDocumentFragment();
-      const sorted = fields.slice().sort((a,b)=> (a.label||a.key).localeCompare(b.label||b.key));
+      const sorted = fields.slice().sort((a, b) => (a.label || a.key).localeCompare(b.label || b.key));
+
       const optNone = document.createElement('option');
       optNone.value = '';
       optNone.textContent = '— not mapped —';
       frag.appendChild(optNone);
+
       for (const f of sorted) {
         const opt = document.createElement('option');
         opt.value = f.key;
@@ -271,48 +330,18 @@
     function sanitizeTagMap(tagMap, fields, sdts) {
       const out = {};
       const validFieldIds = new Set((fields || []).map(f => f.key));
-      const presentTags   = new Set((sdts   || []).map(s => s.sdtKey));
+      const presentTags = new Set((sdts || []).map(s => s.sdtKey));
       for (const [tag, id] of Object.entries(tagMap || {})) {
         if (presentTags.has(tag) && validFieldIds.has(String(id))) out[tag] = String(id);
       }
       return out;
     }
 
-    // Build a patch that mirrors to all known slots and uses setState (instant, cross-tab)
-    async function persistTagMapPatch(docId, cleanedMap) {
-      const state = await window.formSuitePersist?.loadState?.(docId);
-      const basePayload = (state?.payload?.CRONOS_PAYLOAD)
-                       || (state?.CRONOS_PAYLOAD)
-                       || (state?.cronos_payload)
-                       || {};
-      const canonical = { ...basePayload, tagMap: cleanedMap, updatedAt: new Date().toISOString() };
-
-      const patch = {
-        tagMap: cleanedMap,                    // legacy convenience
-        payload: { CRONOS_PAYLOAD: canonical },
-        CRONOS_PAYLOAD: canonical,
-        cronos_payload: canonical
-      };
-
-      try {
-        if (window.formSuitePersist?.setState) {
-          window.formSuitePersist.setState(docId, patch); // broadcasts via fs-payload-v1
-        } else {
-          await window.formSuitePersist?.saveState?.(docId, patch);
-          // Fallback broadcast for older tabs
-          try {
-            bcCanon?.postMessage({ type: 'active:updated', docId, ts: Date.now(), from: 'matcher' });
-            bcLegacy?.postMessage({ type: 'schema-updated', docId, ts: Date.now(), from: 'matcher' });
-          } catch {}
-        }
-      } catch (e) {
-        console.warn('persistTagMapPatch failed', e);
-      }
-    }
-
+    // ========= Rendering =========
     function renderRows(sdts, fields, tagMap, onChange) {
       const tbody = $('#tbody');
       tbody.innerHTML = '';
+
       if (!sdts.length) {
         const tr = document.createElement('tr');
         const td = document.createElement('td');
@@ -324,7 +353,6 @@
         return;
       }
 
-      // Build one shared options fragment reuse
       const optionsFrag = buildFieldOptions(fields);
 
       sdts.forEach((row, i) => {
@@ -362,219 +390,228 @@
       });
     }
 
-    // ---------- Live sync / guards ----------
-    const bcLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc')  : null;
-    const bcCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc')   : null;
-    const bcPayload= ('BroadcastChannel' in window) ? new BroadcastChannel('fs-payload-v1')   : null;
+    // ========= Single mirror: write tagMap via persistence =========
+    async function persistTagMap(docId, cleanedMap) {
+      if (!docId) return;
 
-    let gDocId = null;
-    let gSDTs = []; // cache parsed SDTs to avoid re-parse on schema-only updates
-    let __refreshBusy = false, __refreshPending = false;
-
-    async function refreshAll(reason = '') {
-      if (__refreshBusy) { __refreshPending = true; return; }
-      __refreshBusy = true;
+      __suppressNextPayloadRefresh = true;
       try {
-        const meta = window.formSuitePersist?.getActiveDocMeta?.()
-                  || window.formSuitePersist?.getCurrentDocMeta?.()
-                  || null;
-        if (!meta?.docId) { await hardResetMatcher('no meta'); return; }
-        gDocId = meta.docId;
-        renderDocPill(meta);
-
-        // Permission banner only when a handle exists and permission is NOT granted
-        try {
-          const h = await window.formSuitePersist.getHandle(gDocId);
-          if (supportsFS && h) {
-            let perm = await h.queryPermission?.({ mode: 'readwrite' });
-            $('#permNote').style.display = (perm === 'granted') ? 'none' : 'block';
-          } else {
-            $('#permNote').style.display = 'none';
-          }
-        } catch { $('#permNote').style.display = 'none'; }
-
-        // Ensure bytes; if not, clear UI
-        const bytes = await getWorkingBytes(gDocId);
-        if (!bytes) { await hardResetMatcher('no bytes / no permission'); return; }
-
-        // Re-parse SDTs for this byte snapshot
-        try { gSDTs = await readSDTsFromDocx(bytes); } catch (e) { console.warn('SDT scan failed:', e); gSDTs = []; }
-
-        // Load state -> derive schema + tagMap and render
-        const state = await window.formSuitePersist?.loadState?.(gDocId);
-        const { title, fields } = deriveSchemaInfo(state || {});
-        renderSchemaPill({ title, count: fields.length });
-
-        const payload = (state?.payload?.CRONOS_PAYLOAD)
-                     || (state?.cronos_payload)
-                     || state?.CRONOS_PAYLOAD
-                     || {};
-        let tagMap = sanitizeTagMap(payload.tagMap || state?.tagMap || {}, fields, gSDTs);
-
-        // If sanitization removed entries, persist the cleaned map
-        const orig = payload.tagMap || state?.tagMap || {};
-        if (JSON.stringify(tagMap) !== JSON.stringify(orig)) {
-          await persistTagMapPatch(gDocId, tagMap);
+        // Minimal patch: persistence mirrors into payload.CRONOS_PAYLOAD and broadcasts via fs-payload-v1
+        if (window.formSuitePersist?.setState) {
+          window.formSuitePersist.setState(docId, { tagMap: cleanedMap });
+        } else {
+          await window.formSuitePersist?.saveState?.(docId, { tagMap: cleanedMap });
         }
-
-        renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
-          const nextMap = { ...(tagMap || {}) };
-          if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
-          const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
-          await persistTagMapPatch(gDocId, cleaned);
-          tagMap = cleaned;
-        });
-
-        DBG('refreshAll done', reason);
+        DBG('persistTagMap', { docId, size: Object.keys(cleanedMap || {}).length });
+      } catch (e) {
+        WARN('persistTagMap failed', e);
       } finally {
-        __refreshBusy = false;
-        if (__refreshPending) { __refreshPending = false; refreshAll('coalesced'); }
+        // allow subsequent payload events
+        setTimeout(() => { __suppressNextPayloadRefresh = false; }, 50);
       }
     }
 
-    // Broadcast listeners (legacy + canonical + payload)
-    bcLegacy?.addEventListener('message', async (ev) => {
-      const m = ev?.data || {};
+    // ========= Coordinated refresh =========
+    async function refreshAll(reason = '') {
+      if (__refreshBusy) { __refreshPending = true; return; }
+      __refreshBusy = true;
+
       try {
-        if (m.type === 'doc-cleared') {
-          await hardResetMatcher('cleared by another tab');
+        // Active doc meta is owned by fs-active-doc
+        gDoc = (typeof readActiveDocSync === 'function') ? readActiveDocSync() : null;
+        gDocId = gDoc?.docId || null;
+
+        if (!gDocId) {
+          await hardResetMatcher('no active doc');
+          DBG('refreshAll: no active doc', { reason });
           return;
         }
-        if (m.type === 'doc-switched') {
-          const meta = window.formSuitePersist?.getActiveDocMeta?.()
-                    || window.formSuitePersist?.getCurrentDocMeta?.()
-                    || null;
-          if (!meta?.docId || (m.docId && meta.docId !== m.docId)) return;
-          await refreshAll('doc-switched');
+
+        renderDocPill(gDoc);
+        await updatePermissionBanner(gDocId);
+
+        // Ensure bytes exist; if not, reset (prevents stale SDTs shown)
+        const bytes = await getWorkingBytes(gDocId);
+        if (!bytes || !bytes.byteLength) {
+          await hardResetMatcher('no bytes / no permission');
+          DBG('refreshAll: missing bytes', { reason });
           return;
         }
-        if (m.type === 'doc-updated' || m.type === 'schema-updated') {
-          const meta = window.formSuitePersist?.getActiveDocMeta?.()
-                    || window.formSuitePersist?.getCurrentDocMeta?.()
-                    || null;
-          if (!meta?.docId) return;
-          if (m.docId != null && m.docId !== meta.docId) return;
-          await refreshAll(m.type);
-          return;
+
+        // Re-parse SDTs only if DOCX changed
+        const sha12 = (await sha256Hex(bytes)).slice(0, 12);
+        if (sha12 !== gBytesSha12) {
+          DBG('DOCX bytes changed -> reparse SDTs', { prev: gBytesSha12, next: sha12, reason });
+          gBytesSha12 = sha12;
+          try { gSDTs = await readSDTsFromDocx(bytes); }
+          catch (e) { WARN('SDT scan failed', e); gSDTs = []; }
+        } else {
+          DBG('DOCX bytes unchanged -> keep SDT cache', { sha12, reason });
         }
-      } catch (e) {
-        console.warn('Matcher legacy broadcast handling failed:', e);
+
+        // Load state (schema + tagMap) and render
+        const state = await window.formSuitePersist?.loadState?.(gDocId) || {};
+        const schemaInfo = deriveSchemaInfo(state);
+        renderSchemaPill({ title: schemaInfo.title, count: schemaInfo.fields.length });
+
+        const payloadTagMap =
+          state?.payload?.CRONOS_PAYLOAD?.tagMap ||
+          state?.CRONOS_PAYLOAD?.tagMap ||
+          state?.cronos_payload?.tagMap ||
+          state?.tagMap ||
+          {};
+
+        const cleaned = sanitizeTagMap(payloadTagMap, schemaInfo.fields, gSDTs);
+
+        // Persist cleanup if sanitization changed anything
+        const same = JSON.stringify(cleaned) === JSON.stringify(payloadTagMap || {});
+        if (!same) {
+          DBG('sanitizeTagMap removed invalid entries -> persist cleanup', {
+            before: Object.keys(payloadTagMap || {}).length,
+            after: Object.keys(cleaned || {}).length
+          });
+          await persistTagMap(gDocId, cleaned);
+        }
+
+        renderRows(gSDTs, schemaInfo.fields, cleaned, async (key, mappedTo) => {
+          const nextMap = { ...(cleaned || {}) };
+          if (mappedTo) nextMap[key] = mappedTo;
+          else delete nextMap[key];
+
+          const reCleaned = sanitizeTagMap(nextMap, schemaInfo.fields, gSDTs);
+          await persistTagMap(gDocId, reCleaned);
+          // local in-scope update so subsequent changes use latest baseline
+          Object.assign(cleaned, reCleaned);
+        });
+
+        DBG('refreshAll done', { reason, docId: gDocId, sdtCount: gSDTs.length });
+      } finally {
+        __refreshBusy = false;
+        if (__refreshPending) {
+          __refreshPending = false;
+          refreshAll('coalesced');
+        }
       }
-    });
+    }
 
-    bcCanon?.addEventListener('message', async (ev) => {
-      const m = ev?.data || {};
-      try {
-        if (m.type === 'active:clear') { await hardResetMatcher('active:clear'); return; }
-        if (m.type === 'active:set')   { await refreshAll('active:set'); return; }
-        if (m.type === 'active:updated') {
-          if (!gDocId || (m.docId && m.docId !== gDocId)) return;
-          await refreshAll('active:updated');
-        }
-      } catch (e) { console.warn('Matcher canon broadcast failed:', e); }
-    });
+    // ========= Live updates (single broadcast path) =========
+    // - Active doc changes: fs-active-doc listener
+    // - State patches: fs-payload-v1 listener (emitted by persist.setState/saveState)
+    if (typeof installActiveDocListener === 'function') {
+      installActiveDocListener(async (meta) => {
+        DBG('active-doc event', meta);
+        // Always re-evaluate bytes + schema; refresh is guarded/coalesced
+        await refreshAll('active-doc');
+      });
+    } else {
+      WARN('installActiveDocListener missing; matcher will rely on focus/visibility refresh only');
+    }
 
-    // Instant payload patches from any tab
     bcPayload?.addEventListener('message', async (ev) => {
       const msg = ev?.data || {};
-      if (msg?.t !== 'payload' || !msg.docId || msg.docId !== gDocId) return;
-      // Only react to tagMap/schema relevant changes; keep current SDTs (already parsed)
-      try {
-        const st = await window.formSuitePersist?.loadState?.(gDocId);
-        const { title, fields } = deriveSchemaInfo(st || {});
-        renderSchemaPill({ title, count: fields.length });
+      if (!msg || msg.t !== 'payload') return;
+      if (!gDocId || msg.docId !== gDocId) return;
 
-        const srcMap = (st?.payload?.CRONOS_PAYLOAD?.tagMap)
-                    || (st?.CRONOS_PAYLOAD?.tagMap)
-                    || (st?.cronos_payload?.tagMap)
-                    || st?.tagMap
-                    || {};
-        const tagMap = sanitizeTagMap(srcMap, fields, gSDTs);
-        renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
-          const nextMap = { ...(tagMap || {}) };
-          if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
-          const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
-          await persistTagMapPatch(gDocId, cleaned);
-        });
-      } catch (e) {
-        console.warn('payload listener refresh failed', e);
+      // If we just wrote tagMap ourselves, ignore the immediate echo and rely on UI baseline update
+      if (__suppressNextPayloadRefresh) {
+        DBG('payload event suppressed (self-write)', msg);
+        return;
       }
+
+      // Fast path: schema/tagMap changes typically do NOT require SDT re-parse.
+      // But we still call refreshAll so any docId mismatches or handle permissions are handled.
+      DBG('payload event', msg);
+      await refreshAll('payload');
     });
 
-    // Visibility / focus guards
+    // ========= Visibility / focus guard =========
     document.addEventListener('visibilitychange', async () => {
       if (document.visibilityState !== 'visible') return;
       await refreshAll('visibility');
     });
     window.addEventListener('focus', async () => { await refreshAll('focus'); });
 
-    // ---------- Boot ----------
-    (async function init() {
-      try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
-      const meta = window.formSuitePersist?.getActiveDocMeta?.()
-                || window.formSuitePersist?.getCurrentDocMeta?.()
-                || null;
-      renderDocPill(meta);
-      if (!meta?.docId) { await hardResetMatcher('no meta at boot'); return; }
-      gDocId = meta.docId;
-
-      // Permission banner (only when a handle exists and not granted)
+    // ========= Boot =========
+    (async function boot() {
       try {
-        const h = await window.formSuitePersist.getHandle(gDocId);
-        if (supportsFS && h) {
-          let perm = await h.queryPermission?.({ mode: 'readwrite' });
-          $('#permNote').style.display = (perm === 'granted') ? 'none' : 'block';
-        } else {
-          $('#permNote').style.display = 'none';
+        DBG('boot');
+        try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
+
+        gDoc = (typeof readActiveDocSync === 'function') ? readActiveDocSync() : null;
+        renderDocPill(gDoc);
+
+        if (!gDoc?.docId) {
+          await hardResetMatcher('no active doc at boot');
+          return;
         }
-      } catch { $('#permNote').style.display = 'none'; }
 
-      // Ensure bytes & render or reset
-      const bytes = await getWorkingBytes(gDocId);
-      if (!bytes) { await hardResetMatcher('no bytes / no permission'); return; }
+        gDocId = gDoc.docId;
+        await updatePermissionBanner(gDocId);
 
-      // Parse SDTs + render once at boot
-      try { gSDTs = await readSDTsFromDocx(bytes); } catch { gSDTs = []; }
-      const state = await window.formSuitePersist?.loadState?.(gDocId);
-      const { title, fields } = deriveSchemaInfo(state || {});
-      renderSchemaPill({ title, count: fields.length });
+        // Ensure we start with SDTs parsed if bytes exist
+        const bytes = await getWorkingBytes(gDocId);
+        if (!bytes) {
+          await hardResetMatcher('no bytes at boot');
+          return;
+        }
 
-      const payload = (state?.payload?.CRONOS_PAYLOAD)
-                   || (state?.cronos_payload)
-                   || state?.CRONOS_PAYLOAD
-                   || {};
-      let tagMap = sanitizeTagMap(payload.tagMap || state?.tagMap || {}, fields, gSDTs);
+        gBytesSha12 = (await sha256Hex(bytes)).slice(0, 12);
+        try { gSDTs = await readSDTsFromDocx(bytes); } catch (e) { WARN('SDT scan failed at boot', e); gSDTs = []; }
 
-      // persist cleanup if needed
-      const orig = payload.tagMap || state?.tagMap || {};
-      if (JSON.stringify(tagMap) !== JSON.stringify(orig)) {
-        await persistTagMapPatch(gDocId, tagMap);
+        // Render state
+        const st = await window.formSuitePersist?.loadState?.(gDocId) || {};
+        const schemaInfo = deriveSchemaInfo(st);
+        renderSchemaPill({ title: schemaInfo.title, count: schemaInfo.fields.length });
+
+        const payloadTagMap =
+          st?.payload?.CRONOS_PAYLOAD?.tagMap ||
+          st?.CRONOS_PAYLOAD?.tagMap ||
+          st?.cronos_payload?.tagMap ||
+          st?.tagMap ||
+          {};
+
+        const cleaned = sanitizeTagMap(payloadTagMap, schemaInfo.fields, gSDTs);
+        if (JSON.stringify(cleaned) !== JSON.stringify(payloadTagMap || {})) {
+          await persistTagMap(gDocId, cleaned);
+        }
+
+        renderRows(gSDTs, schemaInfo.fields, cleaned, async (key, mappedTo) => {
+          const nextMap = { ...(cleaned || {}) };
+          if (mappedTo) nextMap[key] = mappedTo;
+          else delete nextMap[key];
+
+          const reCleaned = sanitizeTagMap(nextMap, schemaInfo.fields, gSDTs);
+          await persistTagMap(gDocId, reCleaned);
+          Object.assign(cleaned, reCleaned);
+        });
+
+        DBG('boot complete', { docId: gDocId, sdtCount: gSDTs.length });
+      } catch (e) {
+        WARN('boot failed', e);
+        await hardResetMatcher('boot exception');
       }
-
-      renderRows(gSDTs, fields, tagMap, async (key, mappedTo) => {
-        const nextMap = { ...(tagMap || {}) };
-        if (mappedTo) nextMap[key] = mappedTo; else delete nextMap[key];
-        const cleaned = sanitizeTagMap(nextMap, fields, gSDTs);
-        await persistTagMapPatch(gDocId, cleaned);
-        tagMap = cleaned;
-      });
     })();
 
-    // Re-grant button (user activation → safe to request permission)
+    // ========= Re-grant permission button =========
     document.getElementById('btnRegrant')?.addEventListener('click', async () => {
       try {
         if (!gDocId || !supportsFS) return;
-        const handle = await window.formSuitePersist.getHandle(gDocId);
+        const handle = await window.formSuitePersist?.getHandle?.(gDocId);
         if (!handle) return;
+
         let perm = await handle.queryPermission?.({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          try { perm = await handle.queryPermission?.({ mode: 'read' }); } catch {}
+        }
         if (perm !== 'granted') {
           const res = await handle.requestPermission?.({ mode: 'readwrite' });
           if (res !== 'granted') return;
         }
+
         document.getElementById('permNote').style.display = 'none';
         await refreshAll('regrant');
       } catch (e) {
-        console.warn('Re-grant failed (matcher):', e);
+        WARN('Re-grant failed', e);
       }
     });
 

@@ -6,10 +6,17 @@
   <link rel="icon" href="favicon.ico" type="image/gif" sizes="32x32">
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- flatpickr -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/material_blue.css">
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+
   <link rel="stylesheet" href="style.css">
+
+  <!-- Canonical plumbing -->
   <script src="persistence.js"></script>
+  <script src="fs-active-doc.js"></script>
+  <script src="fs-focus-nav.js"></script>
 </head>
 
 <body class="rules">
@@ -62,11 +69,10 @@
 
 <script>
 /* ------------------------------------------------------------------ *
- * Bulletproof Rules editor (drop-in)
+ * Bulletproof Rules editor (canonical, no LS/legacy broadcasts)
  * ------------------------------------------------------------------ */
 
 const nowt = () => new Date().toISOString().slice(11,23);
-const ACTIVE_LS_KEY = "FS_ACTIVE_DOC_META";
 
 const els = {
   status:      document.getElementById("status"),
@@ -78,8 +84,7 @@ const els = {
   rulesHint:   document.getElementById("rulesHint"),
 };
 
-const bcCanon  = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-active-doc")  : null;
-const bcLegacy = ("BroadcastChannel" in window) ? new BroadcastChannel("form-suite-doc") : null;
+const bcPayload = ("BroadcastChannel" in window) ? new BroadcastChannel("fs-payload-v1") : null;
 
 const setStatus = (s) => { try { els.status.textContent = s || ""; } catch {} };
 const debounce = (fn, ms)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
@@ -99,6 +104,7 @@ const isSelectLike  = (t) => ['select','dropdown','singlechoice','choice','singl
 const isNumericLike = (t) => ['datediff','duration','number'].includes(t);
 
 // app state
+let gDoc = null;
 let gDocId = null;
 let gSchema = { title:"Form", fields:[] };
 let gHeadingsTree = [];
@@ -110,26 +116,16 @@ let gRules = [];
 let gEditingId = null;
 let gDraft = null;
 
+let __reloadBusy = false;
+let __reloadPending = false;
+let __suppressNextPayloadReload = false;
+
 /* ------------------------- small utils ------------------------- */
 
 function safeArr(x){ return Array.isArray(x) ? x : []; }
 
 function deepClone(x){
   try { return JSON.parse(JSON.stringify(x)); } catch { return x; }
-}
-
-function readScopedPayloadLS(docId){
-  try {
-    const s = localStorage.getItem(`CRONOS_PAYLOAD:${docId}`);
-    return s ? JSON.parse(s) : null;
-  } catch { return null; }
-}
-
-function readGlobalPayloadLS(){
-  try {
-    const s = localStorage.getItem('CRONOS_PAYLOAD');
-    return s ? JSON.parse(s) : null;
-  } catch { return null; }
 }
 
 function parseStamp(v){
@@ -187,11 +183,6 @@ async function debugLogPayload(where) {
     console.log('payload.fieldRules     (%d):', safeArr(payload.fieldRules).length, payload.fieldRules || []);
     console.log('payload.rulesVersion   :', payload.rulesVersion);
     console.log('payload.updatedAt      :', payload.updatedAt);
-
-    const lsScoped = readScopedPayloadLS(gDocId);
-    const lsGlobal = readGlobalPayloadLS();
-    console.log('localStorage(scoped)   :', !!lsScoped, safeArr(lsScoped?.rules).length, safeArr(lsScoped?.fieldRules).length, lsScoped?.rulesVersion ?? null);
-    console.log('localStorage(global)   :', !!lsGlobal, safeArr(lsGlobal?.rules).length, safeArr(lsGlobal?.fieldRules).length, lsGlobal?.rulesVersion ?? null);
     console.groupEnd();
   } catch (e) {
     console.error('[rules][debugLogPayload] failed', e);
@@ -222,7 +213,7 @@ function flattenWithNumbers(tree){
   return out;
 }
 
-// same resolver logic you already had (kept)
+// kept resolver logic
 function buildHeadingTargetIndex(baseline) {
   const flat = Array.isArray(baseline?.flat)
     ? baseline.flat
@@ -674,22 +665,6 @@ function removeOneChildAndParent(rule, fieldId, optionValue){
 
 /* ------------------------- CANONICAL persistence ------------------------- */
 
-function computeCanonicalFromCurrent(st0, rules, fieldRules, stamp){
-  const basePayload =
-      (st0?.payload?.CRONOS_PAYLOAD)
-   || (st0?.CRONOS_PAYLOAD)
-   || (st0?.cronos_payload)
-   || {};
-
-  return {
-    ...basePayload,
-    rules: safeArr(rules),
-    fieldRules: safeArr(fieldRules),
-    rulesVersion: stamp,
-    updatedAt: new Date(stamp).toISOString(),
-  };
-}
-
 async function persistRules(reason) {
   if (!gDocId) return;
 
@@ -699,7 +674,6 @@ async function persistRules(reason) {
   const fieldRules = deepClone(gRulesFields   || []);
   const stamp = Date.now();
 
-  // Single-line debug summary (keep extremely compact)
   try {
     const r0 = rules[0] || null;
     const f0 = fieldRules[0] || null;
@@ -710,52 +684,30 @@ async function persistRules(reason) {
 
   console.log(`[${nowt()}] WRITE (${reason}) rules=${rules.length}, fieldRules=${fieldRules.length}`);
 
-  const st0 = await window.formSuitePersist.loadState(gDocId) || {};
-  const canonical = computeCanonicalFromCurrent(st0, rules, fieldRules, stamp);
-
+  __suppressNextPayloadReload = true;
   try {
     if (window.formSuitePersist?.setState) {
+      // Minimal patch: persistence.js is responsible for mirroring into payload.CRONOS_PAYLOAD and broadcasting fs-payload-v1
       await window.formSuitePersist.setState(gDocId, {
         rules,
         fieldRules,
-        rulesVersion: stamp,
-
-        // canonical payload mirrors
-        payload:        { ...(st0.payload || {}), CRONOS_PAYLOAD: canonical },
-        CRONOS_PAYLOAD: canonical,
-        cronos_payload: canonical,
+        rulesVersion: stamp
       });
     } else {
       await window.formSuitePersist.saveState(gDocId, {
         rules,
         fieldRules,
-        rulesVersion: stamp,
-
-        payload:        { ...(st0.payload || {}), CRONOS_PAYLOAD: canonical },
-        CRONOS_PAYLOAD: canonical,
-        cronos_payload: canonical,
+        rulesVersion: stamp
       });
     }
   } catch (e) {
     console.error('[rules] persistRules: write failed', e);
     throw e;
+  } finally {
+    setTimeout(() => { __suppressNextPayloadReload = false; }, 50);
   }
 
-  // LS mirrors
-  try {
-    localStorage.setItem(`CRONOS_PAYLOAD:${gDocId}`, JSON.stringify(canonical));
-    localStorage.setItem(`FS_RULES_STAMP:${gDocId}`, String(stamp));
-  } catch (e) {
-    console.warn('[rules] localStorage mirror failed', e);
-  }
-
-  // Broadcast
-  try { bcCanon?.postMessage({  type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-  try { bcLegacy?.postMessage({ type: 'rules-updated',  docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-  try { bcCanon?.postMessage({  type: 'active:updated', docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-  try { bcLegacy?.postMessage({ type: 'doc-updated',    docId: gDocId, ts: stamp, from: 'rules.html' }); } catch {}
-
-  // Verify
+  // Verify (workspace + payload should both match after persistence mirrors)
   try {
     const st1 = await window.formSuitePersist.loadState(gDocId) || {};
     const p1  = st1?.payload?.CRONOS_PAYLOAD || st1?.CRONOS_PAYLOAD || st1?.cronos_payload || {};
@@ -777,7 +729,7 @@ async function persistRules(reason) {
   await debugLogPayload(`persist:${reason}`);
 }
 
-/* ------------------------- BULLETPROOF reconcile/restore ------------------------- */
+/* ------------------------- reconcile/restore ------------------------- */
 
 async function reconcileAndAutoRestoreIfNeeded(reason){
   if (!gDocId) return;
@@ -792,55 +744,39 @@ async function reconcileAndAutoRestoreIfNeeded(reason){
   const plFieldRules = safeArr(payload.fieldRules);
   const plStamp      = stampOf(payload);
 
-  const lsScoped = readScopedPayloadLS(gDocId);
-  const lsRules      = safeArr(lsScoped?.rules);
-  const lsFieldRules = safeArr(lsScoped?.fieldRules);
-  const lsStamp      = stampOf(lsScoped);
-
-  // Choose best (newest stamp). If equal stamps, prefer workspace.
+  // Choose best between workspace and payload (no localStorage sources)
   let best = { src:'workspace', stamp: wsStamp, rules: wsRules, fieldRules: wsFieldRules };
-
   if (plStamp > best.stamp) best = { src:'payload', stamp: plStamp, rules: plRules, fieldRules: plFieldRules };
-  if (lsStamp > best.stamp) best = { src:'localStorage', stamp: lsStamp, rules: lsRules, fieldRules: lsFieldRules };
 
-  // Special case: workspace exists but is empty (clobbered) while payload/LS has non-empty even at same stamp.
-  if (best.src === 'workspace' && wsRules.length === 0) {
-    if (plRules.length && plStamp >= wsStamp) best = { src:'payload', stamp: plStamp, rules: plRules, fieldRules: plFieldRules };
-    if (lsRules.length && lsStamp >= best.stamp) best = { src:'localStorage', stamp: lsStamp, rules: lsRules, fieldRules: lsFieldRules };
+  // Special case: workspace got clobbered (empty) while payload has rules
+  if (best.src === 'workspace' && wsRules.length === 0 && plRules.length) {
+    best = { src:'payload', stamp: plStamp, rules: plRules, fieldRules: plFieldRules };
   }
 
   const shouldRestore =
       (best.src !== 'workspace')
    && (wsRules.length === 0 || wsStamp < best.stamp);
 
-  if (shouldRestore) {
-    console.warn(`[rules] AUTO-RESTORE (${reason}) from ${best.src} stamp=${best.stamp} → workspace was r=${wsRules.length},fr=${wsFieldRules.length},stamp=${wsStamp}`);
+  if (!shouldRestore) return;
 
-    const canonical = computeCanonicalFromCurrent(st, best.rules, best.fieldRules, best.stamp || Date.now());
+  console.warn(`[rules] AUTO-RESTORE (${reason}) from ${best.src} stamp=${best.stamp} → workspace was r=${wsRules.length},fr=${wsFieldRules.length},stamp=${wsStamp}`);
 
-    try {
-      if (window.formSuitePersist?.setState) {
-        await window.formSuitePersist.setState(gDocId, {
-          rules: best.rules,
-          fieldRules: best.fieldRules,
-          rulesVersion: canonical.rulesVersion,
-          payload:        { ...(st.payload || {}), CRONOS_PAYLOAD: canonical },
-          CRONOS_PAYLOAD: canonical,
-          cronos_payload: canonical,
-        });
-      } else {
-        await window.formSuitePersist.saveState(gDocId, {
-          rules: best.rules,
-          fieldRules: best.fieldRules,
-          rulesVersion: canonical.rulesVersion,
-          payload:        { ...(st.payload || {}), CRONOS_PAYLOAD: canonical },
-          CRONOS_PAYLOAD: canonical,
-          cronos_payload: canonical,
-        });
-      }
-    } catch (e) {
-      console.error('[rules] AUTO-RESTORE write failed', e);
+  try {
+    if (window.formSuitePersist?.setState) {
+      await window.formSuitePersist.setState(gDocId, {
+        rules: best.rules,
+        fieldRules: best.fieldRules,
+        rulesVersion: best.stamp || Date.now()
+      });
+    } else {
+      await window.formSuitePersist.saveState(gDocId, {
+        rules: best.rules,
+        fieldRules: best.fieldRules,
+        rulesVersion: best.stamp || Date.now()
+      });
     }
+  } catch (e) {
+    console.error('[rules] AUTO-RESTORE write failed', e);
   }
 }
 
@@ -937,7 +873,7 @@ function getMultiOptionHeaderIdsForConditions(){
   return ids;
 }
 
-/* ------------------------- editor (kept, minimal edits) ------------------------- */
+/* ------------------------- editor (unchanged UI, canonical writes) ------------------------- */
 
 function renderEditor(){
   const mount = els.editorMount;
@@ -1171,7 +1107,7 @@ function renderEditor(){
     card.appendChild(row2);
   }
 
-  // Targets
+  // Targets (unchanged from your implementation)
   if (gMode==='headings'){
     const row3=document.createElement('div'); row3.className='rule-row';
     const pair=document.createElement('div'); pair.className='pair';
@@ -1353,36 +1289,35 @@ function renderEditor(){
 async function reloadState(reason){
   if (!gDocId) return;
 
-  await reconcileAndAutoRestoreIfNeeded(reason);
-
-  const st = await window.formSuitePersist.loadState(gDocId) || {};
-
-  if (st.schema) gSchema = st.schema;
-
-  if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
-  if (Array.isArray(st.headingsFlat)) gHeadingsFlat = st.headingsFlat;
-  if (!Array.isArray(gHeadingsFlat) || !gHeadingsFlat.length) gHeadingsFlat = flattenWithNumbers(gHeadingsTree);
-
-  gRulesHeadings = safeArr(st.rules).slice();
-  gRulesFields   = safeArr(st.fieldRules).slice();
-
-  // Single-line debug: where did the rules come from, and what is mirrored in payload?
+  if (__reloadBusy) { __reloadPending = true; return; }
+  __reloadBusy = true;
   try {
-    const pl = (st?.payload?.CRONOS_PAYLOAD) || (st?.CRONOS_PAYLOAD) || (st?.cronos_payload) || null;
-    const plRulesLen = Array.isArray(pl?.rules) ? pl.rules.length : (Array.isArray(pl?.headingRules) ? pl.headingRules.length : 0);
-    const plFieldLen = Array.isArray(pl?.fieldRules) ? pl.fieldRules.length : (Array.isArray(pl?.fieldsRules) ? pl.fieldsRules.length : 0);
-    console.log(`[DBG rules.reloadState] ${nowt()} reason=${reason} st.rules=${gRulesHeadings.length} st.fieldRules=${gRulesFields.length} payload.rules=${plRulesLen} payload.fieldRules=${plFieldLen}`);
-  } catch {}
+    await reconcileAndAutoRestoreIfNeeded(reason);
 
-  normalizeAllTargets();
+    const st = await window.formSuitePersist.loadState(gDocId) || {};
 
-  gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
-  if (!gRules.find(r=>r?.id===gEditingId)) gEditingId = null;
+    if (st.schema) gSchema = st.schema;
 
-  setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
-  renderEditor(); renderList();
+    if (Array.isArray(st.headingsTree)) gHeadingsTree = st.headingsTree;
+    if (Array.isArray(st.headingsFlat)) gHeadingsFlat = st.headingsFlat;
+    if (!Array.isArray(gHeadingsFlat) || !gHeadingsFlat.length) gHeadingsFlat = flattenWithNumbers(gHeadingsTree);
 
-  await debugLogPayload(`reload:${reason}`);
+    gRulesHeadings = safeArr(st.rules).slice();
+    gRulesFields   = safeArr(st.fieldRules).slice();
+
+    normalizeAllTargets();
+
+    gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
+    if (!gRules.find(r=>r?.id===gEditingId)) gEditingId = null;
+
+    setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
+    renderEditor(); renderList();
+
+    await debugLogPayload(`reload:${reason}`);
+  } finally {
+    __reloadBusy = false;
+    if (__reloadPending) { __reloadPending = false; reloadState('coalesced'); }
+  }
 }
 
 /* ------------------------- tab switches + add ------------------------- */
@@ -1418,40 +1353,54 @@ window.addEventListener('keydown', async (e) => {
       ws_rulesVersion: st.rulesVersion || null,
       pl_rules: safeArr(p.rules).length,
       pl_fieldRules: safeArr(p.fieldRules).length,
-      pl_rulesVersion: p.rulesVersion || null,
-      ls_has_plain: !!localStorage.getItem('CRONOS_PAYLOAD'),
-      ls_has_scoped: !!localStorage.getItem(`CRONOS_PAYLOAD:${gDocId}`),
-      ls_stamp: localStorage.getItem(`FS_RULES_STAMP:${gDocId}`)
+      pl_rulesVersion: p.rulesVersion || null
     });
   }
 });
 
-/* ------------------------- boot ------------------------- */
+/* ------------------------- broadcasts (canonical only) ------------------------- */
 
-function getActiveDocMeta(){
-  try {
-    // prefer official API
-    const meta =
-      window.formSuitePersist?.getActiveDoc?.sync?.()
-      || window.formSuitePersist?.getCurrentDocMeta?.()
-      || window.readActiveDocSync?.()
-      || null;
-    if (meta?.docId) return meta;
-  } catch {}
-
-  // fallback localStorage
-  try {
-    const v=localStorage.getItem(ACTIVE_LS_KEY);
-    return v ? JSON.parse(v) : null;
-  } catch { return null; }
+// Active doc changes
+if (typeof installActiveDocListener === 'function') {
+  installActiveDocListener(async (meta) => {
+    gDoc = meta || null;
+    gDocId = meta?.docId || null;
+    gDraft = null;
+    gEditingId = null;
+    applyTabUI();
+    if (!gDocId) { setStatus('No active document. Open one first.'); return; }
+    await reloadState('active-doc');
+  });
 }
+
+// State changes (payload patches)
+bcPayload?.addEventListener('message', async (ev) => {
+  const msg = ev?.data || {};
+  if (msg?.t !== 'payload') return;
+  if (!gDocId || msg.docId !== gDocId) return;
+
+  if (__suppressNextPayloadReload) {
+    console.log('[rules] payload event suppressed (self-write)', msg);
+    return;
+  }
+  await reloadState('payload');
+});
+
+// Visibility / focus guard
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible') return;
+  await reloadState('visibility');
+});
+window.addEventListener('focus', async () => { await reloadState('focus'); });
+
+/* ------------------------- boot ------------------------- */
 
 (function boot(){
   try{
     try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
-    const meta = getActiveDocMeta();
-    if (!meta?.docId){ setStatus("No active document. Open one first."); return; }
-    gDocId = meta.docId;
+    gDoc = (typeof readActiveDocSync === 'function') ? readActiveDocSync() : null;
+    if (!gDoc?.docId){ setStatus("No active document. Open one first."); return; }
+    gDocId = gDoc.docId;
     applyTabUI();
     reloadState("boot");
   } catch(e){
@@ -1459,6 +1408,9 @@ function getActiveDocMeta(){
     setStatus("Failed to load state.");
   }
 })();
+
+// Triple-click logo: focus mode + go to index, toggle header links
+installLogoFocusNav();
 </script>
 </body>
 </html>

@@ -32,7 +32,7 @@
       </div>
       <div id="permNote" class="note warn" style="display:none; margin-top:10px">
         This DOCX was opened via picker but I don’t have write permission to the original file.
-        Exports will download a copy instead of writing back.
+        You can still work from the cached copy, but changes cannot be written back until permission is granted.
         <button id="btnRegrant" class="ghost" style="margin-left:8px">Grant write access</button>
       </div>
     </section>
@@ -43,61 +43,37 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+
+  <!-- Canonical single coordination layer -->
   <script src="persistence.js"></script>
+
+  <!-- Canonical rules normalization + visibility eval -->
   <script src="rules-core.js"></script>
+
+  <!-- DOCX utilities (used by persistence hydrate helpers) -->
   <script src="docx-core.js"></script>
-  <script src="fs-active-doc.js"></script>
+
+  <!-- UI helper -->
   <script src="fs-focus-nav.js"></script>
-  <script src="fs-export-core.js"></script>
+
+  <!-- Optional component -->
   <script src="address-autocomplete.js"></script>
-
-
 
   <script>
   'use strict';
 
   // ============================================================
-  // Constants / DOM
-  // ============================================================
-  const STORAGE_KEY = 'FORM_SCHEMA_V1';
-  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
-  const supportsFS  = 'showSaveFilePicker' in window;
-
-  const els = {
-    docStatus:  document.getElementById('docStatus'),
-    formMount:  document.getElementById('formMount'),
-    permNote:   document.getElementById('permNote'),
-    btnRegrant: document.getElementById('btnRegrant'),
-  };
-
-  // ============================================================
-  // App State (in-memory)
-  // ============================================================
-  let currentDoc = null;
-  let schema = null;
-  let values = {};
-  let fieldRules = [];      // evaluated for UI visibility
-  let btnExportMain = null;
-  let btnExportDebug = null;
-
-  let lastExportDebug = null;
-  let exportDebugEscHandler = null;
-
-  // ============================================================
-  // TRACE (simple, non-grouping console logs)
+  // TRACE (debug logs everywhere)
   // ============================================================
   (function ensureTrace() {
     if (typeof window.TRACE === 'function') return;
-
     const DEBUG = { on: true, seq: 0 };
     const ts = () => new Date().toISOString().slice(11, 23);
-
     window.TRACE = function TRACE(name, details) {
       const id = ++DEBUG.seq;
       const prefix = `[Form ${ts()} #${id}] ${name}`;
       if (DEBUG.on) console.log(prefix, details ?? '');
       const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-
       return {
         step(msg, data) { if (DEBUG.on) console.log(`${prefix}  ↳ ${msg}`, data ?? ''); },
         warn(msg, data) { if (DEBUG.on) console.warn(`${prefix}  ⚠ ${msg}`, data ?? ''); },
@@ -113,47 +89,63 @@
   })();
 
   // ============================================================
-  // UI Helpers
+  // DOM
   // ============================================================
+  const els = {
+    docStatus:  document.getElementById('docStatus'),
+    formMount:  document.getElementById('formMount'),
+    permNote:   document.getElementById('permNote'),
+    btnRegrant: document.getElementById('btnRegrant'),
+  };
+
   function setStatus(html) { els.docStatus.innerHTML = html; }
 
-  function clearExportDebugPanel() {
-    if (exportDebugEscHandler) {
-      try { document.removeEventListener('keydown', exportDebugEscHandler); } catch {}
-      exportDebugEscHandler = null;
-    }
+  // ============================================================
+  // Canonical single coordination layer
+  // ============================================================
+  function P() { return window.formSuitePersist; }
+  function U() { return window.formSuiteUtils; }
+
+  // Canonical channels (must match persistence.js)
+  const BC_ACTIVE  = 'fs-active-doc';
+  const BC_PAYLOAD = 'fs-payload-v1';
+
+  // ============================================================
+  // App State (in-memory)
+  // ============================================================
+  let currentDoc = null;       // {docId, name}
+  let schema = null;
+  let values = {};
+  let fieldRules = [];
+
+  // ============================================================
+  // Local schema fallback (ONLY when no active doc)
+  // ============================================================
+  const LS_SCHEMA_FALLBACK = 'FORM_SCHEMA_V1';
+  function saveLocalSchemaFallback(s) { try { localStorage.setItem(LS_SCHEMA_FALLBACK, JSON.stringify(s || {})); } catch {} }
+  function loadLocalSchemaFallback()  { try { return JSON.parse(localStorage.getItem(LS_SCHEMA_FALLBACK) || 'null'); } catch { return null; } }
+
+  // ============================================================
+  // Sanitizers (canonical: from formSuiteUtils)
+  // ============================================================
+  function sanitizeValues(schemaObj, vals) {
     try {
-      const panel = document.getElementById('exportDebugPanel');
-      if (panel) panel.remove();
+      if (U()?.sanitizeValues) return U().sanitizeValues(schemaObj, vals || {});
     } catch {}
-    lastExportDebug = null;
-  }
-
-  async function hardResetOpenForm(reason = '') {
-    schema = null;
-    values = {};
-    fieldRules = [];
-    if (els.formMount) {
-      els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-    }
-    if (btnExportMain) btnExportMain.disabled = true;
-    if (btnExportDebug) btnExportDebug.disabled = true;
-    els.permNote.style.display = 'none';
-    clearExportDebugPanel();
-
-    const suffix = reason ? ` (${reason})` : '';
-    setStatus(`No active document${suffix}. Open one in the <a href="extractor.html">Extractor</a>.`);
+    return (vals && typeof vals === 'object') ? vals : {};
   }
 
   // ============================================================
-  // Permission Banner
+  // Permission Banner (canonical via persistence)
   // ============================================================
   async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
+    const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: currentDoc?.docId });
     try {
-      if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; return 'unsupported'; }
+      if (!('showSaveFilePicker' in window)) { els.permNote.style.display = 'none'; tr.end('unsupported'); return 'unsupported'; }
+      if (!currentDoc?.docId)               { els.permNote.style.display = 'none'; tr.end('no-doc'); return 'no-doc'; }
 
-      const h = await window.formSuitePersist.getHandle?.(currentDoc.docId);
-      if (!h?.queryPermission) { els.permNote.style.display = 'none'; return 'no-handle'; }
+      const h = await P()?.getHandle?.(currentDoc.docId);
+      if (!h?.queryPermission) { els.permNote.style.display = 'none'; tr.end('no-handle'); return 'no-handle'; }
 
       let p = await h.queryPermission({ mode: 'readwrite' });
       if (p !== 'granted' && tryPrompt) {
@@ -161,257 +153,296 @@
       }
 
       els.permNote.style.display = (p === 'granted') ? 'none' : 'block';
+      tr.end({ perm: p });
       return p || 'denied';
     } catch (e) {
-      console.warn('updateWriteAccessBanner failed:', e);
+      tr.warn('failed (showing banner)', e);
       els.permNote.style.display = 'block';
+      tr.end('error');
       return 'error';
     }
   }
 
   els.btnRegrant?.addEventListener('click', async () => {
+    const tr = TRACE('btnRegrant click');
     const p = await updateWriteAccessBanner({ tryPrompt: true });
-    if (p === 'granted') await ensureActiveDocOrReset();
+    tr.step('perm result', p);
+    if (p === 'granted') await refreshFromCanonical({ reason: 'regrant' });
+    tr.end();
   });
 
   // ============================================================
-  // Robust bytes fetcher
-  // ============================================================
-  async function fetchWorkingDocBytes() {
-    try {
-      const b = await window.formSuitePersist.getCurrentDocBytes?.();
-      if (b && b.byteLength) return b;
-    } catch {}
-
-    try {
-      if (currentDoc?.docId) {
-        const b2 = await window.formSuitePersist.getBytes?.(currentDoc.docId);
-        if (b2 && b2.byteLength) return b2;
-      }
-    } catch {}
-
-    try {
-      const h = await window.formSuitePersist.getHandle?.(currentDoc?.docId);
-      if (h?.getFile) {
-        let p = await window.formSuitePersist.ensurePermission?.(h, 'readwrite');
-        if (p !== 'granted') p = await window.formSuitePersist.ensurePermission?.(h, 'read');
-        if (p === 'granted') {
-          const f = await h.getFile();
-          return await f.arrayBuffer();
-        }
-      }
-    } catch {}
-
-    try {
-      await window.formSuitePersist.regrantAll?.();
-      const b3 = await window.formSuitePersist.getCurrentDocBytes?.();
-      if (b3 && b3.byteLength) return b3;
-    } catch {}
-
-    return null;
-  }
-
-  // ============================================================
-  // Local schema fallback (only when no active doc)
-  // ============================================================
-  function saveLS(s) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s || {})); } catch {} }
-  function loadLS() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { return null; } }
-
-  // ============================================================
-  // Persist values (canonical)
+  // Canonical save (workspace only)
   // ============================================================
   let __saveTimer = null;
-  function scheduleSaveState() {
+
+  function scheduleSaveValues() {
     clearTimeout(__saveTimer);
-    __saveTimer = setTimeout(saveState, 150);
+    __saveTimer = setTimeout(saveValuesNow, 150);
   }
-  function saveState() {
-    if (!currentDoc?.docId) return;
-    const cleanValues = sanitizeValues(schema, values);
-    window.formSuitePersist.saveState(currentDoc.docId, { schema, values: cleanValues });
+
+  function saveValuesNow() {
+    const tr = TRACE('saveValuesNow', { docId: currentDoc?.docId });
+    try {
+      if (!currentDoc?.docId) { tr.end('no-doc'); return; }
+      const cleanValues = sanitizeValues(schema, values);
+      values = cleanValues; // keep in-memory aligned with sanitized
+
+      // Canonical: write ONLY to workspace state. No docx embed / no export logic here.
+      P()?.saveState?.(currentDoc.docId, { values: cleanValues });
+
+      tr.end({ keys: Object.keys(cleanValues || {}).length });
+    } catch (e) {
+      tr.error('failed', e);
+      tr.end('error');
+    }
   }
 
   window.addEventListener('beforeunload', () => {
     try {
-      if (currentDoc?.docId) saveState();
-      else if (schema) saveLS(schema);
+      if (currentDoc?.docId) saveValuesNow();
+      else if (schema) saveLocalSchemaFallback(schema);
     } catch {}
   });
 
   // ============================================================
-  // Payload reader (docx-core.js now handles JSZip-first docVar I/O)
+  // Canonical hydration: persistence helper only
   // ============================================================
-  async function readPayloadFromDocx(bytesU8) {
+  async function hydrateWorkspaceIfEmpty(docId) {
+    const tr = TRACE('hydrateWorkspaceIfEmpty', { docId });
     try {
-      if (typeof window.readDocVarSettings === 'function') {
-        const raw = await window.readDocVarSettings(bytesU8, PAYLOAD_KEY);
-        if (raw) return raw;
-      }
+      if (!docId) { tr.end('no-docId'); return false; }
+      const did = await P()?.hydrateFromDocxIfEmpty?.(docId);
+      tr.end({ didHydrate: !!did });
+      return !!did;
     } catch (e) {
-      console.warn('readDocVarSettings payload read failed (continuing):', e);
-    }
-
-    try {
-      if (typeof window.readDocVarCustom === 'function') {
-        const raw = await window.readDocVarCustom(bytesU8, PAYLOAD_KEY);
-        if (raw) return raw;
-      }
-    } catch (e) {
-      console.warn('readDocVarCustom payload read failed (continuing):', e);
-    }
-
-    return null;
-  }
-
-  // ============================================================
-  // Hydrate workspace from DOCX payload if schema missing
-  // ============================================================
-  let __hydrating = false;
-  async function hydrateWorkspaceFromDocxIfEmpty() {
-    try {
-      if (__hydrating) return false;
-      if (!currentDoc?.docId) return false;
-
-      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-      const hasSchema = Array.isArray(st?.schema?.fields) && st.schema.fields.length > 0;
-      if (hasSchema) return false;
-
-      setStatus('Restoring from document…');
-      const bytes = await fetchWorkingDocBytes();
-      if (!bytes) return false;
-
-      __hydrating = true;
-
-      const payloadRaw = await readPayloadFromDocx(bytes);
-      if (!payloadRaw) return false;
-
-      let payload = null;
-      try { payload = JSON.parse(payloadRaw); } catch { payload = null; }
-
-      if (!payload || !Array.isArray(payload.fields) || !payload.fields.length) return false;
-
-      const nextSchema = { title: payload.title || 'Form', fields: payload.fields };
-      const cleanValues = sanitizeValues(nextSchema, payload.values || {});
-      const tagMap = payload.tagMap || {};
-
-      // Keep whatever payload had; we will normalize split below
-      const payloadRules = Array.isArray(payload.rules) ? payload.rules : (Array.isArray(payload.headingRules) ? payload.headingRules : []);
-      const payloadFieldRules = Array.isArray(payload.fieldRules) ? payload.fieldRules : (Array.isArray(payload.fieldsRules) ? payload.fieldsRules : []);
-
-      const normalized = deriveNormalizedRulesForDoc(
-        { rules: payloadRules, fieldRules: payloadFieldRules },
-        nextSchema,
-        { flat: [], tree: [] }
-      );
-
-      await window.formSuitePersist.saveState(currentDoc.docId, {
-        schema: nextSchema,
-        values: cleanValues,
-        tagMap,
-        rules: normalized.headingRules || payloadRules || [],
-        fieldRules: normalized.fieldRules || [],
-        schemaUpdatedAt: new Date().toISOString()
-      });
-
-      schema = nextSchema;
-      values = cleanValues;
-      fieldRules = normalized.fieldRules || [];
-      renderForm();
-
-      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>`);
-      return true;
-    } catch (e) {
-      console.warn('hydrateWorkspaceFromDocxIfEmpty failed:', e);
+      tr.warn('failed', e);
+      tr.end('error');
       return false;
-    } finally {
-      __hydrating = false;
     }
   }
 
-  function sanitizeTagMap(tagMap, validIds) {
-    const out = {};
-    for (const [tag, fid] of Object.entries(tagMap || {})) {
-      if (validIds.has(fid)) out[tag] = fid;
-    }
-    return out;
-  }
-
   // ============================================================
-  // Active doc boot + refresh (coalesced)
+  // Canonical normalization (single workflow)
   // ============================================================
-  let __refreshLock = false;
-  let __refreshPending = false;
+  function normalizeRulesForCurrentState(st) {
+    const tr = TRACE('normalizeRulesForCurrentState', {
+      docId: currentDoc?.docId,
+      hasSchema: !!st?.schema,
+      rulesLen: Array.isArray(st?.rules) ? st.rules.length : null,
+      fieldRulesLen: Array.isArray(st?.fieldRules) ? st.fieldRules.length : null,
+    });
 
-  async function ensureActiveDocOrReset() {
-    if (__refreshLock) { __refreshPending = true; return; }
-    __refreshLock = true;
     try {
-      currentDoc = readActiveDocSync() || currentDoc;
-      if (!currentDoc?.docId) { await hardResetOpenForm('no active doc'); return; }
-
-      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-      schema = st?.schema || null;
-      values = st?.values || {};
+      const hasDeriver = (typeof window.deriveNormalizedRulesForDoc === 'function');
+      if (!hasDeriver) { tr.end('no-deriver'); return { fieldRules: Array.isArray(st?.fieldRules) ? st.fieldRules : [] }; }
 
       const baseline = {
         flat: Array.isArray(st?.headingsFlat) ? st.headingsFlat : (Array.isArray(st?.headings) ? st.headings : []),
         tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
       };
 
-      const normalized = deriveNormalizedRulesForDoc(st, schema, baseline);
-      fieldRules = normalized.fieldRules || [];
+      // IMPORTANT: always pass a schema object (avoid passing null)
+      const schemaForDerive = st?.schema || schema || { title: 'Form', fields: [] };
 
-      if (!schema) await hydrateWorkspaceFromDocxIfEmpty();
+      const normalized = window.deriveNormalizedRulesForDoc(st || {}, schemaForDerive, baseline) || {};
+      const nextHeadingRules = Array.isArray(normalized.headingRules)
+        ? normalized.headingRules
+        : (Array.isArray(st?.rules) ? st.rules : []);
+      const nextFieldRules = Array.isArray(normalized.fieldRules)
+        ? normalized.fieldRules
+        : (Array.isArray(st?.fieldRules) ? st.fieldRules : []);
 
-      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-      renderForm();
-      await updateWriteAccessBanner();
+      const curHeading = Array.isArray(st?.rules) ? st.rules : [];
+      const curField   = Array.isArray(st?.fieldRules) ? st.fieldRules : [];
+
+      const same = (a,b) => { try { return JSON.stringify(a||[]) === JSON.stringify(b||[]); } catch { return false; } };
+
+      if (currentDoc?.docId && (!same(curHeading, nextHeadingRules) || !same(curField, nextFieldRules))) {
+        tr.step('persist normalized rules (replace)', {
+          headingChanged: !same(curHeading, nextHeadingRules),
+          fieldChanged: !same(curField, nextFieldRules),
+        });
+        // May be async depending on implementation; we keep fire-and-forget but safe.
+        try { Promise.resolve(P()?.saveState?.(currentDoc.docId, { rules: nextHeadingRules, fieldRules: nextFieldRules })); } catch {}
+      }
+
+      tr.end({ nextFieldRulesLen: nextFieldRules.length });
+      return { fieldRules: nextFieldRules };
     } catch (e) {
-      console.warn('ensureActiveDocOrReset failed:', e);
-    } finally {
-      __refreshLock = false;
-      if (__refreshPending) { __refreshPending = false; ensureActiveDocOrReset(); }
+      tr.warn('failed', e);
+      tr.end('error');
+      return { fieldRules: Array.isArray(st?.fieldRules) ? st.fieldRules : [] };
     }
   }
 
-  installActiveDocListener(async (meta) => {
-    currentDoc = meta;
-    if (!currentDoc?.docId) { await hardResetOpenForm('cleared'); return; }
-    await ensureActiveDocOrReset();
-  });
+  // ============================================================
+  // Canonical refresh from workspace (override-safe)
+  // ============================================================
+  let __refreshLock = false;
+  let __refreshPending = false;
 
-  document.addEventListener('visibilitychange', async () => {
-    if (document.visibilityState !== 'visible') return;
-    await ensureActiveDocOrReset();
-  });
-  window.addEventListener('focus', async () => { await ensureActiveDocOrReset(); });
+  async function refreshFromCanonical({ reason = '' } = {}) {
+    const tr = TRACE('refreshFromCanonical', { reason });
+
+    if (__refreshLock) {
+      __refreshPending = true;
+      tr.end('coalesced');
+      return;
+    }
+
+    __refreshLock = true;
+    try {
+      const meta = await P()?.getActiveDocMeta?.();
+      currentDoc = (meta && meta.docId) ? meta : null;
+
+      if (!currentDoc?.docId) {
+        await hardResetOpenForm(`no active doc${reason ? ' ('+reason+')' : ''}`);
+        tr.end('no-doc');
+        return;
+      }
+
+      await hydrateWorkspaceIfEmpty(currentDoc.docId);
+
+      const st = await P()?.loadState?.(currentDoc.docId);
+      schema = st?.schema || null;
+      values = st?.values || {};
+
+      const norm = normalizeRulesForCurrentState(st);
+      fieldRules = norm.fieldRules || [];
+
+      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name || currentDoc.docId}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+
+      await updateWriteAccessBanner();
+
+      const ae = document.activeElement;
+      const isEditing = !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT'));
+
+      if (!isEditing) {
+        renderForm();
+      } else {
+        try { applyFieldVisibility(); } catch {}
+        try { if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs(); } catch {}
+      }
+
+      tr.end({ isEditing, hasSchema: !!schema, valuesKeys: Object.keys(values||{}).length });
+    } catch (e) {
+      tr.error('failed', e);
+      tr.end('error');
+    } finally {
+      __refreshLock = false;
+      if (__refreshPending) {
+        __refreshPending = false;
+        refreshFromCanonical({ reason: 'pending' });
+      }
+    }
+  }
+
+  async function hardResetOpenForm(reason = '') {
+    const tr = TRACE('hardResetOpenForm', { reason });
+    schema = null;
+    values = {};
+    fieldRules = [];
+
+    els.permNote.style.display = 'none';
+    setStatus(`No active document${reason ? ` (${reason})` : ''}. Open one in the <a href="extractor.html">Extractor</a>.`);
+
+    if (els.formMount) {
+      els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
+    }
+    tr.end();
+  }
+
+  // ============================================================
+  // Canonical listeners
+  // ============================================================
+  function installCanonicalListeners() {
+    const tr = TRACE('installCanonicalListeners');
+
+    try {
+      const bcActive = new BroadcastChannel(BC_ACTIVE);
+      bcActive.addEventListener('message', (ev) => {
+        const m = ev?.data || {};
+        if (!m?.type) return;
+
+        if (m.type === 'active:clear') {
+          TRACE('BC_ACTIVE', m);
+          refreshFromCanonical({ reason: 'active:clear' });
+          return;
+        }
+        if ((m.type === 'active:set' || m.type === 'active:updated') && m.docId) {
+          TRACE('BC_ACTIVE', m);
+          refreshFromCanonical({ reason: m.type });
+        }
+      });
+      tr.step('listening', { channel: BC_ACTIVE });
+    } catch (e) {
+      tr.warn('BC_ACTIVE failed', e);
+    }
+
+    try {
+      const bcPayload = new BroadcastChannel(BC_PAYLOAD);
+      bcPayload.addEventListener('message', (ev) => {
+        const msg = ev?.data || {};
+        if (msg?.t !== 'payload') return;
+
+        const docId = msg.docId;
+        if (!docId || docId !== currentDoc?.docId) return;
+
+        const patch = msg.patch || {};
+        const touches =
+          ('schema' in patch) ||
+          ('rules' in patch) ||
+          ('fieldRules' in patch) ||
+          ('values' in patch) ||
+          ('tagMap' in patch);
+
+        if (!touches) return;
+
+        TRACE('BC_PAYLOAD', { docId, keys: Object.keys(patch || {}) });
+        refreshFromCanonical({ reason: 'payload-patch' });
+      });
+      tr.step('listening', { channel: BC_PAYLOAD });
+    } catch (e) {
+      tr.warn('BC_PAYLOAD failed', e);
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') refreshFromCanonical({ reason: 'visible' });
+    });
+    window.addEventListener('focus', () => refreshFromCanonical({ reason: 'focus' }));
+
+    tr.end();
+  }
 
   // ============================================================
   // Init
   // ============================================================
-  init().catch(console.error);
+  init().catch((e) => console.error('[Form] init failed', e));
 
   async function init() {
-    currentDoc = readActiveDocSync();
+    const tr = TRACE('init');
 
-    if (currentDoc?.docId) {
-      const bytes = await fetchWorkingDocBytes();
-      if (!bytes) { await hardResetOpenForm('no bytes / no permission'); return; }
-
-      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-      schema = st?.schema || null;
-      values = st?.values || {};
-
-      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
-      await updateWriteAccessBanner();
-
-      if (!schema) await hydrateWorkspaceFromDocxIfEmpty();
-    } else {
-      schema = loadLS();
-      values = {};
+    if (!P()) {
+      tr.error('persistence layer missing', new Error('window.formSuitePersist not found'));
+      await hardResetOpenForm('persistence missing');
+      tr.end('fatal');
+      return;
     }
 
-    renderForm();
+    installCanonicalListeners();
+
+    currentDoc = await P()?.getActiveDocMeta?.();
+    if (currentDoc?.docId) {
+      await refreshFromCanonical({ reason: 'init' });
+    } else {
+      schema = loadLocalSchemaFallback();
+      values = {};
+      fieldRules = [];
+      renderForm();
+    }
+
+    tr.end();
   }
 
   // ============================================================
@@ -493,9 +524,12 @@
   // Field visibility (UI), using rules-core evaluateFieldRulesToVisibility
   // ============================================================
   function applyFieldVisibility() {
+    const tr = TRACE('applyFieldVisibility', { hasSchema: !!schema, fields: schema?.fields?.length, rules: fieldRules?.length });
     try {
-      if (!schema || !Array.isArray(schema.fields)) return;
-      const visMap = evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
+      if (!schema || !Array.isArray(schema.fields)) { tr.end('no-schema'); return; }
+      if (typeof window.evaluateFieldRulesToVisibility !== 'function') { tr.end('no-evaluator'); return; }
+
+      const visMap = window.evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
 
       const clearDisabled = (el) => {
         el.style.opacity = '';
@@ -528,7 +562,7 @@
         if (cb.checked) cb.checked = false;
         const arr = Array.isArray(values[fid]) ? values[fid].map(String) : [];
         values[fid] = arr.filter(v => v !== String(optVal));
-        scheduleSaveState();
+        scheduleSaveValues();
       };
 
       const deselectFieldWrapper = (wrapEl) => {
@@ -541,25 +575,25 @@
         if (t === 'multichoice') {
           wrapEl.querySelectorAll('input[type="checkbox"][data-mc="1"]').forEach(cb => { cb.checked = false; });
           values[fid] = [];
-          scheduleSaveState();
+          scheduleSaveValues();
           return;
         }
 
         if (t === 'select') {
           const sel = wrapEl.querySelector('select');
-          if (sel) { sel.value = ''; values[fid] = ''; scheduleSaveState(); }
+          if (sel) { sel.value = ''; values[fid] = ''; scheduleSaveValues(); }
           return;
         }
 
         if (t === 'text') {
           const inp = wrapEl.querySelector('input[type="text"]:not([data-type="date"])');
-          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
+          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveValues(); }
           return;
         }
 
         if (t === 'number') {
           const inp = wrapEl.querySelector('input[type="number"]');
-          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveState(); }
+          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveValues(); }
           return;
         }
 
@@ -569,7 +603,7 @@
             try { if (inp._flatpickr) inp._flatpickr.clear(); } catch {}
             inp.value = '';
             values[fid] = '';
-            scheduleSaveState();
+            scheduleSaveValues();
           }
         }
       };
@@ -577,7 +611,6 @@
       for (const id of Object.keys(visMap || {})) {
         const dir = visMap[id];
 
-        // Multi-choice option
         if (typeof id === 'string' && id.includes('__opt__')) {
           document.querySelectorAll(`.mc-item[data-opt-id="${esc(id)}"]`).forEach(el => {
             deselectMcItem(el);
@@ -594,7 +627,6 @@
           continue;
         }
 
-        // Normal field
         document.querySelectorAll(`.field[data-field-id="${esc(id)}"]`).forEach(el => {
           deselectFieldWrapper(el);
           if (dir === 'HIDE') {
@@ -608,21 +640,40 @@
           }
         });
       }
-    } catch {
-      // keep UI resilient
+
+      tr.end({ visKeys: Object.keys(visMap || {}).length });
+    } catch (e) {
+      tr.warn('failed (UI kept resilient)', e);
+      tr.end('error');
     }
   }
 
   // ============================================================
   // TABLE helpers
   // ============================================================
-  function emptyRow(field) { const r = {}; (field.columns || []).forEach(c => r[c.id] = ''); return r; }
+  function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
 
   // ============================================================
-  // Render Form (unchanged behavior; cleaned structure)
+  // Safe option normalization (fix: avoid [object Object] in selects)
+  // ============================================================
+  function normOptions(field){
+    const raw = (field && field.options) || [];
+    return (Array.isArray(raw) ? raw : []).map(o => {
+      if (o && typeof o === "object") {
+        const value = (o.value ?? o.id ?? o.key ?? o.code ?? String(o));
+        const label = (o.label ?? o.text ?? o.name ?? String(value));
+        return { value:String(value), label:String(label) };
+      }
+      return { value:String(o), label:String(o) };
+    });
+  }
+
+  // ============================================================
+  // Render Form (behavior preserved; coordination cleaned)
   // ============================================================
   function renderForm() {
-    // CSS inject (multi-choice caret)
+    const tr = TRACE('renderForm', { hasSchema: !!schema, fields: schema?.fields?.length, docId: currentDoc?.docId });
+
     (function injectMcStyles() {
       const ID = 'mc-caret-styles';
       if (document.getElementById(ID)) return;
@@ -647,8 +698,7 @@
 
     if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
       mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-      if (btnExportMain) btnExportMain.disabled = true;
-      if (btnExportDebug) btnExportDebug.disabled = true;
+      tr.end('no-schema');
       return;
     }
 
@@ -772,7 +822,7 @@
         outEl.textContent = display;
         values[storeKey] = { days, months, years, formatted: display };
       });
-      scheduleSaveState();
+      scheduleSaveValues();
     }
     window.recomputeDatediffs = recomputeDatediffs;
 
@@ -808,7 +858,7 @@
         input.id = f.id; input.name = f.id; input.style.width = '100%';
         if (f.required) input.required = true;
         if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); applyFieldVisibility(); });
+        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveValues(); applyFieldVisibility(); });
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
@@ -820,23 +870,33 @@
         input.id = f.id; input.name = f.id; input.style.width = '100%';
         if (f.required) input.required = true;
         if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveState(); applyFieldVisibility(); });
+        input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveValues(); applyFieldVisibility(); });
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
 
-      // Select
+      // Select (FIXED)
       else if (f.type === 'select') {
         const input = document.createElement('select');
         input.id = f.id; input.name = f.id; input.style.width = '100%';
-        (f.options || []).forEach(v => {
+
+        const opts = normOptions(f);
+        // Optional empty option for better UX (keeps required enforcement via HTML if required=true)
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = '— select —';
+        input.appendChild(empty);
+
+        opts.forEach(({value,label}) => {
           const o = document.createElement('option');
-          o.value = String(v); o.textContent = String(v);
+          o.value = value;
+          o.textContent = label;
           input.appendChild(o);
         });
+
         if (f.required) input.required = true;
-        if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); applyFieldVisibility(); });
+        if (values[f.id] != null) input.value = String(values[f.id]);
+        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveValues(); applyFieldVisibility(); });
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
@@ -858,8 +918,8 @@
           clickOpens: true,
           defaultDate: values[f.id] || null,
           onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
-          onChange: () => { values[f.id] = input.value; scheduleSaveState(); recomputeDatediffs(); applyFieldVisibility(); },
-          onValueUpdate: () => { values[f.id] = input.value; scheduleSaveState(); recomputeDatediffs(); applyFieldVisibility(); }
+          onChange: () => { values[f.id] = input.value; scheduleSaveValues(); recomputeDatediffs(); applyFieldVisibility(); },
+          onValueUpdate: () => { values[f.id] = input.value; scheduleSaveValues(); recomputeDatediffs(); applyFieldVisibility(); }
         });
         fp.set('allowInput', false);
         if (fp.altInput) fp.altInput.readOnly = true;
@@ -882,7 +942,7 @@
           label: f.label || 'Address',
           required: !!f.required,
           value: initial || null,
-          onChange: (val) => { values[f.id] = val; scheduleSaveState(); }
+          onChange: (val) => { values[f.id] = val; scheduleSaveValues(); }
         });
       }
 
@@ -913,8 +973,9 @@
         guardPairs.push({ fromId, toId });
       }
 
-      // Multichoice (kept behavior; just structured)
+      // Multichoice (unchanged from your version)
       else if (f.type === 'multichoice') {
+        /* ... unchanged block ... */
         const mcContainer = document.createElement('div');
         mcContainer.className = 'mc-container';
         mcContainer.style.display = 'block';
@@ -953,7 +1014,7 @@
         function persistMainSelection() {
           const boxes = mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
           values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
-          scheduleSaveState();
+          scheduleSaveValues();
         }
 
         function getDateForExtraKey(key) {
@@ -979,6 +1040,7 @@
           const card = document.createElement('div');
           card.className = 'mc-item';
           try { card.dataset.optId = `${f.id}__opt__${slugifyMc(optVal)}`; } catch {}
+
           card.style.position = 'relative';
           card.style.display = 'flex';
           card.style.flexDirection = 'column';
@@ -1048,7 +1110,6 @@
                 lab.style.minWidth = '120px';
                 lab.style.color = 'var(--muted)';
 
-                // Date
                 if (exType === 'date') {
                   const input = document.createElement('input');
                   input.type = 'text';
@@ -1064,8 +1125,8 @@
                     altInput: true,
                     altFormat: 'D, j M Y',
                     defaultDate: values[exKey] || null,
-                    onChange: () => { values[exKey] = input.value; scheduleSaveState(); recomputeDatediffs(); },
-                    onValueUpdate: () => { values[exKey] = input.value; scheduleSaveState(); recomputeDatediffs(); }
+                    onChange: () => { values[exKey] = input.value; scheduleSaveValues(); recomputeDatediffs(); },
+                    onValueUpdate: () => { values[exKey] = input.value; scheduleSaveValues(); recomputeDatediffs(); }
                   });
                   fp.set('allowInput', false);
                   if (fp.altInput) fp.altInput.readOnly = true;
@@ -1074,19 +1135,17 @@
                   return;
                 }
 
-                // Number
                 if (exType === 'number') {
                   const input = document.createElement('input');
                   input.type = 'number';
                   input.value = values[exKey] ?? '';
-                  input.addEventListener('change', () => { values[exKey] = Number(input.value); scheduleSaveState(); });
+                  input.addEventListener('change', () => { values[exKey] = Number(input.value); scheduleSaveValues(); });
                   extrasWrap.appendChild(line);
                   line.appendChild(lab);
                   line.appendChild(input);
                   return;
                 }
 
-                // Datediff (extra)
                 if (exType === 'datediff') {
                   const fromId = ex.fromId || ex.from || '';
                   const toId = ex.toId || ex.to || '';
@@ -1111,11 +1170,10 @@
                   return;
                 }
 
-                // Default text
                 const input = document.createElement('input');
                 input.type = 'text';
                 input.value = values[exKey] ?? '';
-                input.addEventListener('change', () => { values[exKey] = input.value; scheduleSaveState(); });
+                input.addEventListener('change', () => { values[exKey] = input.value; scheduleSaveValues(); });
                 extrasWrap.appendChild(line);
                 line.appendChild(lab);
                 line.appendChild(input);
@@ -1125,10 +1183,8 @@
             mountExtraFields();
           }
 
-          // Toggle caret
-          let caretBtn = null, caretIcon = null;
           if (hasExtras) {
-            caretBtn = document.createElement('button');
+            const caretBtn = document.createElement('button');
             caretBtn.type = 'button';
             caretBtn.className = 'mc-toggle';
             caretBtn.setAttribute('aria-expanded', 'false');
@@ -1149,17 +1205,16 @@
             path.setAttribute('stroke-linejoin', 'round');
             svg.appendChild(path);
 
-            caretIcon = svg;
             caretBtn.appendChild(svg);
             row1.appendChild(caretBtn);
 
-            setExtrasOpen(extrasWrap, caretIcon, false);
+            setExtrasOpen(extrasWrap, svg, false);
 
             caretBtn.addEventListener('click', (e) => {
               e.preventDefault();
               const willOpen = !extrasWrap.classList.contains('open');
               caretBtn.setAttribute('aria-expanded', String(willOpen));
-              setExtrasOpen(extrasWrap, caretIcon, willOpen);
+              setExtrasOpen(extrasWrap, svg, willOpen);
             });
           }
 
@@ -1174,7 +1229,6 @@
           parentHost.appendChild(card);
         }
 
-        // groups layout
         if (f.mc && Array.isArray(f.mc.groups) && f.mc.groups.length) {
           f.mc.groups.forEach(g => {
             const section = document.createElement('div');
@@ -1229,22 +1283,21 @@
           mcContainer.appendChild(host);
         }
 
-        // set main values from DOM (ensures alwaysSelected is applied)
         values[f.id] = Array.from(mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
           .filter(b => b.checked)
           .map(b => b.value);
-        scheduleSaveState();
+        scheduleSaveValues();
 
         wrap.appendChild(mcContainer);
       }
 
-      // Default fallback input
+      // Fallback
       else {
         const input = document.createElement('input');
         input.type = 'text';
         input.id = f.id; input.name = f.id; input.style.width = '100%';
         if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveState(); });
+        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveValues(); });
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
@@ -1252,32 +1305,9 @@
       form.appendChild(wrap);
     });
 
-    // ---- Export buttons ----
-    const bar = document.createElement('div');
-    bar.className = 'bar';
-    bar.style.gridColumn = '1 / -1';
-
-    btnExportMain = document.createElement('button');
-    btnExportMain.type = 'button';
-    btnExportMain.className = 'secondary';
-    btnExportMain.textContent = 'Export…';
-    btnExportMain.disabled = !currentDoc;
-    btnExportMain.addEventListener('click', onExportFromOpenForm);
-    bar.appendChild(btnExportMain);
-
-    btnExportDebug = document.createElement('button');
-    btnExportDebug.type = 'button';
-    btnExportDebug.className = 'ghost';
-    btnExportDebug.textContent = 'Debug export…';
-    btnExportDebug.disabled = !currentDoc;
-    btnExportDebug.addEventListener('click', onExportDebugFromOpenForm);
-    bar.appendChild(btnExportDebug);
-
-    form.appendChild(bar);
     form.addEventListener('change', () => applyFieldVisibility());
     mount.appendChild(form);
 
-    // ---- Date guards (from -> to minDate next day) ----
     (function wireTopLevelDateGuards() {
       function nextDay(d) {
         if (!d) return null;
@@ -1324,12 +1354,15 @@
 
     recomputeDatediffs();
     applyFieldVisibility();
+
+    tr.end();
   }
 
   // ============================================================
-  // TABLE FIELD (kept behavior)
+  // TABLE FIELD (behavior preserved)
   // ============================================================
   function renderTableField(container, field) {
+    /* unchanged from your version */
     if (!Array.isArray(values[field.id])) values[field.id] = [];
     const data = values[field.id];
 
@@ -1541,7 +1574,7 @@
 
       data.push({ ...editorState });
       drawTable();
-      scheduleSaveState();
+      scheduleSaveValues();
       status.textContent = 'Zeile hinzugefügt.';
     });
 
@@ -1549,7 +1582,7 @@
       if (selectedIndex < 0 || selectedIndex >= data.length) return;
       data[selectedIndex] = { ...editorState };
       drawTable();
-      scheduleSaveState();
+      scheduleSaveValues();
       status.textContent = 'Änderungen gespeichert.';
     });
 
@@ -1562,7 +1595,7 @@
       clearSelection();
       resetEditor();
       drawTable();
-      scheduleSaveState();
+      scheduleSaveValues();
       status.textContent = 'Zeile gelöscht.';
     });
 
@@ -1582,906 +1615,11 @@
   }
 
   // ============================================================
-  // EXPORT — Core issue fix: correctly separate heading rules vs field rules
-  // ============================================================
-
-  // --- Rule discovery: pull from common state locations (cleanly, no ad-hoc calls everywhere)
-  function pickFirstArray(obj, keys) {
-    for (const k of keys) {
-      const v = obj?.[k];
-      if (Array.isArray(v)) return { key: k, value: v };
-    }
-    return { key: null, value: [] };
-  }
-  function pickNestedArray(obj, paths) {
-    for (const path of paths) {
-      const parts = path.split('.');
-      let cur = obj;
-      let ok = true;
-      for (const p of parts) {
-        cur = cur?.[p];
-        if (cur === undefined) { ok = false; break; }
-      }
-      if (ok && Array.isArray(cur)) return { path, value: cur };
-    }
-    return { path: null, value: [] };
-  }
-
-  function looksLikeFieldRule(r) {
-    // field visibility rules always have fieldId and typically op/values
-    return !!(r && typeof r === 'object' && ('fieldId' in r || 'op' in r));
-  }
-
-  function looksLikeHeadingRule(r) {
-    // heading removal rules target heading identity (idx/uid/compositeKey/etc.)
-    return !!(r && typeof r === 'object' && (
-      ('idx' in r) || ('key' in r) ||
-      ('uid' in r) || ('compositeKey' in r) ||
-      ('headingId' in r) || ('headingUid' in r) ||
-      (('level' in r) && ('text' in r || 'label' in r || 'title' in r))
-    ));
-  }
-
-  function normalizeRuleSetsForExport(state) {
-    // Canonical contract across the project:
-    //   - state.rules      := "heading rules" (document section visibility / heading targets)
-    //   - state.fieldRules := "field rules"   (form field visibility / requirements)
-    //
-    // Do NOT heuristically split by presence of fieldId/op because heading rules also have conditions.
-    // Instead, rely on rules-core's resolver which already aggregates from:
-    //   workspace state, payload.CRONOS_PAYLOAD, and backward-compatible keys.
-    try {
-      if (typeof window.resolveRulesForState === 'function') {
-        const payloadOverride = state?.payload?.CRONOS_PAYLOAD || state?.CRONOS_PAYLOAD || state?.cronos_payload || null;
-        const resolved = window.resolveRulesForState(state || {}, payloadOverride);
-        return {
-          headingRules: Array.isArray(resolved?.rules) ? resolved.rules : [],
-          fieldRules: Array.isArray(resolved?.fieldRules) ? resolved.fieldRules : [],
-          rulesSource: resolved?.source?.rules || 'resolved',
-          fieldRulesSource: resolved?.source?.fieldRules || 'resolved',
-          contributingRules: resolved?.source?.contributingRules || [],
-          contributingFieldRules: resolved?.source?.contributingFieldRules || []
-        };
-      }
-    } catch (e) {
-      console.warn('[Form] normalizeRuleSetsForExport: resolveRulesForState failed, falling back.', e);
-    }
-
-    // Conservative fallback: treat state.rules as heading rules and state.fieldRules as field rules.
-    const headingRules = Array.isArray(state?.rules) ? state.rules : (Array.isArray(state?.headingRules) ? state.headingRules : []);
-    const fieldRules   = Array.isArray(state?.fieldRules) ? state.fieldRules : [];
-    return { headingRules, fieldRules, rulesSource: 'state.rules', fieldRulesSource: 'state.fieldRules' };
-  }
-
-  function normalizeHideAction(actionLike) {
-    if (actionLike == null) return null;
-    if (typeof actionLike === 'string') {
-      const s = actionLike.trim().toUpperCase();
-      if (s === 'HIDE' || s === 'REMOVE' || s === 'TRUE') return 'HIDE';
-      if (s === 'SHOW' || s === 'KEEP' || s === 'FALSE') return 'SHOW';
-      return null;
-    }
-    if (typeof actionLike === 'boolean') return actionLike ? 'HIDE' : 'SHOW';
-    if (typeof actionLike === 'object') {
-      const a = actionLike.action ?? actionLike.visibility ?? actionLike.state ?? actionLike.mode;
-      return normalizeHideAction(a);
-    }
-    return null;
-  }
-
-  function buildHeadingLookupFromBaseline(baselineFlat) {
-    const by = {
-      idx: new Map(),
-      id: new Map(),
-      uid: new Map(),
-      compositeKey: new Map(),
-      textLevel: new Map(),
-    };
-
-    const normText = (s) => String(s || '')
-      .normalize('NFKD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-
-    for (const h of (baselineFlat || [])) {
-      const idx = Number(h?.idx ?? h?.key);
-      if (Number.isFinite(idx)) by.idx.set(idx, idx);
-      if (h?.id) by.id.set(String(h.id), idx);
-      if (h?.uid) by.uid.set(String(h.uid), idx);
-      if (h?.compositeKey) by.compositeKey.set(String(h.compositeKey), idx);
-
-      const key = `${Number(h?.level) || 'x'}|${normText(h?.label || h?.text || h?.title || '')}`;
-      if (key && Number.isFinite(idx) && !by.textLevel.has(key)) by.textLevel.set(key, idx);
-    }
-    return by;
-  }
-
-  function computeVisibilityMapFallback({ rules, baselineFlat }) {
-    const lookup = buildHeadingLookupFromBaseline(baselineFlat || []);
-    const vis = {};
-
-    for (const r of (rules || [])) {
-      const action = normalizeHideAction(r?.action ?? r?.visibility ?? r?.state ?? r);
-      if (!action) continue;
-
-      const rawTarget =
-        r?.idx ?? r?.key ?? r?.id ?? r?.uid ?? r?.compositeKey ?? r?.target ?? r?.headingId ?? r?.headingUid ?? null;
-
-      let idx = null;
-
-      if (rawTarget != null) {
-        const s = String(rawTarget);
-        if (/^sec_\d+$/i.test(s)) {
-          const n = Number(s.slice(4));
-          if (Number.isFinite(n)) idx = n;
-        } else {
-          const n = Number(rawTarget);
-          if (Number.isFinite(n)) idx = n;
-        }
-
-        if (!Number.isFinite(idx)) {
-          if (lookup.id.has(String(rawTarget))) idx = lookup.id.get(String(rawTarget));
-          else if (lookup.uid.has(String(rawTarget))) idx = lookup.uid.get(String(rawTarget));
-          else if (lookup.compositeKey.has(String(rawTarget))) idx = lookup.compositeKey.get(String(rawTarget));
-        }
-      }
-
-      if (!Number.isFinite(idx)) {
-        const lvl = Number(r?.level);
-        const txt = (r?.text ?? r?.label ?? r?.title ?? '');
-        const key = `${Number.isFinite(lvl) ? lvl : 'x'}|${String(txt || '')
-          .normalize('NFKD')
-          .replace(/[\u0300-\u036f]/g, '')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .toLowerCase()}`;
-        if (lookup.textLevel.has(key)) idx = lookup.textLevel.get(key);
-      }
-
-      if (!Number.isFinite(idx)) continue;
-      vis[String(idx)] = action;
-    }
-
-    return vis;
-  }
-
-  function countHideActions(visMap) {
-    let n = 0;
-    try {
-      for (const k of Object.keys(visMap || {})) {
-        if (String(visMap[k] || '').toUpperCase() === 'HIDE') n++;
-      }
-    } catch {}
-    return n;
-  }
-
-  async function applyRemovalIfNeeded(baseBytesU8, visibilityMap, originalBytesU8) {
-    const hideCount = countHideActions(visibilityMap);
-    const keys = Object.keys(visibilityMap || {});
-    const sample = keys.slice(0, 12).reduce((acc, k) => (acc[k] = visibilityMap[k], acc), {});
-
-    const tr = TRACE('applyRemovalIfNeeded', {
-      hasApply: typeof window.applyRemovalWithBackup,
-      visKeys: keys.length,
-      hideCount,
-      sample
-    });
-
-    try {
-      if (!hideCount) return { bytes: baseBytesU8, applied: false };
-
-      if (typeof window.applyRemovalWithBackup === 'function') {
-        const out = await window.applyRemovalWithBackup(baseBytesU8, visibilityMap, originalBytesU8);
-        return { bytes: (out instanceof Uint8Array ? out : new Uint8Array(out)), applied: true };
-      }
-
-      if (window.fsExportCore && typeof window.fsExportCore.applyRemoval === 'function') {
-        const out = await window.fsExportCore.applyRemoval({ bytes: baseBytesU8, visibilityMap, originalBytes: originalBytesU8 });
-        const bytes = out?.bytes || out;
-        return { bytes: (bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)), applied: true };
-      }
-
-      console.warn('No removal function available. Parts will not be removed.');
-      return { bytes: baseBytesU8, applied: false };
-    } finally {
-      tr.end();
-    }
-  }
-
-  async function gatherExportArtifacts(canBytes) {
-    const tr = TRACE('gatherExportArtifacts');
-
-    try {
-      if (!currentDoc?.docId) throw new Error('No active docId for export.');
-
-      const originalBytes = canBytes
-        ? (canBytes instanceof Uint8Array ? canBytes : new Uint8Array(canBytes))
-        : new Uint8Array(await fetchWorkingDocBytes());
-
-      const state = await window.formSuitePersist.loadState(currentDoc.docId);
-      const effectiveSchema = state?.schema || schema || { title: 'Form', fields: [] };
-
-      const baselineHeadingsFlat = Array.isArray(state?.headingsFlat)
-        ? state.headingsFlat
-        : (Array.isArray(state?.headings) ? state.headings : []);
-
-      const baselineHeadingsTree = Array.isArray(state?.headingsTree) ? state.headingsTree : [];
-
-      const { headingRules: headingRulesRaw, fieldRules: fieldRulesRaw, rulesSource, fieldRulesSource } =
-        normalizeRuleSetsForExport(state);
-
-      tr.step('state rule sources', {
-        rulesSource,
-        fieldRulesSource,
-        headingRulesLen: headingRulesRaw.length,
-        fieldRulesLen: fieldRulesRaw.length
-      });
-
-      tr.step('baseline headings', { flat: baselineHeadingsFlat.length, tree: baselineHeadingsTree.length });
-
-      // Normalize via rules-core if available (keeps your existing rule system consistent)
-      let headingRules = headingRulesRaw;
-      if (typeof window.normalizeHeadingsRulesForSchema === 'function') {
-        try {
-          headingRules = window.normalizeHeadingsRulesForSchema(effectiveSchema, headingRulesRaw, {
-            flat: baselineHeadingsFlat,
-            tree: baselineHeadingsTree
-          });
-        } catch (e) {
-          tr.warn('normalizeHeadingsRulesForSchema failed (using raw)', e);
-          headingRules = headingRulesRaw;
-        }
-      }
-
-      let fieldRulesForDoc = fieldRulesRaw;
-      if (typeof window.normalizeFieldRulesForSchema === 'function') {
-        try {
-          fieldRulesForDoc = window.normalizeFieldRulesForSchema(effectiveSchema, fieldRulesRaw);
-        } catch (e) {
-          tr.warn('normalizeFieldRulesForSchema failed (using raw)', e);
-          fieldRulesForDoc = fieldRulesRaw;
-        }
-      }
-
-      const rulesVersion = state?.rulesVersion;
-
-      const valuesMaybe = state?.values
-        || state?.cronos_payload?.values
-        || state?.CRONOS_PAYLOAD?.values
-        || {};
-
-      const tagMapRaw = state?.tagMap
-        || state?.cronos_payload?.tagMap
-        || state?.CRONOS_PAYLOAD?.tagMap
-        || state?.cronos_payload?.CRONOS_PAYLOAD?.tagMap
-        || {};
-
-      const validIds = new Set((effectiveSchema.fields || []).map(f => f.id));
-      const safeValues = sanitizeValues(effectiveSchema, valuesMaybe || {});
-      const cleanTagMap = sanitizeTagMap(tagMapRaw, validIds);
-
-      const baseline = { flat: baselineHeadingsFlat, tree: baselineHeadingsTree };
-
-      tr.step('calling fsExportCore.buildDoc', {
-        origBytes: originalBytes.length,
-        schemaFields: (effectiveSchema.fields || []).length,
-        headingRulesLen: headingRules.length,
-        fieldRulesLen: fieldRulesForDoc.length,
-        baselineFlat: baseline.flat.length
-      });
-
-      const buildOut = await window.fsExportCore.buildDoc({
-        originalBytes,
-        schema: effectiveSchema,
-        values: safeValues,
-        tagMap: cleanTagMap,
-        rules: headingRules,               // IMPORTANT: only heading rules here
-        fieldRules: fieldRulesForDoc,
-        headingBaseline: baseline,
-        payloadKey: PAYLOAD_KEY,
-        writerKind: 'auto',
-        debugLabel: 'index.gatherExportArtifacts'
-      });
-
-      let visibilityMap = buildOut?.visibilityMap || {};
-      let hideCount = countHideActions(visibilityMap);
-
-      tr.step('buildDoc result', {
-        hasUpdatedBytes: !!buildOut?.updatedBytes,
-        updatedBytesLen: (buildOut?.updatedBytes?.length ?? buildOut?.updatedBytes?.byteLength ?? null),
-        preRemovalLen: (buildOut?.preRemovalBytes?.length ?? buildOut?.preRemovalBytes?.byteLength ?? null),
-        visKeys: Object.keys(visibilityMap).length,
-        hideCount
-      });
-
-      // Fallback ONLY from heading rules + baseline (this is the “missing piece” previously)
-      if (!Object.keys(visibilityMap).length) {
-        const fb = computeVisibilityMapFallback({ rules: headingRules, baselineFlat: baselineHeadingsFlat });
-        const fbHide = countHideActions(fb);
-
-        tr.step('visibilityMap empty → fallback computed', {
-          fbKeys: Object.keys(fb).length,
-          fbHide
-        });
-
-        if (Object.keys(fb).length) {
-          visibilityMap = fb;
-          hideCount = fbHide;
-        }
-      }
-
-      tr.step('visibilityMap keys (sample)', Object.keys(visibilityMap || {}).slice(0, 10));
-
-      return {
-        originalBytes,
-        updatedBytes: buildOut.updatedBytes,
-        preRemovalBytes: buildOut.preRemovalBytes,
-        removalApplied: !!buildOut.removalApplied,
-        visibilityMap,
-        safeValues,
-        cleanTagMap,
-        headingRules,
-        fieldRulesForDoc,
-        rulesVersion,
-        headingResolver: buildOut.headingResolver,
-        state,
-        baselineHeadingsFlat,
-        baselineHeadingsTree,
-        payloadObj: buildOut.payload,
-        payload: JSON.stringify(buildOut.payload),
-        rawTagMap: tagMapRaw,
-        effectiveSchema
-      };
-    } finally {
-      tr.end();
-    }
-  }
-
-  // ============================================================
-  // Export Debug UI (kept behavior; uses simple logs)
-  // ============================================================
-  function summarizeForExportDebug(value) {
-    const seen = new WeakSet();
-    function helper(val, depth) {
-      if (val == null) return val;
-      const t = typeof val;
-      if (t === 'number' || t === 'boolean') return val;
-      if (t === 'string') {
-        if (val.length <= 2048) return val;
-        return { type: 'string', length: val.length, head: val.slice(0, 1024), tail: val.slice(-256) };
-      }
-      if (typeof Date !== 'undefined' && val instanceof Date) return { type: 'Date', value: val.toISOString() };
-      if (typeof Blob !== 'undefined' && val instanceof Blob) return { type: 'Blob', size: val.size, mime: val.type || '' };
-      if (typeof File !== 'undefined' && val instanceof File) return { type: 'File', name: val.name, size: val.size, mime: val.type || '' };
-      if (val instanceof Uint8Array) {
-        const previewLength = Math.min(32, val.length);
-        const preview = Array.from(val.slice(0, previewLength));
-        const hexPreview = preview.map(b => b.toString(16).padStart(2, '0')).join(' ');
-        return { type: 'Uint8Array', length: val.length, previewHex: hexPreview };
-      }
-      if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) return { type: 'ArrayBuffer', byteLength: val.byteLength };
-      if (val && typeof val.byteLength === 'number' && val.buffer instanceof ArrayBuffer) return { type: val.constructor?.name || 'TypedArray', byteLength: val.byteLength };
-      if (t === 'function') return `[Function ${val.name || 'anonymous'}]`;
-      if (seen.has(val)) return '[Circular]';
-
-      const nextDepth = depth + 1;
-      if (nextDepth > 2) {
-        if (Array.isArray(val)) return `[Array length=${val.length}]`;
-        const keys = Object.keys(val);
-        return `[Object keys=${keys.length}]`;
-      }
-
-      seen.add(val);
-      try {
-        if (Array.isArray(val)) {
-          const max = nextDepth === 1 ? 20 : 10;
-          const out = val.slice(0, max).map(item => helper(item, nextDepth));
-          if (val.length > max) out.push(`… ${val.length - max} more`);
-          return out;
-        }
-        if (val instanceof Map) {
-          const entries = Array.from(val.entries());
-          const max = nextDepth === 1 ? 20 : 10;
-          const mapped = entries.slice(0, max).map(([k, v]) => [helper(k, nextDepth), helper(v, nextDepth)]);
-          if (entries.length > max) mapped.push(["__truncated__", `… ${entries.length - max} more`]);
-          return mapped;
-        }
-        const entries = Object.entries(val);
-        const max = nextDepth === 1 ? 25 : 12;
-        const out = {};
-        for (let i = 0; i < entries.length && i < max; i++) {
-          const [k, v] = entries[i];
-          out[k] = helper(v, nextDepth);
-        }
-        if (entries.length > max) out.__truncated__ = `… ${entries.length - max} more keys`;
-        return out;
-      } finally {
-        seen.delete(val);
-      }
-    }
-    return helper(value, 0);
-  }
-
-  function buildExportDebugSnapshot(plan, context) {
-    return { generatedAt: new Date().toISOString(), plan, context: summarizeForExportDebug(context || {}) };
-  }
-  function stringifyExportDebugSnapshot(plan, context) {
-    try { return JSON.stringify(buildExportDebugSnapshot(plan, context), null, 2); }
-    catch (err) {
-      console.warn('Failed to stringify export debug snapshot', err);
-      return JSON.stringify({ error: 'stringify-failed', message: err?.message || String(err || 'unknown-error') }, null, 2);
-    }
-  }
-  function normalizeDebugError(err) {
-    if (!err) return null;
-    if (typeof err === 'string') return { name: null, message: err, stack: null };
-    if (typeof err === 'object') return {
-      name: err?.name || err?.constructor?.name || null,
-      message: err?.message || String(err || ''),
-      stack: typeof err?.stack === 'string' ? err.stack : null
-    };
-    return { name: null, message: String(err), stack: null };
-  }
-  function describeDebugError(err) {
-    if (!err) return '';
-    if (typeof err === 'string') return err;
-    if (typeof err === 'object') {
-      const parts = [];
-      if (err.name) parts.push(err.name);
-      if (err.message && (!parts.length || err.message !== parts[parts.length - 1])) parts.push(err.message);
-      if (!parts.length && err.stack) return err.stack;
-      if (!parts.length) { try { return JSON.stringify(err); } catch { return String(err); } }
-      return parts.join(': ');
-    }
-    return String(err);
-  }
-
-  function renderExportDebugPanel(plan, context = {}) {
-    if (!plan || typeof plan !== 'object') {
-      console.warn('renderExportDebugPanel: invalid plan', plan);
-      return;
-    }
-    clearExportDebugPanel();
-    lastExportDebug = { plan, context };
-    try { window.lastExportDebug = lastExportDebug; } catch {}
-
-    const overlay = document.createElement('div');
-    overlay.id = 'exportDebugPanel';
-    overlay.tabIndex = -1;
-    overlay.style.position = 'fixed';
-    overlay.style.top = '72px';
-    overlay.style.right = '24px';
-    overlay.style.maxWidth = 'min(90vw, 520px)';
-    overlay.style.maxHeight = '70vh';
-    overlay.style.overflowY = 'auto';
-    overlay.style.background = '#ffffff';
-    overlay.style.border = '1px solid rgba(15,23,42,0.12)';
-    overlay.style.boxShadow = '0 18px 45px rgba(15,23,42,0.25)';
-    overlay.style.padding = '18px';
-    overlay.style.borderRadius = '12px';
-    overlay.style.zIndex = '4000';
-    overlay.style.fontSize = '14px';
-    overlay.style.lineHeight = '1.4';
-
-    const header = document.createElement('div');
-    header.style.display = 'flex';
-    header.style.gap = '12px';
-    header.style.alignItems = 'center';
-    header.style.marginBottom = '12px';
-
-    const title = document.createElement('h3');
-    title.textContent = 'Export removal debug';
-    title.style.margin = '0';
-    title.style.fontSize = '16px';
-    title.style.fontWeight = '600';
-
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.className = 'ghost';
-    closeBtn.textContent = 'Close';
-    closeBtn.style.marginLeft = 'auto';
-    closeBtn.addEventListener('click', (ev) => { ev.preventDefault(); clearExportDebugPanel(); });
-
-    header.appendChild(title);
-    header.appendChild(closeBtn);
-    overlay.appendChild(header);
-
-    const summary = document.createElement('div');
-    summary.style.marginBottom = '12px';
-
-    const collectHeadingsFromPlan = (target, planLike) => {
-      if (!planLike) return;
-      (planLike.parts || []).forEach(part => {
-        (part?.headings || []).forEach(h => { target.push({ ...h, part: part?.name || '' }); });
-      });
-      if (!target.length && Array.isArray(planLike.headings)) planLike.headings.forEach(h => target.push({ ...h }));
-    };
-
-    const headings = [];
-    collectHeadingsFromPlan(headings, plan);
-    headings.sort((a, b) => a.idx - b.idx);
-
-    const removalPreview = context?.removalPreview || null;
-    const removalPreviewHeadings = [];
-    if (removalPreview?.plan) {
-      collectHeadingsFromPlan(removalPreviewHeadings, removalPreview.plan);
-      removalPreviewHeadings.sort((a, b) => a.idx - b.idx);
-    }
-
-    const unmatched = Array.isArray(plan.unmatchedActions) ? plan.unmatchedActions : [];
-
-    const summaryLines = [];
-    summaryLines.push(`<strong>${headings.length}</strong> headings detected.`);
-    summaryLines.push(`Style map entries: <strong>${plan.styleMapSize || 0}</strong> (${plan.hasStylesXml ? 'styles.xml present' : 'styles.xml missing'})`);
-    summaryLines.push(`Visibility actions: <strong>${Object.keys(context.visibilityMap || {}).length}</strong>.`);
-    const hiddenTargets = headings.filter(h => (h.action || '').toUpperCase() === 'HIDE').length;
-    summaryLines.push(`Headings flagged for removal: <strong>${hiddenTargets}</strong>.`);
-    if (removalPreviewHeadings.length) summaryLines.push(`Headings after removal preview: <strong>${removalPreviewHeadings.length}</strong>.`);
-    if (removalPreview?.bytes instanceof Uint8Array) summaryLines.push(`Removal preview DOCX size: <strong>${removalPreview.bytes.length}</strong> bytes.`);
-    if (unmatched.length) summaryLines.push(`Unmatched actions: ${unmatched.join(', ')}`);
-    if (removalPreview?.error) summaryLines.push(`Removal preview failed: ${describeDebugError(removalPreview.error)}`);
-    else if (removalPreview?.planError) summaryLines.push(`Removal preview inspection failed: ${describeDebugError(removalPreview.planError)}`);
-
-    summary.innerHTML = summaryLines.map(line => `<div>${line}</div>`).join('');
-    overlay.appendChild(summary);
-
-    const makeTable = () => {
-      const table = document.createElement('table');
-      table.style.width = '100%';
-      table.style.borderCollapse = 'collapse';
-      table.style.marginBottom = '12px';
-      table.style.fontSize = '13px';
-      return table;
-    };
-
-    const headingsWrap = document.createElement('div');
-    const headingTitle = document.createElement('h4');
-    headingTitle.textContent = 'Detected headings';
-    headingTitle.style.margin = '0 0 6px';
-    headingTitle.style.fontSize = '14px';
-    headingTitle.style.fontWeight = '600';
-    headingsWrap.appendChild(headingTitle);
-
-    if (plan.error) {
-      const err = document.createElement('div');
-      err.textContent = `Unable to analyse document (${plan.error}).`;
-      err.style.color = '#b91c1c';
-      headingsWrap.appendChild(err);
-    }
-
-    if (headings.length) {
-      const table = makeTable();
-      const thead = document.createElement('thead');
-      const headerRow = document.createElement('tr');
-      ['Idx', 'Lvl', 'Action', 'Detected by', 'Text'].forEach(text => {
-        const th = document.createElement('th');
-        th.textContent = text;
-        th.style.textAlign = 'left';
-        th.style.padding = '4px 6px';
-        th.style.borderBottom = '1px solid rgba(15,23,42,0.1)';
-        headerRow.appendChild(th);
-      });
-      thead.appendChild(headerRow);
-      table.appendChild(thead);
-
-      const tbody = document.createElement('tbody');
-      headings.forEach(h => {
-        const row = document.createElement('tr');
-        row.style.borderBottom = '1px solid rgba(15,23,42,0.08)';
-        if (h.action === 'HIDE') row.style.background = 'rgba(239,68,68,0.08)';
-        else if (h.action === 'SHOW') row.style.background = 'rgba(34,197,94,0.1)';
-        const cells = [
-          String(h.idx),
-          String(h.level ?? ''),
-          String(h.action || ''),
-          h.detectedBy || '',
-          `${h.text || ''}${h.part ? ` (${h.part})` : ''}`
-        ];
-        cells.forEach((value, i) => {
-          const td = document.createElement('td');
-          td.textContent = value;
-          td.style.padding = '4px 6px';
-          if (i === 2) td.style.textTransform = 'uppercase';
-          row.appendChild(td);
-        });
-        tbody.appendChild(row);
-      });
-      table.appendChild(tbody);
-      headingsWrap.appendChild(table);
-    } else if (!plan.error) {
-      const empty = document.createElement('div');
-      empty.textContent = 'No headings were detected in the document.';
-      headingsWrap.appendChild(empty);
-    }
-
-    if (unmatched.length) {
-      const warn = document.createElement('div');
-      warn.textContent = `Indices without matching headings: ${unmatched.join(', ')}`;
-      warn.style.color = '#b45309';
-      warn.style.marginBottom = '8px';
-      headingsWrap.appendChild(warn);
-    }
-
-    overlay.appendChild(headingsWrap);
-
-    const controls = document.createElement('div');
-    controls.style.display = 'flex';
-    controls.style.flexWrap = 'wrap';
-    controls.style.gap = '8px';
-    controls.style.marginTop = '12px';
-
-    const copyBtn = document.createElement('button');
-    copyBtn.type = 'button';
-    copyBtn.className = 'ghost';
-    copyBtn.textContent = 'Copy JSON';
-    copyBtn.addEventListener('click', async () => {
-      try {
-        const json = stringifyExportDebugSnapshot(plan, context);
-        await navigator.clipboard.writeText(json);
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
-      } catch {
-        copyBtn.textContent = 'Copy failed';
-        setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
-      }
-    });
-    controls.appendChild(copyBtn);
-
-    const downloadBtn = document.createElement('button');
-    downloadBtn.type = 'button';
-    downloadBtn.className = 'ghost';
-    downloadBtn.textContent = 'Download JSON';
-    downloadBtn.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      try {
-        const json = stringifyExportDebugSnapshot(plan, context);
-        const blob = new Blob([json], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = (currentDoc?.name || 'document') + ' - export-debug.json';
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
-      } catch (err) {
-        console.warn('Download debug JSON failed:', err);
-      }
-    });
-    controls.appendChild(downloadBtn);
-
-    overlay.appendChild(controls);
-
-    const details = document.createElement('details');
-    details.style.marginTop = '10px';
-    const summaryEl = document.createElement('summary');
-    summaryEl.textContent = 'Raw debug payload';
-    summaryEl.style.cursor = 'pointer';
-    const pre = document.createElement('pre');
-    pre.style.whiteSpace = 'pre-wrap';
-    pre.style.fontSize = '12px';
-    pre.textContent = stringifyExportDebugSnapshot(plan, context);
-    details.appendChild(summaryEl);
-    details.appendChild(pre);
-    overlay.appendChild(details);
-
-    document.body.appendChild(overlay);
-    try { overlay.focus({ preventScroll: true }); } catch {}
-    exportDebugEscHandler = (ev) => { if (ev.key === 'Escape') clearExportDebugPanel(); };
-    document.addEventListener('keydown', exportDebugEscHandler);
-  }
-
-  async function onExportDebugFromOpenForm() {
-    if (!currentDoc?.docId) { alert('No active document. Open or pick a DOCX first.'); return; }
-
-    try {
-      if (btnExportDebug) btnExportDebug.disabled = true;
-
-      const prepared = await gatherExportArtifacts();
-      if (!prepared) { alert('Could not access the current DOCX bytes.'); return; }
-
-      const inspectionBytes = prepared.preRemovalBytes || prepared.updatedBytes;
-
-      const plan = (typeof window.inspectRemovalPlan === 'function')
-        ? await window.inspectRemovalPlan(inspectionBytes, prepared.visibilityMap)
-        : { error: 'inspectRemovalPlan not available on window' };
-
-      let removalPreview = null;
-      try {
-        const { bytes: removalBytes } = await applyRemovalIfNeeded(
-          (inspectionBytes instanceof Uint8Array ? inspectionBytes : new Uint8Array(inspectionBytes)),
-          prepared.visibilityMap || {},
-          prepared.originalBytes
-        );
-
-        let previewPlan = null;
-        let previewPlanError = null;
-        try {
-          previewPlan = (typeof window.inspectRemovalPlan === 'function')
-            ? await window.inspectRemovalPlan(removalBytes, {})
-            : { error: 'inspectRemovalPlan not available on window' };
-        } catch (planErr) {
-          previewPlanError = normalizeDebugError(planErr);
-        }
-
-        removalPreview = {
-          bytes: removalBytes,
-          plan: previewPlan,
-          planError: previewPlanError || (previewPlan?.error || null),
-        };
-      } catch (removalErr) {
-        removalPreview = { error: normalizeDebugError(removalErr) };
-      }
-
-      const debugContext = { ...prepared, removalPreview };
-
-      // Keep logs simple (no groups)
-      console.log('[ExportDebug] visibilityMap', prepared.visibilityMap);
-      console.log('[ExportDebug] plan (before)', plan);
-      console.log('[ExportDebug] removalPreview', removalPreview);
-
-      renderExportDebugPanel(plan, debugContext);
-    } catch (e) {
-      console.error('Export debug failed:', e);
-      alert('Export debug failed: ' + (e?.message || e));
-    } finally {
-      if (btnExportDebug) btnExportDebug.disabled = !currentDoc;
-    }
-  }
-
-  async function onExportFromOpenForm() {
-    if (!currentDoc?.docId) { alert('No active document. Open or pick a DOCX first.'); return; }
-
-    const canBytes = await fetchWorkingDocBytes();
-    if (!canBytes) { await hardResetOpenForm('no bytes / no permission'); return; }
-
-    let fileHandle = null;
-    let skipPickerReason = '';
-
-    if (supportsFS && window.showSaveFilePicker) {
-      try {
-        const suggested = (currentDoc.name?.replace(/\.docx$/i, '') || 'document') + ' (export).docx';
-        fileHandle = await showSaveFilePicker({
-          suggestedName: suggested,
-          types: [{
-            description: 'Word document',
-            accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
-          }]
-        });
-      } catch (e) {
-        const msg = String(e?.message || '');
-        if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
-        if (e?.name === 'SecurityError' || e?.name === 'NotAllowedError' || /Must be handling a user gesture/i.test(msg)) {
-          skipPickerReason = e?.name || 'SecurityError';
-        } else {
-          console.error('Save picker failed:', e);
-          alert('Export failed: ' + (e?.message || e));
-          return;
-        }
-      }
-    }
-
-    const attempt = async () => {
-      setStatus('Exporting…');
-
-      const prepared = await gatherExportArtifacts(canBytes);
-      if (!prepared) { await hardResetOpenForm('no bytes / no permission'); return; }
-
-      const docId = currentDoc.docId;
-
-      const inspectionBytes = prepared.preRemovalBytes || prepared.updatedBytes;
-      const baseU8 = (inspectionBytes instanceof Uint8Array) ? inspectionBytes : new Uint8Array(inspectionBytes);
-
-      // Apply removal to exported bytes (critical)
-      const { bytes: finalBytesU8, applied: removalAppliedNow } = await applyRemovalIfNeeded(
-        baseU8,
-        prepared.visibilityMap || {},
-        prepared.originalBytes
-      );
-
-      // Persist state + cache bytes (final)
-      try {
-        const payloadObj = prepared.payloadObj || (prepared.payload ? JSON.parse(prepared.payload) : null);
-
-        const nextState = {
-          schema: prepared.effectiveSchema || schema,
-          values: prepared.safeValues || {},
-          tagMap: prepared.cleanTagMap || {},
-          rules: prepared.headingRules || [],
-          fieldRules: prepared.fieldRulesForDoc || [],
-          rulesVersion: prepared.rulesVersion,
-          headingsFlat: prepared.baselineHeadingsFlat || [],
-          headingsTree: prepared.baselineHeadingsTree || [],
-          schemaUpdatedAt: new Date().toISOString(),
-          cronos_payload: payloadObj || undefined,
-          CRONOS_PAYLOAD: payloadObj || undefined,
-          lastExport: {
-            ts: Date.now(),
-            removalApplied: !!(prepared.removalApplied || removalAppliedNow),
-            visibilityKeys: prepared.visibilityMap ? Object.keys(prepared.visibilityMap).length : 0,
-            hideCount: countHideActions(prepared.visibilityMap || {})
-          },
-          lastVisibilityMap: prepared.visibilityMap || {}
-        };
-
-        await window.formSuitePersist.saveState(docId, nextState);
-      } catch (e) {
-        console.warn('Export: state persistence failed (continuing):', e);
-      }
-
-      try { await window.formSuitePersist.putBytes?.(docId, finalBytesU8); }
-      catch (e) { console.warn('Export: putBytes failed:', e); }
-
-      // Keep pre-removal copy for debugging
-      try {
-        const pre = (prepared.preRemovalBytes || prepared.updatedBytes);
-        const preU8 = pre instanceof Uint8Array ? pre : new Uint8Array(pre);
-        await window.formSuitePersist.putBytes?.(docId + '::preRemoval', preU8);
-      } catch (e) {
-        console.warn('Export: preRemoval cache failed (continuing):', e);
-      }
-
-      try { window.broadcastStateUpdated && window.broadcastStateUpdated(docId); } catch {}
-      try { window.broadcastSchemaUpdated && window.broadcastSchemaUpdated(docId); } catch {}
-
-      // Output: write to handle or download
-      let saved = false;
-
-      if (fileHandle) {
-        try {
-          const stream = await fileHandle.createWritable();
-          await stream.write(finalBytesU8);
-          await stream.close();
-          saved = true;
-        } catch (e) {
-          const msg = String(e?.message || '');
-          if (e?.name === 'AbortError' || /canceled/i.test(msg)) return;
-          console.warn('Writing to handle failed, falling back to download:', e);
-        }
-      }
-
-      if (!saved) {
-        if (skipPickerReason) console.info(`Falling back to download due to: ${skipPickerReason}`);
-        const blob = new Blob([finalBytesU8], {
-          type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        });
-        const a = document.createElement('a');
-        const safeName = (currentDoc.name?.replace(/\.docx$/i, '') || 'document') + ' (export).docx';
-        a.href = URL.createObjectURL(blob);
-        a.download = safeName;
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => {
-          try { URL.revokeObjectURL(a.href); } catch {}
-          try { a.remove(); } catch {}
-        }, 1000);
-      }
-
-      const hc = countHideActions(prepared.visibilityMap || {});
-      setStatus(`Export complete.${hc ? (removalAppliedNow ? '' : ' (no remover available)') : ''}`);
-    };
-
-    try {
-      await attempt();
-    } catch (e) {
-      const msg = String(e?.message || '');
-      if (e?.name === 'AbortError' || /export canceled/i.test(msg.toLowerCase())) return;
-      console.error('Export failed (Open Form):', e);
-      alert('Export failed: ' + (e?.message || e));
-      setStatus('Export failed — see console.');
-    }
-  }
-
-  // ============================================================
   // Expose for cross-callbacks
   // ============================================================
-  try {
-    window.applyFieldVisibility = applyFieldVisibility;
-    if (typeof window.inspectRemovalPlan === 'function') window.inspectExportRemovalPlan = window.inspectRemovalPlan;
-    window.renderExportDebugPanel = renderExportDebugPanel;
-  } catch {}
+  try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
 
+  // Keep existing behavior
   installLogoFocusNav();
   </script>
 </body>

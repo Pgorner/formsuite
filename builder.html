@@ -8,8 +8,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css">
+
+  <!-- Canonical single coordination layer -->
   <script src="persistence.js"></script>
-  <script src="fs-active-doc.js"></script>
+
+  <!-- UI helper -->
   <script src="fs-focus-nav.js"></script>
 </head>
 <body>
@@ -35,9 +38,16 @@
         <input id="formTitle" type="text" placeholder="Form title (optional)" style="flex:1; max-width:520px;" />
       </div>
       <div class="row" style="margin-top:8px; align-items:center; gap:10px; font-size:13px;">
-        <span id="docStatus" class="muted">No DOCX active.</span>
+        <span id="docStatus" class="muted">No active document. Open one in the <a href="extractor.html">Extractor</a>.</span>
         <span class="dot"></span>
         <span id="fieldCount" class="muted">0 fields</span>
+      </div>
+
+      <!-- Canonical permission banner (same semantics as index) -->
+      <div id="permNote" class="note warn" style="display:none; margin-top:10px">
+        This DOCX was opened via picker but I don’t have write permission to the original file.
+        Exports will download a copy instead of writing back.
+        <button id="btnRegrant" class="ghost" style="margin-left:8px">Grant write access</button>
       </div>
     </section>
 
@@ -112,200 +122,208 @@
   </main>
 
   <script>
-    // ---------- State ----------
-    const STORAGE_KEY = 'FORM_SCHEMA_V1';
-    const OLD_STORAGE_KEY = 'formSuite.builder.schema';
-    const els = {
-      formTitle: document.getElementById('formTitle'),
-      docStatus: document.getElementById('docStatus'),
-      fieldCount: document.getElementById('fieldCount'),
-      tbodyFields: document.getElementById('tbodyFields'),
-      fieldTable: document.getElementById('fieldTable'),
-      builderStatus: document.getElementById('builderStatus'),
+  'use strict';
 
-      pType: document.getElementById('pType'),
-      pId: document.getElementById('pId'),
-      pLabel: document.getElementById('pLabel'),
-      pRequired: document.getElementById('pRequired'),
-      typeSpecific: document.getElementById('typeSpecific'),
-
-      btnAdd: document.getElementById('btnAdd'),
-      btnDelete: document.getElementById('btnDelete'),
-      btnCancel: document.getElementById('btnCancel'),
-    };
-
-    let currentDoc = null; // from persistence
-    const FORM_BUILDER = {
-      schema: { title: 'Untitled form', fields: [] },
-      selectedIndex: -1,
-      getSchema() { return this.schema; },
-      getValues() { return window.formSuitePersist?.getLastKnownValues?.(currentDoc?.docId) || {}; }
-    };
-
-    // ---------- Broadcast helper (schema-updated) ----------
-    const __bcastLegacy = ('BroadcastChannel' in window) ? new BroadcastChannel('form-suite-doc') : null;
-    const __bcastCanon  = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
-    function broadcastSchemaUpdated(docId) {
-      const msg = { type: 'schema-updated', docId: docId || null, ts: Date.now() };
-      try { __bcastLegacy?.postMessage(msg); } catch {}
-      try { __bcastCanon?.postMessage(msg); } catch {}
-    }
-
-    // ---------- File-Guard helpers ----------
-    function loadDocStatus() {
-      if (currentDoc?.docTitle || currentDoc?.name) {
-        els.docStatus.textContent = `DOCX: ${currentDoc.docTitle || currentDoc.name}`;
-        els.docStatus.classList.remove('muted');
-      } else {
-        els.docStatus.innerHTML = 'No DOCX active.';
-        els.docStatus.classList.add('muted');
-      }
-    }
-    function setStatus(msg, ok) {
-      els.builderStatus.textContent = msg || '';
-      els.builderStatus.style.color = ok ? 'var(--good,#0a7)' : 'var(--muted,#6b7280)';
-      if (msg) setTimeout(() => { els.builderStatus.textContent=''; }, 1200);
-    }
-
-    async function hardResetBuilder(reason = '') {
-      try {} catch {}
-      FORM_BUILDER.schema = { title: 'Untitled form', fields: [] };
-      FORM_BUILDER.selectedIndex = -1;
-      els.formTitle.value = '';
-      renderAll({ persist:false });
-      els.docStatus.innerHTML = reason ? `No DOCX active (${reason}).` : 'No DOCX active.';
-      els.docStatus.classList.add('muted');
-      setStatus('Cleared', true);
-    }
-
-    // Check if we still have byte access to active doc; otherwise reset
-    async function ensureActiveOrReset() {
-      try {
-        currentDoc = readActiveDocSync() || currentDoc;
-        if (!currentDoc?.docId) {
-          const draft = loadLS() || { title: 'Untitled form', fields: [] };
-          FORM_BUILDER.schema = draft;
-          els.formTitle.value = draft.title || '';
-          renderAll({ persist:false });
-          els.docStatus.textContent = 'No DOCX active.';
-          els.docStatus.classList.add('muted');
-          return;
+  // ============================================================
+  // TRACE (debug logs everywhere) — matches index approach
+  // ============================================================
+  (function ensureTrace() {
+    if (typeof window.TRACE === 'function') return;
+    const DEBUG = { on: true, seq: 0 };
+    const ts = () => new Date().toISOString().slice(11, 23);
+    window.TRACE = function TRACE(name, details) {
+      const id = ++DEBUG.seq;
+      const prefix = `[Builder ${ts()} #${id}] ${name}`;
+      if (DEBUG.on) console.log(prefix, details ?? '');
+      const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      return {
+        step(msg, data) { if (DEBUG.on) console.log(`${prefix}  ↳ ${msg}`, data ?? ''); },
+        warn(msg, data) { if (DEBUG.on) console.warn(`${prefix}  ⚠ ${msg}`, data ?? ''); },
+        error(msg, err) { if (DEBUG.on) console.error(`${prefix}  ✖ ${msg}`, err); },
+        end(extra) {
+          if (!DEBUG.on) return;
+          const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+          const ms = Math.round((t1 - t0) * 1000) / 1000;
+          console.log(`${prefix} done (${ms}ms)`, extra ?? '');
         }
-        // Active doc → reload workspace state (no LS fallback)
-        const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-        FORM_BUILDER.schema = st?.schema || { title: 'Untitled form', fields: [] };
-        els.formTitle.value = FORM_BUILDER.schema.title || '';
-        renderAll({ persist:false });
-        els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
-        els.docStatus.classList.remove('muted');
-      } catch (e) {
-        console.warn('ensureActiveOrReset failed:', e);
+      };
+    };
+  })();
+
+  // ============================================================
+  // Canonical single coordination layer
+  // ============================================================
+  function P() { return window.formSuitePersist; }
+
+  // Canonical channels (match persistence.js + index)
+  const BC_ACTIVE  = 'fs-active-doc';
+  const BC_PAYLOAD = 'fs-payload-v1';
+
+  // ============================================================
+  // DOM
+  // ============================================================
+  const els = {
+    formTitle: document.getElementById('formTitle'),
+    docStatus: document.getElementById('docStatus'),
+    fieldCount: document.getElementById('fieldCount'),
+    tbodyFields: document.getElementById('tbodyFields'),
+    fieldTable: document.getElementById('fieldTable'),
+    builderStatus: document.getElementById('builderStatus'),
+
+    pType: document.getElementById('pType'),
+    pId: document.getElementById('pId'),
+    pLabel: document.getElementById('pLabel'),
+    pRequired: document.getElementById('pRequired'),
+    typeSpecific: document.getElementById('typeSpecific'),
+
+    btnAdd: document.getElementById('btnAdd'),
+    btnDelete: document.getElementById('btnDelete'),
+    btnCancel: document.getElementById('btnCancel'),
+
+    permNote: document.getElementById('permNote'),
+    btnRegrant: document.getElementById('btnRegrant'),
+  };
+
+  function setStatus(msg, ok) {
+    els.builderStatus.textContent = msg || '';
+    els.builderStatus.style.color = ok ? 'var(--good,#0a7)' : 'var(--muted,#6b7280)';
+    if (msg) setTimeout(() => { els.builderStatus.textContent=''; }, 1200);
+  }
+
+  // ============================================================
+  // App State (in-memory)
+  // ============================================================
+  let currentDoc = null; // {docId, name}
+  const BUILDER = {
+    schema: { title: 'Untitled form', fields: [] },
+    selectedIndex: -1,
+  };
+
+  // Local fallback (ONLY when no active doc) — matches index fallback key
+  const LS_SCHEMA_FALLBACK = 'FORM_SCHEMA_V1';
+  const OLD_STORAGE_KEY = 'formSuite.builder.schema';
+  function saveLocalSchemaFallback(s) {
+    try { localStorage.setItem(LS_SCHEMA_FALLBACK, JSON.stringify(s || {})); } catch {}
+  }
+  function loadLocalSchemaFallback() {
+    try {
+      const v = localStorage.getItem(LS_SCHEMA_FALLBACK);
+      if (v) return JSON.parse(v);
+      const old = localStorage.getItem(OLD_STORAGE_KEY);
+      if (old) {
+        const parsed = JSON.parse(old);
+        localStorage.setItem(LS_SCHEMA_FALLBACK, old);
+        return parsed;
       }
+    } catch {}
+    return null;
+  }
+
+  // ============================================================
+  // Permission Banner (canonical via persistence)
+  // ============================================================
+  async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
+    const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: currentDoc?.docId });
+    try {
+      if (!('showSaveFilePicker' in window)) { els.permNote.style.display = 'none'; tr.end('unsupported'); return 'unsupported'; }
+      if (!currentDoc?.docId)               { els.permNote.style.display = 'none'; tr.end('no-doc'); return 'no-doc'; }
+
+      const h = await P()?.getHandle?.(currentDoc.docId);
+      if (!h?.queryPermission) { els.permNote.style.display = 'none'; tr.end('no-handle'); return 'no-handle'; }
+
+      let p = await h.queryPermission({ mode: 'readwrite' });
+      if (p !== 'granted' && tryPrompt) {
+        try { p = await h.requestPermission({ mode: 'readwrite' }) || p; } catch {}
+      }
+
+      els.permNote.style.display = (p === 'granted') ? 'none' : 'block';
+      tr.end({ perm: p });
+      return p || 'denied';
+    } catch (e) {
+      tr.warn('failed (showing banner)', e);
+      els.permNote.style.display = 'block';
+      tr.end('error');
+      return 'error';
     }
+  }
 
-    installActiveDocListener(async (meta) => {
-      currentDoc = meta;
+  els.btnRegrant?.addEventListener('click', async () => {
+    const tr = TRACE('btnRegrant click');
+    const p = await updateWriteAccessBanner({ tryPrompt: true });
+    tr.step('perm result', p);
+    if (p === 'granted') await refreshFromCanonical({ reason: 'regrant' });
+    tr.end();
+  });
 
-      if (!currentDoc?.docId) {
-        const draft = loadLS() || { title: 'Untitled form', fields: [] };
-        FORM_BUILDER.schema = draft;
-        els.formTitle.value = draft.title || '';
-        renderAll({ persist: false });
-        els.docStatus.textContent = 'No DOCX active.';
-        els.docStatus.classList.add('muted');
-        return;
-      }
+  // ============================================================
+  // Canonical hydration: only via persistence helper
+  // - Purpose: if workspace is empty but DOCX contains payload, populate workspace
+  // - Safe: only runs when workspace is empty (persistence enforces this)
+  // ============================================================
+  async function hydrateWorkspaceIfEmpty(docId) {
+    const tr = TRACE('hydrateWorkspaceIfEmpty', { docId });
+    try {
+      if (!docId) { tr.end('no-docId'); return false; }
+      const did = await P()?.hydrateFromDocxIfEmpty?.(docId);
+      tr.end({ didHydrate: !!did });
+      return !!did;
+    } catch (e) {
+      tr.warn('failed', e);
+      tr.end('error');
+      return false;
+    }
+  }
 
-      const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-      if (st?.schema) {
-        FORM_BUILDER.schema = st.schema;
-        els.formTitle.value = st.schema.title || '';
-      } else {
-        FORM_BUILDER.schema = { title: 'Untitled form', fields: [] };
-        els.formTitle.value = '';
-      }
-      renderAll({ persist: false });
-      els.docStatus.textContent =
-        `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
-      els.docStatus.classList.remove('muted');
-    });
+  // ============================================================
+  // Prune + migrate helpers (kept from original; now canonicalized)
+  // ============================================================
+  function slugifyMc(s) {
+    return String(s || '')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .toLowerCase();
+  }
+  function mcExtraKey(fieldId, optionValue, extraId) {
+    return `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
+  }
+  function deepClone(o) { return (o && typeof o === 'object') ? JSON.parse(JSON.stringify(o)) : o; }
 
-
-    // Focus/visibility checks
-    document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState !== 'visible') return;
-      await ensureActiveOrReset();
-    });
-    window.addEventListener('focus', async () => { await ensureActiveOrReset(); });
-
-    // ---------- Schema-aware pruning & migration (NEW) ----------
-
-    function getValidFieldIds(schema) {
-      const ids = new Set();
-      const fields = Array.isArray(schema?.fields) ? schema.fields : [];
-
-      // helper mirrors index.html
-      function slugifyMc(s) {
-        return String(s || '')
-          .normalize('NFKD')
-          .replace(/[\u0300-\u036f]/g, '')
-          .replace(/[^a-zA-Z0-9]+/g, '_')
-          .replace(/^_+|_+$/g, '')
-          .toLowerCase();
-      }
-      function mcExtraKey(fieldId, optionValue, extraId) {
-        return `${fieldId}__${slugifyMc(optionValue)}__${slugifyMc(extraId)}`;
-      }
-
-      for (const f of fields) {
-        if (f?.id) ids.add(String(f.id));
-        if (f?.type === 'multichoice' && f?.mc && Array.isArray(f.mc.groups)) {
-          for (const g of f.mc.groups) {
-            for (const it of (g.items || [])) {
-              const optVal = String(it?.value ?? it?.label ?? '');
-              const extras = Array.isArray(it?.fields) ? it.fields : [];
-              for (const ex of extras) {
-                const exId = String(ex?.id || '');
-                if (!exId) continue;
-                ids.add(mcExtraKey(f.id, optVal, exId));
-              }
+  function getValidFieldIds(schema) {
+    const ids = new Set();
+    const fields = Array.isArray(schema?.fields) ? schema.fields : [];
+    for (const f of fields) {
+      if (f?.id) ids.add(String(f.id));
+      if (String(f?.type) === 'multichoice' && f?.mc && Array.isArray(f.mc.groups)) {
+        for (const g of f.mc.groups) {
+          for (const it of (g.items || [])) {
+            const optVal = String(it?.value ?? it?.label ?? '');
+            const extras = Array.isArray(it?.fields) ? it.fields : [];
+            for (const ex of extras) {
+              const exId = String(ex?.id || '');
+              if (!exId) continue;
+              ids.add(mcExtraKey(f.id, optVal, exId));
             }
           }
         }
       }
-      return ids;
     }
+    return ids;
+  }
 
-    // Defensive copy
-    function deepClone(o) {
-      return (o && typeof o === 'object') ? JSON.parse(JSON.stringify(o)) : o;
-    }
+  async function pruneWorkspaceOnSchemaChange(docId, schema) {
+    const tr = TRACE('pruneWorkspaceOnSchemaChange', { docId, fields: schema?.fields?.length });
+    try {
+      if (!docId || !P()?.loadState) { tr.end('no-doc'); return { values:{}, tagMap:{}, rules:[] }; }
 
-    /**
-     * Prune values, tagMap, and rules so they only reference fields present in `schema`.
-     * Returns { values, tagMap, rules } (all pruned) without saving; caller should persist.
-     */
-    async function pruneWorkspaceOnSchemaChange(docId, schema) {
-      if (!docId || !window.formSuitePersist?.loadState) {
-        // No per-doc workspace yet → nothing to prune at this layer
-        return {
-          values: FORM_BUILDER.getValues?.() || {},
-          tagMap: {},
-          rules: []
-        };
-      }
-
-      const st = await window.formSuitePersist.loadState(docId) || {};
+      const st = await P().loadState(docId) || {};
       const valid = getValidFieldIds(schema);
 
-      // values: keep only keys that are valid field ids
       const values = {};
       const srcValues = st.values || {};
-      Object.keys(srcValues || {}).forEach(k => {
-        if (valid.has(k)) values[k] = srcValues[k];
-      });
+      Object.keys(srcValues || {}).forEach(k => { if (valid.has(k)) values[k] = srcValues[k]; });
 
-      // tagMap: drop any tag → fieldId mapping pointing at a deleted field
       const tagMap = {};
       const srcTagMap = st.tagMap || {};
       Object.keys(srcTagMap || {}).forEach(tag => {
@@ -313,18 +331,14 @@
         if (valid.has(fid)) tagMap[tag] = fid;
       });
 
-      // rules: drop any rule whose primary fieldId is gone.
-      // Also defensively prune rule.conditions entries that reference deleted fields.
       const srcRules = Array.isArray(st.rules) ? st.rules : [];
       const rules = [];
       for (const r of srcRules) {
         const rr = deepClone(r);
-        if (!rr || !valid.has(String(rr.fieldId || ''))) continue; // drop entire rule
-
+        if (!rr || !valid.has(String(rr.fieldId || ''))) continue;
         if (Array.isArray(rr.conditions)) {
           rr.conditions = rr.conditions.filter(c => {
             if (!c) return false;
-            // If a condition targets another field, drop if that field is gone.
             const refId = c.fieldId || c.leftFieldId || c.rightFieldId;
             return !refId || valid.has(String(refId));
           });
@@ -332,32 +346,30 @@
         rules.push(rr);
       }
 
+      tr.end({ prunedValues: Object.keys(values).length, prunedTags: Object.keys(tagMap).length, prunedRules: rules.length });
       return { values, tagMap, rules };
+    } catch (e) {
+      tr.warn('failed', e);
+      tr.end('error');
+      return { values:{}, tagMap:{}, rules:[] };
     }
+  }
 
-    /**
-     * Migrate workspace state when a field was renamed from oldId → newId.
-     * We update values, tagMap, and rules (field targets & condition references).
-     * Returns { values, tagMap, rules } (migrated) without saving; caller should persist.
-     */
-    async function migrateWorkspaceOnFieldRename(docId, oldId, newId) {
-      if (!docId || !oldId || !newId || oldId === newId) return null;
-      const st = await window.formSuitePersist.loadState?.(docId) || {};
+  async function migrateWorkspaceOnFieldRename(docId, oldId, newId) {
+    const tr = TRACE('migrateWorkspaceOnFieldRename', { docId, oldId, newId });
+    try {
+      if (!docId || !oldId || !newId || oldId === newId) { tr.end('skip'); return null; }
+      const st = await P()?.loadState?.(docId) || {};
 
-      // values
       const values = deepClone(st.values || {});
       if (Object.prototype.hasOwnProperty.call(values, oldId) && !Object.prototype.hasOwnProperty.call(values, newId)) {
         values[newId] = values[oldId];
         delete values[oldId];
       }
 
-      // tagMap
       const tagMap = deepClone(st.tagMap || {});
-      Object.keys(tagMap).forEach(tag => {
-        if (tagMap[tag] === oldId) tagMap[tag] = newId;
-      });
+      Object.keys(tagMap).forEach(tag => { if (tagMap[tag] === oldId) tagMap[tag] = newId; });
 
-      // rules
       const rules = Array.isArray(st.rules) ? deepClone(st.rules) : [];
       for (const r of rules) {
         if (r?.fieldId === oldId) r.fieldId = newId;
@@ -371,1471 +383,1563 @@
         }
       }
 
+      tr.end({ migrated: true });
       return { values, tagMap, rules };
-    }
-
-
-    // ---------- Helpers ----------
-    function saveLS(schema) {
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(schema)); } catch {}
-    }
-    function loadLS() {
-      try {
-        const v = localStorage.getItem(STORAGE_KEY);
-        if (v) return JSON.parse(v);
-        const old = localStorage.getItem(OLD_STORAGE_KEY);
-        if (old) {
-          const parsed = JSON.parse(old);
-          localStorage.setItem(STORAGE_KEY, old);
-          return parsed;
-        }
-      } catch {}
+    } catch (e) {
+      tr.warn('failed', e);
+      tr.end('error');
       return null;
     }
-    function escapeHtml(s){
-      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-
-    function fieldDetails(f) {
-      if (f.type === 'date') return `Datepicker (${f.dateFormat || 'Y-m-d'})`;
-      if (f.type === 'select') {
-        const opts = Array.isArray(f.options) ? f.options : [];
-        return `Select: ${opts.join(', ') || '—'}`;
-      }
-      if (f.type === 'multichoice') {
-        const groups = Array.isArray(f.mc?.groups) ? f.mc.groups : [];
-        const optCount = groups.length
-          ? groups.reduce((n, g) => n + (g.items?.length || 0), 0)
-          : (Array.isArray(f.options) ? f.options.length : 0);
-        const extras = groups.reduce((n,g)=> n + (g.items||[]).reduce((m,it)=> m + (Array.isArray(it.fields)? it.fields.length:0), 0), 0);
-        const gTxt = groups.length ? `${groups.length} group${groups.length>1?'s':''}` : '1 group';
-        return `Multiple: ${optCount || 0} option(s) in ${gTxt}${extras?`, ${extras} extra field(s)`:''}`;
-      }
-      if (f.type === 'table') {
-        const cols = (f.columns||[]).map(c => `${c.label||c.id}${c.type?`:${c.type}${(c.type==='select'&&c.options?.length)?':'+c.options.join('/'):''}`:''}`);
-        return `Table with ${f.columns?.length||0} column(s)${(f.minRows||f.maxRows)?` ${f.minRows||0}–${f.maxRows||'∞'}`:''} → [ ${cols.join(' | ')} ]`;
-      }
-      if (f.type === 'datediff') {
-        return `Δ ${f.fromId || '—'} → ${f.toId || '—'} (D-M-Y)`;
-      }
-      return '';
-    }
-
-
-    // ---------- Type-specific UI ----------
-    function renderTypeSpecific() {
-      const t = els.pType.value;
-      const wrap = els.typeSpecific;
-      wrap.innerHTML = '';
-
-      // Helper: list current date field ids
-      function listDateFieldIds() {
-        return (FORM_BUILDER.schema?.fields || [])
-          .filter(x => x?.type === 'date')
-          .map(x => x.id);
-      }
-
-      if (t === 'select') {
-        const div = document.createElement('div');
-        div.innerHTML = `
-          <label class="small">Options (comma separated)</label><br/>
-          <input id="pOptions" type="text" placeholder="e.g. Red, Green, Blue" />
-        `;
-        wrap.appendChild(div);
-
-      } else if (t === 'multichoice') {
-        // NEW — advanced, grouped designer with conditional extras
-        const div = document.createElement('div');
-        div.innerHTML = `
-          <div class="tdz-toolbar">
-            <div><strong>Multi-Choice</strong></div>
-          </div>
-          <div id="mcDesigner"></div>
-          <input id="pMcJson" type="hidden" />
-        `;
-        wrap.appendChild(div);
-
-        // init designer
-        window.MultiChoiceDesigner?.destroy?.(); // no-op for now
-        window.MultiChoiceDesigner = createMultiChoiceDesigner({
-          hostEl: div.querySelector('#mcDesigner')
-        });
-
-        // If editing an existing field, load happens in loadFieldIntoEditor();
-        // Otherwise show an empty designer.
-        window.MultiChoiceDesigner.loadModel({ groups: [] });
-
-      } else if (t === 'date') {
-        const div = document.createElement('div');
-        div.innerHTML = `
-          <label class="small">Format</label><br/>
-          <input id="pDateFmt" type="text" placeholder="Y-m-d" />
-        `;
-        wrap.appendChild(div);
-
-      } else if (t === 'table') {
-        const div = document.createElement('div');
-        div.innerHTML = `
-          <div class="tdz-toolbar">
-            <div>
-              <strong>Tabellen-Spalten</strong>
-              <span class="tdz-muted" id="tdzCount"></span>
-            </div>
-          </div>
-
-          <div id="tdzList" aria-live="polite"></div>
-
-          <div class="row" style="margin-top:8px; justify-content:flex-end;">
-            <button type="button" id="tdzAddBottom">+ Spalte hinzufügen</button>
-          </div>
-
-          <div class="row" style="gap:12px; margin-top:10px;">
-            <div class="tdz-col">
-              <label class="small">Min rows</label>
-              <input id="pMinRows" type="number" value="0" min="0" style="width:140px"/>
-            </div>
-            <div class="tdz-col">
-              <label class="small">Max rows</label>
-              <input id="pMaxRows" type="number" value="0" min="0" style="width:140px"/>
-            </div>
-          </div>
-          <input id="pCols" type="hidden" />
-        `;
-        wrap.appendChild(div);
-
-        window.TableDesigner?.destroy?.();
-        window.TableDesigner = createTableDesigner({
-          listEl: wrap.querySelector('#tdzList'),
-          countEl: wrap.querySelector('#tdzCount'),
-          addBtn:  wrap.querySelector('#tdzAddBottom'),
-          hiddenColsEl: wrap.querySelector('#pCols'),
-          minEl: wrap.querySelector('#pMinRows'),
-          maxEl: wrap.querySelector('#pMaxRows'),
-        });
-
-      } else if (t === 'datediff') {
-        const dateIds = listDateFieldIds();
-        const none = !dateIds.length;
-
-        const div = document.createElement('div');
-        div.innerHTML = `
-          <div class="row" style="gap:10px; flex-wrap:wrap;">
-            <div>
-              <label class="small">From (date field)</label><br/>
-              <select id="pFromId" ${none ? 'disabled' : ''}></select>
-            </div>
-            <div>
-              <label class="small">To (date field)</label><br/>
-              <select id="pToId" ${none ? 'disabled' : ''}></select>
-            </div>
-          </div>
-          ${none ? `<div class="note warn" style="margin-top:8px;">You need at least two <em>date</em> fields in the form to wire a datediff.</div>` : ''}
-          <div class="muted" style="margin-top:6px;">Output format: <code>D-M-Y (valueInDays)</code></div>
-        `;
-        wrap.appendChild(div);
-
-        // populate selects
-        const fromSel = div.querySelector('#pFromId');
-        const toSel   = div.querySelector('#pToId');
-        if (!none) {
-          dateIds.forEach(id => {
-            const o1 = document.createElement('option'); o1.value = id; o1.textContent = id; fromSel.appendChild(o1);
-            const o2 = document.createElement('option'); o2.value = id; o2.textContent = id; toSel.appendChild(o2);
-          });
-        }
-      }
-
-      // Hide/disable "required" for datediff (computed)
-      const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
-      if (t === 'datediff') {
-        els.pRequired.checked = false;
-        if (reqContainer) reqContainer.style.display = 'none';
-      } else {
-        if (reqContainer) reqContainer.style.display = '';
-      }
-    }
-
-    // ---------- Table Designer (visual editor for table columns) ----------
-    function createTableDesigner(cfg) {
-      let model = []; // [{id,label,type,options:[]}]
-      const TYPES = ['text','number','select','date'];
-
-      const api = {
-        loadColumns(colsArr = []) {
-          model = (colsArr || []).map(c => ({
-            id: String(c.id || '').trim() || 'col',
-            label: String(c.label != null ? c.label : c.id || 'col'),
-            type: TYPES.includes(c.type) ? c.type : 'text',
-            options: Array.isArray(c.options) ? c.options.map(o => String(o)) : []
-          }));
-          render();
-        },
-        setMinMax(min, max) {
-          if (cfg.minEl) cfg.minEl.value = String(parseInt(min || 0, 10) || 0);
-          if (cfg.maxEl) cfg.maxEl.value = String(parseInt(max || 0, 10) || 0);
-        },
-        getColumns() {
-          return model.slice();
-        },
-        toLegacyString() {
-          // id:label[:type[:opt1/opt2]]
-          const parts = model.map(c => {
-            const base = `${c.id}:${c.label}${c.type && c.type!=='text' ? `:${c.type}`:''}`;
-            if (c.type === 'select' && c.options?.length) return `${base}:${c.options.join('/')}`;
-            return base;
-          });
-          return parts.join(', ');
-        },
-        serializeToHidden() {
-          if (cfg.hiddenColsEl) cfg.hiddenColsEl.value = api.toLegacyString();
-        },
-        addEmpty() {
-          const baseId = 'col';
-          let n = 1;
-          let candidate = baseId;
-          const ids = new Set(model.map(c => c.id));
-          while (ids.has(candidate)) { n++; candidate = baseId + n; }
-          model.push({ id: candidate, label: candidate.toUpperCase(), type:'text', options:[] });
-          render();
-        },
-        move(idx, dir) {
-          const j = idx + dir;
-          if (idx < 0 || j < 0 || idx >= model.length || j >= model.length) return;
-          [model[idx], model[j]] = [model[j], model[idx]];
-          render();
-        },
-        remove(idx) {
-          model.splice(idx, 1);
-          render();
-        },
-        destroy() { /* future cleanup hook */ }
-      };
-
-      function render() {
-        if (cfg.countEl) cfg.countEl.textContent = model.length ? `· ${model.length} Spalten` : '· keine Spalten';
-        if (cfg.listEl) cfg.listEl.innerHTML = '';
-
-        model.forEach((col, idx) => {
-          const row = document.createElement('div');
-          row.className = 'tdz-row';
-
-          // ID
-          const cId = document.createElement('div'); cId.className = 'tdz-col';
-          cId.innerHTML = `<label class="small">ID</label>`;
-          const inId = document.createElement('input'); inId.value = col.id; inId.placeholder = 'e.g. sku';
-          inId.addEventListener('input', () => { col.id = inId.value.trim(); api.serializeToHidden(); });
-          cId.appendChild(inId);
-
-          // Label
-          const cLabel = document.createElement('div'); cLabel.className = 'tdz-col tdz-grow';
-          cLabel.innerHTML = `<label class="small">Label</label>`;
-          const inLabel = document.createElement('input'); inLabel.value = col.label; inLabel.placeholder = 'z. B. Artikelnummer';
-          inLabel.addEventListener('input', () => { col.label = inLabel.value; api.serializeToHidden(); });
-          cLabel.appendChild(inLabel);
-
-          // Typ
-          const cType = document.createElement('div'); cType.className = 'tdz-col';
-          cType.innerHTML = `<label class="small">Typ</label>`;
-          const sel = document.createElement('select');
-          TYPES.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t; sel.appendChild(o); });
-          sel.value = col.type;
-          cType.appendChild(sel);
-
-          // Actions (row-level)
-          const actions = document.createElement('div'); actions.className = 'tdz-actions';
-          const up = document.createElement('button');   up.type='button';   up.textContent='▲'; up.title='Hoch';
-          const down = document.createElement('button'); down.type='button'; down.textContent='▼'; down.title='Runter';
-          const del = document.createElement('button');  del.type='button';  del.className='danger'; del.textContent='Löschen';
-          up.addEventListener('click',   () => api.move(idx, -1));
-          down.addEventListener('click', () => api.move(idx, +1));
-          del.addEventListener('click',  () => api.remove(idx));
-          actions.appendChild(up); actions.appendChild(down); actions.appendChild(del);
-
-          // Compose header cells
-          row.appendChild(cId);
-          row.appendChild(cLabel);
-          row.appendChild(cType);
-          row.appendChild(actions);
-
-          // ===== OPTIONS (INSIDE THIS ROW, FULL-WIDTH BELOW) =====
-          const cOpts = document.createElement('div');
-          cOpts.className = 'tdz-col tdz-grow tdz-col--opts';
-          cOpts.style.gridColumn = '1 / -1';
-          cOpts.innerHTML = `<label class="small">Optionen (nur bei Select)</label>`;
-
-          const optWrap = document.createElement('div'); optWrap.className = 'tdz-chipwrap';
-          const optAddWrap = document.createElement('div'); optAddWrap.className = 'tdz-opts';
-
-          const inOpt = document.createElement('input'); inOpt.placeholder = 'Option eingeben…';
-          // Buttons: Add | Save | Cancel (Cancel visible via border)
-          const btnAddOpt = document.createElement('button'); btnAddOpt.type='button'; btnAddOpt.textContent='Hinzufügen';
-
-          const btnSave = document.createElement('button'); btnSave.type='button'; btnSave.textContent='Speichern';
-          btnSave.style.display = 'none';
-
-          const btnCancel = document.createElement('button'); btnCancel.type='button'; btnCancel.textContent='Abbrechen';
-          btnCancel.style.display = 'none';
-          // make cancel a bordered "ghost" so it never blends into white
-          btnCancel.style.background = 'transparent';
-          btnCancel.style.border = '1px solid var(--border, #e5e7eb)';
-          btnCancel.style.color = 'var(--ink, #0f172a)';
-
-          let editIdx = -1;
-          function enterEdit(i) {
-            editIdx = i;
-            inOpt.value = col.options[i] ?? '';
-            btnAddOpt.style.display = 'none';
-            btnSave.style.display = '';
-            btnCancel.style.display = '';
-            inOpt.focus(); inOpt.select();
-          }
-          function exitEdit() {
-            editIdx = -1;
-            inOpt.value = '';
-            btnAddOpt.style.display = '';
-            btnSave.style.display = 'none';
-            btnCancel.style.display = 'none';
-          }
-
-          btnAddOpt.addEventListener('click', () => {
-            const v = (inOpt.value || '').trim();
-            if (!v) return;
-            col.options = Array.from(new Set([...(col.options || []), v]));
-            inOpt.value = '';
-            drawChips();
-            api.serializeToHidden();
-          });
-          btnSave.addEventListener('click', () => {
-            const v = (inOpt.value || '').trim();
-            if (editIdx < 0 || !v) return;
-            col.options[editIdx] = v;
-            drawChips();
-            api.serializeToHidden();
-            exitEdit();
-          });
-          btnCancel.addEventListener('click', () => exitEdit());
-
-          optAddWrap.appendChild(inOpt);
-          optAddWrap.appendChild(btnAddOpt);
-          optAddWrap.appendChild(btnSave);
-          optAddWrap.appendChild(btnCancel);
-
-          // ---- chips (square-ish pill + drag reorder) ----
-          function drawChips() {
-            optWrap.innerHTML = '';
-
-            let dragFrom = null;
-
-            (col.options || []).forEach((o, i) => {
-              const chip = document.createElement('span');
-              chip.className = 'tdz-chip';
-              // square-ish pill with visible gray outline
-              chip.style.borderRadius = '6px';
-              chip.style.border = '1px solid var(--border, #e5e7eb)';
-              chip.style.background = '#fff';
-              chip.style.padding = '2px 8px';
-              chip.style.display = 'inline-flex';
-              chip.style.alignItems = 'center';
-              chip.style.gap = '6px';
-
-              chip.setAttribute('draggable', 'true');
-              chip.dataset.idx = String(i);
-
-              const label = document.createElement('span');
-              label.textContent = o;
-              label.style.cursor = 'text';
-              label.addEventListener('click', () => enterEdit(i));
-
-              // compact "x" with outline (always visible)
-              const x = document.createElement('button');
-              x.type = 'button';
-              x.setAttribute('aria-label', 'Option entfernen');
-              x.textContent = '×';
-              x.style.background = 'transparent';
-              x.style.border = '1px solid var(--border, #e5e7eb)';
-              x.style.borderRadius = '4px';
-              x.style.width = '20px';
-              x.style.height = '20px';
-              x.style.lineHeight = '18px';
-              x.style.fontSize = '14px';
-              x.style.padding = '0';
-              x.style.cursor = 'pointer';
-              x.style.color = '#000';
-              x.addEventListener('mouseenter', () => { x.style.color = '#6b7280'; });
-              x.addEventListener('mouseleave', () => { x.style.color = '#000'; });
-
-              x.addEventListener('click', (ev) => {
-                ev.stopPropagation();
-                col.options.splice(i, 1);
-                drawChips();
-                api.serializeToHidden();
-              });
-
-              // Drag handlers
-              chip.addEventListener('dragstart', (e) => {
-                dragFrom = i;
-                chip.classList.add('dragging');
-                try { e.dataTransfer.setData('text/plain', String(i)); } catch {}
-                e.dataTransfer.effectAllowed = 'move';
-              });
-              chip.addEventListener('dragend', () => {
-                dragFrom = null;
-                chip.classList.remove('dragging');
-                Array.from(optWrap.children).forEach(c => c.classList.remove('drop-before','drop-after'));
-              });
-              chip.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                const rect = chip.getBoundingClientRect();
-                const before = (e.clientX - rect.left) < rect.width / 2;
-                Array.from(optWrap.children).forEach(c => c.classList.remove('drop-before','drop-after'));
-                chip.classList.add(before ? 'drop-before' : 'drop-after');
-              });
-              chip.addEventListener('dragleave', () => {
-                chip.classList.remove('drop-before','drop-after');
-              });
-              chip.addEventListener('drop', (e) => {
-                e.preventDefault();
-                const from = dragFrom ?? Number(e.dataTransfer.getData('text/plain') || -1);
-                const toIdx = Number(chip.dataset.idx);
-                if (!Number.isFinite(from) || !Number.isFinite(toIdx)) return;
-
-                const rect = chip.getBoundingClientRect();
-                const before = (e.clientX - rect.left) < rect.width / 2;
-                let to = toIdx + (before ? 0 : 1);
-
-                if (from === to) { chip.classList.remove('drop-before','drop-after'); return; }
-                const arr = col.options;
-                const [moved] = arr.splice(from, 1);
-                if (to > from) to -= 1;
-                arr.splice(to, 0, moved);
-
-                chip.classList.remove('drop-before','drop-after');
-                drawChips();
-                api.serializeToHidden();
-              });
-
-              chip.appendChild(label);
-              chip.appendChild(x);
-              optWrap.appendChild(chip);
-            });
-
-            // inline helper styles for drop hints
-            Array.from(optWrap.children).forEach(el => { el.style.position = 'relative'; });
-            const styleEl = document.createElement('style');
-            styleEl.textContent = `
-              .tdz-chip.drop-before { box-shadow: inset 3px 0 0 0 rgba(59,130,246,.35); }
-              .tdz-chip.drop-after  { box-shadow: inset -3px 0 0 0 rgba(59,130,246,.35); }
-              .tdz-chip.dragging    { opacity: .6; }
-            `;
-            optWrap.querySelector('style')?.remove();
-            optWrap.appendChild(styleEl);
-          }
-          drawChips();
-
-          // Toggle visibility of options panel based on type
-          function toggleOpts() {
-            cOpts.style.display = (sel.value === 'select') ? '' : 'none';
-          }
-          sel.addEventListener('change', () => { col.type = sel.value; toggleOpts(); api.serializeToHidden(); });
-          toggleOpts();
-
-          // Mount options INSIDE this row
-          cOpts.appendChild(optWrap);
-          cOpts.appendChild(optAddWrap);
-          row.appendChild(cOpts);
-
-          // Add row to list
-          cfg.listEl.appendChild(row);
-        });
-
-        api.serializeToHidden();
-      }
-
-      cfg.addBtn?.addEventListener('click', () => api.addEmpty());
-      cfg.addBtn2?.addEventListener('click', () => api.addEmpty());
-      return api;
-    }
-
-    // ---------- MultiChoice Designer (groups + conditional fields, DnD w/ handle, now with DURATION type) ----------
-    function createMultiChoiceDesigner(cfg) {
-      // f.mc = { groups:[{ title, items:[{ value, checked, alwaysSelected, fields:[{...}] }]}] }
-      let model = { groups: [] };
-      let mcGroupDragFrom = null; // shared drag-from index across group cards
-
-      function globalDateIds() {
-        try {
-          return (FORM_BUILDER.schema?.fields || [])
-            .filter(x => x?.type === 'date')
-            .map(x => String(x.id));
-        } catch { return []; }
-      }
-      const uniq = (arr) => Array.from(new Set(arr.filter(Boolean).map(String)));
-
-      const api = {
-        loadModel(mc, legacyOptionsArr) {
-          if (mc && Array.isArray(mc.groups)) {
-            // deep copy + migrate any old "duration" → "datediff"
-            model = {
-              groups: mc.groups.map(g => ({
-                title: String(g?.title || ''),
-                items: Array.isArray(g?.items) ? g.items.map(it => ({
-                  value: String(it?.value || ''),
-                  checked: !!it?.checked,
-                  alwaysSelected: !!it?.alwaysSelected,
-                  fields: Array.isArray(it?.fields) ? it.fields.map(x => {
-                    const t = (x?.type === 'duration') ? 'datediff' : (x?.type || 'text');
-                    if (t === 'datediff') {
-                      const fromId = String(x?.fromId || '');
-                      const toId   = String(x?.toId || '');
-                      return {
-                        type: 'datediff',
-                        id: `datediff_${fromId}_${toId}` || `datediff_${Math.random().toString(36).slice(2,8)}`,
-                        label: 'Dauer',
-                        fromId, toId
-                      };
-                    }
-                    if (t === 'text' || t === 'number' || t === 'date') {
-                      return {
-                        type: t,
-                        id: String(x?.id || ''),
-                        label: String(x?.label || ''),
-                        content: String(x?.content || '')
-                      };
-                    }
-                    return { type:'text', id:'', label:'', content:'' };
-                  }) : []
-                })) : []
-              }))
-            };
-          } else if (Array.isArray(legacyOptionsArr) && legacyOptionsArr.length) {
-            model = { groups: [{ title: '', items: legacyOptionsArr.map(v => ({ value:String(v), checked:false, alwaysSelected:false, fields:[] })) }] };
-          } else {
-            model = { groups: [] };
-          }
-          render();
-        },
-        getModel() { return JSON.parse(JSON.stringify(model)); },
-        getFlatOptions() {
-          const out = [];
-          model.groups.forEach(g => g.items.forEach(it => { if (it.value) out.push(it.value); }));
-          return out;
-        }
-      };
-
-      function uid(prefix='id'){ return prefix + '_' + Math.random().toString(36).slice(2,8); }
-
-      function render() {
-        if (!cfg.hostEl) return;
-        cfg.hostEl.innerHTML = `
-          <div class="tdz-toolbar">
-            <div>
-              <strong>Gruppierte Optionen</strong>
-              <span class="tdz-muted">· ${model.groups.reduce((n,g)=>n+g.items.length,0)} Optionen in ${model.groups.length} Gruppe(n)</span>
-            </div>
-          </div>
-          <div class="mc-list"></div>
-          <div class="row" style="margin-top:8px; justify-content:flex-end;">
-            <button type="button" class="mc-add-group">+ Gruppe</button>
-          </div>
-          <input type="hidden" class="mc-hidden-json" />
-        `;
-
-        const list = cfg.hostEl.querySelector('.mc-list');
-        const hidden = cfg.hostEl.querySelector('.mc-hidden-json');
-        hidden.value = JSON.stringify(model);
-
-        const style = document.createElement('style');
-        style.textContent = `
-          .mc-item-row{ position:relative; }
-          .mc-drag { width:34px; min-width:34px; display:flex; align-items:center; justify-content:center;
-                    user-select:none; cursor:grab; color:#6b7280; border-right:1px solid var(--border,#e5e7eb); }
-          .mc-drag:active { cursor:grabbing; }
-          .mc-item-row.dragging{ opacity:.6; }
-          .mc-item-row.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
-          .mc-item-row.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
-          .mc-dd-wrap { display:flex; gap:8px; align-items:center; }
-          .mc-dd-fixed { font-size:12px; color: var(--muted,#6b7280); user-select:none; }
-        `;
-        cfg.hostEl.appendChild(style);
-
-        // Extra styles for group drop hints
-        const gStyle = document.createElement('style');
-        gStyle.textContent = `
-          .mc-group-card { position: relative; }
-          .mc-group-card.dragging { opacity: .6; }
-          .mc-group-card.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
-          .mc-group-card.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
-        `;
-        cfg.hostEl.appendChild(gStyle);
-
-        // Helper: collapse/expand all groups' contents during DnD for easier reordering
-        function setGroupsCollapsed(collapsed) {
-          Array.from(list.querySelectorAll('.mc-group-card')).forEach(gc => {
-            const items = gc.querySelector('.mc-items');
-            const actionsRow = gc.querySelector('.mc-add-opt')?.closest('.row');
-            if (items) items.style.display = collapsed ? 'none' : '';
-            if (actionsRow) actionsRow.style.display = collapsed ? 'none' : '';
-          });
-        }
-
-        model.groups.forEach((grp, gIdx) => {
-          const card = document.createElement('div');
-          card.className = 'card mc-group-card';
-          card.style.marginBottom = '10px';
-          card.dataset.index = String(gIdx);
-
-          card.innerHTML = `
-            <div class="row" style="justify-content:space-between; gap:8px; margin-bottom:8px;">
-              <div class="row" style="gap:8px;">
-                <input type="text" class="mc-group-title" placeholder="Gruppen-Titel (optional)" value="${(grp.title||'').replace(/"/g,'&quot;')}" style="min-width:220px"/>
-              </div>
-              <div class="row" style="gap:6px;">
-                <button type="button" class="danger mc-del-group">Gruppe löschen</button>
-              </div>
-            </div>
-            <div class="mc-items" aria-live="polite"></div>
-            <div class="row" style="margin-top:8px; justify-content:flex-end;">
-              <button type="button" class="mc-add-opt">+ Option</button>
-            </div>
-          `;
-
-          const itemsWrap = card.querySelector('.mc-items');
-          const addOptBtn = card.querySelector('.mc-add-opt');
-          // Inject group drag handle before the title input
-          const titleInput = card.querySelector('.mc-group-title');
-          if (titleInput && titleInput.parentElement) {
-            const gHandle = document.createElement('div');
-            gHandle.className = 'mc-drag mc-g-drag';
-            gHandle.title = 'Ziehen zum Sortieren';
-            gHandle.setAttribute('draggable','true');
-            gHandle.innerHTML = '<span class="grip">☰</span>';
-            titleInput.parentElement.insertBefore(gHandle, titleInput);
-
-            // DnD for groups
-            function clearGroupDropHints(){
-              Array.from(list.querySelectorAll('.mc-group-card')).forEach(el => el.classList.remove('drop-before','drop-after'));
-            }
-            gHandle.addEventListener('dragstart', (e) => {
-              mcGroupDragFrom = gIdx;
-              card.classList.add('dragging');
-              try { e.dataTransfer.setData('text/plain', String(gIdx)); } catch {}
-              e.dataTransfer.effectAllowed = 'move';
-              // Collapse all groups for easier reordering
-              setGroupsCollapsed(true);
-            });
-            gHandle.addEventListener('dragend', () => {
-              mcGroupDragFrom = null;
-              card.classList.remove('dragging');
-              clearGroupDropHints();
-              setGroupsCollapsed(false);
-            });
-            card.addEventListener('dragenter', (e) => { e.preventDefault(); });
-            card.addEventListener('dragover', (e) => {
-              e.preventDefault();
-              const rect = card.getBoundingClientRect();
-              const before = (e.clientY - rect.top) < rect.height / 2;
-              clearGroupDropHints();
-              card.classList.add(before ? 'drop-before' : 'drop-after');
-            });
-            card.addEventListener('dragleave', () => { card.classList.remove('drop-before','drop-after'); });
-            card.addEventListener('drop', (e) => {
-              e.preventDefault();
-              const fromRaw = (mcGroupDragFrom != null) ? mcGroupDragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
-              const rect = card.getBoundingClientRect();
-              const before = (e.clientY - rect.top) < rect.height / 2;
-              let to = gIdx + (before ? 0 : 1);
-              if (!Number.isFinite(fromRaw) || fromRaw < 0 || fromRaw >= model.groups.length) { clearGroupDropHints(); return; }
-              if (to < 0) to = 0;
-              if (to > model.groups.length) to = model.groups.length;
-              if (fromRaw === to) { clearGroupDropHints(); return; }
-              const [moved] = model.groups.splice(fromRaw, 1);
-              if (to > fromRaw) to -= 1;
-              model.groups.splice(to, 0, moved);
-              clearGroupDropHints();
-              setGroupsCollapsed(false);
-              render();
-            });
-          }
-
-          function drawItemRow(it, iIdx) {
-            const row = document.createElement('div');
-            row.className = 'tdz-row mc-item-row';
-            row.style.gridTemplateColumns = '34px 240px 1fr 260px';
-            row.dataset.index = String(iIdx);
-
-            const handleCol = document.createElement('div');
-            handleCol.className = 'mc-drag';
-            handleCol.title = 'Ziehen zum Sortieren';
-            handleCol.innerHTML = `<span class="grip">☰</span>`;
-
-            const first = document.createElement('div');
-            first.className = 'tdz-col';
-            first.style.gap = '6px';
-            first.innerHTML = `
-              <label class="row" style="gap:8px; align-items:center;">
-                <input type="checkbox" class="mc-opt-checked" />
-                <span>Vorausgewählt</span>
-              </label>
-              <label class="row" style="gap:8px; align-items:center;">
-                <input type="checkbox" class="mc-opt-always" />
-                <span>Immer ausgewählt</span>
-              </label>
-            `;
-
-            const valueCol = document.createElement('div');
-            valueCol.className = 'tdz-col tdz-grow';
-            valueCol.innerHTML = `
-              <label class="small">Wert</label>
-              <input type="text" class="mc-opt-value" value="${(it.value||'').replace(/"/g,'&quot;')}" placeholder="z. B. Onboarding"/>
-            `;
-
-            const actions = document.createElement('div');
-            actions.className = 'tdz-actions';
-            actions.innerHTML = `
-              <button type="button" class="ghost mc-add-field">+ Feld</button>
-              <button type="button" class="danger mc-del-opt">Löschen</button>
-            `;
-
-            const fieldsCol = document.createElement('div');
-            fieldsCol.className = 'tdz-col mc-fields-col';
-            fieldsCol.style.gridColumn = '1 / -1';
-
-            row.appendChild(handleCol);
-            row.appendChild(first);
-            row.appendChild(valueCol);
-            row.appendChild(actions);
-            row.appendChild(fieldsCol);
-
-            // wire top-level
-            const cbDefault = first.querySelector('.mc-opt-checked');
-            const cbAlways  = first.querySelector('.mc-opt-always');
-            const inVal     = valueCol.querySelector('.mc-opt-value');
-
-            cbDefault.checked = !!it.checked || !!it.alwaysSelected;
-            cbAlways.checked  = !!it.alwaysSelected;
-            cbDefault.disabled = !!it.alwaysSelected;
-
-            cbDefault.addEventListener('change', () => { it.checked = !!cbDefault.checked; hidden.value = JSON.stringify(model); });
-            cbAlways.addEventListener('change', () => {
-              it.alwaysSelected = !!cbAlways.checked;
-              if (it.alwaysSelected) { it.checked = true; cbDefault.checked = true; cbDefault.disabled = true; }
-              else { cbDefault.disabled = false; }
-              hidden.value = JSON.stringify(model);
-            });
-            inVal.addEventListener('input', () => { it.value = inVal.value; hidden.value = JSON.stringify(model); });
-
-            // Re-render all extras when an earlier field changes type/id, so datediff dropdowns refresh
-            function triggerRefresh() { drawFields(); hidden.value = JSON.stringify(model); }
-
-            function drawFields() {
-              fieldsCol.innerHTML = '';
-              if (!Array.isArray(it.fields)) it.fields = [];
-              if (!it.fields.length) return;
-
-              it.fields.forEach((fld, fIdx) => {
-                const typeSelId = uid('type');
-                const idId      = uid('id');
-                const labelId   = uid('label');
-                const contentId = uid('content');
-
-                if (!fld || typeof fld !== 'object') fld = {};
-                if (!['text','number','date','datediff'].includes(fld.type)) fld.type = 'text';
-
-                // row container (flex)
-                const line = document.createElement('div');
-                line.className = 'row';
-                line.style.gap = '8px';
-                line.style.margin = '6px 0';
-                line.style.alignItems = 'center';
-                line.style.flexWrap = 'nowrap';
-                line.style.padding = '6px 8px';
-                line.style.borderLeft = '2px solid var(--border)';
-                line.style.background = 'rgba(127,127,127,.04)';
-                line.style.borderRadius = '8px';
-
-                // type selector
-                const sel = document.createElement('select');
-                sel.id = typeSelId;
-                sel.innerHTML = `
-                  <option value="text">text</option>
-                  <option value="number">number</option>
-                  <option value="date">date</option>
-                  <option value="datediff">datediff</option>
-                `;
-                sel.className = 'select-compact';
-                sel.style.minWidth = '120px';
-
-                // generic inputs
-                const inId = document.createElement('input');
-                inId.id = idId; inId.type = 'text'; inId.placeholder = 'id';
-                inId.style.minWidth = '140px'; inId.style.width = '140px';
-                inId.classList.add('muted-input');
-
-                const inLabel = document.createElement('input');
-                inLabel.id = labelId; inLabel.type = 'text'; inLabel.placeholder = 'Label';
-                inLabel.style.minWidth = '180px'; inLabel.style.width = '180px';
-
-                const inContent = document.createElement('input');
-                inContent.id = contentId; inContent.type = 'text'; inContent.placeholder = 'Inhalt (optional)';
-                inContent.style.minWidth = '220px'; inContent.style.flex = '1 1 auto';
-
-                // datediff config
-                const ddWrap = document.createElement('div');
-                ddWrap.className = 'mc-dd-wrap';
-                ddWrap.style.display = 'none';
-
-                const ddLabel = document.createElement('span');
-                ddLabel.className = 'mc-dd-fixed';
-                ddLabel.textContent = 'Dauer:';
-
-                const fromSel = document.createElement('select');
-                const toSel   = document.createElement('select');
-
-                // build source list: earlier local date extras + global date fields
-                function availableDateIds() {
-                  const localPrev = it.fields.slice(0, fIdx)
-                    .filter(ff => ff && ff.type === 'date' && ff.id)
-                    .map(ff => String(ff.id));
-                  return uniq([ ...localPrev, ...globalDateIds() ]);
-                }
-                function populateDateSelects() {
-                  const ids = availableDateIds();
-                  [fromSel, toSel].forEach(sel => { sel.innerHTML = ''; });
-                  if (!ids.length) {
-                    const o = document.createElement('option'); o.value = ''; o.textContent = '— keine Date-Felder —';
-                    fromSel.appendChild(o.cloneNode(true)); toSel.appendChild(o.cloneNode(true));
-                    fromSel.disabled = true; toSel.disabled = true;
-                    return;
-                  }
-                  fromSel.disabled = false; toSel.disabled = false;
-                  ids.forEach(id => {
-                    const o1 = document.createElement('option'); o1.value = id; o1.textContent = id; fromSel.appendChild(o1);
-                    const o2 = document.createElement('option'); o2.value = id; o2.textContent = id; toSel.appendChild(o2);
-                  });
-                }
-
-                ddWrap.appendChild(ddLabel);
-                ddWrap.appendChild(fromSel);
-                ddWrap.appendChild(toSel);
-
-                // delete button (always at far right)
-                const btnDel = document.createElement('button');
-                btnDel.type = 'button';
-                btnDel.className = 'ghost mc-field-del';
-                btnDel.textContent = 'Entfernen';
-                // push delete to the right edge
-                btnDel.style.marginLeft = 'auto';
-
-                // init values
-                sel.value = fld.type || 'text';
-                inId.value = fld.id || '';
-                inLabel.value = fld.label || '';
-                inContent.value = fld.content || '';
-
-                // wire helpers
-                function ensureDatediffFixedBits() {
-                  // fixed label + generated id using from/to
-                  fld.label = 'Dauer';
-                  const fromId = fld.fromId || '';
-                  const toId   = fld.toId || '';
-                  fld.id = `datediff_${fromId}_${toId}`;
-                }
-
-                function toggleBits() {
-                  const isDD = sel.value === 'datediff';
-                  ddWrap.style.display   = isDD ? '' : 'none';
-                  inId.style.display     = isDD ? 'none' : '';
-                  inLabel.style.display  = isDD ? 'none' : '';
-                  inContent.style.display= isDD ? 'none' : '';
-                  if (isDD) {
-                    populateDateSelects();
-                    // restore previously selected values
-                    if (fld.fromId) fromSel.value = fld.fromId;
-                    if (fld.toId)   toSel.value   = fld.toId;
-                  }
-                }
-
-                toggleBits();
-
-                // events
-                sel.addEventListener('change', () => {
-                  fld.type = sel.value;
-                  if (fld.type === 'datediff') {
-                    // initialize if empty
-                    if (!fld.fromId || !fld.toId) {
-                      const ids = availableDateIds();
-                      fld.fromId = ids[0] || '';
-                      fld.toId   = ids[1] || ids[0] || '';
-                    }
-                    ensureDatediffFixedBits();
-                  } else {
-                    delete fld.fromId; delete fld.toId;
-                  }
-                  toggleBits();
-                  hidden.value = JSON.stringify(model);
-                });
-
-                // when non-datediff fields change → refresh so datediff lists include them
-                inId.addEventListener('input',   () => { if (fld.type !== 'datediff') { fld.id = inId.value; hidden.value = JSON.stringify(model); /* no re-render on each keystroke */ } });
-                // On blur, if this field is a date, refresh so later datediff dropdowns include updated id
-                inId.addEventListener('blur',    () => { if (fld.type === 'date') { triggerRefresh(); } });
-                inLabel.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.label = inLabel.value; hidden.value = JSON.stringify(model); } });
-                inContent.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.content = inContent.value; hidden.value = JSON.stringify(model); } });
-
-                // switching a field to/from 'date' needs refresh for later datediff fields
-                sel.addEventListener('change', () => { triggerRefresh(); });
-
-                fromSel.addEventListener('change', () => {
-                  if (fld.type !== 'datediff') return;
-                  fld.fromId = fromSel.value;
-                  ensureDatediffFixedBits();
-                  hidden.value = JSON.stringify(model);
-                });
-                toSel.addEventListener('change', () => {
-                  if (fld.type !== 'datediff') return;
-                  fld.toId = toSel.value;
-                  ensureDatediffFixedBits();
-                  hidden.value = JSON.stringify(model);
-                });
-
-                btnDel.addEventListener('click', () => {
-                  it.fields.splice(fIdx,1);
-                  drawFields();
-                  hidden.value = JSON.stringify(model);
-                });
-
-                // mount row (Type, Label, Id, Content)
-                line.appendChild(sel);
-                line.appendChild(inLabel);
-                line.appendChild(inId);
-                line.appendChild(inContent);
-                line.appendChild(ddWrap);
-                line.appendChild(btnDel);
-                fieldsCol.appendChild(line);
-              });
-            }
-            drawFields();
-
-            actions.querySelector('.mc-add-field').addEventListener('click', () => {
-              it.fields = it.fields || [];
-              it.fields.push({ type:'text', id:'', label:'', content:'' }); // default new field
-              drawFields();
-              hidden.value = JSON.stringify(model);
-            });
-
-            actions.querySelector('.mc-del-opt').addEventListener('click', () => {
-              grp.items.splice(iIdx,1);
-              redrawItems();
-              hidden.value = JSON.stringify(model);
-            });
-
-            // DnD via handle
-            let dragFrom = null;
-            handleCol.setAttribute('draggable', 'true');
-            handleCol.addEventListener('dragstart', (e) => {
-              dragFrom = iIdx;
-              row.classList.add('dragging');
-              try { e.dataTransfer.setData('text/plain', String(iIdx)); } catch {}
-              e.dataTransfer.effectAllowed = 'move';
-            });
-            handleCol.addEventListener('dragend', () => {
-              row.classList.remove('dragging');
-              Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
-              dragFrom = null;
-            });
-            row.addEventListener('dragover', (e) => {
-              e.preventDefault();
-              const rect = row.getBoundingClientRect();
-              const before = (e.clientY - rect.top) < rect.height / 2;
-              Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
-              row.classList.add(before ? 'drop-before' : 'drop-after');
-            });
-            row.addEventListener('dragleave', () => { row.classList.remove('drop-before','drop-after'); });
-            row.addEventListener('drop', (e) => {
-              e.preventDefault();
-              const from = (dragFrom != null) ? dragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
-              const rect = row.getBoundingClientRect();
-              const before = (e.clientY - rect.top) < rect.height / 2;
-              let to = iIdx + (before ? 0 : 1);
-
-              if (!Number.isFinite(from) || from < 0 || from >= grp.items.length) return;
-              if (to < 0) to = 0;
-              if (to > grp.items.length) to = grp.items.length;
-              if (from === to) { row.classList.remove('drop-before','drop-after'); return; }
-
-              const [moved] = grp.items.splice(from, 1);
-              if (to > from) to -= 1;
-              grp.items.splice(to, 0, moved);
-
-              row.classList.remove('drop-before','drop-after');
-              redrawItems();
-              hidden.value = JSON.stringify(model);
-            });
-
-            return row;
-          }
-
-          function redrawItems() {
-            itemsWrap.innerHTML = '';
-            grp.items.forEach((it, iIdx) => itemsWrap.appendChild(drawItemRow(it, iIdx)));
-          }
-          redrawItems();
-
-          addOptBtn.addEventListener('click', () => {
-            grp.items.push({ value:'', checked:false, alwaysSelected:false, fields:[] });
-            redrawItems();
-            hidden.value = JSON.stringify(model);
-            try { itemsWrap.lastElementChild?.scrollIntoView({ block: 'nearest' }); } catch {}
-          });
-
-          card.querySelector('.mc-group-title').addEventListener('input', (e) => {
-            grp.title = e.target.value; hidden.value = JSON.stringify(model);
-          });
-          card.querySelector('.mc-del-group').addEventListener('click', () => {
-            model.groups.splice(gIdx,1);
-            render();
-          });
-
-          list.appendChild(card);
-        });
-
-        cfg.hostEl.querySelector('.mc-add-group').addEventListener('click', () => {
-          model.groups.push({ title:'', items:[] });
-          render();
-        });
-      }
-
-      return api;
-    }
-
-
-
-    // ---------- Fields list rendering (with DnD) ----------
-    function renderFields() {
-      const tb = els.tbodyFields;
-      tb.innerHTML = '';
-      if (!FORM_BUILDER.schema.fields.length) {
-        tb.innerHTML = '<tr><td colspan="5" class="empty">No fields yet.</td></tr>';
-        els.fieldCount.textContent = '0 fields';
+  }
+
+  // ============================================================
+  // Canonical refresh from workspace (override-safe)
+  // ============================================================
+  let __refreshLock = false;
+  let __refreshPending = false;
+
+  async function refreshFromCanonical({ reason = '' } = {}) {
+    const tr = TRACE('refreshFromCanonical', { reason });
+
+    if (__refreshLock) { __refreshPending = true; tr.end('coalesced'); return; }
+    __refreshLock = true;
+
+    try {
+      const meta = await P()?.getActiveDocMeta?.();
+      currentDoc = meta && meta.docId ? meta : null;
+
+      if (!currentDoc?.docId) {
+        await hardResetBuilder(`no active doc${reason ? ' ('+reason+')' : ''}`);
+        tr.end('no-doc');
         return;
       }
 
-      FORM_BUILDER.schema.fields.forEach((f, i) => {
-        const tr = document.createElement('tr');
-        tr.dataset.i = i;
-        tr.draggable = true;
+      await hydrateWorkspaceIfEmpty(currentDoc.docId);
 
-        const tdGrip = document.createElement('td');
-        tdGrip.className = 'mono dnd-handle';
-        tdGrip.title = 'Drag to reorder';
-        tdGrip.textContent = '☰';
+      const st = await P()?.loadState?.(currentDoc.docId);
+      const nextSchema = st?.schema || null;
 
-        const tdId = document.createElement('td');
-        tdId.className = 'mono';
-        tdId.textContent = f.id;
+      // Override-safe: if user is editing inputs, avoid clobbering by full reset.
+      const ae = document.activeElement;
+      const isEditing = !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT'));
 
-        const tdLabel = document.createElement('td');
-        tdLabel.textContent = f.label || '';
+      if (!isEditing) {
+        BUILDER.schema = nextSchema || { title: 'Untitled form', fields: [] };
+        els.formTitle.value = BUILDER.schema.title || '';
+        BUILDER.selectedIndex = -1;
+        renderAll({ persistFallback: false, full: true });
+      } else {
+        // Minimal: update status + counts only; keep editor stable
+        if (nextSchema && Array.isArray(nextSchema.fields)) {
+          BUILDER.schema = nextSchema; // safe; UI editor remains because we do not clear its inputs here
+          els.fieldCount.textContent = `${(BUILDER.schema.fields || []).length} fields`;
+        }
+      }
 
-        const tdType = document.createElement('td');
-        tdType.className = 'mono';
-        tdType.textContent = f.type;
+      els.docStatus.innerHTML = `Active DOCX: <span class="kbd">${currentDoc.name || currentDoc.docTitle || currentDoc.docId}</span>`;
+      els.docStatus.classList.remove('muted');
 
-        const tdDet = document.createElement('td');
-        tdDet.className = 'muted';
-        tdDet.textContent = fieldDetails(f);
+      await updateWriteAccessBanner();
 
-        tr.appendChild(tdGrip);
-        tr.appendChild(tdId);
-        tr.appendChild(tdLabel);
-        tr.appendChild(tdType);
-        tr.appendChild(tdDet);
+      tr.end({ isEditing, fields: BUILDER.schema?.fields?.length });
+    } catch (e) {
+      tr.error('failed', e);
+      tr.end('error');
+    } finally {
+      __refreshLock = false;
+      if (__refreshPending) { __refreshPending = false; refreshFromCanonical({ reason: 'pending' }); }
+    }
+  }
 
-        // click to edit
-        tr.addEventListener('click', (ev) => {
-          if (tr.classList.contains('dragging')) return;
-          selectRow(i);
-          loadFieldIntoEditor(f, i);
-        });
+  async function hardResetBuilder(reason = '') {
+    const tr = TRACE('hardResetBuilder', { reason });
+    BUILDER.schema = { title: 'Untitled form', fields: [] };
+    BUILDER.selectedIndex = -1;
 
-        // DnD handlers
-        tr.addEventListener('dragstart', (e) => {
-          tr.classList.add('dragging');
-          e.dataTransfer.effectAllowed = 'move';
-          e.dataTransfer.setData('text/plain', String(i));
-        });
-        tr.addEventListener('dragend', () => {
-          tr.classList.remove('dragging');
-          clearDropHints();
-        });
-        tr.addEventListener('dragover', (e) => {
-          e.preventDefault();
-          const dragIndex = Number(getDataTransferIndex(e));
-          if (Number.isNaN(dragIndex)) return;
-          showDropHint(tr, e);
-        });
-        tr.addEventListener('drop', (e) => {
-          e.preventDefault();
-          const from = Number(e.dataTransfer.getData('text/plain') || -1);
-          if (Number.isNaN(from) || from < 0) return clearDropHints();
-          const to = indexFromDrop(e, tr);
-          if (to < 0) return clearDropHints();
-          reorderFields(from, to);
-          clearDropHints();
-        });
+    els.permNote.style.display = 'none';
 
-        tb.appendChild(tr);
+    // Load local fallback schema for doc-less mode
+    const draft = loadLocalSchemaFallback();
+    if (draft && typeof draft === 'object') {
+      BUILDER.schema = draft;
+      els.formTitle.value = draft.title || '';
+    } else {
+      els.formTitle.value = '';
+    }
+
+    renderAll({ persistFallback: false, full: true });
+
+    els.docStatus.innerHTML =
+      `No active document${reason ? ` (${reason})` : ''}. Open one in the <a href="extractor.html">Extractor</a>.`;
+    els.docStatus.classList.add('muted');
+
+    tr.end();
+  }
+
+  // ============================================================
+  // Canonical listeners (single broadcast mechanism)
+  // ============================================================
+  function installCanonicalListeners() {
+    const tr = TRACE('installCanonicalListeners');
+
+    try {
+      const bcActive = new BroadcastChannel(BC_ACTIVE);
+      bcActive.addEventListener('message', (ev) => {
+        const m = ev?.data || {};
+        if (!m?.type) return;
+
+        if (m.type === 'active:clear') {
+          TRACE('BC_ACTIVE', m);
+          refreshFromCanonical({ reason: 'active:clear' });
+          return;
+        }
+        if ((m.type === 'active:set' || m.type === 'active:updated') && m.docId) {
+          TRACE('BC_ACTIVE', m);
+          refreshFromCanonical({ reason: m.type });
+        }
       });
-      els.fieldCount.textContent = `${FORM_BUILDER.schema.fields.length} fields`;
-      highlightSelectedRow();
+      tr.step('listening', { channel: BC_ACTIVE });
+    } catch (e) {
+      tr.warn('BC_ACTIVE failed', e);
     }
 
-    function getDataTransferIndex(e) {
-      const v = e.dataTransfer?.getData('text/plain');
-      return v != null ? Number(v) : NaN;
-    }
-    function indexFromRow(tr) {
-      return Number(tr?.dataset?.i ?? -1);
-    }
-    function indexFromDrop(e, tr) {
-      const rect = tr.getBoundingClientRect();
-      const mid = rect.top + rect.height / 2;
-      const overIdx = indexFromRow(tr);
-      return (e.clientY < mid) ? overIdx : overIdx + 1;
-    }
-    function clearDropHints() {
-      Array.from(els.tbodyFields.querySelectorAll('tr')).forEach(r => {
-        r.classList.remove('drop-target-above','drop-target-below');
+    try {
+      const bcPayload = new BroadcastChannel(BC_PAYLOAD);
+      bcPayload.addEventListener('message', (ev) => {
+        const msg = ev?.data || {};
+        if (msg?.t !== 'payload') return;
+        const docId = msg.docId;
+        if (!docId || docId !== currentDoc?.docId) return;
+
+        const patch = msg.patch || {};
+        const touches =
+          ('schema' in patch) ||
+          ('values' in patch) ||
+          ('tagMap' in patch) ||
+          ('rules' in patch) ||
+          ('fieldRules' in patch);
+
+        if (!touches) return;
+
+        TRACE('BC_PAYLOAD', { docId, keys: Object.keys(patch || {}) });
+        refreshFromCanonical({ reason: 'payload-patch' });
       });
-    }
-    function showDropHint(tr, e) {
-      clearDropHints();
-      const rect = tr.getBoundingClientRect();
-      const mid = rect.top + rect.height / 2;
-      if (e.clientY < mid) tr.classList.add('drop-target-above');
-      else tr.classList.add('drop-target-below');
-    }
-    function reorderFields(from, to) {
-      const list = FORM_BUILDER.schema.fields;
-      const target = Math.max(0, Math.min(to, list.length));
-      if (from === target) return;
-
-      const [moved] = list.splice(from, 1);
-      const insertAt = (target > from) ? target - 1 : target;
-      list.splice(insertAt, 0, moved);
-
-      FORM_BUILDER.selectedIndex = -1;
-      els.btnDelete.disabled = true;
-      els.btnCancel.disabled = true;
-      clearEditor();
-
-      renderFields();
-      mirror(true);
-      setStatus('Reordered', true);
+      tr.step('listening', { channel: BC_PAYLOAD });
+    } catch (e) {
+      tr.warn('BC_PAYLOAD failed', e);
     }
 
-    function selectRow(i) {
-      FORM_BUILDER.selectedIndex = i;
-      highlightSelectedRow();
-      els.btnDelete.disabled = false;
-      els.btnCancel.disabled = false;
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') refreshFromCanonical({ reason: 'visible' });
+    });
+    window.addEventListener('focus', () => refreshFromCanonical({ reason: 'focus' }));
+
+    tr.end();
+  }
+
+  // ============================================================
+  // Render helpers
+  // ============================================================
+  function fieldDetails(f) {
+    if (!f) return '';
+    if (f.type === 'date') return `Datepicker (${f.dateFormat || 'Y-m-d'})`;
+    if (f.type === 'select') {
+      const opts = Array.isArray(f.options) ? f.options : [];
+      return `Select: ${opts.join(', ') || '—'}`;
     }
-    function highlightSelectedRow() {
-      Array.from(els.tbodyFields.querySelectorAll('tr')).forEach(r => r.classList.remove('is-active'));
-      const i = FORM_BUILDER.selectedIndex;
-      if (i >= 0) {
-        const row = els.tbodyFields.querySelector(`tr[data-i="${i}"]`);
-        if (row) row.classList.add('is-active');
+    if (f.type === 'multichoice') {
+      const groups = Array.isArray(f.mc?.groups) ? f.mc.groups : [];
+      const optCount = groups.length
+        ? groups.reduce((n, g) => n + (g.items?.length || 0), 0)
+        : (Array.isArray(f.options) ? f.options.length : 0);
+      const extras = groups.reduce((n,g)=> n + (g.items||[]).reduce((m,it)=> m + (Array.isArray(it.fields)? it.fields.length:0), 0), 0);
+      const gTxt = groups.length ? `${groups.length} group${groups.length>1?'s':''}` : '1 group';
+      return `Multiple: ${optCount || 0} option(s) in ${gTxt}${extras?`, ${extras} extra field(s)`:''}`;
+    }
+    if (f.type === 'table') {
+      const cols = (f.columns||[]).map(c => `${c.label||c.id}${c.type?`:${c.type}${(c.type==='select'&&c.options?.length)?':'+c.options.join('/'):''}`:''}`);
+      return `Table with ${f.columns?.length||0} column(s)${(f.minRows||f.maxRows)?` ${f.minRows||0}–${f.maxRows||'∞'}`:''} → [ ${cols.join(' | ')} ]`;
+    }
+    if (f.type === 'datediff') return `Δ ${f.fromId || '—'} → ${f.toId || '—'} (D-M-Y)`;
+    return '';
+  }
+
+  // ============================================================
+  // Type-specific UI (kept from original; legacy coordination removed)
+  // ============================================================
+  function renderTypeSpecific() {
+    const t = els.pType.value;
+    const wrap = els.typeSpecific;
+    wrap.innerHTML = '';
+
+    function listDateFieldIds() {
+      return (BUILDER.schema?.fields || []).filter(x => x?.type === 'date').map(x => x.id);
+    }
+
+    if (t === 'select') {
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <label class="small">Options (comma separated)</label><br/>
+        <input id="pOptions" type="text" placeholder="e.g. Red, Green, Blue" />
+      `;
+      wrap.appendChild(div);
+
+    } else if (t === 'multichoice') {
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <div class="tdz-toolbar">
+          <div><strong>Multi-Choice</strong></div>
+        </div>
+        <div id="mcDesigner"></div>
+        <input id="pMcJson" type="hidden" />
+      `;
+      wrap.appendChild(div);
+
+      window.MultiChoiceDesigner?.destroy?.();
+      window.MultiChoiceDesigner = createMultiChoiceDesigner({ hostEl: div.querySelector('#mcDesigner') });
+      window.MultiChoiceDesigner.loadModel({ groups: [] });
+
+    } else if (t === 'date') {
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <label class="small">Format</label><br/>
+        <input id="pDateFmt" type="text" placeholder="Y-m-d" />
+      `;
+      wrap.appendChild(div);
+
+    } else if (t === 'table') {
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <div class="tdz-toolbar">
+          <div>
+            <strong>Tabellen-Spalten</strong>
+            <span class="tdz-muted" id="tdzCount"></span>
+          </div>
+        </div>
+
+        <div id="tdzList" aria-live="polite"></div>
+
+        <div class="row" style="margin-top:8px; justify-content:flex-end;">
+          <button type="button" id="tdzAddBottom">+ Spalte hinzufügen</button>
+        </div>
+
+        <div class="row" style="gap:12px; margin-top:10px;">
+          <div class="tdz-col">
+            <label class="small">Min rows</label>
+            <input id="pMinRows" type="number" value="0" min="0" style="width:140px"/>
+          </div>
+          <div class="tdz-col">
+            <label class="small">Max rows</label>
+            <input id="pMaxRows" type="number" value="0" min="0" style="width:140px"/>
+          </div>
+        </div>
+        <input id="pCols" type="hidden" />
+      `;
+      wrap.appendChild(div);
+
+      window.TableDesigner?.destroy?.();
+      window.TableDesigner = createTableDesigner({
+        listEl: wrap.querySelector('#tdzList'),
+        countEl: wrap.querySelector('#tdzCount'),
+        addBtn:  wrap.querySelector('#tdzAddBottom'),
+        hiddenColsEl: wrap.querySelector('#pCols'),
+        minEl: wrap.querySelector('#pMinRows'),
+        maxEl: wrap.querySelector('#pMaxRows'),
+      });
+
+    } else if (t === 'datediff') {
+      const dateIds = listDateFieldIds();
+      const none = !dateIds.length;
+
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <div class="row" style="gap:10px; flex-wrap:wrap;">
+          <div>
+            <label class="small">From (date field)</label><br/>
+            <select id="pFromId" ${none ? 'disabled' : ''}></select>
+          </div>
+          <div>
+            <label class="small">To (date field)</label><br/>
+            <select id="pToId" ${none ? 'disabled' : ''}></select>
+          </div>
+        </div>
+        ${none ? `<div class="note warn" style="margin-top:8px;">You need at least two <em>date</em> fields in the form to wire a datediff.</div>` : ''}
+        <div class="muted" style="margin-top:6px;">Output format: <code>D-M-Y (valueInDays)</code></div>
+      `;
+      wrap.appendChild(div);
+
+      const fromSel = div.querySelector('#pFromId');
+      const toSel   = div.querySelector('#pToId');
+      if (!none) {
+        dateIds.forEach(id => {
+          const o1 = document.createElement('option'); o1.value = id; o1.textContent = id; fromSel.appendChild(o1);
+          const o2 = document.createElement('option'); o2.value = id; o2.textContent = id; toSel.appendChild(o2);
+        });
       }
     }
 
-    function loadFieldIntoEditor(f, i) {
-      els.pType.value = f.type;
-      els.pId.value = f.id;
-      els.pLabel.value = f.label || '';
-      els.pRequired.checked = !!f.required;
-      renderTypeSpecific();
+    const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
+    if (t === 'datediff') {
+      els.pRequired.checked = false;
+      if (reqContainer) reqContainer.style.display = 'none';
+    } else {
+      if (reqContainer) reqContainer.style.display = '';
+    }
+  }
 
-      if (f.type === 'select') {
-        document.getElementById('pOptions').value = (f.options||[]).join(', ');
+  // ============================================================
+  // Table Designer (unchanged behavior; isolated UI module)
+  // ============================================================
+  function createTableDesigner(cfg) {
+    let model = [];
+    const TYPES = ['text','number','select','date'];
 
-      } else if (f.type === 'multichoice') {
-        // NEW: load advanced groups/extras if present; else derive from options
-        const designer = window.MultiChoiceDesigner;
-        if (designer) {
-          const mc = f.mc && typeof f.mc === 'object' ? f.mc : null;
-          const legacy = Array.isArray(f.options) ? f.options : [];
-          designer.loadModel(mc, legacy);
-        }
-
-      } else if (f.type === 'date') {
-        document.getElementById('pDateFmt').value = f.dateFormat || 'Y-m-d';
-
-      } else if (f.type === 'table') {
-        const colsLegacy = (f.columns||[]).map(c => {
+    const api = {
+      loadColumns(colsArr = []) {
+        model = (colsArr || []).map(c => ({
+          id: String(c.id || '').trim() || 'col',
+          label: String(c.label != null ? c.label : c.id || 'col'),
+          type: TYPES.includes(c.type) ? c.type : 'text',
+          options: Array.isArray(c.options) ? c.options.map(o => String(o)) : []
+        }));
+        render();
+      },
+      setMinMax(min, max) {
+        if (cfg.minEl) cfg.minEl.value = String(parseInt(min || 0, 10) || 0);
+        if (cfg.maxEl) cfg.maxEl.value = String(parseInt(max || 0, 10) || 0);
+      },
+      getColumns() { return model.slice(); },
+      toLegacyString() {
+        const parts = model.map(c => {
           const base = `${c.id}:${c.label}${c.type && c.type!=='text' ? `:${c.type}`:''}`;
           if (c.type === 'select' && c.options?.length) return `${base}:${c.options.join('/')}`;
           return base;
         });
-        document.getElementById('pCols').value = colsLegacy.join(', ');
-        document.getElementById('pMinRows').value = f.minRows || 0;
-        document.getElementById('pMaxRows').value = f.maxRows || 0;
-        if (window.TableDesigner) {
-          window.TableDesigner.loadColumns(Array.isArray(f.columns) ? f.columns : []);
-          window.TableDesigner.setMinMax(f.minRows || 0, f.maxRows || 0);
+        return parts.join(', ');
+      },
+      serializeToHidden() { if (cfg.hiddenColsEl) cfg.hiddenColsEl.value = api.toLegacyString(); },
+      addEmpty() {
+        const baseId = 'col';
+        let n = 1;
+        let candidate = baseId;
+        const ids = new Set(model.map(c => c.id));
+        while (ids.has(candidate)) { n++; candidate = baseId + n; }
+        model.push({ id: candidate, label: candidate.toUpperCase(), type:'text', options:[] });
+        render();
+      },
+      move(idx, dir) {
+        const j = idx + dir;
+        if (idx < 0 || j < 0 || idx >= model.length || j >= model.length) return;
+        [model[idx], model[j]] = [model[j], model[idx]];
+        render();
+      },
+      remove(idx) { model.splice(idx, 1); render(); },
+      destroy() {}
+    };
+
+    function render() {
+      if (cfg.countEl) cfg.countEl.textContent = model.length ? `· ${model.length} Spalten` : '· keine Spalten';
+      if (cfg.listEl) cfg.listEl.innerHTML = '';
+
+      model.forEach((col, idx) => {
+        const row = document.createElement('div');
+        row.className = 'tdz-row';
+
+        const cId = document.createElement('div'); cId.className = 'tdz-col';
+        cId.innerHTML = `<label class="small">ID</label>`;
+        const inId = document.createElement('input'); inId.value = col.id; inId.placeholder = 'e.g. sku';
+        inId.addEventListener('input', () => { col.id = inId.value.trim(); api.serializeToHidden(); });
+        cId.appendChild(inId);
+
+        const cLabel = document.createElement('div'); cLabel.className = 'tdz-col tdz-grow';
+        cLabel.innerHTML = `<label class="small">Label</label>`;
+        const inLabel = document.createElement('input'); inLabel.value = col.label; inLabel.placeholder = 'z. B. Artikelnummer';
+        inLabel.addEventListener('input', () => { col.label = inLabel.value; api.serializeToHidden(); });
+        cLabel.appendChild(inLabel);
+
+        const cType = document.createElement('div'); cType.className = 'tdz-col';
+        cType.innerHTML = `<label class="small">Typ</label>`;
+        const sel = document.createElement('select');
+        TYPES.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t; sel.appendChild(o); });
+        sel.value = col.type;
+        cType.appendChild(sel);
+
+        const actions = document.createElement('div'); actions.className = 'tdz-actions';
+        const up = document.createElement('button');   up.type='button';   up.textContent='▲'; up.title='Hoch';
+        const down = document.createElement('button'); down.type='button'; down.textContent='▼'; down.title='Runter';
+        const del = document.createElement('button');  del.type='button';  del.className='danger'; del.textContent='Löschen';
+        up.addEventListener('click',   () => api.move(idx, -1));
+        down.addEventListener('click', () => api.move(idx, +1));
+        del.addEventListener('click',  () => api.remove(idx));
+        actions.appendChild(up); actions.appendChild(down); actions.appendChild(del);
+
+        row.appendChild(cId);
+        row.appendChild(cLabel);
+        row.appendChild(cType);
+        row.appendChild(actions);
+
+        const cOpts = document.createElement('div');
+        cOpts.className = 'tdz-col tdz-grow tdz-col--opts';
+        cOpts.style.gridColumn = '1 / -1';
+        cOpts.innerHTML = `<label class="small">Optionen (nur bei Select)</label>`;
+
+        const optWrap = document.createElement('div'); optWrap.className = 'tdz-chipwrap';
+        const optAddWrap = document.createElement('div'); optAddWrap.className = 'tdz-opts';
+
+        const inOpt = document.createElement('input'); inOpt.placeholder = 'Option eingeben…';
+        const btnAddOpt = document.createElement('button'); btnAddOpt.type='button'; btnAddOpt.textContent='Hinzufügen';
+
+        const btnSave = document.createElement('button'); btnSave.type='button'; btnSave.textContent='Speichern';
+        btnSave.style.display = 'none';
+
+        const btnCancel = document.createElement('button'); btnCancel.type='button'; btnCancel.textContent='Abbrechen';
+        btnCancel.style.display = 'none';
+        btnCancel.style.background = 'transparent';
+        btnCancel.style.border = '1px solid var(--border, #e5e7eb)';
+        btnCancel.style.color = 'var(--ink, #0f172a)';
+
+        let editIdx = -1;
+        function enterEdit(i) {
+          editIdx = i;
+          inOpt.value = col.options[i] ?? '';
+          btnAddOpt.style.display = 'none';
+          btnSave.style.display = '';
+          btnCancel.style.display = '';
+          inOpt.focus(); inOpt.select();
+        }
+        function exitEdit() {
+          editIdx = -1;
+          inOpt.value = '';
+          btnAddOpt.style.display = '';
+          btnSave.style.display = 'none';
+          btnCancel.style.display = 'none';
         }
 
-      } else if (f.type === 'datediff') {
-        const fromSel = document.getElementById('pFromId');
-        const toSel   = document.getElementById('pToId');
-        if (fromSel && f.fromId) fromSel.value = f.fromId;
-        if (toSel && f.toId) toSel.value = f.toId;
+        btnAddOpt.addEventListener('click', () => {
+          const v = (inOpt.value || '').trim();
+          if (!v) return;
+          col.options = Array.from(new Set([...(col.options || []), v]));
+          inOpt.value = '';
+          drawChips();
+          api.serializeToHidden();
+        });
+        btnSave.addEventListener('click', () => {
+          const v = (inOpt.value || '').trim();
+          if (editIdx < 0 || !v) return;
+          col.options[editIdx] = v;
+          drawChips();
+          api.serializeToHidden();
+          exitEdit();
+        });
+        btnCancel.addEventListener('click', () => exitEdit());
 
-        els.pRequired.checked = false;
-        const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
-        if (reqContainer) reqContainer.style.display = 'none';
-      }
-    } 
+        optAddWrap.appendChild(inOpt);
+        optAddWrap.appendChild(btnAddOpt);
+        optAddWrap.appendChild(btnSave);
+        optAddWrap.appendChild(btnCancel);
 
-    // ---------- Parse, Save, Delete, Cancel ----------
-    function parseFieldFromInputs() {
-      const t  = els.pType.value;
-      const id = (els.pId.value || '').trim();
-      if (!id) { alert('Please enter a field id'); return null; }
-      const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
+        function drawChips() {
+          optWrap.innerHTML = '';
+          let dragFrom = null;
 
-      if (t === 'select') {
-        const raw = (document.getElementById('pOptions')?.value || '').trim();
-        f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+          (col.options || []).forEach((o, i) => {
+            const chip = document.createElement('span');
+            chip.className = 'tdz-chip';
+            chip.style.borderRadius = '6px';
+            chip.style.border = '1px solid var(--border, #e5e7eb)';
+            chip.style.background = '#fff';
+            chip.style.padding = '2px 8px';
+            chip.style.display = 'inline-flex';
+            chip.style.alignItems = 'center';
+            chip.style.gap = '6px';
 
-      } else if (t === 'multichoice') {
-        // NEW: persist advanced groups/extras while keeping legacy f.options for compatibility
-        const designer = window.MultiChoiceDesigner;
-        if (designer) {
-          const mc = designer.getModel();
-          const flat = designer.getFlatOptions();
-          f.mc = mc;                 // advanced config (groups + extras)
-          f.options = flat;          // compatibility (flat list of labels)
+            chip.setAttribute('draggable', 'true');
+            chip.dataset.idx = String(i);
+
+            const label = document.createElement('span');
+            label.textContent = o;
+            label.style.cursor = 'text';
+            label.addEventListener('click', () => enterEdit(i));
+
+            const x = document.createElement('button');
+            x.type = 'button';
+            x.setAttribute('aria-label', 'Option entfernen');
+            x.textContent = '×';
+            x.style.background = 'transparent';
+            x.style.border = '1px solid var(--border, #e5e7eb)';
+            x.style.borderRadius = '4px';
+            x.style.width = '20px';
+            x.style.height = '20px';
+            x.style.lineHeight = '18px';
+            x.style.fontSize = '14px';
+            x.style.padding = '0';
+            x.style.cursor = 'pointer';
+            x.style.color = '#000';
+            x.addEventListener('mouseenter', () => { x.style.color = '#6b7280'; });
+            x.addEventListener('mouseleave', () => { x.style.color = '#000'; });
+
+            x.addEventListener('click', (ev) => {
+              ev.stopPropagation();
+              col.options.splice(i, 1);
+              drawChips();
+              api.serializeToHidden();
+            });
+
+            chip.addEventListener('dragstart', (e) => {
+              dragFrom = i;
+              chip.classList.add('dragging');
+              try { e.dataTransfer.setData('text/plain', String(i)); } catch {}
+              e.dataTransfer.effectAllowed = 'move';
+            });
+            chip.addEventListener('dragend', () => {
+              dragFrom = null;
+              chip.classList.remove('dragging');
+              Array.from(optWrap.children).forEach(c => c.classList.remove('drop-before','drop-after'));
+            });
+            chip.addEventListener('dragover', (e) => {
+              e.preventDefault();
+              const rect = chip.getBoundingClientRect();
+              const before = (e.clientX - rect.left) < rect.width / 2;
+              Array.from(optWrap.children).forEach(c => c.classList.remove('drop-before','drop-after'));
+              chip.classList.add(before ? 'drop-before' : 'drop-after');
+            });
+            chip.addEventListener('dragleave', () => {
+              chip.classList.remove('drop-before','drop-after');
+            });
+            chip.addEventListener('drop', (e) => {
+              e.preventDefault();
+              const from = dragFrom ?? Number(e.dataTransfer.getData('text/plain') || -1);
+              const toIdx = Number(chip.dataset.idx);
+              if (!Number.isFinite(from) || !Number.isFinite(toIdx)) return;
+
+              const rect = chip.getBoundingClientRect();
+              const before = (e.clientX - rect.left) < rect.width / 2;
+              let to = toIdx + (before ? 0 : 1);
+
+              if (from === to) { chip.classList.remove('drop-before','drop-after'); return; }
+              const arr = col.options;
+              const [moved] = arr.splice(from, 1);
+              if (to > from) to -= 1;
+              arr.splice(to, 0, moved);
+
+              chip.classList.remove('drop-before','drop-after');
+              drawChips();
+              api.serializeToHidden();
+            });
+
+            chip.appendChild(label);
+            chip.appendChild(x);
+            optWrap.appendChild(chip);
+          });
+
+          Array.from(optWrap.children).forEach(el => { el.style.position = 'relative'; });
+          const styleEl = document.createElement('style');
+          styleEl.textContent = `
+            .tdz-chip.drop-before { box-shadow: inset 3px 0 0 0 rgba(59,130,246,.35); }
+            .tdz-chip.drop-after  { box-shadow: inset -3px 0 0 0 rgba(59,130,246,.35); }
+            .tdz-chip.dragging    { opacity: .6; }
+          `;
+          optWrap.querySelector('style')?.remove();
+          optWrap.appendChild(styleEl);
+        }
+        drawChips();
+
+        function toggleOpts() { cOpts.style.display = (sel.value === 'select') ? '' : 'none'; }
+        sel.addEventListener('change', () => { col.type = sel.value; toggleOpts(); api.serializeToHidden(); });
+        toggleOpts();
+
+        cOpts.appendChild(optWrap);
+        cOpts.appendChild(optAddWrap);
+        row.appendChild(cOpts);
+
+        cfg.listEl.appendChild(row);
+      });
+
+      api.serializeToHidden();
+    }
+
+    cfg.addBtn?.addEventListener('click', () => api.addEmpty());
+    cfg.addBtn2?.addEventListener('click', () => api.addEmpty());
+    return api;
+  }
+
+  // ============================================================
+  // MultiChoice Designer (unchanged behavior; isolated UI module)
+  // ============================================================
+  function createMultiChoiceDesigner(cfg) {
+    let model = { groups: [] };
+    let mcGroupDragFrom = null;
+
+    function globalDateIds() {
+      try {
+        return (BUILDER.schema?.fields || []).filter(x => x?.type === 'date').map(x => String(x.id));
+      } catch { return []; }
+    }
+    const uniq = (arr) => Array.from(new Set(arr.filter(Boolean).map(String)));
+
+    const api = {
+      loadModel(mc, legacyOptionsArr) {
+        if (mc && Array.isArray(mc.groups)) {
+          model = {
+            groups: mc.groups.map(g => ({
+              title: String(g?.title || ''),
+              items: Array.isArray(g?.items) ? g.items.map(it => ({
+                value: String(it?.value || ''),
+                checked: !!it?.checked,
+                alwaysSelected: !!it?.alwaysSelected,
+                fields: Array.isArray(it?.fields) ? it.fields.map(x => {
+                  const t = (x?.type === 'duration') ? 'datediff' : (x?.type || 'text');
+                  if (t === 'datediff') {
+                    const fromId = String(x?.fromId || '');
+                    const toId   = String(x?.toId || '');
+                    return {
+                      type: 'datediff',
+                      id: `datediff_${fromId}_${toId}` || `datediff_${Math.random().toString(36).slice(2,8)}`,
+                      label: 'Dauer',
+                      fromId, toId
+                    };
+                  }
+                  if (t === 'text' || t === 'number' || t === 'date') {
+                    return {
+                      type: t,
+                      id: String(x?.id || ''),
+                      label: String(x?.label || ''),
+                      content: String(x?.content || '')
+                    };
+                  }
+                  return { type:'text', id:'', label:'', content:'' };
+                }) : []
+              })) : []
+            }))
+          };
+        } else if (Array.isArray(legacyOptionsArr) && legacyOptionsArr.length) {
+          model = { groups: [{ title: '', items: legacyOptionsArr.map(v => ({ value:String(v), checked:false, alwaysSelected:false, fields:[] })) }] };
         } else {
-          f.options = [];
-          f.mc = { groups: [] };
+          model = { groups: [] };
         }
+        render();
+      },
+      getModel() { return JSON.parse(JSON.stringify(model)); },
+      getFlatOptions() {
+        const out = [];
+        model.groups.forEach(g => g.items.forEach(it => { if (it.value) out.push(it.value); }));
+        return out;
+      },
+      destroy() {}
+    };
 
-      } else if (t === 'date') {
-        f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
+    function uid(prefix='id'){ return prefix + '_' + Math.random().toString(36).slice(2,8); }
 
-      } else if (t === 'table') {
-        const mr = parseInt(document.getElementById('pMinRows')?.value||'0',10);
-        const xr = parseInt(document.getElementById('pMaxRows')?.value||'0',10);
+    function render() {
+      if (!cfg.hostEl) return;
+      cfg.hostEl.innerHTML = `
+        <div class="tdz-toolbar">
+          <div>
+            <strong>Gruppierte Optionen</strong>
+            <span class="tdz-muted">· ${model.groups.reduce((n,g)=>n+g.items.length,0)} Optionen in ${model.groups.length} Gruppe(n)</span>
+          </div>
+        </div>
+        <div class="mc-list"></div>
+        <div class="row" style="margin-top:8px; justify-content:flex-end;">
+          <button type="button" class="mc-add-group">+ Gruppe</button>
+        </div>
+        <input type="hidden" class="mc-hidden-json" />
+      `;
 
-        if (window.TableDesigner) {
-          const cols = window.TableDesigner.getColumns();
-          f.columns = cols;
-        } else {
-          const raw = (document.getElementById('pCols')?.value || '').trim();
-          f.columns = raw ? raw.split(',').map(s => s.trim()).filter(Boolean).map(seg => {
-            const [cid, label, ctype, opts] = seg.split(':');
-            const col = { id: (cid||'col').trim(), label: (label||cid||'col').trim() };
-            if (ctype) col.type = ctype.trim();
-            if (col.type === 'select' && opts) col.options = opts.split('/').map(s=>s.trim()).filter(Boolean);
-            return col;
-          }) : [];
-        }
-        if (mr>0) f.minRows = mr;
-        if (xr>0) f.maxRows = xr;
+      const list = cfg.hostEl.querySelector('.mc-list');
+      const hidden = cfg.hostEl.querySelector('.mc-hidden-json');
+      hidden.value = JSON.stringify(model);
 
-      } else if (t === 'datediff') {
-        const fromId = (document.getElementById('pFromId')?.value || '').trim();
-        const toId   = (document.getElementById('pToId')?.value || '').trim();
+      const style = document.createElement('style');
+      style.textContent = `
+        .mc-item-row{ position:relative; }
+        .mc-drag { width:34px; min-width:34px; display:flex; align-items:center; justify-content:center;
+                  user-select:none; cursor:grab; color:#6b7280; border-right:1px solid var(--border,#e5e7eb); }
+        .mc-drag:active { cursor:grabbing; }
+        .mc-item-row.dragging{ opacity:.6; }
+        .mc-item-row.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
+        .mc-item-row.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
+        .mc-dd-wrap { display:flex; gap:8px; align-items:center; }
+        .mc-dd-fixed { font-size:12px; color: var(--muted,#6b7280); user-select:none; }
+      `;
+      cfg.hostEl.appendChild(style);
 
-        const dateIds = (FORM_BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
-        if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
-          alert('Please choose two existing date fields for the datediff.');
-          return null;
-        }
-        if (fromId === toId) {
-          alert('Please select two different date fields for the datediff.');
-          return null;
-        }
-        f.fromId = fromId;
-        f.toId   = toId;
-        f.required = false; // computed, never required
+      const gStyle = document.createElement('style');
+      gStyle.textContent = `
+        .mc-group-card { position: relative; }
+        .mc-group-card.dragging { opacity: .6; }
+        .mc-group-card.drop-before{ box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
+        .mc-group-card.drop-after{  box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
+      `;
+      cfg.hostEl.appendChild(gStyle);
+
+      function setGroupsCollapsed(collapsed) {
+        Array.from(list.querySelectorAll('.mc-group-card')).forEach(gc => {
+          const items = gc.querySelector('.mc-items');
+          const actionsRow = gc.querySelector('.mc-add-opt')?.closest('.row');
+          if (items) items.style.display = collapsed ? 'none' : '';
+          if (actionsRow) actionsRow.style.display = collapsed ? 'none' : '';
+        });
       }
 
-      return f;
+      model.groups.forEach((grp, gIdx) => {
+        const card = document.createElement('div');
+        card.className = 'card mc-group-card';
+        card.style.marginBottom = '10px';
+        card.dataset.index = String(gIdx);
+
+        card.innerHTML = `
+          <div class="row" style="justify-content:space-between; gap:8px; margin-bottom:8px;">
+            <div class="row" style="gap:8px;">
+              <input type="text" class="mc-group-title" placeholder="Gruppen-Titel (optional)" value="${(grp.title||'').replace(/"/g,'&quot;')}" style="min-width:220px"/>
+            </div>
+            <div class="row" style="gap:6px;">
+              <button type="button" class="danger mc-del-group">Gruppe löschen</button>
+            </div>
+          </div>
+          <div class="mc-items" aria-live="polite"></div>
+          <div class="row" style="margin-top:8px; justify-content:flex-end;">
+            <button type="button" class="mc-add-opt">+ Option</button>
+          </div>
+        `;
+
+        const itemsWrap = card.querySelector('.mc-items');
+        const addOptBtn = card.querySelector('.mc-add-opt');
+
+        const titleInput = card.querySelector('.mc-group-title');
+        if (titleInput && titleInput.parentElement) {
+          const gHandle = document.createElement('div');
+          gHandle.className = 'mc-drag mc-g-drag';
+          gHandle.title = 'Ziehen zum Sortieren';
+          gHandle.setAttribute('draggable','true');
+          gHandle.innerHTML = '<span class="grip">☰</span>';
+          titleInput.parentElement.insertBefore(gHandle, titleInput);
+
+          function clearGroupDropHints(){
+            Array.from(list.querySelectorAll('.mc-group-card')).forEach(el => el.classList.remove('drop-before','drop-after'));
+          }
+          gHandle.addEventListener('dragstart', (e) => {
+            mcGroupDragFrom = gIdx;
+            card.classList.add('dragging');
+            try { e.dataTransfer.setData('text/plain', String(gIdx)); } catch {}
+            e.dataTransfer.effectAllowed = 'move';
+            setGroupsCollapsed(true);
+          });
+          gHandle.addEventListener('dragend', () => {
+            mcGroupDragFrom = null;
+            card.classList.remove('dragging');
+            clearGroupDropHints();
+            setGroupsCollapsed(false);
+          });
+          card.addEventListener('dragenter', (e) => { e.preventDefault(); });
+          card.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            const rect = card.getBoundingClientRect();
+            const before = (e.clientY - rect.top) < rect.height / 2;
+            clearGroupDropHints();
+            card.classList.add(before ? 'drop-before' : 'drop-after');
+          });
+          card.addEventListener('dragleave', () => { card.classList.remove('drop-before','drop-after'); });
+          card.addEventListener('drop', (e) => {
+            e.preventDefault();
+            const fromRaw = (mcGroupDragFrom != null) ? mcGroupDragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
+            const rect = card.getBoundingClientRect();
+            const before = (e.clientY - rect.top) < rect.height / 2;
+            let to = gIdx + (before ? 0 : 1);
+            if (!Number.isFinite(fromRaw) || fromRaw < 0 || fromRaw >= model.groups.length) { clearGroupDropHints(); return; }
+            if (to < 0) to = 0;
+            if (to > model.groups.length) to = model.groups.length;
+            if (fromRaw === to) { clearGroupDropHints(); return; }
+            const [moved] = model.groups.splice(fromRaw, 1);
+            if (to > fromRaw) to -= 1;
+            model.groups.splice(to, 0, moved);
+            clearGroupDropHints();
+            setGroupsCollapsed(false);
+            render();
+          });
+        }
+
+        function drawItemRow(it, iIdx) {
+          const row = document.createElement('div');
+          row.className = 'tdz-row mc-item-row';
+          row.style.gridTemplateColumns = '34px 240px 1fr 260px';
+          row.dataset.index = String(iIdx);
+
+          const handleCol = document.createElement('div');
+          handleCol.className = 'mc-drag';
+          handleCol.title = 'Ziehen zum Sortieren';
+          handleCol.innerHTML = `<span class="grip">☰</span>`;
+
+          const first = document.createElement('div');
+          first.className = 'tdz-col';
+          first.style.gap = '6px';
+          first.innerHTML = `
+            <label class="row" style="gap:8px; align-items:center;">
+              <input type="checkbox" class="mc-opt-checked" />
+              <span>Vorausgewählt</span>
+            </label>
+            <label class="row" style="gap:8px; align-items:center;">
+              <input type="checkbox" class="mc-opt-always" />
+              <span>Immer ausgewählt</span>
+            </label>
+          `;
+
+          const valueCol = document.createElement('div');
+          valueCol.className = 'tdz-col tdz-grow';
+          valueCol.innerHTML = `
+            <label class="small">Wert</label>
+            <input type="text" class="mc-opt-value" value="${(it.value||'').replace(/"/g,'&quot;')}" placeholder="z. B. Onboarding"/>
+          `;
+
+          const actions = document.createElement('div');
+          actions.className = 'tdz-actions';
+          actions.innerHTML = `
+            <button type="button" class="ghost mc-add-field">+ Feld</button>
+            <button type="button" class="danger mc-del-opt">Löschen</button>
+          `;
+
+          const fieldsCol = document.createElement('div');
+          fieldsCol.className = 'tdz-col mc-fields-col';
+          fieldsCol.style.gridColumn = '1 / -1';
+
+          row.appendChild(handleCol);
+          row.appendChild(first);
+          row.appendChild(valueCol);
+          row.appendChild(actions);
+          row.appendChild(fieldsCol);
+
+          const cbDefault = first.querySelector('.mc-opt-checked');
+          const cbAlways  = first.querySelector('.mc-opt-always');
+          const inVal     = valueCol.querySelector('.mc-opt-value');
+
+          cbDefault.checked = !!it.checked || !!it.alwaysSelected;
+          cbAlways.checked  = !!it.alwaysSelected;
+          cbDefault.disabled = !!it.alwaysSelected;
+
+          cbDefault.addEventListener('change', () => { it.checked = !!cbDefault.checked; hidden.value = JSON.stringify(model); });
+          cbAlways.addEventListener('change', () => {
+            it.alwaysSelected = !!cbAlways.checked;
+            if (it.alwaysSelected) { it.checked = true; cbDefault.checked = true; cbDefault.disabled = true; }
+            else { cbDefault.disabled = false; }
+            hidden.value = JSON.stringify(model);
+          });
+          inVal.addEventListener('input', () => { it.value = inVal.value; hidden.value = JSON.stringify(model); });
+
+          function triggerRefresh() { drawFields(); hidden.value = JSON.stringify(model); }
+
+          function drawFields() {
+            fieldsCol.innerHTML = '';
+            if (!Array.isArray(it.fields)) it.fields = [];
+            if (!it.fields.length) return;
+
+            it.fields.forEach((fld, fIdx) => {
+              if (!fld || typeof fld !== 'object') fld = {};
+              if (!['text','number','date','datediff'].includes(fld.type)) fld.type = 'text';
+
+              const line = document.createElement('div');
+              line.className = 'row';
+              line.style.gap = '8px';
+              line.style.margin = '6px 0';
+              line.style.alignItems = 'center';
+              line.style.flexWrap = 'nowrap';
+              line.style.padding = '6px 8px';
+              line.style.borderLeft = '2px solid var(--border)';
+              line.style.background = 'rgba(127,127,127,.04)';
+              line.style.borderRadius = '8px';
+
+              const sel = document.createElement('select');
+              sel.innerHTML = `
+                <option value="text">text</option>
+                <option value="number">number</option>
+                <option value="date">date</option>
+                <option value="datediff">datediff</option>
+              `;
+              sel.className = 'select-compact';
+              sel.style.minWidth = '120px';
+
+              const inId = document.createElement('input');
+              inId.type = 'text'; inId.placeholder = 'id';
+              inId.style.minWidth = '140px'; inId.style.width = '140px';
+              inId.classList.add('muted-input');
+
+              const inLabel = document.createElement('input');
+              inLabel.type = 'text'; inLabel.placeholder = 'Label';
+              inLabel.style.minWidth = '180px'; inLabel.style.width = '180px';
+
+              const inContent = document.createElement('input');
+              inContent.type = 'text'; inContent.placeholder = 'Inhalt (optional)';
+              inContent.style.minWidth = '220px'; inContent.style.flex = '1 1 auto';
+
+              const ddWrap = document.createElement('div');
+              ddWrap.className = 'mc-dd-wrap';
+              ddWrap.style.display = 'none';
+
+              const ddLabel = document.createElement('span');
+              ddLabel.className = 'mc-dd-fixed';
+              ddLabel.textContent = 'Dauer:';
+
+              const fromSel = document.createElement('select');
+              const toSel   = document.createElement('select');
+
+              function availableDateIds() {
+                const localPrev = it.fields.slice(0, fIdx)
+                  .filter(ff => ff && ff.type === 'date' && ff.id)
+                  .map(ff => String(ff.id));
+                return uniq([ ...localPrev, ...globalDateIds() ]);
+              }
+              function populateDateSelects() {
+                const ids = availableDateIds();
+                [fromSel, toSel].forEach(sel => { sel.innerHTML = ''; });
+                if (!ids.length) {
+                  const o = document.createElement('option'); o.value = ''; o.textContent = '— keine Date-Felder —';
+                  fromSel.appendChild(o.cloneNode(true)); toSel.appendChild(o.cloneNode(true));
+                  fromSel.disabled = true; toSel.disabled = true;
+                  return;
+                }
+                fromSel.disabled = false; toSel.disabled = false;
+                ids.forEach(id => {
+                  const o1 = document.createElement('option'); o1.value = id; o1.textContent = id; fromSel.appendChild(o1);
+                  const o2 = document.createElement('option'); o2.value = id; o2.textContent = id; toSel.appendChild(o2);
+                });
+              }
+
+              ddWrap.appendChild(ddLabel);
+              ddWrap.appendChild(fromSel);
+              ddWrap.appendChild(toSel);
+
+              const btnDel = document.createElement('button');
+              btnDel.type = 'button';
+              btnDel.className = 'ghost mc-field-del';
+              btnDel.textContent = 'Entfernen';
+              btnDel.style.marginLeft = 'auto';
+
+              sel.value = fld.type || 'text';
+              inId.value = fld.id || '';
+              inLabel.value = fld.label || '';
+              inContent.value = fld.content || '';
+
+              function ensureDatediffFixedBits() {
+                fld.label = 'Dauer';
+                const fromId = fld.fromId || '';
+                const toId   = fld.toId || '';
+                fld.id = `datediff_${fromId}_${toId}`;
+              }
+
+              function toggleBits() {
+                const isDD = sel.value === 'datediff';
+                ddWrap.style.display   = isDD ? '' : 'none';
+                inId.style.display     = isDD ? 'none' : '';
+                inLabel.style.display  = isDD ? 'none' : '';
+                inContent.style.display= isDD ? 'none' : '';
+                if (isDD) {
+                  populateDateSelects();
+                  if (fld.fromId) fromSel.value = fld.fromId;
+                  if (fld.toId)   toSel.value   = fld.toId;
+                }
+              }
+
+              toggleBits();
+
+              sel.addEventListener('change', () => {
+                fld.type = sel.value;
+                if (fld.type === 'datediff') {
+                  if (!fld.fromId || !fld.toId) {
+                    const ids = availableDateIds();
+                    fld.fromId = ids[0] || '';
+                    fld.toId   = ids[1] || ids[0] || '';
+                  }
+                  ensureDatediffFixedBits();
+                } else {
+                  delete fld.fromId; delete fld.toId;
+                }
+                toggleBits();
+                hidden.value = JSON.stringify(model);
+                triggerRefresh();
+              });
+
+              inId.addEventListener('input', () => {
+                if (fld.type !== 'datediff') { fld.id = inId.value; hidden.value = JSON.stringify(model); }
+              });
+              inId.addEventListener('blur', () => { if (fld.type === 'date') triggerRefresh(); });
+              inLabel.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.label = inLabel.value; hidden.value = JSON.stringify(model); } });
+              inContent.addEventListener('input',() => { if (fld.type !== 'datediff') { fld.content = inContent.value; hidden.value = JSON.stringify(model); } });
+
+              fromSel.addEventListener('change', () => {
+                if (fld.type !== 'datediff') return;
+                fld.fromId = fromSel.value;
+                ensureDatediffFixedBits();
+                hidden.value = JSON.stringify(model);
+              });
+              toSel.addEventListener('change', () => {
+                if (fld.type !== 'datediff') return;
+                fld.toId = toSel.value;
+                ensureDatediffFixedBits();
+                hidden.value = JSON.stringify(model);
+              });
+
+              btnDel.addEventListener('click', () => {
+                it.fields.splice(fIdx,1);
+                drawFields();
+                hidden.value = JSON.stringify(model);
+              });
+
+              line.appendChild(sel);
+              line.appendChild(inLabel);
+              line.appendChild(inId);
+              line.appendChild(inContent);
+              line.appendChild(ddWrap);
+              line.appendChild(btnDel);
+              fieldsCol.appendChild(line);
+            });
+          }
+          drawFields();
+
+          actions.querySelector('.mc-add-field').addEventListener('click', () => {
+            it.fields = it.fields || [];
+            it.fields.push({ type:'text', id:'', label:'', content:'' });
+            triggerRefresh();
+            hidden.value = JSON.stringify(model);
+          });
+
+          actions.querySelector('.mc-del-opt').addEventListener('click', () => {
+            grp.items.splice(iIdx,1);
+            redrawItems();
+            hidden.value = JSON.stringify(model);
+          });
+
+          let dragFrom = null;
+          handleCol.setAttribute('draggable', 'true');
+          handleCol.addEventListener('dragstart', (e) => {
+            dragFrom = iIdx;
+            row.classList.add('dragging');
+            try { e.dataTransfer.setData('text/plain', String(iIdx)); } catch {}
+            e.dataTransfer.effectAllowed = 'move';
+          });
+          handleCol.addEventListener('dragend', () => {
+            row.classList.remove('dragging');
+            Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
+            dragFrom = null;
+          });
+          row.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            const rect = row.getBoundingClientRect();
+            const before = (e.clientY - rect.top) < rect.height / 2;
+            Array.from(itemsWrap.querySelectorAll('.mc-item-row')).forEach(r => r.classList.remove('drop-before','drop-after'));
+            row.classList.add(before ? 'drop-before' : 'drop-after');
+          });
+          row.addEventListener('dragleave', () => { row.classList.remove('drop-before','drop-after'); });
+          row.addEventListener('drop', (e) => {
+            e.preventDefault();
+            const from = (dragFrom != null) ? dragFrom : Number(e.dataTransfer.getData('text/plain') || -1);
+            const rect = row.getBoundingClientRect();
+            const before = (e.clientY - rect.top) < rect.height / 2;
+            let to = iIdx + (before ? 0 : 1);
+
+            if (!Number.isFinite(from) || from < 0 || from >= grp.items.length) return;
+            if (to < 0) to = 0;
+            if (to > grp.items.length) to = grp.items.length;
+            if (from === to) { row.classList.remove('drop-before','drop-after'); return; }
+
+            const [moved] = grp.items.splice(from, 1);
+            if (to > from) to -= 1;
+            grp.items.splice(to, 0, moved);
+
+            row.classList.remove('drop-before','drop-after');
+            redrawItems();
+            hidden.value = JSON.stringify(model);
+          });
+
+          return row;
+        }
+
+        function redrawItems() {
+          itemsWrap.innerHTML = '';
+          grp.items.forEach((it, iIdx) => itemsWrap.appendChild(drawItemRow(it, iIdx)));
+        }
+        redrawItems();
+
+        addOptBtn.addEventListener('click', () => {
+          grp.items.push({ value:'', checked:false, alwaysSelected:false, fields:[] });
+          redrawItems();
+          hidden.value = JSON.stringify(model);
+          try { itemsWrap.lastElementChild?.scrollIntoView({ block: 'nearest' }); } catch {}
+        });
+
+        card.querySelector('.mc-group-title').addEventListener('input', (e) => {
+          grp.title = e.target.value; hidden.value = JSON.stringify(model);
+        });
+        card.querySelector('.mc-del-group').addEventListener('click', () => {
+          model.groups.splice(gIdx,1);
+          render();
+        });
+
+        list.appendChild(card);
+      });
+
+      cfg.hostEl.querySelector('.mc-add-group').addEventListener('click', () => {
+        model.groups.push({ title:'', items:[] });
+        render();
+      });
     }
 
+    return api;
+  }
 
-    async function upsertField() {
-      const f = parseFieldFromInputs();
-      if (!f) return;
+  // ============================================================
+  // Fields list rendering (with DnD) — behavior preserved
+  // ============================================================
+  function renderFields() {
+    const trc = TRACE('renderFields', { fields: BUILDER.schema?.fields?.length, selected: BUILDER.selectedIndex });
+    const tb = els.tbodyFields;
+    tb.innerHTML = '';
 
-      const i = FORM_BUILDER.selectedIndex;
-      const isUpdate = i >= 0;
+    const list = Array.isArray(BUILDER.schema?.fields) ? BUILDER.schema.fields : [];
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="5" class="empty">No fields yet.</td></tr>';
+      els.fieldCount.textContent = '0 fields';
+      trc.end('empty');
+      return;
+    }
 
-      let oldId = null;
-      if (isUpdate) {
-        oldId = FORM_BUILDER.schema.fields[i].id;
-        // Uniqueness check (allow same index to keep its id)
-        if (f.id !== oldId && FORM_BUILDER.schema.fields.some(x => x.id === f.id)) {
-          alert('Field id must be unique.');
-          return;
-        }
-        FORM_BUILDER.schema.fields[i] = f;
-        setStatus('Field updated', true);
-      } else {
-        if (FORM_BUILDER.schema.fields.some(x => x.id === f.id)) {
-          alert('Field id must be unique.');
-          return;
-        }
-        FORM_BUILDER.schema.fields.push(f);
-        setStatus('Field added', true);
+    list.forEach((f, i) => {
+      const tr = document.createElement('tr');
+      tr.dataset.i = i;
+      tr.draggable = true;
+
+      const tdGrip = document.createElement('td');
+      tdGrip.className = 'mono dnd-handle';
+      tdGrip.title = 'Drag to reorder';
+      tdGrip.textContent = '☰';
+
+      const tdId = document.createElement('td');
+      tdId.className = 'mono';
+      tdId.textContent = f.id;
+
+      const tdLabel = document.createElement('td');
+      tdLabel.textContent = f.label || '';
+
+      const tdType = document.createElement('td');
+      tdType.className = 'mono';
+      tdType.textContent = f.type;
+
+      const tdDet = document.createElement('td');
+      tdDet.className = 'muted';
+      tdDet.textContent = fieldDetails(f);
+
+      tr.appendChild(tdGrip);
+      tr.appendChild(tdId);
+      tr.appendChild(tdLabel);
+      tr.appendChild(tdType);
+      tr.appendChild(tdDet);
+
+      tr.addEventListener('click', () => {
+        if (tr.classList.contains('dragging')) return;
+        selectRow(i);
+        loadFieldIntoEditor(f, i);
+      });
+
+      tr.addEventListener('dragstart', (e) => {
+        tr.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(i));
+      });
+      tr.addEventListener('dragend', () => { tr.classList.remove('dragging'); clearDropHints(); });
+      tr.addEventListener('dragover', (e) => { e.preventDefault(); showDropHint(tr, e); });
+      tr.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const from = Number(e.dataTransfer.getData('text/plain') || -1);
+        if (!Number.isFinite(from) || from < 0) return clearDropHints();
+        const to = indexFromDrop(e, tr);
+        if (to < 0) return clearDropHints();
+        reorderFields(from, to);
+        clearDropHints();
+      });
+
+      tb.appendChild(tr);
+    });
+
+    els.fieldCount.textContent = `${list.length} fields`;
+    highlightSelectedRow();
+    trc.end({ rendered: list.length });
+  }
+
+  function indexFromRow(tr) { return Number(tr?.dataset?.i ?? -1); }
+  function indexFromDrop(e, tr) {
+    const rect = tr.getBoundingClientRect();
+    const mid = rect.top + rect.height / 2;
+    const overIdx = indexFromRow(tr);
+    return (e.clientY < mid) ? overIdx : overIdx + 1;
+  }
+  function clearDropHints() {
+    Array.from(els.tbodyFields.querySelectorAll('tr')).forEach(r => {
+      r.classList.remove('drop-target-above','drop-target-below');
+    });
+  }
+  function showDropHint(tr, e) {
+    clearDropHints();
+    const rect = tr.getBoundingClientRect();
+    const mid = rect.top + rect.height / 2;
+    if (e.clientY < mid) tr.classList.add('drop-target-above');
+    else tr.classList.add('drop-target-below');
+  }
+
+  function reorderFields(from, to) {
+    const tr = TRACE('reorderFields', { from, to });
+    const list = BUILDER.schema.fields;
+    const target = Math.max(0, Math.min(to, list.length));
+    if (from === target) { tr.end('noop'); return; }
+
+    const [moved] = list.splice(from, 1);
+    const insertAt = (target > from) ? target - 1 : target;
+    list.splice(insertAt, 0, moved);
+
+    BUILDER.selectedIndex = -1;
+    els.btnDelete.disabled = true;
+    els.btnCancel.disabled = true;
+    clearEditor();
+
+    renderFields();
+    mirrorSchemaToWorkspace({ notify: true, reason: 'reorder' }).catch(()=>{});
+    setStatus('Reordered', true);
+    tr.end({ insertAt });
+  }
+
+  function selectRow(i) {
+    BUILDER.selectedIndex = i;
+    highlightSelectedRow();
+    els.btnDelete.disabled = false;
+    els.btnCancel.disabled = false;
+  }
+
+  function highlightSelectedRow() {
+    Array.from(els.tbodyFields.querySelectorAll('tr')).forEach(r => r.classList.remove('is-active'));
+    const i = BUILDER.selectedIndex;
+    if (i >= 0) {
+      const row = els.tbodyFields.querySelector(`tr[data-i="${i}"]`);
+      if (row) row.classList.add('is-active');
+    }
+  }
+
+  // ============================================================
+  // Editor load/parse
+  // ============================================================
+  function loadFieldIntoEditor(f) {
+    const tr = TRACE('loadFieldIntoEditor', { id: f?.id, type: f?.type });
+    els.pType.value = f.type;
+    els.pId.value = f.id;
+    els.pLabel.value = f.label || '';
+    els.pRequired.checked = !!f.required;
+
+    renderTypeSpecific();
+
+    if (f.type === 'select') {
+      document.getElementById('pOptions').value = (f.options||[]).join(', ');
+
+    } else if (f.type === 'multichoice') {
+      const designer = window.MultiChoiceDesigner;
+      if (designer) {
+        const mc = f.mc && typeof f.mc === 'object' ? f.mc : null;
+        const legacy = Array.isArray(f.options) ? f.options : [];
+        designer.loadModel(mc, legacy);
       }
 
-      clearEditor();
-      renderFields();
+    } else if (f.type === 'date') {
+      document.getElementById('pDateFmt').value = f.dateFormat || 'Y-m-d';
 
-      // Single save path with migrate (if rename) and prune
-      await mirror(true, { renamedFrom: oldId, renamedTo: isUpdate ? f.id : null });
-    }
+    } else if (f.type === 'table') {
+      document.getElementById('pMinRows').value = f.minRows || 0;
+      document.getElementById('pMaxRows').value = f.maxRows || 0;
+      if (window.TableDesigner) {
+        window.TableDesigner.loadColumns(Array.isArray(f.columns) ? f.columns : []);
+        window.TableDesigner.setMinMax(f.minRows || 0, f.maxRows || 0);
+      }
 
-    async function deleteSelected() {
-      const i = FORM_BUILDER.selectedIndex;
-      if (i < 0) return;
+    } else if (f.type === 'datediff') {
+      const fromSel = document.getElementById('pFromId');
+      const toSel   = document.getElementById('pToId');
+      if (fromSel && f.fromId) fromSel.value = f.fromId;
+      if (toSel && f.toId) toSel.value = f.toId;
 
-      FORM_BUILDER.schema.fields.splice(i, 1);
-      clearEditor();
-      renderFields();
-
-      // mirror() will prune values/tagMap/rules for removed fields
-      await mirror(true);
-    }
-
-
-    function clearEditor() {
-      FORM_BUILDER.selectedIndex = -1;
-      els.btnDelete.disabled = true;
-      els.btnCancel.disabled = true;
-
-      // Reset inputs
-      els.pType.value = 'text';
-      els.pId.value = '';
-      els.pLabel.value = '';
       els.pRequired.checked = false;
-      renderTypeSpecific();
-      highlightSelectedRow();
+      const reqContainer = els.pRequired.closest('label')?.parentElement || els.pRequired.parentElement;
+      if (reqContainer) reqContainer.style.display = 'none';
     }
 
-    function cancelEditing() {
-      clearEditor();
-      setStatus('Edit canceled', true);
-    }
+    tr.end();
+  }
 
-    function renderAll({ persist = true } = {}) {
-      renderFields();
-      els.fieldCount.textContent = `${FORM_BUILDER.schema.fields.length} fields`;
-      if (persist) saveLS(FORM_BUILDER.schema);
-    }
+  function parseFieldFromInputs() {
+    const tr = TRACE('parseFieldFromInputs', { type: els.pType.value });
+    const t  = els.pType.value;
+    const id = (els.pId.value || '').trim();
+    if (!id) { alert('Please enter a field id'); tr.end('missing-id'); return null; }
 
-    // ---------- Persistence ----------
-    async function mirror(notify, opts = {}) {
-      if (els.formTitle.value && FORM_BUILDER.schema) {
-        FORM_BUILDER.schema.title = els.formTitle.value;
+    const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
+
+    if (t === 'select') {
+      const raw = (document.getElementById('pOptions')?.value || '').trim();
+      f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+    } else if (t === 'multichoice') {
+      const designer = window.MultiChoiceDesigner;
+      if (designer) {
+        const mc = designer.getModel();
+        const flat = designer.getFlatOptions();
+        f.mc = mc;
+        f.options = flat;
+      } else {
+        f.options = [];
+        f.mc = { groups: [] };
       }
-      const nowIso = new Date().toISOString();
 
-      // Always keep a local backup copy of the schema
-      saveLS(FORM_BUILDER.schema);
+    } else if (t === 'date') {
+      f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
+
+    } else if (t === 'table') {
+      const mr = parseInt(document.getElementById('pMinRows')?.value||'0',10);
+      const xr = parseInt(document.getElementById('pMaxRows')?.value||'0',10);
+
+      if (window.TableDesigner) {
+        f.columns = window.TableDesigner.getColumns();
+      } else {
+        const raw = (document.getElementById('pCols')?.value || '').trim();
+        f.columns = raw ? raw.split(',').map(s => s.trim()).filter(Boolean).map(seg => {
+          const [cid, label, ctype, opts] = seg.split(':');
+          const col = { id: (cid||'col').trim(), label: (label||cid||'col').trim() };
+          if (ctype) col.type = ctype.trim();
+          if (col.type === 'select' && opts) col.options = opts.split('/').map(s=>s.trim()).filter(Boolean);
+          return col;
+        }) : [];
+      }
+      if (mr>0) f.minRows = mr;
+      if (xr>0) f.maxRows = xr;
+
+    } else if (t === 'datediff') {
+      const fromId = (document.getElementById('pFromId')?.value || '').trim();
+      const toId   = (document.getElementById('pToId')?.value || '').trim();
+
+      const dateIds = (BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
+      if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
+        alert('Please choose two existing date fields for the datediff.');
+        tr.end('bad-datediff');
+        return null;
+      }
+      if (fromId === toId) {
+        alert('Please select two different date fields for the datediff.');
+        tr.end('same-datediff');
+        return null;
+      }
+      f.fromId = fromId;
+      f.toId   = toId;
+      f.required = false;
+    }
+
+    tr.end({ id: f.id });
+    return f;
+  }
+
+  // ============================================================
+  // Editor actions
+  // ============================================================
+  async function upsertField() {
+    const tr = TRACE('upsertField', { selectedIndex: BUILDER.selectedIndex });
+    const f = parseFieldFromInputs();
+    if (!f) { tr.end('no-field'); return; }
+
+    const i = BUILDER.selectedIndex;
+    const isUpdate = i >= 0;
+
+    let oldId = null;
+    if (isUpdate) {
+      oldId = BUILDER.schema.fields[i].id;
+      if (f.id !== oldId && BUILDER.schema.fields.some(x => x.id === f.id)) {
+        alert('Field id must be unique.');
+        tr.end('dup-id');
+        return;
+      }
+      BUILDER.schema.fields[i] = f;
+      setStatus('Field updated', true);
+    } else {
+      if (BUILDER.schema.fields.some(x => x.id === f.id)) {
+        alert('Field id must be unique.');
+        tr.end('dup-id');
+        return;
+      }
+      BUILDER.schema.fields.push(f);
+      setStatus('Field added', true);
+    }
+
+    clearEditor();
+    renderFields();
+
+    await mirrorSchemaToWorkspace({
+      notify: true,
+      reason: isUpdate ? 'update-field' : 'add-field',
+      renamedFrom: oldId,
+      renamedTo: isUpdate ? f.id : null
+    });
+
+    tr.end({ isUpdate, oldId, newId: f.id });
+  }
+
+  async function deleteSelected() {
+    const tr = TRACE('deleteSelected', { selectedIndex: BUILDER.selectedIndex });
+    const i = BUILDER.selectedIndex;
+    if (i < 0) { tr.end('none'); return; }
+
+    BUILDER.schema.fields.splice(i, 1);
+    clearEditor();
+    renderFields();
+
+    await mirrorSchemaToWorkspace({ notify: true, reason: 'delete-field' });
+
+    tr.end('ok');
+  }
+
+  function clearEditor() {
+    BUILDER.selectedIndex = -1;
+    els.btnDelete.disabled = true;
+    els.btnCancel.disabled = true;
+
+    els.pType.value = 'text';
+    els.pId.value = '';
+    els.pLabel.value = '';
+    els.pRequired.checked = false;
+
+    renderTypeSpecific();
+    highlightSelectedRow();
+  }
+
+  function cancelEditing() {
+    clearEditor();
+    setStatus('Edit canceled', true);
+  }
+
+  function renderAll({ persistFallback = true, full = true } = {}) {
+    const tr = TRACE('renderAll', { persistFallback, full });
+    renderFields();
+    els.fieldCount.textContent = `${(BUILDER.schema.fields || []).length} fields`;
+
+    if (!currentDoc?.docId && persistFallback) {
+      saveLocalSchemaFallback(BUILDER.schema);
+    }
+    tr.end();
+  }
+
+  // ============================================================
+  // Canonical save path (workspace only; local fallback only without active doc)
+  // - Migrates on rename
+  // - Prunes values/tagMap/rules against schema
+  // - Saves schema as canonical workspace patch
+  // - Broadcast handled by persistence.js via BC_PAYLOAD
+  // ============================================================
+  async function mirrorSchemaToWorkspace({ notify = false, reason = '', renamedFrom = null, renamedTo = null } = {}) {
+    const tr = TRACE('mirrorSchemaToWorkspace', { notify, reason, docId: currentDoc?.docId, renamedFrom, renamedTo });
+
+    try {
+      // keep schema title mirrored
+      if (els.formTitle.value && BUILDER.schema) BUILDER.schema.title = els.formTitle.value;
+
+      // Always keep local fallback updated (safety net)
+      saveLocalSchemaFallback(BUILDER.schema);
 
       if (!currentDoc?.docId) {
-        // No active doc → schema only (values/rules live in per-doc workspaces)
-        broadcastSchemaUpdated(null);
-        if (notify) setStatus('Saved locally.', 1);
+        // No active doc: only local fallback
+        if (notify) setStatus('Saved locally.', true);
+        tr.end('local-only');
         return;
       }
 
-      // If we renamed a field, migrate state first (values/tagMap/rules)
+      // Rename migration (values/tagMap/rules)
       let migrated = null;
-      if (opts?.renamedFrom && opts?.renamedTo && opts.renamedFrom !== opts.renamedTo) {
-        migrated = await migrateWorkspaceOnFieldRename(currentDoc.docId, opts.renamedFrom, opts.renamedTo);
+      if (renamedFrom && renamedTo && renamedFrom !== renamedTo) {
+        migrated = await migrateWorkspaceOnFieldRename(currentDoc.docId, renamedFrom, renamedTo);
       }
 
-      // Then prune everything against the new schema
-      const pruned = await pruneWorkspaceOnSchemaChange(currentDoc.docId, FORM_BUILDER.getSchema());
+      // Prune against updated schema
+      const pruned = await pruneWorkspaceOnSchemaChange(currentDoc.docId, BUILDER.schema);
 
-      // Prefer migrated (if present), then prune again to be safe (order matters)
-      const valuesToSave = (migrated?.values) ? migrated.values : pruned.values;
-      const tagMapToSave = (migrated?.tagMap) ? migrated.tagMap : pruned.tagMap;
-      const rulesToSave  = (migrated?.rules)  ? migrated.rules  : pruned.rules;
+      // Prefer migrated if present, but keep prune safety
+      const valuesToSave = migrated?.values || pruned.values || {};
+      const tagMapToSave = migrated?.tagMap || pruned.tagMap || {};
+      const rulesToSave  = migrated?.rules  || pruned.rules  || [];
 
-      await window.formSuitePersist.saveState(currentDoc.docId, {
-        schema: FORM_BUILDER.getSchema(),
-        values: valuesToSave || {},
-        tagMap: tagMapToSave || {},
-        rules:  rulesToSave  || [],
-        schemaUpdatedAt: nowIso
-      });
+      const patch = {
+        schema: BUILDER.schema,
+        values: valuesToSave,
+        tagMap: tagMapToSave,
+        rules:  rulesToSave,
+        schemaUpdatedAt: new Date().toISOString()
+      };
 
-      broadcastSchemaUpdated(currentDoc.docId);
-      if (notify) setStatus('Saved.', 1);
+      tr.step('saveState patch', { keys: Object.keys(patch), valuesKeys: Object.keys(valuesToSave).length });
+
+      await P()?.saveState?.(currentDoc.docId, patch);
+
+      if (notify) setStatus('Saved.', true);
+      tr.end('ok');
+    } catch (e) {
+      tr.error('failed', e);
+      if (notify) setStatus('Save failed (see console).', false);
+      tr.end('error');
+    }
+  }
+
+  // ============================================================
+  // Init
+  // ============================================================
+  init().catch((e) => console.error('[Builder] init failed', e));
+
+  async function init() {
+    const tr = TRACE('init');
+
+    if (!P()) {
+      tr.error('persistence layer missing', new Error('window.formSuitePersist not found'));
+      await hardResetBuilder('persistence missing');
+      tr.end('fatal');
+      return;
     }
 
+    installCanonicalListeners();
 
-
-    (async function boot(){
-      try {
-        currentDoc = readActiveDocSync();
-
-        if (currentDoc?.docId) {
-          const st = await window.formSuitePersist.loadState?.(currentDoc.docId);
-          if (st?.schema) {
-            FORM_BUILDER.schema = st.schema;
-            els.formTitle.value = st.schema.title || '';
-          } else {
-            FORM_BUILDER.schema = { title: 'Untitled form', fields: [] };
-            els.formTitle.value = '';
-          }
-          els.docStatus.textContent = `DOCX: ${currentDoc.name || currentDoc.docTitle || currentDoc.docId}`;
-          els.docStatus.classList.remove('muted');
-        } else {
-          const ls = loadLS();
-          if (ls) { FORM_BUILDER.schema = ls; els.formTitle.value = ls.title || ''; }
-          els.docStatus.textContent = 'No DOCX active.';
-          els.docStatus.classList.add('muted');
-        }
-
-        renderAll({ persist:false });
-
-        // keep title mirrored
-        els.formTitle.addEventListener('change', () => mirror(true));
-
-        // Focus/visibility refresh uses unified guard
-        document.addEventListener('visibilitychange', async () => {
-          if (document.visibilityState === 'visible') await ensureActiveOrReset();
-        });
-        window.addEventListener('focus', async () => { await ensureActiveOrReset(); });
-
-        window.addEventListener('beforeunload', () => {
-          try { if (!currentDoc?.docId) saveLS(FORM_BUILDER.schema); } catch {}
-        });
-
-        // Ensure type-specific UI is visible on load
-        renderTypeSpecific();
-      } catch (e) {
-        console.warn('Builder boot failed', e);
+    currentDoc = await P()?.getActiveDocMeta?.();
+    if (currentDoc?.docId) {
+      await refreshFromCanonical({ reason: 'init' });
+    } else {
+      // doc-less: load local fallback
+      const draft = loadLocalSchemaFallback();
+      if (draft && typeof draft === 'object') {
+        BUILDER.schema = draft;
+        els.formTitle.value = draft.title || '';
       }
-    })();
+      renderAll({ persistFallback: false, full: true });
+    }
 
+    // Type-specific UI initial paint
+    renderTypeSpecific();
 
-    // ---------- Wire-up ----------
-    els.pType.addEventListener('change', renderTypeSpecific);
-    els.btnAdd.addEventListener('click', upsertField);
-    els.btnDelete.addEventListener('click', deleteSelected);
-    els.btnCancel.addEventListener('click', cancelEditing);
-    els.formTitle.addEventListener('input', () => mirror(false));
+    // Title mirroring
+    els.formTitle.addEventListener('change', () => mirrorSchemaToWorkspace({ notify: true, reason: 'title-change' }));
+    els.formTitle.addEventListener('input', () => mirrorSchemaToWorkspace({ notify: false, reason: 'title-typing' }).catch(()=>{}));
 
-    // Triple-click logo: focus mode + go to index, toggle header links
-    installLogoFocusNav();
+    // Ensure local fallback is persisted on exit even if no doc
+    window.addEventListener('beforeunload', () => {
+      try { if (!currentDoc?.docId) saveLocalSchemaFallback(BUILDER.schema); } catch {}
+    });
+
+    tr.end();
+  }
+
+  // ============================================================
+  // Wire-up
+  // ============================================================
+  els.pType.addEventListener('change', renderTypeSpecific);
+  els.btnAdd.addEventListener('click', upsertField);
+  els.btnDelete.addEventListener('click', deleteSelected);
+  els.btnCancel.addEventListener('click', cancelEditing);
+
+  // Triple-click logo: focus mode + go to index, toggle header links
+  installLogoFocusNav();
   </script>
 </body>
 </html>
