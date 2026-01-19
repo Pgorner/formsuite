@@ -1,93 +1,116 @@
 /* ============================================================================
- * Form Suite — persistence.js (CANONICAL)
+ * Form Suite — persistence.js (CANONICAL / HARDENED)
  * ----------------------------------------------------------------------------
- * Goals (enforced here):
- *  1) One coordination layer: this file (window.formSuitePersist)
+ * Design goals:
+ *  1) One coordination layer: window.formSuitePersist
  *  2) One broadcast mechanism: BroadcastChannel("fs-active-doc")
- *  3) One payload mirror: state.payload.CRONOS_PAYLOAD (ONLY)
- *  4) One byte workflow: OPFS working copy as canonical; FileSystemHandle optional
- *  5) Hydration: supported as a SAFE, best-effort utility (never overwrites local
- *     state unless the state is empty / caller explicitly applies)
- *  6) Legacy code: removed (no legacy channels, no legacy LS keys, no interceptors)
- *  7) Debug logs everywhere
+ *  3) One payload mirror: state.payload.CRONOS_PAYLOAD (ONLY; derived here)
+ *  4) Bytes persistence is robust:
+ *      - Primary: OPFS working copy (safe filename; no illegal chars)
+ *      - Secondary: IndexedDB bytes store (structured-clone ArrayBuffer)
+ *      - Tertiary: FileSystemHandle (optional; for rehydration)
+ *  5) Identity is stable:
+ *      - Prefer embedded DOC GUID in DOCX (docVar/custom prop)
+ *      - Else: handle mapping (IDB) if same file
+ *      - Else: fingerprint map (LS) for exact bytes
+ *      - Else: mint new fsdoc:UUID
+ *  6) Debuggability:
+ *      - Every critical path logs: OPFS, IDB, handle, permissions, state
+ *      - Includes explicit “why we missed” logs for bytes
  *
  * Dependencies (optional):
- *  - docx-core.js: window.readDocVarSettings/readDocVarCustom and
- *                  window.writeDocVarSettings/writeDocVarCustom (or wrappers)
+ *  - docx-core.js:
+ *      window.readDocVarSettings / window.readDocVarCustom
+ *      window.writeDocVarSettings / window.writeDocVarCustom
  * ----------------------------------------------------------------------------
  * Public API: window.formSuitePersist
  * ============================================================================
  */
 (() => {
-  // =========================
+  // ===========================================================================
   // DEBUG / TRACE
-  // =========================
-  const DEBUG = { on: true, seq: 0 };
+  // ===========================================================================
+  const DEBUG = {
+    on: true,
+    seq: 0,
+    // Flip these to reduce noise
+    verbose: true,
+    logStatePayload: true,
+    logStorageOps: true
+  };
+
   const _t = () => new Date().toISOString().slice(11, 23);
-  const tag = (name) => `%c[Persist ${_t()} #${++DEBUG.seq}] ${name}`;
-  const tagStyle = 'color:#2563eb;font-weight:700';
+  const _tag = (name) => `%c[Persist ${_t()} #${++DEBUG.seq}] ${name}`;
+  const _style = 'color:#2563eb;font-weight:700';
 
   function TRACE(name, details) {
     const label = `${name} :: ${_t()} :: #${DEBUG.seq + 1}`;
-    try { console.groupCollapsed(tag(name), tagStyle, details ?? ''); } catch {}
-    try { console.time(label); } catch {}
+    if (DEBUG.on) {
+      try { console.groupCollapsed(_tag(name), _style, details ?? ''); } catch {}
+      try { console.time(label); } catch {}
+    }
     let ended = false;
-    return {
-      step(msg, data) { try { console.log(tag(`  ↳ ${msg}`), tagStyle, data ?? ''); } catch {} },
-      warn(msg, data) { try { console.warn(tag(`  ⚠ ${msg}`), tagStyle, data ?? ''); } catch {} },
-      error(msg, err) { try { console.error(tag(`  ✖ ${msg}`), tagStyle, err); } catch {} },
+    const api = {
+      step(msg, data) { if (!DEBUG.on) return; try { console.log(_tag(`  ↳ ${msg}`), _style, data ?? ''); } catch {} },
+      info(msg, data) { if (!DEBUG.on) return; try { console.log(_tag(`  • ${msg}`), _style, data ?? ''); } catch {} },
+      warn(msg, data) { if (!DEBUG.on) return; try { console.warn(_tag(`  ⚠ ${msg}`), _style, data ?? ''); } catch {} },
+      error(msg, err) { if (!DEBUG.on) return; try { console.error(_tag(`  ✖ ${msg}`), _style, err); } catch {} },
       end(extra) {
-        if (ended) return;
+        if (!DEBUG.on || ended) return;
         ended = true;
-        if (extra) { try { console.log(tag('done'), tagStyle, extra); } catch {} }
+        if (extra !== undefined) { try { console.log(_tag('done'), _style, extra); } catch {} }
         try { console.timeEnd(label); } catch {}
         try { console.groupEnd(); } catch {}
       }
     };
+    return api;
   }
 
   window.addEventListener('error', (e) => {
+    if (!DEBUG.on) return;
     try {
-      console.error(tag('window.error'), tagStyle, {
+      console.error(_tag('window.error'), _style, {
         message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno, error: e.error
       });
     } catch {}
   });
+
   window.addEventListener('unhandledrejection', (e) => {
-    try { console.error(tag('window.unhandledrejection'), tagStyle, e.reason); } catch {}
+    if (!DEBUG.on) return;
+    try { console.error(_tag('window.unhandledrejection'), _style, e.reason); } catch {}
   });
 
-  // =========================
+  // ===========================================================================
   // CONSTANTS (CANONICAL)
-  // =========================
+  // ===========================================================================
   const LS_KEYS = {
-    ACTIVE_META: 'FS_ACTIVE_DOC_META', // { docId, name }
-    STATE_PREFIX: 'FS_state_',         // per docId -> state
-    FP_MAP: 'FS_DOC_FINGERPRINT_MAP_V1'// { [sha256]: { docId, ts } } - mapping utility (not "state")
+    ACTIVE_META: 'FS_ACTIVE_DOC_META',          // { docId, name }
+    STATE_PREFIX: 'FS_state_',                  // per docId -> state JSON
+    FP_MAP: 'FS_DOC_FINGERPRINT_MAP_V2',        // { [sha256]: { docId, ts } }
   };
 
-  const BC_NAME = 'fs-active-doc'; // ONLY broadcast channel
+  const BC_NAME = 'fs-active-doc';
   const bc = ('BroadcastChannel' in window) ? new BroadcastChannel(BC_NAME) : null;
 
-  const DB_NAME = 'formsuite_v1';
+  const DB_NAME = 'formsuite_v2';
+  const DB_VER = 2;
   const DB_STORE_HANDLES = 'handles'; // { docId, handle }
+  const DB_STORE_BYTES = 'bytes';     // { docId, ab, ts, len }
+  const DB_STORE_META = 'meta';       // { k, v } future-proof
 
-  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';   // payload key inside state.payload
-  const DOC_GUID_KEY = 'FS_DOC_GUID';     // stable GUID stored in DOCX docVar/custom prop
-  const STABLE_DOCID_PREFIX = 'fsdoc:';   // internal stable docId prefix
+  const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
+  const DOC_GUID_KEY = 'FS_DOC_GUID';
+  const STABLE_DOCID_PREFIX = 'fsdoc:';
+  const OPFS_EXT = '.docx';
 
-  // OPFS working copy: canonical bytes store
-  const OPFS_EXT = '.docx'; // we always store a .docx working copy per docId (even if docm etc)
-
-  // Tab identity for broadcast filtering
   const TAB_ID = (() => {
     try { return crypto?.randomUUID?.() || (Date.now() + '_' + Math.random().toString(16).slice(2)); }
     catch { return (Date.now() + '_' + Math.random().toString(16).slice(2)); }
   })();
 
-  // =========================
+  // ===========================================================================
   // BASIC UTILS
-  // =========================
+  // ===========================================================================
   const isPlainObject = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
   const _nowIso = () => { try { return new Date().toISOString(); } catch { return ''; } };
   const _safeArr = (v) => Array.isArray(v) ? v.slice() : (v == null ? [] : [v]);
@@ -113,9 +136,7 @@
     if (Array.isArray(b)) return b.slice();
     if (!isPlainObject(b)) return (b === undefined) ? a : b;
     const out = isPlainObject(a) ? { ...a } : {};
-    for (const [k, v] of Object.entries(b)) {
-      out[k] = deepMerge(a?.[k], v);
-    }
+    for (const [k, v] of Object.entries(b)) out[k] = deepMerge(a?.[k], v);
     return out;
   }
 
@@ -129,12 +150,27 @@
     return LS_KEYS.STATE_PREFIX + String(docId || '');
   }
 
-  function splitNameAndExt(fileName) {
-    const m = String(fileName || 'document.docx').match(/\.(docx|docm|dotx|dotm)$/i);
-    return {
-      base: String(fileName || 'document.docx').replace(/\.(docx|docm|dotx|dotm)$/i, ''),
-      ext:  (m ? m[1] : 'docx').toLowerCase()
-    };
+  function normalizeStableDocId(raw) {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    if (!s) return null;
+    if (s.startsWith(STABLE_DOCID_PREFIX)) return s;
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) {
+      return STABLE_DOCID_PREFIX + s;
+    }
+    return null;
+  }
+
+  function makeStableDocId() {
+    try { if (crypto?.randomUUID) return STABLE_DOCID_PREFIX + crypto.randomUUID(); } catch {}
+    const u8 = new Uint8Array(16);
+    try { crypto.getRandomValues(u8); } catch { for (let i = 0; i < 16; i++) u8[i] = Math.floor(Math.random() * 256); }
+    u8[6] = (u8[6] & 0x0f) | 0x40;
+    u8[8] = (u8[8] & 0x3f) | 0x80;
+    const hex = Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
+    return STABLE_DOCID_PREFIX + (
+      hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
+    );
   }
 
   async function sha256Hex(bufOrU8) {
@@ -157,53 +193,20 @@
     }
   }
 
-  function normalizeStableDocId(raw) {
-    if (!raw) return null;
-    const s = String(raw).trim();
-    if (!s) return null;
-    if (s.startsWith(STABLE_DOCID_PREFIX)) return s;
-    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) {
-      return STABLE_DOCID_PREFIX + s;
-    }
-    return null;
-  }
-
-  function makeStableDocId() {
-    try {
-      if (crypto?.randomUUID) return STABLE_DOCID_PREFIX + crypto.randomUUID();
-    } catch {}
-    const u8 = new Uint8Array(16);
-    try { crypto.getRandomValues(u8); } catch { for (let i = 0; i < 16; i++) u8[i] = Math.floor(Math.random() * 256); }
-    u8[6] = (u8[6] & 0x0f) | 0x40;
-    u8[8] = (u8[8] & 0x3f) | 0x80;
-    const hex = Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
-    return STABLE_DOCID_PREFIX + (
-      hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20)
-    );
-  }
-
-  // =========================
-  // FINGERPRINT MAP (utility)
-  // =========================
+  // ===========================================================================
+  // FINGERPRINT MAP (LS utility)
+  // ===========================================================================
   function _readFpMap() {
-    const tr = TRACE('_readFpMap');
     try {
       const raw = localStorage.getItem(LS_KEYS.FP_MAP);
       const obj = raw ? JSON.parse(raw) : {};
-      const out = (obj && typeof obj === 'object') ? obj : {};
-      tr.end({ entries: Object.keys(out).length });
-      return out;
-    } catch (e) {
-      tr.warn('read fp map failed', e);
-      tr.end();
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch {
       return {};
     }
   }
   function _writeFpMap(map) {
-    const tr = TRACE('_writeFpMap', { entries: Object.keys(map || {}).length });
-    try { localStorage.setItem(LS_KEYS.FP_MAP, JSON.stringify(map || {})); }
-    catch (e) { tr.warn('write fp map failed', e); }
-    finally { tr.end(); }
+    try { localStorage.setItem(LS_KEYS.FP_MAP, JSON.stringify(map || {})); } catch {}
   }
   function getMappedDocIdForFingerprint(fpHex) {
     if (!fpHex || fpHex === '(hash-error)') return null;
@@ -218,12 +221,12 @@
     const m = _readFpMap();
     m[fpHex] = { docId: norm, ts: Date.now() };
 
-    // bounded growth: keep most recent 200 (best-effort)
+    // Bound growth (best effort)
     try {
       const entries = Object.entries(m);
-      if (entries.length > 250) {
+      if (entries.length > 350) {
         entries.sort((a, b) => ((a[1]?.ts || 0) - (b[1]?.ts || 0)));
-        const keep = entries.slice(-200);
+        const keep = entries.slice(-250);
         const nm = {};
         for (const [k, v] of keep) nm[k] = v;
         _writeFpMap(nm);
@@ -234,17 +237,23 @@
     _writeFpMap(m);
   }
 
-  // =========================
-  // INDEXEDDB HANDLE STORE
-  // =========================
+  // ===========================================================================
+  // IDB (handles + bytes)
+  // ===========================================================================
   function openDB() {
     return new Promise((resolve, reject) => {
-      const tr = TRACE('openDB', { DB_NAME });
-      const req = indexedDB.open(DB_NAME, 1);
+      const tr = TRACE('openDB', { DB_NAME, DB_VER });
+      const req = indexedDB.open(DB_NAME, DB_VER);
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains(DB_STORE_HANDLES)) {
           db.createObjectStore(DB_STORE_HANDLES, { keyPath: 'docId' });
+        }
+        if (!db.objectStoreNames.contains(DB_STORE_BYTES)) {
+          db.createObjectStore(DB_STORE_BYTES, { keyPath: 'docId' });
+        }
+        if (!db.objectStoreNames.contains(DB_STORE_META)) {
+          db.createObjectStore(DB_STORE_META, { keyPath: 'k' });
         }
       };
       req.onsuccess = () => { tr.end('ok'); resolve(req.result); };
@@ -252,42 +261,72 @@
     });
   }
 
-  async function idbPutHandle(docId, handle) {
-    const tr = TRACE('idbPutHandle', { docId, hasHandle: !!handle });
+  async function idbPut(store, keyObj) {
+    const tr = TRACE('idbPut', { store, key: keyObj?.docId ?? keyObj?.k ?? '(unknown)' });
     try {
-      if (!docId || !handle) { tr.end('skip'); return; }
       const db = await openDB();
       await new Promise((res, rej) => {
-        const tx = db.transaction(DB_STORE_HANDLES, 'readwrite');
-        tx.objectStore(DB_STORE_HANDLES).put({ docId, handle });
+        const tx = db.transaction(store, 'readwrite');
+        tx.objectStore(store).put(keyObj);
         tx.oncomplete = res;
         tx.onerror = () => rej(tx.error);
       });
       tr.end('stored');
+      return true;
     } catch (e) {
-      tr.warn('store handle failed', e);
-      tr.end();
+      tr.warn('idbPut failed', e);
+      tr.end('fail');
+      return false;
     }
+  }
+
+  async function idbGet(store, key) {
+    const tr = TRACE('idbGet', { store, key });
+    try {
+      const db = await openDB();
+      const v = await new Promise((res, rej) => {
+        const tx = db.transaction(store, 'readonly');
+        const req = tx.objectStore(store).get(key);
+        req.onsuccess = () => res(req.result || null);
+        req.onerror = () => rej(req.error);
+      });
+      tr.end({ ok: !!v });
+      return v;
+    } catch (e) {
+      tr.warn('idbGet failed', e);
+      tr.end('fail');
+      return null;
+    }
+  }
+
+  async function idbPutHandle(docId, handle) {
+    const tr = TRACE('idbPutHandle', { docId, hasHandle: !!handle });
+    if (!docId || !handle) { tr.end('skip'); return false; }
+    return idbPut(DB_STORE_HANDLES, { docId, handle, ts: Date.now() });
   }
 
   async function idbGetHandle(docId) {
     const tr = TRACE('idbGetHandle', { docId });
-    try {
-      if (!docId) { tr.end('no docId'); return null; }
-      const db = await openDB();
-      const handle = await new Promise((res, rej) => {
-        const tx = db.transaction(DB_STORE_HANDLES, 'readonly');
-        const req = tx.objectStore(DB_STORE_HANDLES).get(docId);
-        req.onsuccess = () => res(req.result ? req.result.handle : null);
-        req.onerror = () => rej(req.error);
-      });
-      tr.end({ hasHandle: !!handle });
-      return handle || null;
-    } catch (e) {
-      tr.warn('get handle failed', e);
-      tr.end();
-      return null;
-    }
+    if (!docId) { tr.end('no docId'); return null; }
+    const rec = await idbGet(DB_STORE_HANDLES, docId);
+    const h = rec?.handle || null;
+    tr.end({ hasHandle: !!h, kind: h?.kind || null });
+    return h;
+  }
+
+  async function idbPutBytes(docId, ab) {
+    const tr = TRACE('idbPutBytes', { docId, len: ab?.byteLength || 0 });
+    if (!docId || !ab) { tr.end('skip'); return false; }
+    return idbPut(DB_STORE_BYTES, { docId, ab, len: ab.byteLength, ts: Date.now() });
+  }
+
+  async function idbGetBytes(docId) {
+    const tr = TRACE('idbGetBytes', { docId });
+    if (!docId) { tr.end('no docId'); return null; }
+    const rec = await idbGet(DB_STORE_BYTES, docId);
+    const ab = rec?.ab || null;
+    tr.end({ ok: !!ab, len: ab?.byteLength || 0, ts: rec?.ts || null });
+    return ab;
   }
 
   async function findDocIdByHandle(handle) {
@@ -323,17 +362,33 @@
       return null;
     } catch (e) {
       tr.warn('find by handle failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
 
-  // =========================
-  // OPFS WORKING COPY (CANONICAL BYTES)
-  // =========================
+  // ===========================================================================
+  // OPFS (working copy) — SAFE FILENAMES
+  // ===========================================================================
+  function opfsFileNameForDocId(docId) {
+    // OPFS filenames should be conservative: avoid ":" and any odd characters.
+    const safe = String(docId || '')
+      .replace(/^fsdoc:/i, 'fsdoc_')
+      .replace(/[^a-z0-9._-]/gi, '_');
+    return `${safe}${OPFS_EXT}`;
+  }
+
   async function opfsRoot() {
-    try { return await navigator.storage.getDirectory(); }
-    catch { return null; }
+    const tr = TRACE('opfsRoot');
+    try {
+      const root = await navigator.storage.getDirectory();
+      tr.end({ ok: !!root });
+      return root;
+    } catch (e) {
+      tr.warn('no OPFS root', e);
+      tr.end({ ok: false });
+      return null;
+    }
   }
 
   async function opfsPut(docId, bytes) {
@@ -343,11 +398,15 @@
       if (!root) { tr.end('no root'); return false; }
 
       const u8 = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes || []);
-      const fh = await root.getFileHandle(`${docId}${OPFS_EXT}`, { create: true });
+      const fname = opfsFileNameForDocId(docId);
+      tr.step('fname', fname);
+
+      const fh = await root.getFileHandle(fname, { create: true });
       const w = await fh.createWritable();
       await w.write(u8);
       await w.close();
-      tr.end({ ok: true, len: u8.byteLength });
+
+      tr.end({ ok: true, len: u8.byteLength, fname });
       return true;
     } catch (e) {
       tr.warn('opfs put failed', e);
@@ -362,10 +421,14 @@
       const root = await opfsRoot();
       if (!root) { tr.end('no root'); return null; }
 
-      const fh = await root.getFileHandle(`${docId}${OPFS_EXT}`, { create: false });
+      const fname = opfsFileNameForDocId(docId);
+      tr.step('fname', fname);
+
+      const fh = await root.getFileHandle(fname, { create: false });
       const f = await fh.getFile();
       const ab = await f.arrayBuffer();
-      tr.end({ len: ab?.byteLength || 0 });
+
+      tr.end({ ok: true, len: ab?.byteLength || 0, fname });
       return ab || null;
     } catch (e) {
       tr.end('miss');
@@ -373,9 +436,9 @@
     }
   }
 
-  // =========================
+  // ===========================================================================
   // PERMISSIONS (HANDLE OPTIONAL)
-  // =========================
+  // ===========================================================================
   async function ensurePermission(handle, mode = 'readwrite') {
     const tr = TRACE('ensurePermission', { mode, hasHandle: !!handle });
     try {
@@ -392,19 +455,15 @@
     }
   }
 
-  // =========================
-  // ACTIVE DOC (SINGLE SOURCE OF TRUTH)
-  // =========================
+  // ===========================================================================
+  // ACTIVE DOC (single source of truth)
+  // ===========================================================================
   let _active = null; // { docId, name }
   const activeListeners = new Set();
   const stateListeners = new Set();
 
-  function emitActive(meta) {
-    for (const fn of activeListeners) { try { fn(meta); } catch {} }
-  }
-  function emitState(msg) {
-    for (const fn of stateListeners) { try { fn(msg); } catch {} }
-  }
+  function emitActive(meta) { for (const fn of activeListeners) { try { fn(meta); } catch {} } }
+  function emitState(msg) { for (const fn of stateListeners) { try { fn(msg); } catch {} } }
 
   function getActiveDocMeta() {
     if (_active?.docId) return _active;
@@ -421,7 +480,7 @@
       tr.end('written');
     } catch (e) {
       tr.warn('write active failed', e);
-      tr.end();
+      tr.end('fail');
     }
   }
 
@@ -449,7 +508,7 @@
       return next;
     } catch (e) {
       tr.error('setActiveDoc failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
@@ -461,11 +520,10 @@
       tr.end('sent');
     } catch (e) {
       tr.warn('broadcast updated failed', e);
-      tr.end();
+      tr.end('fail');
     }
   }
 
-  // Keep in-memory active aligned with storage changes (cross-tab)
   window.addEventListener('storage', (e) => {
     if (e.key !== LS_KEYS.ACTIVE_META) return;
     const tr = TRACE('storage:ACTIVE_META', { hasNew: !!e.newValue });
@@ -476,11 +534,10 @@
       tr.end(meta);
     } catch (err) {
       tr.warn('parse active meta failed', err);
-      tr.end();
+      tr.end('fail');
     }
   });
 
-  // BC messages (single channel)
   bc?.addEventListener('message', (ev) => {
     const m = ev?.data || {};
     if (!m || typeof m !== 'object') return;
@@ -490,34 +547,32 @@
     try {
       if (m.type === 'active:set') {
         _active = { docId: m.docId, name: m.name || 'document.docx' };
-        writeJSON(LS_KEYS.ACTIVE_META, _active); // align storage for non-BC listeners
+        writeJSON(LS_KEYS.ACTIVE_META, _active);
         emitActive(_active);
       } else if (m.type === 'active:clear') {
         _active = null;
         writeJSON(LS_KEYS.ACTIVE_META, null);
         emitActive(null);
       } else if (m.type === 'active:updated') {
-        // no-op here; pages may listen + react (rehydrate UI)
-        // we still forward as a "state-ish" event for convenience
         emitState({ docId: m.docId, kind: 'bytes-updated', from: m.from, ts: m.ts });
       } else if (m.type === 'state:patched') {
         emitState({ docId: m.docId, kind: 'state-patched', patch: m.patch || {}, from: m.from, ts: m.ts });
+      } else if (m.type === 'rules-updated') {
+        emitState({ docId: m.docId, kind: 'rules-updated', from: m.from, ts: m.ts });
       }
       tr.end('handled');
     } catch (e) {
       tr.warn('BC handler failed', e);
-      tr.end();
+      tr.end('fail');
     }
   });
 
-  // =========================
+  // ===========================================================================
   // STATE + CANONICAL PAYLOAD MIRROR
-  // =========================
+  // ===========================================================================
   function buildCanonicalPayloadFromState(state) {
-    // IMPORTANT: payload mirror is derived. It must be deterministic and complete.
     const schema = isPlainObject(state?.schema) ? state.schema : {};
     const fields = Array.isArray(schema.fields) ? schema.fields : [];
-
     return {
       title: schema.title || 'Form',
       fields,
@@ -540,23 +595,35 @@
       if (!Array.isArray(st.fieldRules)) st.fieldRules = [];
       if (!isPlainObject(st.payload)) st.payload = {};
 
-      // enforce canonical mirror ONLY here
       st.payload[PAYLOAD_KEY] = buildCanonicalPayloadFromState(st);
-
-      // version counter for lightweight change detection
       st.__v = (st.__v | 0) + 1;
 
-      tr.end({
-        v: st.__v,
-        rulesLen: st.rules.length,
-        fieldRulesLen: st.fieldRules.length,
-        hasPayload: !!st.payload?.[PAYLOAD_KEY]
-      });
+      if (DEBUG.logStatePayload) {
+        try {
+          console.log('[DBG persist.normalizeState]', {
+            docId,
+            v: st.__v,
+            rulesLen: st.rules.length,
+            fieldRulesLen: st.fieldRules.length,
+            payloadRulesLen: st.payload?.[PAYLOAD_KEY]?.rules?.length ?? null
+          });
+        } catch {}
+      }
+
+      tr.end({ v: st.__v });
       return st;
     } catch (e) {
       tr.warn('normalizeState failed', e);
-      tr.end();
-      return { payload: { [PAYLOAD_KEY]: { title: 'Form', fields: [], values: {}, tagMap: {}, rules: [], fieldRules: [], updatedAt: _nowIso() } }, __v: 1 };
+      tr.end('fail');
+      return {
+        schema: {},
+        values: {},
+        tagMap: {},
+        rules: [],
+        fieldRules: [],
+        payload: { [PAYLOAD_KEY]: { title: 'Form', fields: [], values: {}, tagMap: {}, rules: [], fieldRules: [], updatedAt: _nowIso() } },
+        __v: 1
+      };
     }
   }
 
@@ -565,13 +632,12 @@
     try {
       if (!docId) { tr.end('no docId'); return {}; }
       const st = readJSON(keyForState(docId)) || {};
-      const out = normalizeState(docId, st); // keep invariant even if someone edited LS manually
-      // IMPORTANT: We do not write back on getState (avoid chatty LS). Only on setState/saveState.
-      tr.end({ keys: Object.keys(out || {}).length, v: out.__v });
+      const out = normalizeState(docId, st);
+      tr.end({ v: out.__v, keys: Object.keys(out || {}).length });
       return out;
     } catch (e) {
       tr.warn('getState failed', e);
-      tr.end();
+      tr.end('fail');
       return {};
     }
   }
@@ -584,25 +650,17 @@
 
       const prev = readJSON(keyForState(docId)) || {};
       const normalizedPatch = { ...patch };
-
-      // enforce arrays replacing semantics; accept explicit empty arrays
       if ('rules' in normalizedPatch) normalizedPatch.rules = _safeArr(normalizedPatch.rules);
       if ('fieldRules' in normalizedPatch) normalizedPatch.fieldRules = _safeArr(normalizedPatch.fieldRules);
 
-      // Merge then normalize (canonical mirror regenerated)
       const merged = deepMerge(prev, normalizedPatch);
       const next = normalizeState(docId, merged);
 
       writeJSON(keyForState(docId), next);
 
-      try {
-        console.log('[DBG persist.setState]', { docId, v: next.__v, rulesLen: next.rules.length, fieldRulesLen: next.fieldRules.length });
-        console.log('[DBG persist.setState] payload.CRONOS_PAYLOAD', {
-          has: !!next?.payload?.CRONOS_PAYLOAD,
-          rulesLen: next?.payload?.CRONOS_PAYLOAD?.rules?.length ?? null,
-          fieldRulesLen: next?.payload?.CRONOS_PAYLOAD?.fieldRules?.length ?? null
-        });
-      } catch {}
+      if (DEBUG.on && DEBUG.logStorageOps) {
+        try { console.log('[DBG persist.setState]', { docId, v: next.__v }); } catch {}
+      }
 
       if (broadcast) {
         try { bc?.postMessage({ type: 'state:patched', docId, patch: normalizedPatch, from: TAB_ID, ts: Date.now() }); } catch {}
@@ -613,7 +671,7 @@
       return next;
     } catch (e) {
       tr.error('setState failed', e);
-      tr.end();
+      tr.end('fail');
       return {};
     }
   }
@@ -626,7 +684,7 @@
       return out;
     } catch (e) {
       tr.error('saveState failed', e);
-      tr.end();
+      tr.end('fail');
       return {};
     }
   }
@@ -635,14 +693,21 @@
     const tr = TRACE('loadState', { docId });
     try {
       const st = getState(docId);
-      try {
-        console.log('[DBG persist.loadState]', { docId, v: st.__v, keys: Object.keys(st || {}), rulesLen: st.rules?.length ?? null });
-      } catch {}
+      if (DEBUG.on) {
+        try {
+          console.log('[DBG persist.loadState]', {
+            docId, v: st.__v,
+            rulesLen: st.rules?.length ?? null,
+            fieldRulesLen: st.fieldRules?.length ?? null,
+            hasPayload: !!st?.payload?.[PAYLOAD_KEY]
+          });
+        } catch {}
+      }
       tr.end({ v: st.__v });
       return st;
     } catch (e) {
       tr.warn('loadState failed', e);
-      tr.end();
+      tr.end('fail');
       return {};
     }
   }
@@ -651,14 +716,13 @@
     try { return (getState(docId) || {}).values || {}; } catch { return {}; }
   }
 
-  // =========================
-  // DOCX PAYLOAD + GUID (OPTIONAL; uses docx-core.js if present)
-  // =========================
+  // ===========================================================================
+  // DOCX GUID + PAYLOAD (optional)
+  // ===========================================================================
   async function readDocVar(bytes, key) {
     const tr = TRACE('readDocVar', { key, len: bytes?.byteLength || bytes?.length });
     try {
       if (!bytes) { tr.end('no bytes'); return null; }
-      // Prefer docx-core.js wrappers if present
       if (typeof window.readDocVarSettings === 'function') {
         const v = await window.readDocVarSettings(bytes, key);
         if (v != null) { tr.end({ via: 'settings' }); return v; }
@@ -671,7 +735,7 @@
       return null;
     } catch (e) {
       tr.warn('readDocVar failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
@@ -680,7 +744,6 @@
     const tr = TRACE('writeDocVar', { key, valueLen: String(value ?? '').length });
     try {
       if (!bytes) { tr.end('no bytes'); return bytes; }
-      // Prefer settings writer; fallback custom writer if available
       if (typeof window.writeDocVarSettings === 'function') {
         const out = await window.writeDocVarSettings(bytes, key, value);
         tr.end({ via: 'settings' });
@@ -695,7 +758,7 @@
       return bytes;
     } catch (e) {
       tr.warn('writeDocVar failed', e);
-      tr.end();
+      tr.end('fail');
       return bytes;
     }
   }
@@ -708,7 +771,7 @@
       return raw;
     } catch (e) {
       tr.warn('read payload failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
@@ -722,7 +785,7 @@
       return norm;
     } catch (e) {
       tr.warn('read doc guid failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
@@ -738,22 +801,19 @@
       return out;
     } catch (e) {
       tr.warn('write doc guid failed', e);
-      tr.end();
+      tr.end('fail');
       return bytes;
     }
   }
 
-  // =========================
-  // HYDRATION (SAFE BY DESIGN)
-  //  - Only hydrates if state has NO schema fields (empty workspace)
-  //  - Never overwrites non-empty local state
-  // =========================
+  // ===========================================================================
+  // HYDRATION (safe only if empty schema)
+  // ===========================================================================
   let __hydrating = false;
 
   async function hydrateFromDocxIfEmpty(docId) {
     const tr = TRACE('hydrateFromDocxIfEmpty', { docId, locked: __hydrating });
     if (!docId || __hydrating) { tr.end('skip'); return false; }
-
     __hydrating = true;
     try {
       const st = await loadState(docId);
@@ -769,7 +829,8 @@
       let payload = null;
       try { payload = JSON.parse(raw); } catch { payload = null; }
       if (!payload || !Array.isArray(payload.fields) || payload.fields.length === 0) {
-        tr.end('payload invalid/empty'); return false;
+        tr.end('payload invalid/empty');
+        return false;
       }
 
       const schema = { title: payload.title || 'Form', fields: payload.fields };
@@ -778,22 +839,12 @@
       const rules = Array.isArray(payload.rules) ? payload.rules : [];
       const fieldRules = Array.isArray(payload.fieldRules) ? payload.fieldRules : [];
 
-      // IMPORTANT: store into canonical state; payload mirror derived automatically
-      setState(docId, {
-        schema,
-        values,
-        tagMap,
-        rules,
-        fieldRules,
-        schemaUpdatedAt: _nowIso(),
-        hydratedAt: _nowIso()
-      });
-
+      setState(docId, { schema, values, tagMap, rules, fieldRules, hydratedAt: _nowIso() }, { broadcast: true });
       tr.end({ fields: schema.fields.length, rulesLen: rules.length, fieldRulesLen: fieldRules.length });
       return true;
     } catch (e) {
       tr.error('hydrate failed', e);
-      tr.end();
+      tr.end('fail');
       return false;
     } finally {
       __hydrating = false;
@@ -810,30 +861,41 @@
       return ok;
     } catch (e) {
       tr.warn('ensureHydrated failed', e);
-      tr.end();
+      tr.end('fail');
       return false;
     }
   }
 
-  // =========================
-  // BYTES API (CANONICAL)
-  // =========================
+  // ===========================================================================
+  // BYTES API (hardened): OPFS -> IDB bytes -> handle -> MISS
+  // ===========================================================================
   async function getBytes(docId) {
     const tr = TRACE('getBytes', { docId });
     try {
       if (!docId) { tr.end('no docId'); return null; }
 
-      // 1) OPFS working copy is canonical
+      // 1) OPFS (canonical)
       const opfs = await opfsGet(docId);
       if (opfs) { tr.end({ via: 'opfs', len: opfs.byteLength }); return opfs; }
 
-      // 2) Fallback: handle (if stored), then refresh OPFS
+      // 2) IDB bytes fallback
+      const idb = await idbGetBytes(docId);
+      if (idb) {
+        // Best-effort: re-seed OPFS for faster next time
+        await opfsPut(docId, new Uint8Array(idb));
+        tr.end({ via: 'idb', len: idb.byteLength });
+        return idb;
+      }
+
+      // 3) Handle fallback
       const h = await idbGetHandle(docId);
       if (h?.getFile) {
         try {
           const f = await h.getFile();
           const ab = await f.arrayBuffer();
+          // persist everywhere best-effort
           await opfsPut(docId, new Uint8Array(ab));
+          await idbPutBytes(docId, ab);
           tr.end({ via: 'handle', len: ab.byteLength });
           return ab;
         } catch (e) {
@@ -841,11 +903,18 @@
         }
       }
 
+      // MISS (explicit why)
+      tr.warn('MISS bytes', {
+        docId,
+        opfs: 'miss',
+        idbBytes: 'miss',
+        handle: h ? 'present-but-unreadable' : 'none'
+      });
       tr.end('miss');
       return null;
     } catch (e) {
       tr.error('getBytes failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
@@ -860,7 +929,7 @@
       return ab;
     } catch (e) {
       tr.warn('getCurrentDocBytes failed', e);
-      tr.end();
+      tr.end('fail');
       return null;
     }
   }
@@ -870,35 +939,37 @@
     try {
       if (!docId) { tr.end('no docId'); return false; }
       const u8 = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes || []);
-      const ok = await opfsPut(docId, u8);
-      if (ok && broadcast) {
+      const ab = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+
+      const okOpfs = await opfsPut(docId, u8);
+      const okIdb = await idbPutBytes(docId, ab);
+
+      if (broadcast) {
         const meta = getActiveDocMeta();
         broadcastActiveUpdated(docId, meta?.name);
       }
-      tr.end({ ok });
-      return ok;
+
+      tr.end({ ok: !!(okOpfs || okIdb), opfs: okOpfs, idb: okIdb });
+      return !!(okOpfs || okIdb);
     } catch (e) {
       tr.error('putBytes failed', e);
-      tr.end();
+      tr.end('fail');
       return false;
     }
   }
 
-  // =========================
-  // STABLE IDENTITY + CURRENT DOC SETUP
-  // =========================
+  // ===========================================================================
+  // IDENTITY + CURRENT DOC SETUP (hardened)
+  // ===========================================================================
   /**
-   * Identity rules (canonical):
-   *  - Prefer embedded DOC_GUID_KEY in DOCX when present (portable stability)
-   *  - Else, if opened via FS handle, reuse IDB mapping for that handle (stability on same machine)
-   *  - Else, reuse fingerprint map if available (stability for exact bytes)
-   *  - Else, mint new stable docId (fsdoc:UUID) and (best-effort) embed it into DOCX working copy
+   * setCurrentDoc({ bytes|handle, name })
    *
-   * Result:
-   *  - OPFS working copy always exists for docId
-   *  - Active meta set
-   *  - State initialized (if empty)
-   *  - Optional safe hydration attempt (schema/payload) if state is empty
+   * Guarantees best-effort persistence:
+   *  - writes bytes to OPFS and IDB bytes store
+   *  - stores handle mapping (optional)
+   *  - sets active meta (LS + BC)
+   *  - initializes state if missing
+   *  - attempts safe hydration (if schema empty)
    */
   async function setCurrentDoc({ bytes, handle, name }) {
     const tr = TRACE('setCurrentDoc', { hasBytes: !!bytes, hasHandle: !!handle, name });
@@ -916,14 +987,14 @@
 
       const u8 = (ab instanceof Uint8Array) ? ab : new Uint8Array(ab);
 
-      // Compute helpers
+      // Fingerprint
       const fp = await sha256Hex(u8);
       const fromFp = getMappedDocIdForFingerprint(fp);
 
       // Determine docId
       let docId = null;
 
-      // 1) embedded doc guid
+      // 1) embedded guid
       const embedded = await readDocGuidFromDocx(u8);
       if (embedded) docId = embedded;
 
@@ -933,32 +1004,41 @@
         if (mapped) docId = mapped;
       }
 
-      // 3) fingerprint map
+      // 3) fp mapping
       if (!docId && fromFp) docId = fromFp;
 
       // 4) mint
       if (!docId) docId = makeStableDocId();
 
-      // Store handle mapping (optional) and set active
-      if (handle) await idbPutHandle(docId, handle);
+      tr.step('identity', { docId, embedded: !!embedded, viaFp: !!fromFp, hasHandle: !!handle });
 
-      // Best-effort embed guid into working copy if missing (only if docx-core write support exists)
-      let working = u8;
+      // Store handle mapping (optional)
+      if (handle) {
+        const okH = await idbPutHandle(docId, handle);
+        tr.step('idbPutHandle', { ok: okH });
+      }
+
+      // Best-effort embed guid into working bytes if missing and writer exists
+      let workingU8 = u8;
       if (!embedded) {
         const maybe = await writeDocGuidToDocx(u8, docId);
-        // If writer exists, it may return a new buffer
         if (maybe && maybe !== u8) {
-          working = (maybe instanceof Uint8Array) ? maybe : new Uint8Array(maybe);
+          workingU8 = (maybe instanceof Uint8Array) ? maybe : new Uint8Array(maybe);
         }
       }
 
-      // Write working copy to OPFS (canonical bytes)
-      await opfsPut(docId, working);
+      // Persist bytes HARD: OPFS + IDB
+      const abWorking = workingU8.buffer.slice(workingU8.byteOffset, workingU8.byteOffset + workingU8.byteLength);
 
-      // Update fingerprint map for both original and working bytes (best-effort)
+      const okOpfs = await opfsPut(docId, workingU8);
+      const okIdb = await idbPutBytes(docId, abWorking);
+
+      tr.step('persist bytes', { opfs: okOpfs, idb: okIdb, len: workingU8.byteLength });
+
+      // Update fp mapping (best effort)
       try {
         setMappedDocIdForFingerprint(fp, docId);
-        const fp2 = await sha256Hex(working);
+        const fp2 = await sha256Hex(workingU8);
         if (fp2 && fp2 !== fp) setMappedDocIdForFingerprint(fp2, docId);
       } catch {}
 
@@ -979,14 +1059,22 @@
         }, { broadcast: false });
       }
 
-      // Safe hydration attempt if empty schema
+      // Safe hydrate attempt (if empty schema)
       await hydrateFromDocxIfEmpty(docId);
 
-      tr.end({ docId, name: fileName, fp12: fp.slice(0, 12) });
+      // Final verification: can we read bytes back now?
+      // This is critical for diagnosing “bytes missing after open”.
+      const verify = await getBytes(docId);
+      tr.step('verify getBytes after setCurrentDoc', {
+        ok: !!verify,
+        len: verify?.byteLength || 0
+      });
+
+      tr.end({ docId, name: fileName, fp12: (fp || '').slice(0, 12) });
       return meta;
     } catch (e) {
       tr.error('setCurrentDoc failed', e);
-      tr.end();
+      tr.end('fail');
       throw e;
     }
   }
@@ -995,10 +1083,9 @@
     return setCurrentDoc({ bytes, handle: meta.handle || null, name: meta.name || 'document.docx' });
   }
 
-  // =========================
-  // RULES APIs (CANONICAL STORAGE ONLY)
-  // NOTE: normalization is handled in rules-core.js (not here)
-  // =========================
+  // ===========================================================================
+  // RULES APIs (storage only)
+  // ===========================================================================
   function getRules(docId) {
     const st = getState(docId);
     return {
@@ -1017,28 +1104,24 @@
         rulesUpdatedAt: _nowIso()
       }, { broadcast });
 
-      // Optional: nudge consumers that listen specifically for "rules-updated"
-      try {
-        bc?.postMessage({ type: 'rules-updated', docId, from: TAB_ID, ts: Date.now() });
-      } catch {}
+      try { bc?.postMessage({ type: 'rules-updated', docId, from: TAB_ID, ts: Date.now() }); } catch {}
 
       tr.end({ v: out.__v });
       return out;
     } catch (e) {
       tr.error('overwriteRules failed', e);
-      tr.end();
+      tr.end('fail');
       throw e;
     }
   }
 
   async function persistRules(docId, rules, fieldRules) {
-    // legacy-friendly name; canonical behavior: store only
     return overwriteRules(docId, { rules, fieldRules }, { broadcast: true });
   }
 
-  // =========================
+  // ===========================================================================
   // CONCURRENCY HELPERS
-  // =========================
+  // ===========================================================================
   const __locks = new Map(); // docId -> promise chain
   async function withDocLock(docId, fn) {
     const tr = TRACE('withDocLock', { docId });
@@ -1055,7 +1138,8 @@
       return out;
     } finally {
       try { release(); } catch {}
-      if (__locks.get(docId) === gate) __locks.delete(docId);
+      // best-effort cleanup
+      try { __locks.delete(docId); } catch {}
     }
   }
 
@@ -1069,30 +1153,61 @@
     __coals.set(key, t);
   }
 
-  // =========================
-  // SUBSCRIPTIONS (for pages)
-  // =========================
-  function onActiveChange(fn) {
-    activeListeners.add(fn);
-    return () => activeListeners.delete(fn);
-  }
-  function onStateChange(fn) {
-    stateListeners.add(fn);
-    return () => stateListeners.delete(fn);
+  // ===========================================================================
+  // SUBSCRIPTIONS
+  // ===========================================================================
+  function onActiveChange(fn) { activeListeners.add(fn); return () => activeListeners.delete(fn); }
+  function onStateChange(fn) { stateListeners.add(fn); return () => stateListeners.delete(fn); }
+
+  // ===========================================================================
+  // DIAGNOSTICS (public)
+  // ===========================================================================
+  async function diag(docId = null) {
+    const tr = TRACE('diag', { docId });
+    try {
+      const meta = getActiveDocMeta();
+      const id = docId || meta?.docId || null;
+
+      const out = {
+        tabId: TAB_ID,
+        active: meta || null,
+        docId: id,
+        opfs: null,
+        idbBytes: null,
+        idbHandle: null
+      };
+
+      if (id) {
+        const opfs = await opfsGet(id);
+        out.opfs = { ok: !!opfs, len: opfs?.byteLength || 0, fname: opfsFileNameForDocId(id) };
+
+        const idb = await idbGetBytes(id);
+        out.idbBytes = { ok: !!idb, len: idb?.byteLength || 0 };
+
+        const h = await idbGetHandle(id);
+        out.idbHandle = { ok: !!h, kind: h?.kind || null };
+      }
+
+      tr.end(out);
+      return out;
+    } catch (e) {
+      tr.error('diag failed', e);
+      tr.end('fail');
+      return null;
+    }
   }
 
-  // =========================
-  // BOOTSTRAP (best-effort)
-  // =========================
+  // ===========================================================================
+  // BOOTSTRAP
+  // ===========================================================================
   (function boot() {
-    const tr = TRACE('boot');
+    const tr = TRACE('boot', { ua: navigator.userAgent });
     try {
       const meta = readJSON(LS_KEYS.ACTIVE_META);
       if (meta?.docId) {
         _active = meta;
         tr.step('restored active', meta);
         emitActive(meta);
-        // do not auto-hydrate here; pages can call ensureHydrated when ready
       } else {
         tr.step('no active meta');
       }
@@ -1103,16 +1218,21 @@
     }
   })();
 
-  // =========================
+  // ===========================================================================
   // PUBLIC API
-  // =========================
+  // ===========================================================================
   const api = {
     // constants
     ACTIVE_DOC_KEY: LS_KEYS.ACTIVE_META,
+    BC_NAME,
     PAYLOAD_KEY,
     DOC_GUID_KEY,
     STABLE_DOCID_PREFIX,
-    BC_NAME,
+    __TAB_ID: TAB_ID,
+
+    // debug controls
+    __DEBUG: DEBUG,
+    diag,
 
     // active doc
     getActiveDocMeta,
@@ -1126,12 +1246,12 @@
     saveState,
     getLastKnownValues,
 
-    // rules (storage only)
+    // rules
     getRules,
     overwriteRules,
     persistRules,
 
-    // bytes + identity
+    // bytes / identity
     setCurrentDoc,
     setCurrentDocFromBytes,
     getHandle: idbGetHandle,
@@ -1140,7 +1260,7 @@
     getCurrentDocBytes,
     putBytes,
 
-    // hydration helpers
+    // hydration
     ensureHydrated,
     hydrateFromDocxIfEmpty,
     readPayloadFromDocx,
@@ -1149,16 +1269,9 @@
     readDocVar,
     writeDocVar,
 
-    // concurrency helpers
+    // concurrency
     withDocLock,
-    coalesce,
-
-    // subscriptions
-    onActiveChange,
-    onStateChange,
-
-    // debug
-    __TAB_ID: TAB_ID
+    coalesce
   };
 
   window.formSuitePersist = Object.freeze(api);

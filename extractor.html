@@ -53,6 +53,23 @@
       Clicking <em>Save</em> will write to a copy instead of the original.
       <button id="btnRegrant" class="ghost" style="margin-left:8px">Grant write access</button>
     </div>
+
+    <!-- DEBUG PANEL -->
+    <details class="panel" style="margin-top:12px;">
+      <summary><strong>Debug (Bytes/Handle/Persistence)</strong></summary>
+      <div class="row" style="gap:8px; flex-wrap:wrap; margin-top:10px;">
+        <button id="btnDbgSnap" class="secondary">Snapshot now</button>
+        <button id="btnDbgClear" class="ghost">Clear debug log</button>
+        <label class="row" style="gap:6px; align-items:center;">
+          <input type="checkbox" id="dbgVerbose" checked />
+          <span class="muted">Verbose</span>
+        </label>
+      </div>
+      <textarea id="dbgLog" spellcheck="false" style="width:100%; min-height:220px; margin-top:10px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></textarea>
+      <div class="muted" style="margin-top:8px; font-size:0.85rem;">
+        Tip: reproduce the issue, then copy/paste this log. Look for “diagPersist” and “getWorkingDocBytesU8” fallbacks.
+      </div>
+    </details>
   </section>
 
   <div class="grid-3">
@@ -107,7 +124,7 @@
 'use strict';
 
 /* ============================================================
-   TRACE (exactly one tracing primitive; used everywhere)
+   TRACE (one primitive) + DEBUG LOG SINK
    ============================================================ */
 (function ensureTrace() {
   if (typeof window.TRACE === 'function') return;
@@ -115,21 +132,64 @@
   const DEBUG = { on: true, seq: 0 };
   const ts = () => new Date().toISOString().slice(11, 23);
 
+  function safeJson(x) {
+    try {
+      return JSON.stringify(x, (k, v) => {
+        if (v instanceof ArrayBuffer) return { __type: 'ArrayBuffer', byteLength: v.byteLength };
+        if (v instanceof Uint8Array) return { __type: 'Uint8Array', byteLength: v.byteLength };
+        if (v && typeof v === 'object' && v.kind && v.name && typeof v.getFile === 'function') {
+          return { __type: 'FileSystemHandle', kind: v.kind, name: v.name };
+        }
+        if (typeof v === 'function') return { __type: 'function', name: v.name || '(anon)' };
+        return v;
+      }, 2);
+    } catch {
+      try { return String(x); } catch { return '(unprintable)'; }
+    }
+  }
+
+  window.__DBG = {
+    verbose: true,
+    buf: [],
+    max: 2000,
+    write(line) {
+      this.buf.push(line);
+      if (this.buf.length > this.max) this.buf.splice(0, this.buf.length - this.max);
+      const el = document.getElementById('dbgLog');
+      if (el) el.value = this.buf.join('\n');
+    },
+    log(name, payload) {
+      const line = `[${ts()}] ${name} ${payload !== undefined ? safeJson(payload) : ''}`;
+      this.write(line);
+    }
+  };
+
   window.TRACE = function TRACE(name, details) {
     const id = ++DEBUG.seq;
     const prefix = `[Extractor ${ts()} #${id}] ${name}`;
-    if (DEBUG.on) console.log(prefix, details ?? '');
     const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
+    if (DEBUG.on) console.log(prefix, details ?? '');
+    try { window.__DBG?.log(prefix, details ?? ''); } catch {}
+
     return {
-      step(msg, data) { if (DEBUG.on) console.log(`${prefix}  ↳ ${msg}`, data ?? ''); },
-      warn(msg, data) { if (DEBUG.on) console.warn(`${prefix}  ⚠ ${msg}`, data ?? ''); },
-      error(msg, err) { if (DEBUG.on) console.error(`${prefix}  ✖ ${msg}`, err); },
+      step(msg, data) {
+        if (DEBUG.on) console.log(`${prefix}  ↳ ${msg}`, data ?? '');
+        if (window.__DBG?.verbose) window.__DBG.log(`${prefix}  ↳ ${msg}`, data ?? '');
+      },
+      warn(msg, data) {
+        if (DEBUG.on) console.warn(`${prefix}  ⚠ ${msg}`, data ?? '');
+        window.__DBG?.log(`${prefix}  ⚠ ${msg}`, data ?? '');
+      },
+      error(msg, err) {
+        if (DEBUG.on) console.error(`${prefix}  ✖ ${msg}`, err);
+        window.__DBG?.log(`${prefix}  ✖ ${msg}`, { message: err?.message, name: err?.name, stack: err?.stack });
+      },
       end(extra) {
-        if (!DEBUG.on) return;
         const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         const ms = Math.round((t1 - t0) * 1000) / 1000;
-        console.log(`${prefix} done (${ms}ms)`, extra ?? '');
+        if (DEBUG.on) console.log(`${prefix} done (${ms}ms)`, extra ?? '');
+        window.__DBG?.log(`${prefix} done (${ms}ms)`, extra ?? '');
       }
     };
   };
@@ -143,15 +203,23 @@ window.addEventListener('error', (e) => {
     colno: e.colno,
     error: e.error
   });
+  try { window.__DBG?.log('[window.error]', { message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno }); } catch {}
 });
 window.addEventListener('unhandledrejection', (e) => {
   console.error('[Extractor window.unhandledrejection]', e.reason);
+  try { window.__DBG?.log('[unhandledrejection]', { reason: String(e.reason?.message || e.reason) }); } catch {}
+});
+
+window.addEventListener('pageshow', (e) => {
+  // If BFCache is in play you want to know; it can change unload/restore behavior.
+  window.__DBG?.log('[pageshow]', { persisted: !!e.persisted });
+});
+window.addEventListener('pagehide', (e) => {
+  window.__DBG?.log('[pagehide]', { persisted: !!e.persisted });
 });
 
 /* ============================================================
    Single coordination layer: fs-active-doc + formSuitePersist
-   Single broadcast: BroadcastChannel("fs-active-doc")
-   Single payload mirror: workspace state payload.CRONOS_PAYLOAD
    ============================================================ */
 
 const PAYLOAD_KEY = 'CRONOS_PAYLOAD';
@@ -169,9 +237,27 @@ const els = {
   formMount: document.getElementById('formMount'),
   tableBody: document.getElementById('sdt-tbody'),
   headersTree: document.getElementById('headersTree'),
+  dbgLog: document.getElementById('dbgLog'),
+  btnDbgSnap: document.getElementById('btnDbgSnap'),
+  btnDbgClear: document.getElementById('btnDbgClear'),
+  dbgVerbose: document.getElementById('dbgVerbose'),
 };
 
+if (els.dbgVerbose) {
+  els.dbgVerbose.addEventListener('change', () => {
+    window.__DBG.verbose = !!els.dbgVerbose.checked;
+    window.__DBG.log('[dbgVerbose]', { verbose: window.__DBG.verbose });
+  });
+}
+if (els.btnDbgClear) {
+  els.btnDbgClear.addEventListener('click', () => {
+    window.__DBG.buf = [];
+    if (els.dbgLog) els.dbgLog.value = '';
+  });
+}
+
 const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('fs-active-doc') : null;
+window.__DBG?.log('[init]', { supportsFS, hasBC: !!bc, ua: navigator.userAgent });
 
 function setStatus(text) {
   const tr = TRACE('setStatus', { text });
@@ -186,11 +272,20 @@ function assertDeps() {
     if (!window.formSuitePersist) miss.push('window.formSuitePersist (persistence.js)');
     if (typeof window.readActiveDocSync !== 'function') miss.push('readActiveDocSync (fs-active-doc.js)');
     if (typeof window.installActiveDocListener !== 'function') miss.push('installActiveDocListener (fs-active-doc.js)');
+
+    // Introspect persist surface area
+    if (window.formSuitePersist) {
+      const keys = Object.keys(window.formSuitePersist).sort();
+      tr.step('formSuitePersist.keys', keys);
+    }
+
     if (miss.length) {
       console.error('[Extractor] Missing deps:', miss);
       setStatus('Error: missing core dependencies (see console).');
+      tr.end({ ok: false, miss });
       return false;
     }
+    tr.end({ ok: true });
     return true;
   } finally {
     tr.end();
@@ -225,7 +320,7 @@ async function sha256Hex(bufOrU8) {
 }
 
 /* ============================================================
-   In-memory state (Extractor)
+   In-memory state
    ============================================================ */
 let currentDoc = null;           // {docId, name}
 let currentHandle = null;        // FileSystemFileHandle (best-effort cache)
@@ -244,14 +339,92 @@ let __fgRefreshLock = false;
 const __addressValues = Object.create(null);
 
 /* ============================================================
-   Canonical byte access workflow (one function)
+   PERSIST DIAGNOSTICS (critical for this bug)
+   ============================================================ */
+function describeHandle(h) {
+  if (!h) return null;
+  return {
+    kind: h.kind,
+    name: h.name,
+    hasGetFile: typeof h.getFile === 'function',
+    hasCreateWritable: typeof h.createWritable === 'function',
+    hasQueryPermission: typeof h.queryPermission === 'function',
+    hasRequestPermission: typeof h.requestPermission === 'function',
+  };
+}
+
+async function diagPersist(docId, note) {
+  const tr = TRACE('diagPersist', { note, docId, mem: { hasBytes: !!currentBytesU8, hasHandle: !!currentHandle } });
+  try {
+    const out = { note, docId, supportsFS, mem: {}, persist: {}, handle: {} };
+
+    out.mem.bytesLen = currentBytesU8?.byteLength || 0;
+    out.mem.handle = describeHandle(currentHandle);
+
+    // Persist: current bytes
+    try {
+      const b0 = await window.formSuitePersist.getCurrentDocBytes?.();
+      out.persist.currentBytes = !!(b0 && (b0.byteLength || b0.length));
+      out.persist.currentBytesLen = b0?.byteLength || b0?.length || 0;
+    } catch (e) {
+      out.persist.currentBytesErr = { name: e?.name, message: e?.message };
+    }
+
+    // Persist: per-doc bytes
+    try {
+      const b1 = docId ? await window.formSuitePersist.getBytes?.(docId) : null;
+      out.persist.docBytes = !!(b1 && (b1.byteLength || b1.length));
+      out.persist.docBytesLen = b1?.byteLength || b1?.length || 0;
+    } catch (e) {
+      out.persist.docBytesErr = { name: e?.name, message: e?.message };
+    }
+
+    // Persist: handle
+    try {
+      const h = docId ? await window.formSuitePersist.getHandle?.(docId) : null;
+      out.persist.handle = describeHandle(h);
+      if (h?.queryPermission) {
+        try { out.persist.permRead = await h.queryPermission({ mode: 'read' }); } catch (e) { out.persist.permReadErr = e?.message; }
+        try { out.persist.permRW = await h.queryPermission({ mode: 'readwrite' }); } catch (e) { out.persist.permRWErr = e?.message; }
+      }
+    } catch (e) {
+      out.persist.handleErr = { name: e?.name, message: e?.message };
+    }
+
+    // Active meta
+    try {
+      const meta = (typeof window.readActiveDocSync === 'function') ? window.readActiveDocSync() : null;
+      out.activeMeta = meta || null;
+    } catch (e) {
+      out.activeMetaErr = { name: e?.name, message: e?.message };
+    }
+
+    tr.end(out);
+    return out;
+  } catch (e) {
+    tr.error('diagPersist failed', e);
+    tr.end();
+    return null;
+  }
+}
+
+/* ============================================================
+   Canonical byte access workflow (one function) + EXTRA TRACE
    ============================================================ */
 async function getWorkingDocBytesU8() {
-  const tr = TRACE('getWorkingDocBytesU8', { docId: currentDoc?.docId, hasHandle: !!currentHandle });
+  const tr = TRACE('getWorkingDocBytesU8', { docId: currentDoc?.docId, hasHandle: !!currentHandle, memBytes: currentBytesU8?.byteLength || 0 });
   try {
+    // 0) In-memory cache (if still present)
+    if (currentBytesU8?.byteLength) {
+      tr.step('use mem cache', { len: currentBytesU8.byteLength });
+      tr.end({ mode: 'mem', len: currentBytesU8.byteLength });
+      return currentBytesU8;
+    }
+
     // 1) Prefer persistence "current bytes" (already includes in-memory writes)
     try {
       const b0 = await window.formSuitePersist.getCurrentDocBytes?.();
+      tr.step('persist.getCurrentDocBytes', { ok: !!b0, len: b0?.byteLength || b0?.length || 0, type: b0?.constructor?.name });
       if (b0 && (b0.byteLength || b0.length)) {
         const u8 = (b0 instanceof Uint8Array) ? b0 : new Uint8Array(b0);
         tr.end({ mode: 'persist.getCurrentDocBytes', len: u8.byteLength });
@@ -263,6 +436,7 @@ async function getWorkingDocBytesU8() {
     try {
       if (currentDoc?.docId) {
         const b1 = await window.formSuitePersist.getBytes?.(currentDoc.docId);
+        tr.step('persist.getBytes', { ok: !!b1, len: b1?.byteLength || b1?.length || 0, type: b1?.constructor?.name });
         if (b1 && (b1.byteLength || b1.length)) {
           const u8 = (b1 instanceof Uint8Array) ? b1 : new Uint8Array(b1);
           tr.end({ mode: 'persist.getBytes', len: u8.byteLength });
@@ -274,10 +448,13 @@ async function getWorkingDocBytesU8() {
     // 3) Handle fallback
     try {
       const h = currentHandle || (currentDoc?.docId ? await window.formSuitePersist.getHandle?.(currentDoc.docId) : null);
+      tr.step('handle candidate', { memHandle: !!currentHandle, persistHandle: !!(!currentHandle && !!h), h: describeHandle(h) });
       if (h?.getFile) {
         const p = await window.formSuitePersist.ensurePermission?.(h, 'read') || 'granted';
+        tr.step('ensurePermission(read)', p);
         if (p === 'granted') {
           const f = await h.getFile();
+          tr.step('handle.getFile', { name: f?.name, size: f?.size, type: f?.type });
           const u8 = new Uint8Array(await f.arrayBuffer());
           currentHandle = h;
           tr.end({ mode: 'handle.getFile', len: u8.byteLength });
@@ -285,6 +462,9 @@ async function getWorkingDocBytesU8() {
         }
       }
     } catch (e) { tr.warn('handle.getFile failed', e); }
+
+    // As a last resort, print a persist snapshot right here
+    await diagPersist(currentDoc?.docId, 'getWorkingDocBytesU8:miss');
 
     tr.end({ mode: 'none' });
     return null;
@@ -296,18 +476,19 @@ async function getWorkingDocBytesU8() {
 }
 
 /* ============================================================
-   Single write access banner workflow
+   Single write access banner workflow (unchanged except extra trace)
    ============================================================ */
 async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
   const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: currentDoc?.docId, supportsFS });
   try {
-    if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; return 'unsupported'; }
+    if (!supportsFS || !currentDoc?.docId) { els.permNote.style.display = 'none'; tr.end('unsupported/no-doc'); return 'unsupported'; }
 
     const h = currentHandle || await window.formSuitePersist.getHandle?.(currentDoc.docId);
-    if (!h?.queryPermission) { els.permNote.style.display = 'none'; return 'no-handle'; }
+    tr.step('handle', describeHandle(h));
+    if (!h?.queryPermission) { els.permNote.style.display = 'none'; tr.end('no-handle'); return 'no-handle'; }
 
     let p = await h.queryPermission({ mode: 'readwrite' });
-    tr.step('queryPermission', p);
+    tr.step('queryPermission(readwrite)', p);
 
     if (p !== 'granted' && tryPrompt && h.requestPermission) {
       try { p = await h.requestPermission({ mode: 'readwrite' }) || p; }
@@ -321,6 +502,7 @@ async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
   } catch (e) {
     tr.error('updateWriteAccessBanner failed', e);
     els.permNote.style.display = 'block';
+    tr.end('error');
     return 'error';
   }
 }
@@ -344,7 +526,7 @@ function clearUi(message = 'Idle') {
 }
 
 /* ============================================================
-   DOCX reads/writes (payload only) — docx-core.js is canonical
+   DOCX reads/writes (payload only)
    ============================================================ */
 async function readPayloadFromDocx(bytesU8) {
   const tr = TRACE('readPayloadFromDocx', { len: bytesU8?.byteLength });
@@ -376,7 +558,7 @@ async function readPayloadFromDocx(bytesU8) {
 }
 
 async function writePayloadToDocx(bytesU8, payloadObj) {
-  const tr = TRACE('writePayloadToDocx', { inLen: bytesU8?.byteLength });
+  const tr = TRACE('writePayloadToDocx', { inLen: bytesU8?.byteLength, fields: payloadObj?.fields?.length || 0 });
   try {
     if (!bytesU8?.byteLength) throw new Error('No bytes to write');
     const json = JSON.stringify(payloadObj || {}, null, 0);
@@ -399,7 +581,7 @@ async function writePayloadToDocx(bytesU8, payloadObj) {
     if (!out) throw new Error('No docx writer available (writeDocVarSettings/writeDocVarCustom missing).');
 
     const outU8 = (out instanceof Uint8Array) ? out : new Uint8Array(out);
-    tr.end({ outLen: outU8.byteLength });
+    tr.end({ outLen: outU8.byteLength, outSha: (await sha256Hex(outU8)).slice(0, 12) });
     return outU8;
   } catch (e) {
     tr.error('writePayloadToDocx failed', e);
@@ -409,7 +591,7 @@ async function writePayloadToDocx(bytesU8, payloadObj) {
 }
 
 /* ============================================================
-   Rules + payload normalization (single workflow via deriveNormalizedRulesForDoc)
+   Rules + payload normalization (same as yours)
    ============================================================ */
 function makeBaselineFromParsed(parsed) {
   return {
@@ -459,7 +641,6 @@ async function saveWorkspaceMirror(docId, payloadObj, { baseline } = {}) {
   try {
     if (!docId) return;
 
-    // Single mirror location: payload.CRONOS_PAYLOAD
     const patch = {
       schema: { title: payloadObj.title || 'Form', fields: Array.isArray(payloadObj.fields) ? payloadObj.fields : [] },
       values: payloadObj.values || {},
@@ -483,7 +664,7 @@ async function saveWorkspaceMirror(docId, payloadObj, { baseline } = {}) {
 }
 
 /* ============================================================
-   SDT parsing
+   SDT parsing (unchanged)
    ============================================================ */
 const DOCX_NS = window.DOCX_W_NS || window.W_NS || "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
@@ -592,19 +773,16 @@ function renderSDTsView(parsed) {
 }
 
 /* ============================================================
-   Headings: keep using your existing implementation if present.
-   If none exists, we degrade gracefully to "no headings".
+   Headings: degrade gracefully
    ============================================================ */
 async function parseHeadings_JS(arrayBuffer) {
   const tr = TRACE('parseHeadings_JS', { len: arrayBuffer?.byteLength });
   try {
-    // If your docx-core already provides a parser, prefer it:
     if (typeof window.parseHeadings_JS === 'function' && window.parseHeadings_JS !== parseHeadings_JS) {
       const out = await window.parseHeadings_JS(arrayBuffer);
       tr.end({ mode: 'window.parseHeadings_JS', flat: out?.flat?.length || 0 });
       return out;
     }
-    // Otherwise: no-op (stable)
     const out = { flat: [], tree: [], count: 0 };
     tr.end({ mode: 'noop', flat: 0 });
     return out;
@@ -706,7 +884,7 @@ function renderHeadingsTreeView(tree) {
 }
 
 /* ============================================================
-   Preview + form rendering (Extractor live form)
+   Preview + form rendering (unchanged)
    ============================================================ */
 function collectFormValues(schema) {
   const form = document.getElementById('liveForm');
@@ -945,14 +1123,12 @@ async function updatePreview() {
     const docId = currentDoc?.docId;
     const st = docId ? (await window.formSuitePersist.loadState(docId) || {}) : {};
 
-    // Adopt best-known headings baseline for normalization
     const baseline = {
       flat: Array.isArray(st.headingsFlat) ? st.headingsFlat : (Array.isArray(lastParsedHeadings.flat) ? lastParsedHeadings.flat : []),
       tree: Array.isArray(st.headingsTree) ? st.headingsTree : (Array.isArray(lastParsedHeadings.tree) ? lastParsedHeadings.tree : []),
     };
     headingsBaseline = baseline;
 
-    // Single mirror is payload.CRONOS_PAYLOAD; fall back to raw state fields
     const payload = st.payload?.CRONOS_PAYLOAD || null;
 
     const effectiveSchema = payload?.fields?.length
@@ -963,7 +1139,6 @@ async function updatePreview() {
     const effectiveTagMap = payload?.tagMap ? payload.tagMap : (st.tagMap || tagMap || {});
 
     const { headingRules, fieldRules } = normalizeAllForDoc(st, effectiveSchema, baseline);
-
     const pruned = pruneBySchema(effectiveSchema, effectiveValues, effectiveTagMap);
 
     const previewObj = {
@@ -985,7 +1160,7 @@ async function updatePreview() {
 }
 
 /* ============================================================
-   Render pipeline: bytes -> SDTs/headings/payload -> workspace mirror
+   Render pipeline (unchanged except trace additions)
    ============================================================ */
 async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
   const tr = TRACE('renderFromBytes', { prefix, len: bytesU8?.byteLength, docId: currentDoc?.docId });
@@ -994,11 +1169,9 @@ async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
 
     setStatus((prefix || '') + 'Parsing…');
 
-    // SDTs
     const parsedSDTs = await parseSDTs_JS(bytesU8.buffer);
     renderSDTsView(parsedSDTs);
 
-    // Headings (best effort)
     const headingsParsed = await parseHeadings_JS(bytesU8.buffer);
     lastParsedHeadings = {
       flat: Array.isArray(headingsParsed?.flat) ? headingsParsed.flat : [],
@@ -1011,19 +1184,13 @@ async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
 
     renderHeadingsTreeView(tree);
 
-    // Payload from DOCX (optional)
     const payloadRaw = await readPayloadFromDocx(bytesU8);
     let payloadFromDoc = null;
     try { payloadFromDoc = payloadRaw ? JSON.parse(payloadRaw) : null; } catch { payloadFromDoc = null; }
 
-    // Workspace state
     const docId = currentDoc?.docId;
     const st = docId ? (await window.formSuitePersist.loadState(docId) || {}) : {};
 
-    // Choose schema:
-    // - Prefer workspace schema if present (it represents your "working set")
-    // - Otherwise use doc payload schema if present
-    // - Otherwise empty schema
     const wsSchema = st.schema;
     const docSchema = (Array.isArray(payloadFromDoc?.fields) && payloadFromDoc.fields.length)
       ? { title: payloadFromDoc.title || 'Form', fields: payloadFromDoc.fields }
@@ -1031,7 +1198,6 @@ async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
 
     const chosenSchema = (wsSchema?.fields?.length ? wsSchema : (docSchema || { title: 'Form', fields: [] }));
 
-    // Values/tagMap: workspace overrides doc (working set wins)
     const mergedValues = Object.assign({}, payloadFromDoc?.values || {}, st.values || {});
     const mergedTagMap = Object.assign({}, payloadFromDoc?.tagMap || {}, st.tagMap || {});
 
@@ -1040,13 +1206,11 @@ async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
 
     const pruned = pruneBySchema(chosenSchema, mergedValues, mergedTagMap);
 
-    // Update in-memory
     schema = chosenSchema;
     values = pruned.values;
     tagMap = pruned.tagMap;
     headingsBaseline = baseline;
 
-    // Build canonical payload mirror and write into workspace ONLY (no duplication)
     const payloadObj = {
       title: schema.title || 'Form',
       fields: schema.fields || [],
@@ -1075,9 +1239,7 @@ async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
 }
 
 /* ============================================================
-   Hydrate / refresh from workspace (override-safe)
-   - ONLY re-renders UI from latest bytes/state
-   - DOES NOT overwrite state unless we successfully parsed bytes
+   Hydrate / refresh on foreground (extra trace)
    ============================================================ */
 async function rehydrateOnForeground(source) {
   const tr = TRACE('rehydrateOnForeground', { source, locked: __fgRefreshLock, docId: currentDoc?.docId });
@@ -1086,8 +1248,9 @@ async function rehydrateOnForeground(source) {
   try {
     if (!currentDoc?.docId) { tr.end('no doc'); return; }
 
-    // small debounce to allow other tabs to finish writing
     await new Promise(r => setTimeout(r, 120));
+
+    await diagPersist(currentDoc?.docId, `rehydrateOnForeground:${source}:pre`);
 
     const bytes = await getWorkingDocBytesU8();
     if (!bytes) { tr.end('no bytes'); return; }
@@ -1095,6 +1258,8 @@ async function rehydrateOnForeground(source) {
     currentBytesU8 = bytes;
     await renderFromBytes(bytes, { prefix: `(${source} refreshed) ` });
     await updateWriteAccessBanner();
+
+    await diagPersist(currentDoc?.docId, `rehydrateOnForeground:${source}:post`);
     tr.end('refreshed');
   } catch (e) {
     tr.error('rehydrateOnForeground failed', e);
@@ -1105,12 +1270,13 @@ async function rehydrateOnForeground(source) {
 }
 
 document.addEventListener('visibilitychange', () => {
+  window.__DBG?.log('[visibilitychange]', { state: document.visibilityState });
   if (document.visibilityState === 'visible') rehydrateOnForeground('visible');
 });
 window.addEventListener('focus', () => rehydrateOnForeground('focus'));
 
 /* ============================================================
-   Apply payload JSON from preview (single normalization + mirror update)
+   Apply payload JSON from preview (unchanged)
    ============================================================ */
 async function applyPayloadObject(obj) {
   const tr = TRACE('applyPayloadObject', { hasObj: !!obj });
@@ -1123,7 +1289,6 @@ async function applyPayloadObject(obj) {
     const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
     const rawFieldR  = Array.isArray(obj.fieldRules) ? obj.fieldRules : [];
 
-    // Normalize using deriveNormalizedRulesForDoc by building a temp wsState shape
     const tmpState = { rules: rawRules, fieldRules: rawFieldR };
     const baseline = headingsBaseline || { flat: [], tree: [] };
     const normalized = normalizeAllForDoc(tmpState, nextSchema, baseline);
@@ -1168,7 +1333,7 @@ async function applyPayloadObject(obj) {
 }
 
 /* ============================================================
-   Save: payload-only write into DOCX, then update workspace + broadcast
+   Save: payload-only write into DOCX (extra trace + diag)
    ============================================================ */
 async function doSave() {
   const tr = TRACE('doSave', { docId: currentDoc?.docId });
@@ -1176,17 +1341,18 @@ async function doSave() {
     if (!currentDoc?.docId) { setStatus('No active document.'); return; }
 
     const docId = currentDoc.docId;
+
+    await diagPersist(docId, 'doSave:pre');
+
     const st = await window.formSuitePersist.loadState(docId) || {};
     const baseline = {
       flat: Array.isArray(st.headingsFlat) ? st.headingsFlat : (lastParsedHeadings.flat || []),
       tree: Array.isArray(st.headingsTree) ? st.headingsTree : (lastParsedHeadings.tree || [])
     };
 
-    // Ensure current UI values are included
     const liveVals = collectFormValues(schema);
     values = { ...(values || {}), ...(liveVals || {}) };
 
-    // Normalize rules one time, and build canonical payload object
     const normalized = normalizeAllForDoc(st, schema, baseline);
     const pruned = pruneBySchema(schema, values, tagMap);
 
@@ -1200,7 +1366,6 @@ async function doSave() {
       updatedAt: new Date().toISOString()
     };
 
-    // Get bytes and write payload
     const inBytes = await getWorkingDocBytesU8();
     if (!inBytes) {
       setStatus('No bytes / no permission (cannot save).');
@@ -1210,13 +1375,11 @@ async function doSave() {
 
     const outBytes = await writePayloadToDocx(inBytes, payloadObj);
 
-    // Write back:
-    // 1) If we have write permission on original handle -> overwrite original
-    // 2) Else -> Save As copy, and switch active doc to new handle/meta
     let wroteToOriginal = false;
 
     const h = currentHandle || await window.formSuitePersist.getHandle?.(docId);
     const p = h?.queryPermission ? await h.queryPermission({ mode: 'readwrite' }) : 'denied';
+    tr.step('write target', { h: describeHandle(h), permRW: p });
 
     if (h?.createWritable && p === 'granted') {
       const wt = TRACE('doSave:writeOriginal');
@@ -1225,6 +1388,7 @@ async function doSave() {
         await w.write(outBytes);
         await w.close();
         currentHandle = h;
+        currentBytesU8 = outBytes; // keep mem current
         wroteToOriginal = true;
         wt.end({ ok: true, len: outBytes.byteLength, sha: (await sha256Hex(outBytes)).slice(0, 12) });
       } catch (e) {
@@ -1254,7 +1418,6 @@ async function doSave() {
         await w.write(outBytes);
         await w.close();
 
-        // Switch the active doc to the copy (future-proof: treat it as new doc)
         const file = await saveHandle.getFile();
         const bytes = new Uint8Array(await file.arrayBuffer());
         const meta = await window.formSuitePersist.setCurrentDoc({
@@ -1279,12 +1442,14 @@ async function doSave() {
       }
     }
 
-    // Update workspace mirror (single) and broadcast update
     await saveWorkspaceMirror(currentDoc.docId, payloadObj, { baseline });
+
     bc?.postMessage({ type: 'active:updated', docId: currentDoc.docId, ts: Date.now() });
 
     await updateWriteAccessBanner();
     await updatePreview();
+
+    await diagPersist(currentDoc.docId, 'doSave:post');
 
     setStatus('Saved payload to DOCX.');
     tr.end({ ok: true });
@@ -1296,7 +1461,7 @@ async function doSave() {
 }
 
 /* ============================================================
-   Open / switch document
+   Open / switch document (extra diag)
    ============================================================ */
 async function doOpen() {
   const tr = TRACE('doOpen');
@@ -1323,6 +1488,8 @@ async function doOpen() {
     const file = await handle.getFile();
     const bytes = new Uint8Array(await file.arrayBuffer());
 
+    tr.step('picked file', { name: file.name, size: file.size, handle: describeHandle(handle), sha: (await sha256Hex(bytes)).slice(0, 12) });
+
     const meta = await window.formSuitePersist.setCurrentDoc({
       bytes,
       handle,
@@ -1336,7 +1503,9 @@ async function doOpen() {
     try { if (typeof window.setActiveDocMeta === 'function') window.setActiveDocMeta({ docId: meta.docId, name: meta.name }); } catch {}
     bc?.postMessage({ type: 'active:set', docId: meta.docId, name: meta.name, ts: Date.now() });
 
-    tr.step('opened', { docId: meta.docId, name: meta.name, len: bytes.byteLength, sha: (await sha256Hex(bytes)).slice(0, 12) });
+    tr.step('opened meta', meta);
+
+    await diagPersist(meta.docId, 'doOpen:after-setCurrentDoc');
 
     await renderFromBytes(bytes, { prefix: '' });
     await updateWriteAccessBanner({ tryPrompt: true });
@@ -1357,27 +1526,38 @@ async function switchToDoc(meta) {
   const tr = TRACE('switchToDoc', meta);
   try {
     if (!meta?.docId) return;
+
+    await diagPersist(meta.docId, 'switchToDoc:entry');
+
     if (currentDoc?.docId === meta.docId && currentBytesU8?.byteLength) { tr.end('already active'); return; }
 
     clearUi('Switching document…');
 
-    currentDoc = meta;
-    currentHandle = null;
-    currentBytesU8 = null;
+    // NOTE: do NOT immediately discard mem cache before we know we can hydrate.
+    const prev = { doc: currentDoc, handle: currentHandle, bytesLen: currentBytesU8?.byteLength || 0 };
 
+    currentDoc = meta;
+
+    // attempt hydrate without nuking caches first
     const bytes = await getWorkingDocBytesU8();
     if (!bytes) {
+      window.__DBG?.log('[switchToDoc] hydrate failed, keeping previous in-memory cache', prev);
       clearUi('No bytes / no permission.');
+      await diagPersist(meta.docId, 'switchToDoc:no-bytes');
       tr.end('no-bytes');
       return;
     }
 
+    // now swap
+    currentHandle = null;        // will be rederived by getWorkingDocBytesU8 if needed
     currentBytesU8 = bytes;
+
     await renderFromBytes(bytes, { prefix: '(switched) ' });
     await updateWriteAccessBanner();
     els.btnSave.disabled = false;
     els.btnSaveFromPreview.disabled = false;
 
+    await diagPersist(meta.docId, 'switchToDoc:ok');
     tr.end({ ok: true });
   } catch (e) {
     tr.error('switchToDoc failed', e);
@@ -1387,7 +1567,7 @@ async function switchToDoc(meta) {
 }
 
 /* ============================================================
-   One broadcast handler (only fs-active-doc)
+   One broadcast handler (extra trace)
    ============================================================ */
 bc?.addEventListener('message', async (ev) => {
   const tr = TRACE('BroadcastChannel:message', ev?.data);
@@ -1396,6 +1576,7 @@ bc?.addEventListener('message', async (ev) => {
     if (!m || typeof m !== 'object') return;
 
     if (m.type === 'active:set') {
+      tr.step('active:set received', { docId: m.docId, name: m.name });
       if (m.docId && m.docId !== currentDoc?.docId) {
         await switchToDoc({ docId: m.docId, name: m.name || 'document.docx' });
       }
@@ -1403,6 +1584,7 @@ bc?.addEventListener('message', async (ev) => {
     }
 
     if (m.type === 'active:updated') {
+      tr.step('active:updated received', { docId: m.docId });
       if (m.docId && m.docId === currentDoc?.docId) {
         await rehydrateOnForeground('active:updated');
       }
@@ -1410,6 +1592,7 @@ bc?.addEventListener('message', async (ev) => {
     }
 
     if (m.type === 'active:clear') {
+      tr.step('active:clear received');
       currentDoc = null;
       currentHandle = null;
       currentBytesU8 = null;
@@ -1421,8 +1604,8 @@ bc?.addEventListener('message', async (ev) => {
     }
 
     if (m.type === 'state:changed') {
+      tr.step('state:changed received', { docId: m.docId });
       if (!m.docId || m.docId === currentDoc?.docId) {
-        // override-safe: re-render only from workspace state/bytes
         await updatePreview();
       }
       return;
@@ -1435,7 +1618,7 @@ bc?.addEventListener('message', async (ev) => {
 });
 
 /* ============================================================
-   Active-doc listener (single coordination layer)
+   Active-doc listener
    ============================================================ */
 installActiveDocListener(async (meta) => {
   const tr = TRACE('installActiveDocListener:cb', meta);
@@ -1456,9 +1639,7 @@ installActiveDocListener(async (meta) => {
 });
 
 /* ============================================================
-   Preview textarea: validate + apply (manual apply via button)
-   - We do NOT auto-save on every keystroke into DOCX.
-   - Button "Apply JSON & Save" applies to workspace + triggers doSave().
+   Preview textarea wiring (unchanged)
    ============================================================ */
 function tryParseJSON(txt) { try { return JSON.parse(txt); } catch { return null; } }
 
@@ -1499,6 +1680,7 @@ els.btnRegrant?.addEventListener('click', async () => {
   const tr = TRACE('btnRegrant:click');
   try {
     await updateWriteAccessBanner({ tryPrompt: true });
+    await diagPersist(currentDoc?.docId, 'btnRegrant:post');
   } catch (e) {
     tr.error('regrant failed', e);
     els.permNote.style.display = 'block';
@@ -1507,16 +1689,30 @@ els.btnRegrant?.addEventListener('click', async () => {
   }
 });
 
+els.btnDbgSnap?.addEventListener('click', async () => {
+  const docId = currentDoc?.docId || null;
+  await diagPersist(docId, 'manual snapshot');
+});
+
 window.addEventListener('beforeunload', async () => {
   const tr = TRACE('beforeunload');
   try {
+    window.__DBG?.log('[beforeunload]', { docId: currentDoc?.docId, memBytes: currentBytesU8?.byteLength || 0, memHandle: describeHandle(currentHandle) });
+
     if (!currentDoc?.docId) { tr.end('no doc'); return; }
+
     const vals = collectFormValues(schema);
     await window.formSuitePersist.saveState(currentDoc.docId, {
       schema,
       values: { ...(values || {}), ...(vals || {}) }
     });
+
+    // We do NOT change behavior here yet (just observe).
+    // Once we confirm missing persistence APIs, we will patch persistence.js.
+
     try { if (typeof window.setActiveDocMeta === 'function') window.setActiveDocMeta({ docId: currentDoc.docId, name: currentDoc.name }); } catch {}
+
+    await diagPersist(currentDoc.docId, 'beforeunload:post-saveState');
   } catch (e) {
     tr.warn('beforeunload failed', e);
   } finally {
@@ -1525,7 +1721,7 @@ window.addEventListener('beforeunload', async () => {
 });
 
 /* ============================================================
-   Boot
+   Boot (extra diag)
    ============================================================ */
 (async function boot() {
   const tr = TRACE('boot');
@@ -1534,6 +1730,8 @@ window.addEventListener('beforeunload', async () => {
 
     const meta = (typeof window.readActiveDocSync === 'function') ? window.readActiveDocSync() : null;
     tr.step('readActiveDocSync', meta);
+
+    await diagPersist(meta?.docId || null, 'boot:after-readActiveDocSync');
 
     if (!meta?.docId) {
       clearUi('Idle');
@@ -1547,6 +1745,7 @@ window.addEventListener('beforeunload', async () => {
     const bytes = await getWorkingDocBytesU8();
     if (!bytes) {
       clearUi('No bytes / no permission.');
+      await diagPersist(meta.docId, 'boot:no-bytes');
       tr.end('no-bytes');
       return;
     }
@@ -1565,6 +1764,8 @@ window.addEventListener('beforeunload', async () => {
 
     els.btnSave.disabled = false;
     els.btnSaveFromPreview.disabled = false;
+
+    await diagPersist(meta.docId, 'boot:ok');
 
     tr.end('ok');
   } catch (e) {
