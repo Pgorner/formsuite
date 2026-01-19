@@ -1361,258 +1361,302 @@
   // ============================================================
   // TABLE FIELD (behavior preserved)
   // ============================================================
-  function renderTableField(container, field) {
-    /* unchanged from your version */
-    if (!Array.isArray(values[field.id])) values[field.id] = [];
-    const data = values[field.id];
+// ============================================================
+// TABLE FIELD (FIXED: write-through to values + autosave)
+// ============================================================
+function renderTableField(container, field) {
+  // Canonical backing array
+  if (!Array.isArray(values[field.id])) values[field.id] = [];
+  const data = values[field.id];
 
-    const editorWrap = document.createElement('div');
-    editorWrap.style.display = 'flex';
-    editorWrap.style.flexWrap = 'wrap';
-    editorWrap.style.gap = '10px';
+  const editorWrap = document.createElement('div');
+  editorWrap.style.display = 'flex';
+  editorWrap.style.flexWrap = 'wrap';
+  editorWrap.style.gap = '10px';
 
-    const editorInputs = {};
-    let editorState = emptyRow(field);
+  const editorInputs = {};
+  let editorState = emptyRow(field);
 
-    const measurer = document.createElement('canvas').getContext('2d');
-    function textPx(str) {
-      try { measurer.font = getComputedStyle(document.body).font; } catch {}
-      return Math.ceil(measurer.measureText(String(str || '')).width);
-    }
-    function longest(arr) {
-      return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
-    }
+  const measurer = document.createElement('canvas').getContext('2d');
+  function textPx(str) {
+    try { measurer.font = getComputedStyle(document.body).font; } catch {}
+    return Math.ceil(measurer.measureText(String(str || '')).width);
+  }
+  function longest(arr) {
+    return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
+  }
 
-    function rowIsEmpty(row) {
-      return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
-    }
+  function rowIsEmpty(row) {
+    return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
+  }
 
-    (field.columns || []).forEach(col => {
-      const pair = document.createElement('label');
-      pair.style.display = 'flex';
-      pair.style.alignItems = 'center';
-      pair.style.gap = '8px';
+  // Selected row index in the *data* array
+  let selectedIndex = -1;
 
-      const lbl = document.createElement('span');
-      lbl.textContent = col.label || col.id;
+  // Ensure minRows exist (but keep them empty until user fills them)
+  const minRows = Math.max(0, parseInt(field.minRows || 0, 10));
+  if (data.length < minRows) {
+    for (let i = data.length; i < minRows; i++) data.push(emptyRow(field));
+  }
 
-      let el;
-      if (col.type === 'select') {
-        el = document.createElement('select');
-        const opts = (col.options || []);
-        const empty = document.createElement('option'); empty.value = ''; empty.textContent = '— wählen —';
-        el.appendChild(empty);
-        opts.forEach(opt => {
-          const o = document.createElement('option');
-          o.value = String(opt); o.textContent = String(opt);
-          el.appendChild(o);
+  // --- UI: per-column editor inputs ---
+  (field.columns || []).forEach(col => {
+    const pair = document.createElement('label');
+    pair.style.display = 'flex';
+    pair.style.alignItems = 'center';
+    pair.style.gap = '8px';
+
+    const lbl = document.createElement('span');
+    lbl.textContent = col.label || col.id;
+
+    let el;
+    if (col.type === 'select') {
+      el = document.createElement('select');
+      const opts = (col.options || []);
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = '— wählen —';
+      el.appendChild(empty);
+      opts.forEach(opt => {
+        const o = document.createElement('option');
+        o.value = String(opt);
+        o.textContent = String(opt);
+        el.appendChild(o);
+      });
+      el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
+    } else if (col.type === 'date') {
+      el = document.createElement('input');
+      el.type = 'text';
+      el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
+      setTimeout(() => {
+        flatpickr(el, {
+          allowInput: true,
+          dateFormat: 'Y-m-d',
+          onChange: () => onEditorInput(col.id, el.value),
+          onValueUpdate: () => onEditorInput(col.id, el.value),
         });
-        el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
-        el.addEventListener('change', () => { editorState[col.id] = el.value; });
-      } else if (col.type === 'date') {
-        el = document.createElement('input');
-        el.type = 'text';
-        el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
-        setTimeout(() => {
-          flatpickr(el, { allowInput: true, dateFormat: 'Y-m-d', onChange: () => { editorState[col.id] = el.value; } });
-        }, 0);
-        el.addEventListener('change', () => { editorState[col.id] = el.value; });
-      } else if (col.type === 'number') {
-        el = document.createElement('input');
-        el.type = 'number';
-        el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
-        el.addEventListener('change', () => { editorState[col.id] = el.value; });
-      } else {
-        el = document.createElement('input');
-        el.type = 'text';
-        el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
-        el.addEventListener('change', () => { editorState[col.id] = el.value; });
+      }, 0);
+    } else if (col.type === 'number') {
+      el = document.createElement('input');
+      el.type = 'number';
+      el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
+    } else {
+      el = document.createElement('input');
+      el.type = 'text';
+      el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
+    }
+
+    // KEY FIX: use input+change and write-through
+    const onAny = () => onEditorInput(col.id, el.value);
+    el.addEventListener('input', onAny);
+    el.addEventListener('change', onAny);
+
+    editorInputs[col.id] = el;
+    pair.appendChild(lbl);
+    pair.appendChild(el);
+    editorWrap.appendChild(pair);
+  });
+
+  function onEditorInput(colId, value) {
+    editorState[colId] = value;
+
+    // If editing an existing row, write-through immediately
+    if (selectedIndex >= 0 && selectedIndex < data.length) {
+      data[selectedIndex] = { ...data[selectedIndex], ...editorState };
+      scheduleSaveValues();
+      drawTable(); // keep preview row in sync
+    }
+  }
+
+  // --- Toolbar ---
+  const toolbar = document.createElement('div');
+  toolbar.className = 'row';
+  toolbar.style.gap = '8px';
+
+  const btnAdd = document.createElement('button');
+  btnAdd.type = 'button';
+  btnAdd.textContent = 'Zeile hinzufügen';
+
+  const btnSave = document.createElement('button');
+  btnSave.type = 'button';
+  btnSave.className = 'secondary';
+  btnSave.textContent = 'Änderungen speichern';
+
+  const btnDelete = document.createElement('button');
+  btnDelete.type = 'button';
+  btnDelete.className = 'ghost';
+  btnDelete.textContent = 'Zeile löschen';
+
+  const btnCancel = document.createElement('button');
+  btnCancel.type = 'button';
+  btnCancel.className = 'ghost';
+  btnCancel.textContent = 'Abbrechen';
+
+  toolbar.appendChild(btnAdd);
+  toolbar.appendChild(btnSave);
+  toolbar.appendChild(btnDelete);
+  toolbar.appendChild(btnCancel);
+
+  const status = document.createElement('div');
+  status.className = 'muted';
+  status.style.minHeight = '1.2em';
+
+  // --- Table preview ---
+  const tableWrap = document.createElement('div');
+  tableWrap.style.overflow = 'auto';
+
+  const table = document.createElement('table');
+  table.style.width = '100%';
+
+  const thead = document.createElement('thead');
+  const trh = document.createElement('tr');
+  thead.appendChild(trh);
+
+  const tbody = document.createElement('tbody');
+
+  table.appendChild(thead);
+  table.appendChild(tbody);
+  tableWrap.appendChild(table);
+
+  (field.columns || []).forEach(col => {
+    const th = document.createElement('th');
+    th.textContent = col.label || col.id;
+    trh.appendChild(th);
+  });
+
+  function applyPreviewVisibility() {
+    const hasAnyNonEmpty = data.some(r => !rowIsEmpty(r));
+    tableWrap.style.display = hasAnyNonEmpty ? '' : 'none';
+  }
+
+  function updateToolbar() {
+    const min = Math.max(0, parseInt(field.minRows || 0, 10));
+    const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+
+    btnAdd.disabled = (max && data.length >= max);
+
+    const showEdit = selectedIndex >= 0;
+    btnSave.style.display = showEdit ? '' : 'none';
+    btnDelete.style.display = showEdit ? '' : 'none';
+    btnCancel.style.display = showEdit ? '' : 'none';
+
+    btnDelete.disabled = !showEdit || (min && data.length <= min);
+  }
+
+  function loadIntoEditor(i) {
+    const rec = data[i] || emptyRow(field);
+    (field.columns || []).forEach(c => {
+      const el = editorInputs[c.id];
+      if (!el) return;
+      el.value = rec[c.id] || '';
+    });
+    editorState = { ...rec };
+    updateToolbar();
+  }
+
+  function resetEditor() {
+    editorState = emptyRow(field);
+    (field.columns || []).forEach(c => {
+      const el = editorInputs[c.id];
+      if (el) el.value = '';
+    });
+  }
+
+  function clearSelection() {
+    selectedIndex = -1;
+    updateToolbar();
+  }
+
+  function drawTable() {
+    tbody.innerHTML = '';
+
+    data.forEach((row, realIdx) => {
+      if (rowIsEmpty(row)) return;
+
+      const tr = document.createElement('tr');
+      const isSel = realIdx === selectedIndex;
+
+      if (isSel) {
+        tr.style.background = '#DBEAFE';
+        tr.style.outline = '2px solid #93C5FD';
+        tr.style.outlineOffset = '-2px';
       }
 
-      editorInputs[col.id] = el;
-      pair.appendChild(lbl);
-      pair.appendChild(el);
-      editorWrap.appendChild(pair);
-    });
-
-    const toolbar = document.createElement('div');
-    toolbar.className = 'row';
-    toolbar.style.gap = '8px';
-
-    const btnAdd = document.createElement('button');
-    btnAdd.type = 'button';
-    btnAdd.textContent = 'Zeile hinzufügen';
-
-    const btnSave = document.createElement('button');
-    btnSave.type = 'button';
-    btnSave.className = 'secondary';
-    btnSave.textContent = 'Änderungen speichern';
-
-    const btnDelete = document.createElement('button');
-    btnDelete.type = 'button';
-    btnDelete.className = 'ghost';
-    btnDelete.textContent = 'Zeile löschen';
-
-    const btnCancel = document.createElement('button');
-    btnCancel.type = 'button';
-    btnCancel.className = 'ghost';
-    btnCancel.textContent = 'Abbrechen';
-
-    toolbar.appendChild(btnAdd);
-    toolbar.appendChild(btnSave);
-    toolbar.appendChild(btnDelete);
-    toolbar.appendChild(btnCancel);
-
-    const status = document.createElement('div');
-    status.className = 'muted';
-    status.style.minHeight = '1.2em';
-
-    const tableWrap = document.createElement('div');
-    tableWrap.style.overflow = 'auto';
-    const table = document.createElement('table');
-    table.style.width = '100%';
-    const thead = document.createElement('thead');
-    const trh = document.createElement('tr');
-    thead.appendChild(trh);
-    const tbody = document.createElement('tbody');
-    table.appendChild(thead);
-    table.appendChild(tbody);
-    tableWrap.appendChild(table);
-
-    (field.columns || []).forEach(col => {
-      const th = document.createElement('th');
-      th.textContent = col.label || col.id;
-      trh.appendChild(th);
-    });
-
-    let selectedIndex = -1;
-
-    function applyPreviewVisibility() {
-      const hasAnyNonEmpty = data.some(r => !rowIsEmpty(r));
-      tableWrap.style.display = hasAnyNonEmpty ? '' : 'none';
-    }
-
-    function drawTable() {
-      tbody.innerHTML = '';
-      data.forEach((row, realIdx) => {
-        if (rowIsEmpty(row)) return;
-
-        const tr = document.createElement('tr');
-        const isSel = realIdx === selectedIndex;
-
-        if (isSel) {
-          tr.style.background = '#DBEAFE';
-          tr.style.outline = '2px solid #93C5FD';
-          tr.style.outlineOffset = '-2px';
-        }
-
-        tr.addEventListener('click', () => {
-          selectedIndex = realIdx;
-          drawTable();
-          loadIntoEditor(realIdx);
-        });
-
-        (field.columns || []).forEach(col => {
-          const td = document.createElement('td');
-          td.textContent = row[col.id] || '';
-          tr.appendChild(td);
-        });
-
-        tbody.appendChild(tr);
+      tr.addEventListener('click', () => {
+        selectedIndex = realIdx;
+        loadIntoEditor(realIdx);
+        drawTable();
       });
 
-      applyPreviewVisibility();
-      updateToolbar();
-    }
+      (field.columns || []).forEach(col => {
+        const td = document.createElement('td');
+        td.textContent = row[col.id] || '';
+        tr.appendChild(td);
+      });
 
-    function clearSelection() { selectedIndex = -1; updateToolbar(); }
-    function updateToolbar() {
-      const min = Math.max(0, parseInt(field.minRows || 0, 10));
-      const max = Math.max(0, parseInt(field.maxRows || 0, 10));
-
-      btnAdd.disabled = (max && data.length >= max);
-
-      const showEdit = selectedIndex >= 0;
-      btnSave.style.display = showEdit ? '' : 'none';
-      btnDelete.style.display = showEdit ? '' : 'none';
-      btnCancel.style.display = showEdit ? '' : 'none';
-
-      btnSave.disabled = !showEdit;
-      btnDelete.disabled = !showEdit || (min && data.length <= min);
-      btnCancel.disabled = !showEdit;
-    }
-
-    function loadIntoEditor(i) {
-      const rec = data[i] || emptyRow(field);
-      for (const c of (field.columns || [])) {
-        const el = editorInputs[c.id];
-        if (!el) continue;
-        el.value = rec[c.id] || '';
-      }
-      editorState = { ...rec };
-      updateToolbar();
-    }
-
-    function resetEditor() {
-      editorState = emptyRow(field);
-      for (const c of (field.columns || [])) {
-        const el = editorInputs[c.id];
-        if (!el) continue;
-        el.value = '';
-      }
-    }
-
-    if (!data.length) {
-      const min = Math.max(0, parseInt(field.minRows || 0, 10));
-      for (let i = 0; i < min; i++) data.push(emptyRow(field));
-    }
-    drawTable();
-
-    btnAdd.addEventListener('click', () => {
-      const max = Math.max(0, parseInt(field.maxRows || 0, 10));
-      if (max && data.length >= max) return;
-
-      data.push({ ...editorState });
-      drawTable();
-      scheduleSaveValues();
-      status.textContent = 'Zeile hinzugefügt.';
+      tbody.appendChild(tr);
     });
-
-    btnSave.addEventListener('click', () => {
-      if (selectedIndex < 0 || selectedIndex >= data.length) return;
-      data[selectedIndex] = { ...editorState };
-      drawTable();
-      scheduleSaveValues();
-      status.textContent = 'Änderungen gespeichert.';
-    });
-
-    btnDelete.addEventListener('click', () => {
-      const min = Math.max(0, parseInt(field.minRows || 0, 10));
-      if (selectedIndex < 0) return;
-      if (min && data.length <= min) return;
-
-      data.splice(selectedIndex, 1);
-      clearSelection();
-      resetEditor();
-      drawTable();
-      scheduleSaveValues();
-      status.textContent = 'Zeile gelöscht.';
-    });
-
-    btnCancel.addEventListener('click', () => {
-      clearSelection();
-      resetEditor();
-      drawTable();
-      status.textContent = 'Auswahl aufgehoben.';
-    });
-
-    container.appendChild(editorWrap);
-    container.appendChild(toolbar);
-    container.appendChild(status);
-    container.appendChild(tableWrap);
 
     applyPreviewVisibility();
+    updateToolbar();
   }
+
+  // --- Actions ---
+  btnAdd.addEventListener('click', () => {
+    const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+    if (max && data.length >= max) return;
+
+    // Add a cloned row from current editorState
+    data.push({ ...editorState });
+    scheduleSaveValues();
+
+    // Prepare for next entry
+    clearSelection();
+    resetEditor();
+    drawTable();
+
+    status.textContent = 'Zeile hinzugefügt.';
+  });
+
+  btnSave.addEventListener('click', () => {
+    if (selectedIndex < 0 || selectedIndex >= data.length) return;
+    data[selectedIndex] = { ...editorState };
+    scheduleSaveValues();
+    drawTable();
+    status.textContent = 'Änderungen gespeichert.';
+  });
+
+  btnDelete.addEventListener('click', () => {
+    const min = Math.max(0, parseInt(field.minRows || 0, 10));
+    if (selectedIndex < 0) return;
+    if (min && data.length <= min) return;
+
+    data.splice(selectedIndex, 1);
+    scheduleSaveValues();
+
+    clearSelection();
+    resetEditor();
+    drawTable();
+
+    status.textContent = 'Zeile gelöscht.';
+  });
+
+  btnCancel.addEventListener('click', () => {
+    clearSelection();
+    resetEditor();
+    drawTable();
+    status.textContent = 'Auswahl aufgehoben.';
+  });
+
+  // Mount
+  container.appendChild(editorWrap);
+  container.appendChild(toolbar);
+  container.appendChild(status);
+  container.appendChild(tableWrap);
+
+  drawTable();
+  applyPreviewVisibility();
+}
 
   // ============================================================
   // Expose for cross-callbacks
