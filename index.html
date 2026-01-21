@@ -97,26 +97,31 @@
     permNote:   document.getElementById('permNote'),
     btnRegrant: document.getElementById('btnRegrant'),
   };
-
   function setStatus(html) { els.docStatus.innerHTML = html; }
 
   // ============================================================
-  // Canonical single coordination layer
+  // Canonical coordination layer
   // ============================================================
   function P() { return window.formSuitePersist; }
   function U() { return window.formSuiteUtils; }
 
-  // Canonical channels (must match persistence.js)
+  // Canonical channels (must match the other pages)
   const BC_ACTIVE  = 'fs-active-doc';
   const BC_PAYLOAD = 'fs-payload-v1';
 
   // ============================================================
-  // App State (in-memory)
+  // CANONICAL IN-MEMORY STATE (stable identities; never replaced)
   // ============================================================
-  let currentDoc = null;       // {docId, name}
-  let schema = null;
-  let values = {};
-  let fieldRules = [];
+  const STATE = {
+    doc: null,          // {docId, name}
+    schema: null,       // object
+    fieldRules: [],     // array
+    values: {},         // object (stable identity)
+    dirty: false,
+    lastSaveAt: 0,
+    refreshLock: false,
+    refreshPending: false
+  };
 
   // ============================================================
   // Local schema fallback (ONLY when no active doc)
@@ -126,25 +131,140 @@
   function loadLocalSchemaFallback()  { try { return JSON.parse(localStorage.getItem(LS_SCHEMA_FALLBACK) || 'null'); } catch { return null; } }
 
   // ============================================================
-  // Sanitizers (canonical: from formSuiteUtils)
+  // helpers: identity-stable merge
+  // ============================================================
+  function clearAndAssignObject(target, src) {
+    if (!target || typeof target !== 'object') return;
+    for (const k of Object.keys(target)) delete target[k];
+    if (src && typeof src === 'object') {
+      for (const k of Object.keys(src)) target[k] = src[k];
+    }
+  }
+
+  function deepCloneSafe(v) {
+    try {
+      if (typeof structuredClone === 'function') return structuredClone(v);
+    } catch {}
+    try { return JSON.parse(JSON.stringify(v)); } catch { return v; }
+  }
+
+  // ============================================================
+  // TABLE helpers (canonical data normalization)
+  // ============================================================
+  function emptyRow(field){
+    const r = {};
+    (field.columns || []).forEach(c => { r[String(c.id || '')] = ''; });
+    return r;
+  }
+
+  function rowIsEmpty(field, row) {
+    try {
+      return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
+    } catch {
+      return true;
+    }
+  }
+
+  function normalizeTableArray(field, arr) {
+    const base = emptyRow(field);
+    const min = Math.max(0, parseInt(field.minRows || 0, 10));
+    const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+
+    let out = Array.isArray(arr) ? arr.slice() : [];
+    // Ensure shape
+    out = out.map(r => ({ ...base, ...(r || {}) }));
+
+    // Remove fully empty rows (canonical behavior: draft/placeholder rows are not data)
+    out = out.filter(r => !rowIsEmpty(field, r));
+
+    // Enforce max (drop extra trailing rows, but keep earliest rows)
+    if (max && out.length > max) out = out.slice(0, max);
+
+    // Enforce min by padding (schema constraint)
+    while (out.length < min) out.push({ ...base });
+
+    return out;
+  }
+
+  function normalizeAllTablesInValues(schemaObj, vals) {
+    try {
+      if (!schemaObj || !Array.isArray(schemaObj.fields) || !vals || typeof vals !== 'object') return vals;
+      for (const f of (schemaObj.fields || [])) {
+        if (String(f?.type) !== 'table') continue;
+        const fid = String(f.id || '');
+        if (!fid) continue;
+        vals[fid] = normalizeTableArray(f, vals[fid]);
+      }
+      return vals;
+    } catch {
+      return vals;
+    }
+  }
+
+  // ============================================================
+  // Sanitizer (canonical: utils + table enforcement)
   // ============================================================
   function sanitizeValues(schemaObj, vals) {
+    const tr = TRACE('sanitizeValues', {
+      hasUtils: !!U(),
+      hasSanitizer: !!U()?.sanitizeValues,
+      hasSchema: !!schemaObj
+    });
+
     try {
-      if (U()?.sanitizeValues) return U().sanitizeValues(schemaObj, vals || {});
-    } catch {}
-    return (vals && typeof vals === 'object') ? vals : {};
+      const inVals = (vals && typeof vals === 'object') ? vals : {};
+
+      let out = inVals;
+      if (U()?.sanitizeValues) out = U().sanitizeValues(schemaObj, inVals);
+      if (!out || typeof out !== 'object') out = {};
+
+      // Canonical: table arrays are always normalized and schema-enforced.
+      out = normalizeAllTablesInValues(schemaObj, out);
+
+      tr.end({ keys: Object.keys(out || {}).length });
+      return out;
+    } catch (e) {
+      tr.warn('sanitize fallback', e);
+      const fallback = (vals && typeof vals === 'object') ? vals : {};
+      tr.end('fallback');
+      return normalizeAllTablesInValues(schemaObj, fallback);
+    }
+  }
+
+  // ============================================================
+  // Canonical setters (all UI writes go through these)
+  // ============================================================
+  function markDirty() { STATE.dirty = true; }
+
+  function setValue(fid, v) {
+    STATE.values[String(fid || '')] = v;
+    markDirty();
+    scheduleSaveValues();
+  }
+
+  function getValue(fid) {
+    return STATE.values[String(fid || '')];
+  }
+
+  function ensureTableValue(field) {
+    const fid = String(field?.id || '');
+    if (!fid) return [];
+    if (!Array.isArray(STATE.values[fid])) STATE.values[fid] = [];
+    // Normalize immediately so UI always sees canonical rows (no empties)
+    STATE.values[fid] = normalizeTableArray(field, STATE.values[fid]);
+    return STATE.values[fid];
   }
 
   // ============================================================
   // Permission Banner (canonical via persistence)
   // ============================================================
   async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
-    const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: currentDoc?.docId });
+    const tr = TRACE('updateWriteAccessBanner', { tryPrompt, docId: STATE.doc?.docId });
     try {
       if (!('showSaveFilePicker' in window)) { els.permNote.style.display = 'none'; tr.end('unsupported'); return 'unsupported'; }
-      if (!currentDoc?.docId)               { els.permNote.style.display = 'none'; tr.end('no-doc'); return 'no-doc'; }
+      if (!STATE.doc?.docId)                 { els.permNote.style.display = 'none'; tr.end('no-doc'); return 'no-doc'; }
 
-      const h = await P()?.getHandle?.(currentDoc.docId);
+      const h = await P()?.getHandle?.(STATE.doc.docId);
       if (!h?.queryPermission) { els.permNote.style.display = 'none'; tr.end('no-handle'); return 'no-handle'; }
 
       let p = await h.queryPermission({ mode: 'readwrite' });
@@ -172,7 +292,7 @@
   });
 
   // ============================================================
-  // Canonical save (workspace only)
+  // Canonical save (workspace only; stable identities; deterministic)
   // ============================================================
   let __saveTimer = null;
 
@@ -181,17 +301,45 @@
     __saveTimer = setTimeout(saveValuesNow, 150);
   }
 
-  function saveValuesNow() {
-    const tr = TRACE('saveValuesNow', { docId: currentDoc?.docId });
+  function flushSaveNow() {
     try {
-      if (!currentDoc?.docId) { tr.end('no-doc'); return; }
-      const cleanValues = sanitizeValues(schema, values);
-      values = cleanValues; // keep in-memory aligned with sanitized
+      clearTimeout(__saveTimer);
+      __saveTimer = null;
+      saveValuesNow();
+    } catch {}
+  }
 
-      // Canonical: write ONLY to workspace state. No docx embed / no export logic here.
-      P()?.saveState?.(currentDoc.docId, { values: cleanValues });
+  function saveValuesNow() {
+    const tr = TRACE('saveValuesNow', { docId: STATE.doc?.docId, dirty: STATE.dirty });
+    try {
+      if (!STATE.doc?.docId) { tr.end('no-doc'); return; }
+      if (!STATE.schema || !Array.isArray(STATE.schema.fields)) {
+        // Still allow saving raw values if schema missing, but keep table normalization best-effort
+        const snapshot0 = deepCloneSafe(STATE.values);
+        const clean0 = sanitizeValues(STATE.schema || { title:'Form', fields:[] }, snapshot0);
+        clearAndAssignObject(STATE.values, clean0);
+        P()?.saveState?.(STATE.doc.docId, { values: clean0 });
+        STATE.dirty = false;
+        STATE.lastSaveAt = Date.now();
+        tr.end({ keys: Object.keys(clean0||{}).length, schema: 'missing' });
+        return;
+      }
 
-      tr.end({ keys: Object.keys(cleanValues || {}).length });
+      // Snapshot (so sanitizers cannot mutate live state)
+      const snap = deepCloneSafe(STATE.values);
+
+      // Canonical sanitize (including: table filtering + min/max enforcement)
+      const clean = sanitizeValues(STATE.schema, snap);
+
+      // Keep in-memory aligned WITHOUT changing object identity
+      clearAndAssignObject(STATE.values, clean);
+
+      // Persist canonical state
+      P()?.saveState?.(STATE.doc.docId, { values: clean });
+
+      STATE.dirty = false;
+      STATE.lastSaveAt = Date.now();
+      tr.end({ keys: Object.keys(clean||{}).length });
     } catch (e) {
       tr.error('failed', e);
       tr.end('error');
@@ -200,8 +348,8 @@
 
   window.addEventListener('beforeunload', () => {
     try {
-      if (currentDoc?.docId) saveValuesNow();
-      else if (schema) saveLocalSchemaFallback(schema);
+      flushSaveNow();
+      if (!STATE.doc?.docId && STATE.schema) saveLocalSchemaFallback(STATE.schema);
     } catch {}
   });
 
@@ -227,7 +375,7 @@
   // ============================================================
   function normalizeRulesForCurrentState(st) {
     const tr = TRACE('normalizeRulesForCurrentState', {
-      docId: currentDoc?.docId,
+      docId: STATE.doc?.docId,
       hasSchema: !!st?.schema,
       rulesLen: Array.isArray(st?.rules) ? st.rules.length : null,
       fieldRulesLen: Array.isArray(st?.fieldRules) ? st.fieldRules.length : null,
@@ -242,8 +390,7 @@
         tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
       };
 
-      // IMPORTANT: always pass a schema object (avoid passing null)
-      const schemaForDerive = st?.schema || schema || { title: 'Form', fields: [] };
+      const schemaForDerive = st?.schema || STATE.schema || { title: 'Form', fields: [] };
 
       const normalized = window.deriveNormalizedRulesForDoc(st || {}, schemaForDerive, baseline) || {};
       const nextHeadingRules = Array.isArray(normalized.headingRules)
@@ -253,18 +400,16 @@
         ? normalized.fieldRules
         : (Array.isArray(st?.fieldRules) ? st.fieldRules : []);
 
+      const same = (a,b) => { try { return JSON.stringify(a||[]) === JSON.stringify(b||[]); } catch { return false; } };
       const curHeading = Array.isArray(st?.rules) ? st.rules : [];
       const curField   = Array.isArray(st?.fieldRules) ? st.fieldRules : [];
 
-      const same = (a,b) => { try { return JSON.stringify(a||[]) === JSON.stringify(b||[]); } catch { return false; } };
-
-      if (currentDoc?.docId && (!same(curHeading, nextHeadingRules) || !same(curField, nextFieldRules))) {
+      if (STATE.doc?.docId && (!same(curHeading, nextHeadingRules) || !same(curField, nextFieldRules))) {
         tr.step('persist normalized rules (replace)', {
           headingChanged: !same(curHeading, nextHeadingRules),
           fieldChanged: !same(curField, nextFieldRules),
         });
-        // May be async depending on implementation; we keep fire-and-forget but safe.
-        try { Promise.resolve(P()?.saveState?.(currentDoc.docId, { rules: nextHeadingRules, fieldRules: nextFieldRules })); } catch {}
+        try { Promise.resolve(P()?.saveState?.(STATE.doc.docId, { rules: nextHeadingRules, fieldRules: nextFieldRules })); } catch {}
       }
 
       tr.end({ nextFieldRulesLen: nextFieldRules.length });
@@ -277,41 +422,50 @@
   }
 
   // ============================================================
-  // Canonical refresh from workspace (override-safe)
+  // Canonical refresh from workspace (override-safe; does not break identities)
   // ============================================================
-  let __refreshLock = false;
-  let __refreshPending = false;
-
   async function refreshFromCanonical({ reason = '' } = {}) {
     const tr = TRACE('refreshFromCanonical', { reason });
 
-    if (__refreshLock) {
-      __refreshPending = true;
+    if (STATE.refreshLock) {
+      STATE.refreshPending = true;
       tr.end('coalesced');
       return;
     }
 
-    __refreshLock = true;
+    STATE.refreshLock = true;
     try {
-      const meta = await P()?.getActiveDocMeta?.();
-      currentDoc = (meta && meta.docId) ? meta : null;
+      // If we have unsaved changes, flush first so refresh cannot stomp in-memory edits.
+      if (STATE.dirty) flushSaveNow();
 
-      if (!currentDoc?.docId) {
+      const meta = await P()?.getActiveDocMeta?.();
+      STATE.doc = (meta && meta.docId) ? meta : null;
+
+      if (!STATE.doc?.docId) {
         await hardResetOpenForm(`no active doc${reason ? ' ('+reason+')' : ''}`);
         tr.end('no-doc');
         return;
       }
 
-      await hydrateWorkspaceIfEmpty(currentDoc.docId);
+      await hydrateWorkspaceIfEmpty(STATE.doc.docId);
 
-      const st = await P()?.loadState?.(currentDoc.docId);
-      schema = st?.schema || null;
-      values = st?.values || {};
+      const st = await P()?.loadState?.(STATE.doc.docId);
+
+      // Merge schema (identity stable) by replacement on STATE.schema ref:
+      // (schema is not mutated by UI the same way as values; safe to replace ref)
+      STATE.schema = st?.schema || null;
+
+      // Values: identity stable merge
+      const nextValues = (st?.values && typeof st.values === 'object') ? st.values : {};
+      clearAndAssignObject(STATE.values, nextValues);
+
+      // Canonical: normalize tables immediately (removes empties, enforces min/max)
+      normalizeAllTablesInValues(STATE.schema, STATE.values);
 
       const norm = normalizeRulesForCurrentState(st);
-      fieldRules = norm.fieldRules || [];
+      STATE.fieldRules = norm.fieldRules || [];
 
-      setStatus(`Active DOCX: <span class="kbd">${currentDoc.name || currentDoc.docId}</span>${schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+      setStatus(`Active DOCX: <span class="kbd">${STATE.doc.name || STATE.doc.docId}</span>${STATE.schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
 
       await updateWriteAccessBanner();
 
@@ -325,14 +479,14 @@
         try { if (typeof window.recomputeDatediffs === 'function') window.recomputeDatediffs(); } catch {}
       }
 
-      tr.end({ isEditing, hasSchema: !!schema, valuesKeys: Object.keys(values||{}).length });
+      tr.end({ isEditing, hasSchema: !!STATE.schema, valuesKeys: Object.keys(STATE.values||{}).length });
     } catch (e) {
       tr.error('failed', e);
       tr.end('error');
     } finally {
-      __refreshLock = false;
-      if (__refreshPending) {
-        __refreshPending = false;
+      STATE.refreshLock = false;
+      if (STATE.refreshPending) {
+        STATE.refreshPending = false;
         refreshFromCanonical({ reason: 'pending' });
       }
     }
@@ -340,9 +494,12 @@
 
   async function hardResetOpenForm(reason = '') {
     const tr = TRACE('hardResetOpenForm', { reason });
-    schema = null;
-    values = {};
-    fieldRules = [];
+
+    STATE.doc = null;
+    STATE.schema = null;
+    STATE.fieldRules = [];
+    clearAndAssignObject(STATE.values, {});
+    STATE.dirty = false;
 
     els.permNote.style.display = 'none';
     setStatus(`No active document${reason ? ` (${reason})` : ''}. Open one in the <a href="extractor.html">Extractor</a>.`);
@@ -387,7 +544,7 @@
         if (msg?.t !== 'payload') return;
 
         const docId = msg.docId;
-        if (!docId || docId !== currentDoc?.docId) return;
+        if (!docId || docId !== STATE.doc?.docId) return;
 
         const patch = msg.patch || {};
         const touches =
@@ -409,6 +566,7 @@
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') refreshFromCanonical({ reason: 'visible' });
+      if (document.visibilityState === 'hidden') flushSaveNow();
     });
     window.addEventListener('focus', () => refreshFromCanonical({ reason: 'focus' }));
 
@@ -432,13 +590,13 @@
 
     installCanonicalListeners();
 
-    currentDoc = await P()?.getActiveDocMeta?.();
-    if (currentDoc?.docId) {
+    STATE.doc = await P()?.getActiveDocMeta?.();
+    if (STATE.doc?.docId) {
       await refreshFromCanonical({ reason: 'init' });
     } else {
-      schema = loadLocalSchemaFallback();
-      values = {};
-      fieldRules = [];
+      STATE.schema = loadLocalSchemaFallback();
+      clearAndAssignObject(STATE.values, {});
+      STATE.fieldRules = [];
       renderForm();
     }
 
@@ -524,12 +682,12 @@
   // Field visibility (UI), using rules-core evaluateFieldRulesToVisibility
   // ============================================================
   function applyFieldVisibility() {
-    const tr = TRACE('applyFieldVisibility', { hasSchema: !!schema, fields: schema?.fields?.length, rules: fieldRules?.length });
+    const tr = TRACE('applyFieldVisibility', { hasSchema: !!STATE.schema, fields: STATE.schema?.fields?.length, rules: STATE.fieldRules?.length });
     try {
-      if (!schema || !Array.isArray(schema.fields)) { tr.end('no-schema'); return; }
+      if (!STATE.schema || !Array.isArray(STATE.schema.fields)) { tr.end('no-schema'); return; }
       if (typeof window.evaluateFieldRulesToVisibility !== 'function') { tr.end('no-evaluator'); return; }
 
-      const visMap = window.evaluateFieldRulesToVisibility(schema, values || {}, fieldRules || []);
+      const visMap = window.evaluateFieldRulesToVisibility(STATE.schema, STATE.values || {}, STATE.fieldRules || []);
 
       const clearDisabled = (el) => {
         el.style.opacity = '';
@@ -560,8 +718,9 @@
         const optVal = cb.value;
 
         if (cb.checked) cb.checked = false;
-        const arr = Array.isArray(values[fid]) ? values[fid].map(String) : [];
-        values[fid] = arr.filter(v => v !== String(optVal));
+        const arr = Array.isArray(STATE.values[fid]) ? STATE.values[fid].map(String) : [];
+        STATE.values[fid] = arr.filter(v => v !== String(optVal));
+        markDirty();
         scheduleSaveValues();
       };
 
@@ -569,31 +728,35 @@
         const fid = wrapEl?.dataset?.fieldId || '';
         if (!fid) return;
 
-        const fld = (schema?.fields || []).find(f => String(f.id) === String(fid));
+        const fld = (STATE.schema?.fields || []).find(f => String(f.id) === String(fid));
         const t = String(fld?.type || '').toLowerCase();
+
+        // CRITICAL: do not clear structured table data on hide/disable.
+        if (t === 'table') return;
 
         if (t === 'multichoice') {
           wrapEl.querySelectorAll('input[type="checkbox"][data-mc="1"]').forEach(cb => { cb.checked = false; });
-          values[fid] = [];
+          STATE.values[fid] = [];
+          markDirty();
           scheduleSaveValues();
           return;
         }
 
         if (t === 'select') {
           const sel = wrapEl.querySelector('select');
-          if (sel) { sel.value = ''; values[fid] = ''; scheduleSaveValues(); }
+          if (sel) { sel.value = ''; STATE.values[fid] = ''; markDirty(); scheduleSaveValues(); }
           return;
         }
 
         if (t === 'text') {
           const inp = wrapEl.querySelector('input[type="text"]:not([data-type="date"])');
-          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveValues(); }
+          if (inp) { inp.value = ''; STATE.values[fid] = ''; markDirty(); scheduleSaveValues(); }
           return;
         }
 
         if (t === 'number') {
           const inp = wrapEl.querySelector('input[type="number"]');
-          if (inp) { inp.value = ''; values[fid] = ''; scheduleSaveValues(); }
+          if (inp) { inp.value = ''; STATE.values[fid] = ''; markDirty(); scheduleSaveValues(); }
           return;
         }
 
@@ -602,7 +765,8 @@
           if (inp) {
             try { if (inp._flatpickr) inp._flatpickr.clear(); } catch {}
             inp.value = '';
-            values[fid] = '';
+            STATE.values[fid] = '';
+            markDirty();
             scheduleSaveValues();
           }
         }
@@ -649,11 +813,6 @@
   }
 
   // ============================================================
-  // TABLE helpers
-  // ============================================================
-  function emptyRow(field){ const r={}; (field.columns||[]).forEach(c=>r[c.id]=''); return r; }
-
-  // ============================================================
   // Safe option normalization (fix: avoid [object Object] in selects)
   // ============================================================
   function normOptions(field){
@@ -669,10 +828,10 @@
   }
 
   // ============================================================
-  // Render Form (behavior preserved; coordination cleaned)
+  // Render Form
   // ============================================================
   function renderForm() {
-    const tr = TRACE('renderForm', { hasSchema: !!schema, fields: schema?.fields?.length, docId: currentDoc?.docId });
+    const tr = TRACE('renderForm', { hasSchema: !!STATE.schema, fields: STATE.schema?.fields?.length, docId: STATE.doc?.docId });
 
     (function injectMcStyles() {
       const ID = 'mc-caret-styles';
@@ -696,29 +855,21 @@
     const mount = els.formMount;
     mount.innerHTML = '';
 
-    if (!schema || !Array.isArray(schema.fields) || !schema.fields.length) {
+    if (!STATE.schema || !Array.isArray(STATE.schema.fields) || !STATE.schema.fields.length) {
       mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
       tr.end('no-schema');
       return;
     }
 
-    // Ensure tables have correct row shape
-    (schema.fields || []).forEach(f => {
-      if (f.type !== 'table') return;
-      if (!Array.isArray(values[f.id])) {
-        const min = Math.max(0, parseInt(f.minRows || 0, 10));
-        values[f.id] = Array.from({ length: min }, () => emptyRow(f));
-      } else {
-        values[f.id] = values[f.id].map(r => ({ ...emptyRow(f), ...(r || {}) }));
-      }
-    });
+    // Canonical: tables in values are always normalized BEFORE UI mount.
+    normalizeAllTablesInValues(STATE.schema, STATE.values);
 
     const form = document.createElement('form');
     form.classList.add('form-grid');
 
-    if (schema.title) {
+    if (STATE.schema.title) {
       const h = document.createElement('h4');
-      h.textContent = schema.title;
+      h.textContent = STATE.schema.title;
       h.style.gridColumn = '1 / -1';
       form.appendChild(h);
     }
@@ -728,76 +879,13 @@
     const datediffRefs = [];
     const guardPairs = [];
 
-    function setExtrasOpen(extras, caretEl, open) {
-      if (!extras) return;
-      const DURATION = 220;
-
-      if (extras._animTimer) { clearTimeout(extras._animTimer); extras._animTimer = null; }
-      if (extras._onTe) { extras.removeEventListener('transitionend', extras._onTe); extras._onTe = null; }
-
-      const onEnd = () => {
-        extras.style.transition = '';
-        extras.style.willChange = '';
-        extras.style.opacity = open ? '1' : '0';
-        extras.style.marginTop = open ? '8px' : '0px';
-        extras.style.height = open ? 'auto' : '0px';
-        extras.style.overflow = 'visible';
-        if (!open) extras.style.display = 'none';
-        if (extras._onTe) {
-          extras.removeEventListener('transitionend', extras._onTe);
-          extras._onTe = null;
-        }
-      };
-      extras._onTe = onEnd;
-      extras.addEventListener('transitionend', onEnd);
-
-      if (caretEl) caretEl.classList.toggle('open', !!open);
-
-      if (open) {
-        extras.style.display = 'grid';
-        extras.style.overflow = 'visible';
-        extras.style.willChange = 'height, opacity, margin-top';
-        extras.style.opacity = '0';
-        extras.style.marginTop = '0px';
-        extras.style.height = '0px';
-
-        requestAnimationFrame(() => {
-          const h = extras.scrollHeight;
-          extras.classList.add('open');
-          extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
-          extras.style.height = h + 'px';
-          extras.style.opacity = '1';
-          extras.style.marginTop = '8px';
-          extras._animTimer = setTimeout(onEnd, DURATION + 40);
-        });
-      } else {
-        const current = extras.offsetHeight || extras.scrollHeight || 0;
-        extras.classList.remove('open');
-        extras.style.display = 'grid';
-        extras.style.overflow = 'hidden';
-        extras.style.willChange = 'height, opacity, margin-top';
-        extras.style.transition = '';
-        extras.style.height = current + 'px';
-        extras.style.opacity = '1';
-        extras.style.marginTop = '8px';
-
-        requestAnimationFrame(() => {
-          extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
-          extras.style.height = '0px';
-          extras.style.opacity = '0';
-          extras.style.marginTop = '0px';
-          extras._animTimer = setTimeout(onEnd, DURATION + 40);
-        });
-      }
-    }
-
     function getDateForField(fid) {
       const el = inputRefs[fid];
       if (!el) return null;
       const fp = el?._flatpickr;
       if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
 
-      const iso = values[fid];
+      const iso = getValue(fid);
       if (iso) {
         const d = (window.flatpickr && window.flatpickr.parseDate)
           ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
@@ -812,7 +900,7 @@
         const { a, b } = resolve();
         if (!a || !b) {
           outEl.textContent = '—';
-          values[storeKey] = null;
+          STATE.values[storeKey] = null;
           return;
         }
         const days = diffInDays(a, b);
@@ -820,14 +908,15 @@
         const years = diffInYears(a, b);
         const display = `${days}D ${months}M ${years}Y (${days} Days total)`;
         outEl.textContent = display;
-        values[storeKey] = { days, months, years, formatted: display };
+        STATE.values[storeKey] = { days, months, years, formatted: display };
       });
+      markDirty();
       scheduleSaveValues();
     }
     window.recomputeDatediffs = recomputeDatediffs;
 
     // ---- Fields ----
-    (schema.fields || []).forEach(f => {
+    (STATE.schema.fields || []).forEach(f => {
       const wrap = document.createElement('div');
       wrap.className = 'field';
       try { wrap.dataset.fieldId = String(f.id || ''); } catch {}
@@ -857,8 +946,12 @@
         input.type = 'text';
         input.id = f.id; input.name = f.id; input.style.width = '100%';
         if (f.required) input.required = true;
-        if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveValues(); applyFieldVisibility(); });
+        if (getValue(f.id) != null) input.value = getValue(f.id);
+
+        const commit = () => { setValue(f.id, input.value); applyFieldVisibility(); };
+        input.addEventListener('input', commit);
+        input.addEventListener('change', commit);
+
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
@@ -869,19 +962,26 @@
         input.type = 'number';
         input.id = f.id; input.name = f.id; input.style.width = '100%';
         if (f.required) input.required = true;
-        if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = Number(input.value); scheduleSaveValues(); applyFieldVisibility(); });
+        if (getValue(f.id) != null) input.value = getValue(f.id);
+
+        const commit = () => {
+          const v = input.value;
+          setValue(f.id, (v === '' ? '' : Number(v)));
+          applyFieldVisibility();
+        };
+        input.addEventListener('input', commit);
+        input.addEventListener('change', commit);
+
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
 
-      // Select (FIXED)
+      // Select
       else if (f.type === 'select') {
         const input = document.createElement('select');
         input.id = f.id; input.name = f.id; input.style.width = '100%';
 
         const opts = normOptions(f);
-        // Optional empty option for better UX (keeps required enforcement via HTML if required=true)
         const empty = document.createElement('option');
         empty.value = '';
         empty.textContent = '— select —';
@@ -895,8 +995,10 @@
         });
 
         if (f.required) input.required = true;
-        if (values[f.id] != null) input.value = String(values[f.id]);
-        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveValues(); applyFieldVisibility(); });
+        if (getValue(f.id) != null) input.value = String(getValue(f.id));
+
+        input.addEventListener('change', () => { setValue(f.id, input.value); applyFieldVisibility(); });
+
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
@@ -913,45 +1015,56 @@
         const fp = createPrettyDatepicker(input, {
           dateFormat: 'Y-m-d',
           altInput: true,
-          altFormat: 'D-d-M-Y',
+          altFormat: 'D, j M Y',
           allowInput: false,
           clickOpens: true,
-          defaultDate: values[f.id] || null,
-          onReady: (_sel, _str, inst) => { if (inst.altInput) inst.altInput.readOnly = true; },
-          onChange: () => { values[f.id] = input.value; scheduleSaveValues(); recomputeDatediffs(); applyFieldVisibility(); },
-          onValueUpdate: () => { values[f.id] = input.value; scheduleSaveValues(); recomputeDatediffs(); applyFieldVisibility(); }
+          defaultDate: getValue(f.id) || null,
+          onChange: () => { setValue(f.id, input.value); recomputeDatediffs(); applyFieldVisibility(); },
+          onValueUpdate: () => { setValue(f.id, input.value); recomputeDatediffs(); applyFieldVisibility(); }
         });
         fp.set('allowInput', false);
         if (fp.altInput) fp.altInput.readOnly = true;
         inputRefs[f.id] = input;
       }
 
-      // Address
+      // Address (optional component)
       else if (f.type === 'address') {
         const host = document.createElement('div');
         host.className = 'addr-host';
         wrap.appendChild(host);
 
         const initial =
-          typeof values[f.id] === 'string'
-            ? { formatted: values[f.id] }
-            : (values[f.id] || null);
+          typeof getValue(f.id) === 'string'
+            ? { formatted: getValue(f.id) }
+            : (getValue(f.id) || null);
 
-        AddressAuto.mount(host, {
-          id: f.id,
-          label: f.label || 'Address',
-          required: !!f.required,
-          value: initial || null,
-          onChange: (val) => { values[f.id] = val; scheduleSaveValues(); }
-        });
+        if (window.AddressAuto?.mount) {
+          AddressAuto.mount(host, {
+            id: f.id,
+            label: f.label || 'Address',
+            required: !!f.required,
+            value: initial || null,
+            onChange: (val) => { setValue(f.id, val); }
+          });
+        } else {
+          // Hard fallback: plain text input if component missing
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
+          input.value = (initial && typeof initial === 'object') ? (initial.formatted || '') : (initial || '');
+          input.addEventListener('input', () => setValue(f.id, input.value));
+          input.addEventListener('change', () => setValue(f.id, input.value));
+          host.appendChild(input);
+          inputRefs[f.id] = input;
+        }
       }
 
-      // Table
+      // Table (FULL FIX: canonical persistence; no implicit writes; deterministic add/edit/delete)
       else if (f.type === 'table') {
         renderTableField(wrap, f);
       }
 
-      // Datediff (top level)
+      // Datediff
       else if (f.type === 'datediff') {
         const fromId = f.fromId || f.from || '';
         const toId = f.toId || f.to || '';
@@ -973,9 +1086,8 @@
         guardPairs.push({ fromId, toId });
       }
 
-      // Multichoice (unchanged from your version)
+      // Multichoice (kept; all writes through STATE)
       else if (f.type === 'multichoice') {
-        /* ... unchanged block ... */
         const mcContainer = document.createElement('div');
         mcContainer.className = 'mc-container';
         mcContainer.style.display = 'block';
@@ -1005,16 +1117,80 @@
           });
         }
 
-        if (!Array.isArray(values[f.id])) {
+        if (!Array.isArray(getValue(f.id))) {
           const initial = items.filter(it => it.alwaysSelected || it.preselected).map(it => it.value);
-          if (initial.length) values[f.id] = initial.slice();
+          if (initial.length) STATE.values[f.id] = initial.slice();
         }
-        const selected = new Set(Array.isArray(values[f.id]) ? values[f.id].map(String) : []);
+        const selected = new Set(Array.isArray(getValue(f.id)) ? getValue(f.id).map(String) : []);
 
         function persistMainSelection() {
           const boxes = mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`);
-          values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
+          STATE.values[f.id] = Array.from(boxes).filter(b => b.checked).map(b => b.value);
+          markDirty();
           scheduleSaveValues();
+        }
+
+        function setExtrasOpen(extras, caretEl, open) {
+          if (!extras) return;
+          const DURATION = 220;
+
+          if (extras._animTimer) { clearTimeout(extras._animTimer); extras._animTimer = null; }
+          if (extras._onTe) { extras.removeEventListener('transitionend', extras._onTe); extras._onTe = null; }
+
+          const onEnd = () => {
+            extras.style.transition = '';
+            extras.style.willChange = '';
+            extras.style.opacity = open ? '1' : '0';
+            extras.style.marginTop = open ? '8px' : '0px';
+            extras.style.height = open ? 'auto' : '0px';
+            extras.style.overflow = 'visible';
+            if (!open) extras.style.display = 'none';
+            if (extras._onTe) {
+              extras.removeEventListener('transitionend', extras._onTe);
+              extras._onTe = null;
+            }
+          };
+          extras._onTe = onEnd;
+          extras.addEventListener('transitionend', onEnd);
+
+          if (caretEl) caretEl.classList.toggle('open', !!open);
+
+          if (open) {
+            extras.style.display = 'grid';
+            extras.style.overflow = 'visible';
+            extras.style.willChange = 'height, opacity, margin-top';
+            extras.style.opacity = '0';
+            extras.style.marginTop = '0px';
+            extras.style.height = '0px';
+
+            requestAnimationFrame(() => {
+              const h = extras.scrollHeight;
+              extras.classList.add('open');
+              extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
+              extras.style.height = h + 'px';
+              extras.style.opacity = '1';
+              extras.style.marginTop = '8px';
+              extras._animTimer = setTimeout(onEnd, DURATION + 40);
+            });
+          } else {
+            const current = extras.offsetHeight || extras.scrollHeight || 0;
+            extras.classList.remove('open');
+            extras.style.display = 'grid';
+            extras.style.overflow = 'hidden';
+            extras.style.willChange = 'height, opacity, margin-top';
+            extras.style.transition = '';
+            extras.style.height = current + 'px';
+            extras.style.opacity = '1';
+            extras.style.marginTop = '8px';
+
+            requestAnimationFrame(() => {
+              extras.style.transition = `height ${DURATION}ms ease, opacity ${DURATION}ms ease, margin-top ${DURATION}ms ease`;
+              extras.style.height = '0px';
+              extras.style.opacity = '0';
+              extras.style.marginTop = '0px';
+              extras._animTimer = setTimeout(onEnd, DURATION + 40);
+            });
+          }
         }
 
         function getDateForExtraKey(key) {
@@ -1022,7 +1198,7 @@
           const fp = el?._flatpickr;
           if (fp?.selectedDates?.[0] instanceof Date) return fp.selectedDates[0];
 
-          const iso = values[key];
+          const iso = STATE.values[key];
           if (iso) {
             const d = (window.flatpickr && window.flatpickr.parseDate)
               ? window.flatpickr.parseDate(String(iso), 'Y-m-d')
@@ -1124,9 +1300,9 @@
                     dateFormat: 'Y-m-d',
                     altInput: true,
                     altFormat: 'D, j M Y',
-                    defaultDate: values[exKey] || null,
-                    onChange: () => { values[exKey] = input.value; scheduleSaveValues(); recomputeDatediffs(); },
-                    onValueUpdate: () => { values[exKey] = input.value; scheduleSaveValues(); recomputeDatediffs(); }
+                    defaultDate: STATE.values[exKey] || null,
+                    onChange: () => { STATE.values[exKey] = input.value; markDirty(); scheduleSaveValues(); recomputeDatediffs(); },
+                    onValueUpdate: () => { STATE.values[exKey] = input.value; markDirty(); scheduleSaveValues(); recomputeDatediffs(); }
                   });
                   fp.set('allowInput', false);
                   if (fp.altInput) fp.altInput.readOnly = true;
@@ -1138,8 +1314,9 @@
                 if (exType === 'number') {
                   const input = document.createElement('input');
                   input.type = 'number';
-                  input.value = values[exKey] ?? '';
-                  input.addEventListener('change', () => { values[exKey] = Number(input.value); scheduleSaveValues(); });
+                  input.value = STATE.values[exKey] ?? '';
+                  input.addEventListener('input', () => { STATE.values[exKey] = (input.value === '' ? '' : Number(input.value)); markDirty(); scheduleSaveValues(); });
+                  input.addEventListener('change', () => { STATE.values[exKey] = (input.value === '' ? '' : Number(input.value)); markDirty(); scheduleSaveValues(); });
                   extrasWrap.appendChild(line);
                   line.appendChild(lab);
                   line.appendChild(input);
@@ -1172,8 +1349,9 @@
 
                 const input = document.createElement('input');
                 input.type = 'text';
-                input.value = values[exKey] ?? '';
-                input.addEventListener('change', () => { values[exKey] = input.value; scheduleSaveValues(); });
+                input.value = STATE.values[exKey] ?? '';
+                input.addEventListener('input', () => { STATE.values[exKey] = input.value; markDirty(); scheduleSaveValues(); });
+                input.addEventListener('change', () => { STATE.values[exKey] = input.value; markDirty(); scheduleSaveValues(); });
                 extrasWrap.appendChild(line);
                 line.appendChild(lab);
                 line.appendChild(input);
@@ -1283,9 +1461,10 @@
           mcContainer.appendChild(host);
         }
 
-        values[f.id] = Array.from(mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
+        STATE.values[f.id] = Array.from(mcContainer.querySelectorAll(`input[type="checkbox"][data-mc="1"]`))
           .filter(b => b.checked)
           .map(b => b.value);
+        markDirty();
         scheduleSaveValues();
 
         wrap.appendChild(mcContainer);
@@ -1296,8 +1475,12 @@
         const input = document.createElement('input');
         input.type = 'text';
         input.id = f.id; input.name = f.id; input.style.width = '100%';
-        if (values[f.id] != null) input.value = values[f.id];
-        input.addEventListener('change', () => { values[f.id] = input.value; scheduleSaveValues(); });
+        if (getValue(f.id) != null) input.value = getValue(f.id);
+
+        const commit = () => { setValue(f.id, input.value); };
+        input.addEventListener('input', commit);
+        input.addEventListener('change', commit);
+
         wrap.appendChild(input);
         inputRefs[f.id] = input;
       }
@@ -1359,304 +1542,370 @@
   }
 
   // ============================================================
-  // TABLE FIELD (behavior preserved)
+  // TABLE FIELD — FULL FIX
+  // Deterministic behavior:
+  //  - Table rows in STATE.values[field.id] are CANONICAL data (no draft rows)
+  //  - Editor has a separate draft buffer; draft is NOT persisted until "Add row"
+  //  - Editing existing rows persists immediately (like other fields)
+  //  - All saves go through STATE + canonical sanitizer (filters empties + min/max)
   // ============================================================
-// ============================================================
-// TABLE FIELD (FIXED: write-through to values + autosave)
-// ============================================================
-function renderTableField(container, field) {
-  // Canonical backing array
-  if (!Array.isArray(values[field.id])) values[field.id] = [];
-  const data = values[field.id];
+  function renderTableField(container, field) {
+    const fid = String(field?.id || '');
+    const tr = TRACE('renderTableField', { fid, cols: (field?.columns||[]).length });
 
-  const editorWrap = document.createElement('div');
-  editorWrap.style.display = 'flex';
-  editorWrap.style.flexWrap = 'wrap';
-  editorWrap.style.gap = '10px';
+    // Canonical committed rows
+    let rows = ensureTableValue(field);
 
-  const editorInputs = {};
-  let editorState = emptyRow(field);
+    // UI state
+    let selectedIndex = null;          // index in rows or null
+    let draft = emptyRow(field);       // not persisted
+    let statusText = '';
 
-  const measurer = document.createElement('canvas').getContext('2d');
-  function textPx(str) {
-    try { measurer.font = getComputedStyle(document.body).font; } catch {}
-    return Math.ceil(measurer.measureText(String(str || '')).width);
-  }
-  function longest(arr) {
-    return arr.reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
-  }
+    // UI root
+    const editorWrap = document.createElement('div');
+    editorWrap.style.display = 'flex';
+    editorWrap.style.flexWrap = 'wrap';
+    editorWrap.style.gap = '10px';
 
-  function rowIsEmpty(row) {
-    return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
-  }
+    const toolbar = document.createElement('div');
+    toolbar.className = 'row';
+    toolbar.style.gap = '8px';
+    toolbar.style.alignItems = 'center';
 
-  // Selected row index in the *data* array
-  let selectedIndex = -1;
+    const status = document.createElement('div');
+    status.className = 'muted';
+    status.style.minHeight = '1.2em';
 
-  // Ensure minRows exist (but keep them empty until user fills them)
-  const minRows = Math.max(0, parseInt(field.minRows || 0, 10));
-  if (data.length < minRows) {
-    for (let i = data.length; i < minRows; i++) data.push(emptyRow(field));
-  }
+    const tableWrap = document.createElement('div');
+    tableWrap.style.overflow = 'auto';
 
-  // --- UI: per-column editor inputs ---
-  (field.columns || []).forEach(col => {
-    const pair = document.createElement('label');
-    pair.style.display = 'flex';
-    pair.style.alignItems = 'center';
-    pair.style.gap = '8px';
+    const table = document.createElement('table');
+    table.style.width = '100%';
 
-    const lbl = document.createElement('span');
-    lbl.textContent = col.label || col.id;
+    const thead = document.createElement('thead');
+    const trh = document.createElement('tr');
+    thead.appendChild(trh);
 
-    let el;
-    if (col.type === 'select') {
-      el = document.createElement('select');
-      const opts = (col.options || []);
-      const empty = document.createElement('option');
-      empty.value = '';
-      empty.textContent = '— wählen —';
-      el.appendChild(empty);
-      opts.forEach(opt => {
-        const o = document.createElement('option');
-        o.value = String(opt);
-        o.textContent = String(opt);
-        el.appendChild(o);
+    const tbody = document.createElement('tbody');
+
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+
+    // Buttons
+    const btnAdd = document.createElement('button');
+    btnAdd.type = 'button';
+    btnAdd.textContent = 'Zeile hinzufügen';
+
+    const btnNew = document.createElement('button');
+    btnNew.type = 'button';
+    btnNew.className = 'secondary';
+    btnNew.textContent = 'Neue Zeile';
+
+    const btnDelete = document.createElement('button');
+    btnDelete.type = 'button';
+    btnDelete.className = 'ghost';
+    btnDelete.textContent = 'Zeile löschen';
+
+    const btnCancel = document.createElement('button');
+    btnCancel.type = 'button';
+    btnCancel.className = 'ghost';
+    btnCancel.textContent = 'Abbrechen';
+
+    toolbar.appendChild(btnAdd);
+    toolbar.appendChild(btnNew);
+    toolbar.appendChild(btnDelete);
+    toolbar.appendChild(btnCancel);
+
+    // Header cells
+    (field.columns || []).forEach(col => {
+      const th = document.createElement('th');
+      th.textContent = col.label || col.id;
+      trh.appendChild(th);
+    });
+
+    // Editor inputs
+    const editorInputs = {};
+    const measurer = document.createElement('canvas').getContext('2d');
+    function textPx(str) {
+      try { measurer.font = getComputedStyle(document.body).font; } catch {}
+      return Math.ceil(measurer.measureText(String(str || '')).width);
+    }
+    function longest(arr) {
+      return (arr || []).reduce((a, b) => (String(b).length > String(a).length ? String(b) : String(a)), '');
+    }
+
+    function currentModel() {
+      // editing existing row -> that row; else draft buffer
+      if (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length) return rows[selectedIndex];
+      return draft;
+    }
+
+    function setSelected(idxOrNull) {
+      selectedIndex = (typeof idxOrNull === 'number') ? idxOrNull : null;
+      // When selecting a row, editor shows that row. When clearing, editor shows draft.
+      syncEditorFromModel();
+      updateToolbar();
+      drawTable();
+    }
+
+    function syncEditorFromModel() {
+      const model = currentModel();
+      (field.columns || []).forEach(c => {
+        const el = editorInputs[c.id];
+        if (!el) return;
+        const v = (model && Object.prototype.hasOwnProperty.call(model, c.id)) ? model[c.id] : '';
+        // If flatpickr exists, setting input value is ok; widget reads it
+        el.value = (v == null) ? '' : String(v);
+        try { if (el._flatpickr && el.value) el._flatpickr.setDate(el.value, false); } catch {}
+        try { if (el._flatpickr && !el.value) el._flatpickr.clear(); } catch {}
       });
-      el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
-    } else if (col.type === 'date') {
-      el = document.createElement('input');
-      el.type = 'text';
-      el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
-      setTimeout(() => {
-        flatpickr(el, {
-          allowInput: true,
-          dateFormat: 'Y-m-d',
-          onChange: () => onEditorInput(col.id, el.value),
-          onValueUpdate: () => onEditorInput(col.id, el.value),
+    }
+
+    function syncModelFromEditor(colId, value) {
+      const model = currentModel();
+      model[colId] = value;
+
+      // Editing existing row is immediately canonical -> normalize & persist
+      if (typeof selectedIndex === 'number') {
+        rows[selectedIndex] = { ...emptyRow(field), ...(rows[selectedIndex] || {}) };
+        // canonical normalize + persist
+        STATE.values[fid] = normalizeTableArray(field, rows);
+        rows = STATE.values[fid];
+        markDirty();
+        scheduleSaveValues();
+      } else {
+        // draft is transient; enable Add if non-empty
+        updateToolbar();
+      }
+      statusText = '';
+      status.textContent = statusText;
+    }
+
+    (field.columns || []).forEach(col => {
+      const pair = document.createElement('label');
+      pair.style.display = 'flex';
+      pair.style.alignItems = 'center';
+      pair.style.gap = '8px';
+
+      const lbl = document.createElement('span');
+      lbl.textContent = col.label || col.id;
+
+      let el;
+      if (col.type === 'select') {
+        el = document.createElement('select');
+        const opts = Array.isArray(col.options) ? col.options : [];
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = '— wählen —';
+        el.appendChild(empty);
+        opts.forEach(opt => {
+          const o = document.createElement('option');
+          o.value = String(opt);
+          o.textContent = String(opt);
+          el.appendChild(o);
         });
-      }, 0);
-    } else if (col.type === 'number') {
-      el = document.createElement('input');
-      el.type = 'number';
-      el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
-    } else {
-      el = document.createElement('input');
-      el.type = 'text';
-      el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
-    }
+        el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
+        el.addEventListener('change', () => syncModelFromEditor(col.id, el.value));
+      } else if (col.type === 'date') {
+        el = document.createElement('input');
+        el.type = 'text';
+        el.dataset.type = 'date';
+        el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
 
-    // KEY FIX: use input+change and write-through
-    const onAny = () => onEditorInput(col.id, el.value);
-    el.addEventListener('input', onAny);
-    el.addEventListener('change', onAny);
-
-    editorInputs[col.id] = el;
-    pair.appendChild(lbl);
-    pair.appendChild(el);
-    editorWrap.appendChild(pair);
-  });
-
-  function onEditorInput(colId, value) {
-    editorState[colId] = value;
-
-    // If editing an existing row, write-through immediately
-    if (selectedIndex >= 0 && selectedIndex < data.length) {
-      data[selectedIndex] = { ...data[selectedIndex], ...editorState };
-      scheduleSaveValues();
-      drawTable(); // keep preview row in sync
-    }
-  }
-
-  // --- Toolbar ---
-  const toolbar = document.createElement('div');
-  toolbar.className = 'row';
-  toolbar.style.gap = '8px';
-
-  const btnAdd = document.createElement('button');
-  btnAdd.type = 'button';
-  btnAdd.textContent = 'Zeile hinzufügen';
-
-  const btnSave = document.createElement('button');
-  btnSave.type = 'button';
-  btnSave.className = 'secondary';
-  btnSave.textContent = 'Änderungen speichern';
-
-  const btnDelete = document.createElement('button');
-  btnDelete.type = 'button';
-  btnDelete.className = 'ghost';
-  btnDelete.textContent = 'Zeile löschen';
-
-  const btnCancel = document.createElement('button');
-  btnCancel.type = 'button';
-  btnCancel.className = 'ghost';
-  btnCancel.textContent = 'Abbrechen';
-
-  toolbar.appendChild(btnAdd);
-  toolbar.appendChild(btnSave);
-  toolbar.appendChild(btnDelete);
-  toolbar.appendChild(btnCancel);
-
-  const status = document.createElement('div');
-  status.className = 'muted';
-  status.style.minHeight = '1.2em';
-
-  // --- Table preview ---
-  const tableWrap = document.createElement('div');
-  tableWrap.style.overflow = 'auto';
-
-  const table = document.createElement('table');
-  table.style.width = '100%';
-
-  const thead = document.createElement('thead');
-  const trh = document.createElement('tr');
-  thead.appendChild(trh);
-
-  const tbody = document.createElement('tbody');
-
-  table.appendChild(thead);
-  table.appendChild(tbody);
-  tableWrap.appendChild(table);
-
-  (field.columns || []).forEach(col => {
-    const th = document.createElement('th');
-    th.textContent = col.label || col.id;
-    trh.appendChild(th);
-  });
-
-  function applyPreviewVisibility() {
-    const hasAnyNonEmpty = data.some(r => !rowIsEmpty(r));
-    tableWrap.style.display = hasAnyNonEmpty ? '' : 'none';
-  }
-
-  function updateToolbar() {
-    const min = Math.max(0, parseInt(field.minRows || 0, 10));
-    const max = Math.max(0, parseInt(field.maxRows || 0, 10));
-
-    btnAdd.disabled = (max && data.length >= max);
-
-    const showEdit = selectedIndex >= 0;
-    btnSave.style.display = showEdit ? '' : 'none';
-    btnDelete.style.display = showEdit ? '' : 'none';
-    btnCancel.style.display = showEdit ? '' : 'none';
-
-    btnDelete.disabled = !showEdit || (min && data.length <= min);
-  }
-
-  function loadIntoEditor(i) {
-    const rec = data[i] || emptyRow(field);
-    (field.columns || []).forEach(c => {
-      const el = editorInputs[c.id];
-      if (!el) return;
-      el.value = rec[c.id] || '';
-    });
-    editorState = { ...rec };
-    updateToolbar();
-  }
-
-  function resetEditor() {
-    editorState = emptyRow(field);
-    (field.columns || []).forEach(c => {
-      const el = editorInputs[c.id];
-      if (el) el.value = '';
-    });
-  }
-
-  function clearSelection() {
-    selectedIndex = -1;
-    updateToolbar();
-  }
-
-  function drawTable() {
-    tbody.innerHTML = '';
-
-    data.forEach((row, realIdx) => {
-      if (rowIsEmpty(row)) return;
-
-      const tr = document.createElement('tr');
-      const isSel = realIdx === selectedIndex;
-
-      if (isSel) {
-        tr.style.background = '#DBEAFE';
-        tr.style.outline = '2px solid #93C5FD';
-        tr.style.outlineOffset = '-2px';
+        // Use pretty datepicker (consistent with other dates)
+        createPrettyDatepicker(el, {
+          dateFormat: 'Y-m-d',
+          altInput: true,
+          altFormat: 'D, j M Y',
+          allowInput: false,
+          clickOpens: true,
+          defaultDate: '',
+          onChange: () => syncModelFromEditor(col.id, el.value),
+          onValueUpdate: () => syncModelFromEditor(col.id, el.value),
+        });
+      } else if (col.type === 'number') {
+        el = document.createElement('input');
+        el.type = 'number';
+        el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
+        el.addEventListener('input', () => syncModelFromEditor(col.id, el.value === '' ? '' : Number(el.value)));
+        el.addEventListener('change', () => syncModelFromEditor(col.id, el.value === '' ? '' : Number(el.value)));
+      } else {
+        el = document.createElement('input');
+        el.type = 'text';
+        el.style.minWidth = Math.max(160, Math.min(360, textPx(lbl.textContent) + 20)) + 'px';
+        el.addEventListener('input', () => syncModelFromEditor(col.id, el.value));
+        el.addEventListener('change', () => syncModelFromEditor(col.id, el.value));
       }
 
-      tr.addEventListener('click', () => {
-        selectedIndex = realIdx;
-        loadIntoEditor(realIdx);
-        drawTable();
-      });
-
-      (field.columns || []).forEach(col => {
-        const td = document.createElement('td');
-        td.textContent = row[col.id] || '';
-        tr.appendChild(td);
-      });
-
-      tbody.appendChild(tr);
+      editorInputs[col.id] = el;
+      pair.appendChild(lbl);
+      pair.appendChild(el);
+      editorWrap.appendChild(pair);
     });
 
-    applyPreviewVisibility();
+    function committedCount() {
+      rows = ensureTableValue(field);
+      return rows.filter(r => !rowIsEmpty(field, r)).length;
+    }
+
+    function updateToolbar() {
+      rows = ensureTableValue(field);
+      const min = Math.max(0, parseInt(field.minRows || 0, 10));
+      const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+      const isEditingExisting = (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length);
+
+      // Add button is ONLY for draft
+      const draftHasData = !rowIsEmpty(field, draft);
+      btnAdd.style.display = isEditingExisting ? 'none' : '';
+      btnAdd.disabled = !draftHasData || (!!max && committedCount() >= max);
+
+      // New row is available always; it clears selection and clears draft
+      btnNew.style.display = '';
+      btnNew.disabled = false;
+
+      // Delete/Cancel only if editing an existing row
+      btnDelete.style.display = isEditingExisting ? '' : 'none';
+      btnCancel.style.display = isEditingExisting ? '' : 'none';
+
+      btnDelete.disabled = !isEditingExisting || (!!min && committedCount() <= min);
+    }
+
+    function drawTable() {
+      rows = ensureTableValue(field);
+      tbody.innerHTML = '';
+
+      const hasAny = rows.some(r => !rowIsEmpty(field, r));
+      tableWrap.style.display = hasAny ? '' : 'none';
+
+      rows.forEach((row, idx) => {
+        // If schema padded minRows with empties, hide empties in preview
+        if (rowIsEmpty(field, row)) return;
+
+        const trEl = document.createElement('tr');
+        const isSel = (idx === selectedIndex);
+
+        if (isSel) {
+          trEl.style.background = '#DBEAFE';
+          trEl.style.outline = '2px solid #93C5FD';
+          trEl.style.outlineOffset = '-2px';
+        }
+
+        trEl.addEventListener('click', () => {
+          // Select row for editing
+          setSelected(idx);
+          statusText = '';
+          status.textContent = statusText;
+        });
+
+        (field.columns || []).forEach(col => {
+          const td = document.createElement('td');
+          td.textContent = row[col.id] ?? '';
+          trEl.appendChild(td);
+        });
+
+        tbody.appendChild(trEl);
+      });
+    }
+
+    // Actions
+    btnAdd.addEventListener('click', () => {
+      rows = ensureTableValue(field);
+
+      if (rowIsEmpty(field, draft)) {
+        statusText = 'Keine Eingaben zum Hinzufügen.';
+        status.textContent = statusText;
+        updateToolbar();
+        return;
+      }
+
+      const max = Math.max(0, parseInt(field.maxRows || 0, 10));
+      if (max && committedCount() >= max) {
+        statusText = 'Maximale Anzahl Zeilen erreicht.';
+        status.textContent = statusText;
+        updateToolbar();
+        return;
+      }
+
+      // Commit draft into canonical rows
+      rows.push({ ...emptyRow(field), ...draft });
+      STATE.values[fid] = normalizeTableArray(field, rows);
+      rows = STATE.values[fid];
+
+      // Clear draft and remain in draft mode (so next row can be entered)
+      draft = emptyRow(field);
+      syncEditorFromModel();
+
+      markDirty();
+      scheduleSaveValues();
+
+      statusText = 'Zeile hinzugefügt.';
+      status.textContent = statusText;
+
+      updateToolbar();
+      drawTable();
+    });
+
+    btnNew.addEventListener('click', () => {
+      // Always go back to draft (new row entry)
+      selectedIndex = null;
+      draft = emptyRow(field);
+      syncEditorFromModel();
+      updateToolbar();
+      drawTable();
+      statusText = 'Neue Zeile.';
+      status.textContent = statusText;
+    });
+
+    btnDelete.addEventListener('click', () => {
+      rows = ensureTableValue(field);
+
+      const min = Math.max(0, parseInt(field.minRows || 0, 10));
+      if (!(typeof selectedIndex === 'number') || selectedIndex < 0 || selectedIndex >= rows.length) return;
+      if (min && committedCount() <= min) return;
+
+      rows.splice(selectedIndex, 1);
+      STATE.values[fid] = normalizeTableArray(field, rows);
+      rows = STATE.values[fid];
+
+      selectedIndex = null;
+      draft = emptyRow(field);
+      syncEditorFromModel();
+
+      markDirty();
+      scheduleSaveValues();
+
+      statusText = 'Zeile gelöscht.';
+      status.textContent = statusText;
+
+      updateToolbar();
+      drawTable();
+    });
+
+    btnCancel.addEventListener('click', () => {
+      // Cancel editing existing row: drop selection, revert editor to draft (does not undo saved edits)
+      // (Edits are already persisted immediately; Cancel is just "stop editing this row")
+      selectedIndex = null;
+      syncEditorFromModel();
+      updateToolbar();
+      drawTable();
+      statusText = 'Bearbeitung beendet.';
+      status.textContent = statusText;
+    });
+
+    // Mount
+    container.appendChild(editorWrap);
+    container.appendChild(toolbar);
+    container.appendChild(status);
+    container.appendChild(tableWrap);
+
+    // Init
     updateToolbar();
+    syncEditorFromModel();
+    drawTable();
+
+    tr.end({ rows: rows.length });
   }
-
-  // --- Actions ---
-  btnAdd.addEventListener('click', () => {
-    const max = Math.max(0, parseInt(field.maxRows || 0, 10));
-    if (max && data.length >= max) return;
-
-    // Add a cloned row from current editorState
-    data.push({ ...editorState });
-    scheduleSaveValues();
-
-    // Prepare for next entry
-    clearSelection();
-    resetEditor();
-    drawTable();
-
-    status.textContent = 'Zeile hinzugefügt.';
-  });
-
-  btnSave.addEventListener('click', () => {
-    if (selectedIndex < 0 || selectedIndex >= data.length) return;
-    data[selectedIndex] = { ...editorState };
-    scheduleSaveValues();
-    drawTable();
-    status.textContent = 'Änderungen gespeichert.';
-  });
-
-  btnDelete.addEventListener('click', () => {
-    const min = Math.max(0, parseInt(field.minRows || 0, 10));
-    if (selectedIndex < 0) return;
-    if (min && data.length <= min) return;
-
-    data.splice(selectedIndex, 1);
-    scheduleSaveValues();
-
-    clearSelection();
-    resetEditor();
-    drawTable();
-
-    status.textContent = 'Zeile gelöscht.';
-  });
-
-  btnCancel.addEventListener('click', () => {
-    clearSelection();
-    resetEditor();
-    drawTable();
-    status.textContent = 'Auswahl aufgehoben.';
-  });
-
-  // Mount
-  container.appendChild(editorWrap);
-  container.appendChild(toolbar);
-  container.appendChild(status);
-  container.appendChild(tableWrap);
-
-  drawTable();
-  applyPreviewVisibility();
-}
 
   // ============================================================
   // Expose for cross-callbacks
@@ -1664,7 +1913,7 @@ function renderTableField(container, field) {
   try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
 
   // Keep existing behavior
-  installLogoFocusNav();
+  try { installLogoFocusNav(); } catch {}
   </script>
 </body>
 </html>
