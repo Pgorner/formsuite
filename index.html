@@ -205,31 +205,51 @@
   // Sanitizer (canonical: utils + table enforcement)
   // ============================================================
   function sanitizeValues(schemaObj, vals) {
-    const tr = TRACE('sanitizeValues', {
-      hasUtils: !!U(),
-      hasSanitizer: !!U()?.sanitizeValues,
-      hasSchema: !!schemaObj
-    });
+  const tr = TRACE('sanitizeValues', {
+    hasUtils: !!U(),
+    hasSanitizer: !!U()?.sanitizeValues,
+    hasSchema: !!schemaObj
+  });
 
-    try {
-      const inVals = (vals && typeof vals === 'object') ? vals : {};
+  try {
+    const inVals = (vals && typeof vals === 'object') ? vals : {};
 
-      let out = inVals;
-      if (U()?.sanitizeValues) out = U().sanitizeValues(schemaObj, inVals);
-      if (!out || typeof out !== 'object') out = {};
-
-      // Canonical: table arrays are always normalized and schema-enforced.
-      out = normalizeAllTablesInValues(schemaObj, out);
-
-      tr.end({ keys: Object.keys(out || {}).length });
-      return out;
-    } catch (e) {
-      tr.warn('sanitize fallback', e);
-      const fallback = (vals && typeof vals === 'object') ? vals : {};
-      tr.end('fallback');
-      return normalizeAllTablesInValues(schemaObj, fallback);
+    // Preserve table arrays in case an upstream sanitizer drops non-scalars.
+    const preservedTables = {};
+    if (schemaObj && Array.isArray(schemaObj.fields)) {
+      (schemaObj.fields || []).forEach(f => {
+        if (String(f?.type) !== 'table') return;
+        const fid = String(f.id || '');
+        if (!fid) return;
+        if (Array.isArray(inVals[fid])) preservedTables[fid] = inVals[fid];
+      });
     }
+
+    let out = inVals;
+    if (U()?.sanitizeValues) out = U().sanitizeValues(schemaObj, inVals);
+    if (!out || typeof out !== 'object') out = {};
+
+    // Restore tables if missing after sanitize
+    for (const fid of Object.keys(preservedTables)) {
+      if (!Array.isArray(out[fid])) out[fid] = preservedTables[fid];
+    }
+
+    // Canonical: table arrays are always normalized and schema-enforced.
+    out = normalizeAllTablesInValues(schemaObj, out);
+
+    tr.end({
+      keys: Object.keys(out || {}).length,
+      preservedTables: Object.keys(preservedTables).length
+    });
+    return out;
+  } catch (e) {
+    tr.warn('sanitize fallback', e);
+    const fallback = (vals && typeof vals === 'object') ? vals : {};
+    tr.end('fallback');
+    return normalizeAllTablesInValues(schemaObj, fallback);
   }
+}
+
 
   // ============================================================
   // Canonical setters (all UI writes go through these)

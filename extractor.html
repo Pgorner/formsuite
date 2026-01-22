@@ -892,20 +892,38 @@ function collectFormValues(schema) {
   if (!form || !schema) return out;
 
   for (const f of (schema.fields || [])) {
+    const fid = String(f.id || '');
+    if (!fid) continue;
+
+    // Tables are edited in the Form page (index) and persisted in workspace state.
+    // Extractor does not render native controls for tables; never overwrite them.
+    if (f.type === 'table') continue;
+
     if (f.type === 'multichoice') {
-      const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(f.id)}"]`);
-      out[f.id] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
+      const nodes = form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape(fid)}"]`);
+      // If there are no checkboxes rendered (e.g., hidden/disabled/not in this form), do not overwrite.
+      if (!nodes || nodes.length === 0) continue;
+      out[fid] = Array.from(nodes).filter(n => n.checked).map(n => n.value);
       continue;
     }
+
     if (f.type === 'address') {
-      out[f.id] = __addressValues[f.id] ?? null;
+      // If address component isn't mounted/changed, do not overwrite.
+      if (!(fid in __addressValues)) continue;
+      out[fid] = __addressValues[fid] ?? null;
       continue;
     }
-    const el = form.elements[f.id];
-    out[f.id] = el ? el.value : null;
+
+    const el = form.elements[fid];
+    // If this field has no native element (e.g., hidden/removed/custom UI), do not overwrite.
+    if (!el) continue;
+
+    out[fid] = el.value;
   }
+
   return out;
 }
+
 
 let previewTimer = null;
 function schedulePreviewUpdate() {
@@ -1350,8 +1368,31 @@ async function doSave() {
       tree: Array.isArray(st.headingsTree) ? st.headingsTree : (lastParsedHeadings.tree || [])
     };
 
+    // IMPORTANT (tables + structured fields):
+    // collectFormValues(schema) only sees native input/select/textarea controls.
+    // Table fields are edited through custom UI and are persisted in workspace
+    // (st.values) but typically have no native inputs to collect here.
+    // If we do not merge st.values into the outgoing payload, table values will
+    // never be written into CRONOS_PAYLOAD even though they are present in the
+    // workspace state.
+    const cloneSafe = (o) => {
+      try {
+        if (typeof structuredClone === 'function') return structuredClone(o);
+        return JSON.parse(JSON.stringify(o));
+      } catch {
+        return o;
+      }
+    };
+
+    const wsValues = (st?.values && typeof st.values === 'object') ? st.values : {};
+    const wsTagMap = (st?.tagMap && typeof st.tagMap === 'object') ? st.tagMap : {};
+
     const liveVals = collectFormValues(schema);
-    values = { ...(values || {}), ...(liveVals || {}) };
+
+    // Merge precedence: workspace -> in-memory -> live DOM
+    // (DOM should win for scalar fields; tables live in workspace/in-memory)
+    values = { ...cloneSafe(wsValues), ...(values || {}), ...(liveVals || {}) };
+    tagMap = { ...cloneSafe(wsTagMap), ...(tagMap || {}) };
 
     const normalized = normalizeAllForDoc(st, schema, baseline);
     const pruned = pruneBySchema(schema, values, tagMap);
@@ -1365,6 +1406,22 @@ async function doSave() {
       fieldRules: normalized.fieldRules,
       updatedAt: new Date().toISOString()
     };
+
+    // Keep workspace mirror aligned with what we're about to persist into the DOCX.
+    // This is especially important for non-DOM collected values (e.g., tables).
+    try {
+      await window.formSuitePersist.saveState(docId, {
+        values: pruned.values,
+        tagMap: pruned.tagMap,
+        rules: normalized.headingRules,
+        fieldRules: normalized.fieldRules,
+        payload: { CRONOS_PAYLOAD: payloadObj },
+        updatedAt: payloadObj.updatedAt
+      });
+    } catch (e) {
+      // Non-fatal: the DOCX write below is still the source of truth for the payload.
+      tr.step('workspace mirror save failed (non-fatal)', String(e && e.message ? e.message : e));
+    }
 
     const inBytes = await getWorkingDocBytesU8();
     if (!inBytes) {
