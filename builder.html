@@ -707,7 +707,8 @@
           id: String(c.id || '').trim() || 'col',
           label: String(c.label != null ? c.label : c.id || 'col'),
           type: TYPES.includes(c.type) ? c.type : 'text',
-          options: Array.isArray(c.options) ? c.options.map(o => String(o)) : []
+          options: Array.isArray(c.options) ? c.options.map(o => String(o)) : [],
+          multiple: !!c.multiple
         }));
         render();
       },
@@ -792,6 +793,29 @@
 
         const optWrap = document.createElement('div'); optWrap.className = 'tdz-chipwrap';
         const optAddWrap = document.createElement('div'); optAddWrap.className = 'tdz-opts';
+
+        const multiWrap = document.createElement('label');
+        multiWrap.className = 'small';
+        multiWrap.style.display = 'flex';
+        multiWrap.style.gap = '8px';
+        multiWrap.style.alignItems = 'center';
+        multiWrap.style.marginTop = '6px';
+
+        const cbMulti = document.createElement('input');
+        cbMulti.type = 'checkbox';
+        cbMulti.checked = !!col.multiple;
+
+        const cbTxt = document.createElement('span');
+        cbTxt.textContent = 'Mehrfachauswahl (multiple)';
+
+        cbMulti.addEventListener('change', () => {
+          col.multiple = !!cbMulti.checked;
+          api.serializeToHidden();
+        });
+
+        multiWrap.appendChild(cbMulti);
+        multiWrap.appendChild(cbTxt);
+
 
         const inOpt = document.createElement('input'); inOpt.placeholder = 'Option eingeben…';
         const btnAddOpt = document.createElement('button'); btnAddOpt.type='button'; btnAddOpt.textContent='Hinzufügen';
@@ -952,11 +976,21 @@
         drawChips();
 
         function toggleOpts() { cOpts.style.display = (sel.value === 'select') ? '' : 'none'; }
-        sel.addEventListener('change', () => { col.type = sel.value; toggleOpts(); api.serializeToHidden(); });
+        sel.addEventListener('change', () => {
+          col.type = sel.value;
+          if (col.type !== 'select') {
+            col.multiple = false;
+          } else {
+            col.options = Array.isArray(col.options) ? col.options : [];
+          }
+          toggleOpts();
+          api.serializeToHidden();
+        });
         toggleOpts();
 
         cOpts.appendChild(optWrap);
         cOpts.appendChild(optAddWrap);
+        cOpts.appendChild(multiWrap);
         row.appendChild(cOpts);
 
         cfg.listEl.appendChild(row);

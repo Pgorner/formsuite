@@ -210,7 +210,10 @@
   // ============================================================
   function emptyRow(field){
     const r = {};
-    (field.columns || []).forEach(c => { r[String(c.id || '')] = ''; });
+    (field.columns || []).forEach(c => {
+      const isMultiSelectCol = (String(c?.type) === 'select' && !!c?.multiple);
+      r[String(c.id || '')] = isMultiSelectCol ? [] : '';
+    });
     return r;
   }
 
@@ -228,8 +231,55 @@
     const max = Math.max(0, parseInt(field.maxRows || 0, 10));
 
     let out = Array.isArray(arr) ? arr.slice() : [];
-    // Ensure shape
-    out = out.map(r => ({ ...base, ...(r || {}) }));
+
+    // Ensure shape + coerce per-column types (esp. multi-select -> array)
+    out = out.map(r0 => {
+      const r = { ...base, ...(r0 || {}) };
+
+      (field.columns || []).forEach(c => {
+        const cid = String(c.id || '');
+        if (!cid) return;
+
+        const isMulti = (String(c?.type) === 'select' && !!c?.multiple);
+        if (!isMulti) {
+          if (r[cid] == null) r[cid] = '';
+          return;
+        }
+
+        // Multi-select cell: ensure array-of-strings
+        const v = r[cid];
+
+        if (Array.isArray(v)) {
+          r[cid] = v.map(String).filter(s => s !== '');
+        } else if (typeof v === 'string') {
+          const s = v.trim();
+          if (!s) r[cid] = [];
+          else if (s.startsWith('[')) {
+            try {
+              const parsed = JSON.parse(s);
+              r[cid] = Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+            } catch {
+              r[cid] = s.split(',').map(x => x.trim()).filter(Boolean);
+            }
+          } else {
+            r[cid] = s.split(',').map(x => x.trim()).filter(Boolean);
+          }
+        } else if (v == null) {
+          r[cid] = [];
+        } else {
+          r[cid] = [String(v)].filter(Boolean);
+        }
+
+        // Optional: enforce allowed options only
+        const opts = Array.isArray(c.options) ? c.options.map(String) : [];
+        if (opts.length) {
+          const ok = new Set(opts);
+          r[cid] = r[cid].filter(x => ok.has(String(x)));
+        }
+      });
+
+      return r;
+    });
 
     // Remove fully empty rows (canonical behavior: draft/placeholder rows are not data)
     out = out.filter(r => !rowIsEmpty(field, r));
@@ -927,6 +977,163 @@
     });
   }
 
+
+
+  // ==========================================
+  // Multi-select UI (shared by fields + table columns)
+  
+  // ==========================================
+  // Multi-select UI (shared by fields + table columns)
+  // ==========================================
+  function createFsMultiSelectControl({ fid = null, options = [], initialSelected = [], placeholder = '— select —', onChange = null }) {
+    const opts = (Array.isArray(options) ? options : []).map(o => {
+      if (o && typeof o === 'object') {
+        const value = String(o.value ?? o.id ?? o.key ?? o.code ?? o);
+        const label = String(o.label ?? o.text ?? o.name ?? value);
+        return { value, label };
+      }
+      return { value: String(o), label: String(o) };
+    });
+
+    const root = document.createElement('div');
+    root.className = 'fs-multi';
+    if (fid != null) root.dataset.fid = String(fid);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'fs-multi-btn';
+    btn.setAttribute('aria-haspopup', 'listbox');
+    btn.setAttribute('aria-expanded', 'false');
+
+    const menu = document.createElement('div');
+    menu.className = 'fs-multi-menu';
+    menu.setAttribute('role', 'listbox');
+
+    // Optional hidden input (keeps compatibility with form.elements and older code paths)
+    let hidden = null;
+    if (fid != null) {
+      hidden = document.createElement('input');
+      hidden.type = 'hidden';
+      hidden.id = String(fid);
+      hidden.name = String(fid);
+    }
+
+    let selected = Array.isArray(initialSelected) ? initialSelected.map(String) : [];
+    const labelByValue = new Map(opts.map(o => [o.value, o.label]));
+
+    const normalizeSelected = () => {
+      const ok = new Set(opts.map(o => o.value));
+      selected = selected.map(String).filter(v => ok.has(v));
+    };
+
+    const updateBtnText = () => {
+      normalizeSelected();
+      btn.innerHTML = '';
+      if (!selected.length) {
+        const ph = document.createElement('span');
+        ph.className = 'fs-multi-placeholder';
+        ph.textContent = placeholder;
+        btn.appendChild(ph);
+      } else {
+        selected
+          .map(v => labelByValue.get(v) ?? v)
+          .forEach(l => {
+            const chip = document.createElement('span');
+            chip.className = 'fs-multi-chip';
+            chip.textContent = String(l);
+            btn.appendChild(chip);
+          });
+      }
+    };
+
+    const syncMenu = () => {
+      const nodes = menu.querySelectorAll('.fs-multi-opt');
+      nodes.forEach(n => {
+        const v = String(n.dataset.value || '');
+        const isSel = selected.includes(v);
+        n.classList.toggle('selected', isSel);
+        const cb = n.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = isSel;
+      });
+    };
+
+    const commit = (fire = true) => {
+      normalizeSelected();
+      updateBtnText();
+      syncMenu();
+      if (hidden) hidden.value = selected.join(',');
+      if (fire && typeof onChange === 'function') onChange(selected.slice());
+    };
+
+    opts.forEach(({ value, label }) => {
+      const row = document.createElement('div');
+      row.className = 'fs-multi-opt';
+      row.dataset.value = value;
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.tabIndex = -1;
+
+      const lab = document.createElement('span');
+      lab.textContent = label;
+
+      row.appendChild(cb);
+      row.appendChild(lab);
+
+      row.addEventListener('click', (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+
+        const idx = selected.indexOf(value);
+        if (idx >= 0) selected.splice(idx, 1);
+        else selected.push(value);
+
+        commit(true);
+      });
+
+      menu.appendChild(row);
+    });
+
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const open = !menu.classList.contains('open');
+      menu.classList.toggle('open', open);
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) syncMenu();
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!root.contains(e.target)) {
+        menu.classList.remove('open');
+        btn.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    root.appendChild(btn);
+    root.appendChild(menu);
+    if (hidden) root.appendChild(hidden);
+
+    // initial paint (no onChange spam)
+    commit(false);
+
+    const api = {
+      el: root,
+      setSelected(next, fire = false) {
+        selected = Array.isArray(next) ? next.map(String) : [];
+        commit(!!fire);
+      },
+      getSelected() {
+        normalizeSelected();
+        return selected.slice();
+      }
+    };
+
+    // Attach for external sync (table editor)
+    root.dataset.type = 'multiselect';
+    root.__fsMultiApi = api;
+
+    return api;
+  }
   // ============================================================
   // Render Form
   // ============================================================
@@ -1115,150 +1322,24 @@ else if (f.type === 'select') {
 
   // Multi-select: custom dropdown with checkmarks (no Ctrl/⌘ required)
   else {
-    const root = document.createElement('div');
-    root.className = 'fs-multi';
-    root.dataset.fid = String(f.id);
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'fs-multi-btn';
-    btn.setAttribute('aria-haspopup', 'listbox');
-    btn.setAttribute('aria-expanded', 'false');
-
-    const menu = document.createElement('div');
-    menu.className = 'fs-multi-menu';
-    menu.setAttribute('role', 'listbox');
-
-    // Hidden input keeps the field in form.elements and allows other code paths to "see" a value.
-    const hidden = document.createElement('input');
-    hidden.type = 'hidden';
-    hidden.id = f.id;
-    hidden.name = f.id;
-
     const cur = getValue(f.id);
-    let selected = Array.isArray(cur)
+    const selected = Array.isArray(cur)
       ? cur.map(String)
       : (cur != null && cur !== '' ? [String(cur)] : []);
 
-    const labelByValue = new Map(opts.map(o => [String(o.value), String(o.label)]));
-    const normalizeSelected = () => {
-      // Keep only values that exist in options, preserve order of selection.
-      const ok = new Set(opts.map(o => String(o.value)));
-      selected = selected.map(String).filter(v => ok.has(v));
-    };
-
-    const updateBtnText = () => {
-      normalizeSelected();
-      btn.innerHTML = '';
-      if (!selected.length) {
-        const ph = document.createElement('span');
-        ph.className = 'fs-multi-placeholder';
-        ph.textContent = '-- select --';
-        btn.appendChild(ph);
-      } else {
-        const labels = selected.map(v => labelByValue.get(String(v)) ?? String(v));
-        labels.forEach(l => {
-          const chip = document.createElement('span');
-          chip.className = 'fs-multi-chip';
-          chip.textContent = String(l);
-          btn.appendChild(chip);
-        });
+    const api = createFsMultiSelectControl({
+      fid: f.id,
+      options: opts,
+      initialSelected: selected,
+      placeholder: '-- select --',
+      onChange: (arr) => {
+        setValue(f.id, arr);
+        applyFieldVisibility();
       }
-    };
-
-    const commit = () => {
-      normalizeSelected();
-      hidden.value = JSON.stringify(selected);
-      setValue(f.id, selected);
-      applyFieldVisibility();
-    };
-
-    const syncMenu = () => {
-      const nodes = menu.querySelectorAll('.fs-multi-opt');
-      nodes.forEach(n => {
-        const v = String(n.dataset.value || '');
-        const isSel = selected.includes(v);
-        n.classList.toggle('selected', isSel);
-        const cb = n.querySelector('input[type="checkbox"]');
-        if (cb) cb.checked = isSel;
-      });
-    };
-
-    opts.forEach(({value,label}) => {
-      const v = String(value);
-
-      const row = document.createElement('div');
-      row.className = 'fs-multi-opt';
-      row.dataset.value = v;
-
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.tabIndex = -1;
-
-      const lab = document.createElement('span');
-      lab.textContent = String(label);
-
-      row.appendChild(cb);
-      row.appendChild(lab);
-
-      const toggle = (evt) => {
-        evt.preventDefault();
-        evt.stopPropagation();
-
-        const idx = selected.indexOf(v);
-        if (idx >= 0) selected.splice(idx, 1);
-        else selected.push(v);
-
-        updateBtnText();
-        syncMenu();
-        commit();
-      };
-
-      row.addEventListener('click', toggle);
-      cb.addEventListener('click', toggle);
-
-      menu.appendChild(row);
     });
 
-    const openMenu = () => {
-      menu.classList.add('open');
-      btn.setAttribute('aria-expanded', 'true');
-      syncMenu();
-    };
-    const closeMenu = () => {
-      menu.classList.remove('open');
-      btn.setAttribute('aria-expanded', 'false');
-    };
-    const toggleMenu = () => {
-      if (menu.classList.contains('open')) closeMenu();
-      else openMenu();
-    };
-
-    btn.addEventListener('click', (e) => { e.preventDefault(); toggleMenu(); });
-
-    // Close on outside click / escape
-    const onDocClick = (e) => {
-      if (!root.contains(e.target)) closeMenu();
-    };
-    const onKeyDown = (e) => {
-      if (e.key === 'Escape') closeMenu();
-    };
-    document.addEventListener('click', onDocClick);
-    document.addEventListener('keydown', onKeyDown);
-
-    // Initial paint
-    updateBtnText();
-    syncMenu();
-    hidden.value = JSON.stringify(selected);
-
-    root.appendChild(btn);
-    root.appendChild(menu);
-    root.appendChild(hidden);
-
-    if (f.required) root.dataset.required = '1';
-
-    wrap.appendChild(root);
-    inputRefs[f.id] = root;
+    wrap.appendChild(api.el);
+    inputRefs[f.id] = api.el;
   }
 }
 
@@ -1913,12 +1994,23 @@ else if (f.type === 'select') {
       (field.columns || []).forEach(c => {
         const el = editorInputs[c.id];
         if (!el) return;
-        const v = (model && Object.prototype.hasOwnProperty.call(model, c.id)) ? model[c.id] : '';
-        // If flatpickr exists, setting input value is ok; widget reads it
+
+        const isMulti = (String(c?.type) === 'select' && !!c?.multiple);
+        const fallback = isMulti ? [] : '';
+        const v = (model && Object.prototype.hasOwnProperty.call(model, c.id)) ? model[c.id] : fallback;
+
+        // Custom multi-select control
+        if (isMulti && el.dataset.type === 'multiselect' && el.__fsMultiApi) {
+          el.__fsMultiApi.setSelected(Array.isArray(v) ? v : [], false);
+          return;
+        }
+
+        // Native inputs/selects
         el.value = (v == null) ? '' : String(v);
         try { if (el._flatpickr && el.value) el._flatpickr.setDate(el.value, false); } catch {}
         try { if (el._flatpickr && !el.value) el._flatpickr.clear(); } catch {}
       });
+    
     }
 
     function syncModelFromEditor(colId, value) {
@@ -1952,20 +2044,40 @@ else if (f.type === 'select') {
 
       let el;
       if (col.type === 'select') {
-        el = document.createElement('select');
         const opts = Array.isArray(col.options) ? col.options : [];
-        const empty = document.createElement('option');
-        empty.value = '';
-        empty.textContent = '— wählen —';
-        el.appendChild(empty);
-        opts.forEach(opt => {
-          const o = document.createElement('option');
-          o.value = String(opt);
-          o.textContent = String(opt);
-          el.appendChild(o);
-        });
-        el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
-        el.addEventListener('change', () => syncModelFromEditor(col.id, el.value));
+        const isMulti = !!col.multiple;
+
+        // Single-select: native <select>
+        if (!isMulti) {
+          el = document.createElement('select');
+          const empty = document.createElement('option');
+          empty.value = '';
+          empty.textContent = '— wählen —';
+          el.appendChild(empty);
+          opts.forEach(opt => {
+            const o = document.createElement('option');
+            o.value = String(opt);
+            o.textContent = String(opt);
+            el.appendChild(o);
+          });
+          el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
+          el.addEventListener('change', () => syncModelFromEditor(col.id, el.value));
+        }
+
+        // Multi-select: shared fs-multi control
+        else {
+          const model = currentModel();
+          const cur = model?.[col.id];
+          const api = createFsMultiSelectControl({
+            fid: null,
+            options: opts,
+            initialSelected: Array.isArray(cur) ? cur : [],
+            placeholder: '-- select --',
+            onChange: (arr) => syncModelFromEditor(col.id, arr)
+          });
+          el = api.el;
+          el.style.minWidth = '260px';
+        }
       } else if (col.type === 'date') {
         el = document.createElement('input');
         el.type = 'text';
