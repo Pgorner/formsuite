@@ -8,6 +8,63 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/material_blue.css">
   <link rel="stylesheet" href="style.css">
+
+<style id="fs-multi-style">
+/* Multi-select dropdown (checkbox-style) */
+.fs-multi { position: relative; width: 100%; }
+.fs-multi-btn {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid rgba(0,0,0,.25);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-height: 38px;
+}
+.fs-multi-placeholder { color: rgba(0,0,0,.55); }
+.fs-multi-chip {
+  background: #e6f0ff;
+  color: #1a1a1a;
+  border: 1px solid #c7dbff;
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+
+.fs-multi-menu {
+  position: absolute;
+  left: 0; right: 0;
+  margin-top: 6px;
+  border: 1px solid rgba(0,0,0,.25);
+  border-radius: 6px;
+  background: #fff;
+  max-height: 240px;
+  overflow: auto;
+  display: none;
+  z-index: 2000;
+}
+.fs-multi-menu.open { display: block; }
+.fs-multi-opt {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.fs-multi-opt.selected { background: rgba(0,0,0,.06); }
+.fs-multi-opt:hover { background: rgba(0,0,0,.04); }
+.fs-multi-opt input[type="checkbox"] { pointer-events: none; }
+</style>
+
 </head>
 <body>
   <header>
@@ -214,14 +271,32 @@
   try {
     const inVals = (vals && typeof vals === 'object') ? vals : {};
 
-    // Preserve table arrays in case an upstream sanitizer drops non-scalars.
-    const preservedTables = {};
+    // Preserve non-scalar values (arrays/objects) that are part of the schema
+    // in case an upstream sanitizer drops non-scalars.
+    // - table => array of rows
+    // - multichoice => array of selected option values
+    // - select+multiple => array of selected option values
+    // - address => object (formatted + parts)
+    const preservedNonScalars = {};
     if (schemaObj && Array.isArray(schemaObj.fields)) {
       (schemaObj.fields || []).forEach(f => {
-        if (String(f?.type) !== 'table') return;
-        const fid = String(f.id || '');
+        const fid = String(f?.id || '');
         if (!fid) return;
-        if (Array.isArray(inVals[fid])) preservedTables[fid] = inVals[fid];
+
+        const t = String(f?.type || '');
+        const isMultiSelect = (t === 'select' && !!f?.multiple);
+        const isMultiChoice = (t === 'multichoice');
+        const isTable       = (t === 'table');
+        const isAddress     = (t === 'address');
+
+        if (!(isTable || isMultiChoice || isMultiSelect || isAddress)) return;
+
+        const v = inVals[fid];
+        if (isAddress) {
+          if (v && typeof v === 'object' && !Array.isArray(v)) preservedNonScalars[fid] = v;
+          return;
+        }
+        if (Array.isArray(v)) preservedNonScalars[fid] = v;
       });
     }
 
@@ -229,9 +304,14 @@
     if (U()?.sanitizeValues) out = U().sanitizeValues(schemaObj, inVals);
     if (!out || typeof out !== 'object') out = {};
 
-    // Restore tables if missing after sanitize
-    for (const fid of Object.keys(preservedTables)) {
-      if (!Array.isArray(out[fid])) out[fid] = preservedTables[fid];
+    // Restore preserved non-scalars if missing after sanitize
+    for (const fid of Object.keys(preservedNonScalars)) {
+      const pv = preservedNonScalars[fid];
+      if (Array.isArray(pv)) {
+        if (!Array.isArray(out[fid])) out[fid] = pv;
+      } else {
+        if (!(out[fid] && typeof out[fid] === 'object' && !Array.isArray(out[fid]))) out[fid] = pv;
+      }
     }
 
     // Canonical: table arrays are always normalized and schema-enforced.
@@ -239,7 +319,7 @@
 
     tr.end({
       keys: Object.keys(out || {}).length,
-      preservedTables: Object.keys(preservedTables).length
+      preservedNonScalars: Object.keys(preservedNonScalars).length
     });
     return out;
   } catch (e) {
@@ -997,31 +1077,190 @@
       }
 
       // Select
-      else if (f.type === 'select') {
-        const input = document.createElement('select');
-        input.id = f.id; input.name = f.id; input.style.width = '100%';
+else if (f.type === 'select') {
+  const opts = normOptions(f);
+  const isMulti = !!f.multiple;
 
-        const opts = normOptions(f);
-        const empty = document.createElement('option');
-        empty.value = '';
-        empty.textContent = '— select —';
-        input.appendChild(empty);
+  // Single-select: keep native <select>
+  if (!isMulti) {
+    const input = document.createElement('select');
+    input.id = f.id; input.name = f.id; input.style.width = '100%';
 
-        opts.forEach(({value,label}) => {
-          const o = document.createElement('option');
-          o.value = value;
-          o.textContent = label;
-          input.appendChild(o);
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = '— select —';
+    input.appendChild(empty);
+
+    opts.forEach(({value,label}) => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      input.appendChild(o);
+    });
+
+    if (f.required) input.required = true;
+
+    const cur = getValue(f.id);
+    if (cur != null) input.value = String(cur);
+
+    const commit = () => {
+      setValue(f.id, input.value);
+      applyFieldVisibility();
+    };
+    input.addEventListener('change', commit);
+
+    wrap.appendChild(input);
+    inputRefs[f.id] = input;
+  }
+
+  // Multi-select: custom dropdown with checkmarks (no Ctrl/⌘ required)
+  else {
+    const root = document.createElement('div');
+    root.className = 'fs-multi';
+    root.dataset.fid = String(f.id);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'fs-multi-btn';
+    btn.setAttribute('aria-haspopup', 'listbox');
+    btn.setAttribute('aria-expanded', 'false');
+
+    const menu = document.createElement('div');
+    menu.className = 'fs-multi-menu';
+    menu.setAttribute('role', 'listbox');
+
+    // Hidden input keeps the field in form.elements and allows other code paths to "see" a value.
+    const hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.id = f.id;
+    hidden.name = f.id;
+
+    const cur = getValue(f.id);
+    let selected = Array.isArray(cur)
+      ? cur.map(String)
+      : (cur != null && cur !== '' ? [String(cur)] : []);
+
+    const labelByValue = new Map(opts.map(o => [String(o.value), String(o.label)]));
+    const normalizeSelected = () => {
+      // Keep only values that exist in options, preserve order of selection.
+      const ok = new Set(opts.map(o => String(o.value)));
+      selected = selected.map(String).filter(v => ok.has(v));
+    };
+
+    const updateBtnText = () => {
+      normalizeSelected();
+      btn.innerHTML = '';
+      if (!selected.length) {
+        const ph = document.createElement('span');
+        ph.className = 'fs-multi-placeholder';
+        ph.textContent = '-- select --';
+        btn.appendChild(ph);
+      } else {
+        const labels = selected.map(v => labelByValue.get(String(v)) ?? String(v));
+        labels.forEach(l => {
+          const chip = document.createElement('span');
+          chip.className = 'fs-multi-chip';
+          chip.textContent = String(l);
+          btn.appendChild(chip);
         });
-
-        if (f.required) input.required = true;
-        if (getValue(f.id) != null) input.value = String(getValue(f.id));
-
-        input.addEventListener('change', () => { setValue(f.id, input.value); applyFieldVisibility(); });
-
-        wrap.appendChild(input);
-        inputRefs[f.id] = input;
       }
+    };
+
+    const commit = () => {
+      normalizeSelected();
+      hidden.value = JSON.stringify(selected);
+      setValue(f.id, selected);
+      applyFieldVisibility();
+    };
+
+    const syncMenu = () => {
+      const nodes = menu.querySelectorAll('.fs-multi-opt');
+      nodes.forEach(n => {
+        const v = String(n.dataset.value || '');
+        const isSel = selected.includes(v);
+        n.classList.toggle('selected', isSel);
+        const cb = n.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = isSel;
+      });
+    };
+
+    opts.forEach(({value,label}) => {
+      const v = String(value);
+
+      const row = document.createElement('div');
+      row.className = 'fs-multi-opt';
+      row.dataset.value = v;
+
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.tabIndex = -1;
+
+      const lab = document.createElement('span');
+      lab.textContent = String(label);
+
+      row.appendChild(cb);
+      row.appendChild(lab);
+
+      const toggle = (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+
+        const idx = selected.indexOf(v);
+        if (idx >= 0) selected.splice(idx, 1);
+        else selected.push(v);
+
+        updateBtnText();
+        syncMenu();
+        commit();
+      };
+
+      row.addEventListener('click', toggle);
+      cb.addEventListener('click', toggle);
+
+      menu.appendChild(row);
+    });
+
+    const openMenu = () => {
+      menu.classList.add('open');
+      btn.setAttribute('aria-expanded', 'true');
+      syncMenu();
+    };
+    const closeMenu = () => {
+      menu.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+    };
+    const toggleMenu = () => {
+      if (menu.classList.contains('open')) closeMenu();
+      else openMenu();
+    };
+
+    btn.addEventListener('click', (e) => { e.preventDefault(); toggleMenu(); });
+
+    // Close on outside click / escape
+    const onDocClick = (e) => {
+      if (!root.contains(e.target)) closeMenu();
+    };
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') closeMenu();
+    };
+    document.addEventListener('click', onDocClick);
+    document.addEventListener('keydown', onKeyDown);
+
+    // Initial paint
+    updateBtnText();
+    syncMenu();
+    hidden.value = JSON.stringify(selected);
+
+    root.appendChild(btn);
+    root.appendChild(menu);
+    root.appendChild(hidden);
+
+    if (f.required) root.dataset.required = '1';
+
+    wrap.appendChild(root);
+    inputRefs[f.id] = root;
+  }
+}
 
       // Date
       else if (f.type === 'date') {
