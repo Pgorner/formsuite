@@ -828,25 +828,304 @@ function renderSDTsView(parsed) {
 }
 
 /* ============================================================
-   Headings: degrade gracefully
+   Headings parsing (DOCX -> headings)
+   - Robust across templates/locales (Heading 1 / Überschrift 1 / outlineLvl)
+   - Uses JSZip to read word/document.xml (+ word/styles.xml if present)
+   - Exposes:
+       window.FormSuite.parsers.headings.parse(arrayBuffer)  -> { flat, tree, count, debug }
+       window.parseHeadings_JS(arrayBuffer)                  -> { headingsFlat, headingsTree, debug }
    ============================================================ */
+(function initHeadingsParser(){
+  const NS = (window.FormSuite = window.FormSuite || {});
+  NS.parsers = NS.parsers || {};
+  NS.parsers.headings = NS.parsers.headings || {};
+
+  // If a parser already exists (e.g., injected by another page), do not overwrite it.
+  if (typeof NS.parsers.headings.parse === 'function') return;
+
+  const warn = (...a) => { try { console.warn(...a); } catch {} };
+
+  function first(node, selectors) {
+    if (!node || !selectors) return null;
+    for (const sel of selectors) {
+      try {
+        const el = node.querySelector(sel);
+        if (el) return el;
+      } catch {}
+    }
+    return null;
+  }
+
+  function getAttr(el, names) {
+    if (!el) return null;
+    for (const n of names) {
+      try {
+        const v = el.getAttribute(n);
+        if (v != null && v !== '') return v;
+      } catch {}
+    }
+    return null;
+  }
+
+  function extractParagraphText(p) {
+    // Collect w:t text runs
+    const texts = [];
+    try {
+      const walker = document.createTreeWalker(p, NodeFilter.SHOW_ELEMENT, null);
+      let n = walker.currentNode;
+      while (n) {
+        if (n.localName === 't') texts.push(n.textContent || '');
+        n = walker.nextNode();
+      }
+    } catch {}
+    return (texts.join('') || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function matchHeadingLevelFromString(s) {
+    if (!s) return null;
+    const str = String(s).trim();
+
+    // Matches: Heading1, Heading 1, Überschrift1, Überschrift 1, Ueberschrift 1, etc.
+    const m =
+      str.match(/\bHeading\s*([1-9])\b/i) ||
+      str.match(/\bHeading([1-9])\b/i) ||
+      str.match(/\bÜberschrift\s*([1-9])\b/i) ||
+      str.match(/\bÜberschrift([1-9])\b/i) ||
+      str.match(/\bUeberschrift\s*([1-9])\b/i) ||
+      str.match(/\bUeberschrift([1-9])\b/i);
+
+    if (m) return parseInt(m[1], 10);
+    return null;
+  }
+
+  function buildStyleMap(stylesDom) {
+    // styleId -> { name, basedOn, outlineLvl }
+    const map = new Map();
+    if (!stylesDom) return map;
+
+    const styles = Array.from(stylesDom.getElementsByTagNameNS('*', 'style'));
+    for (const st of styles) {
+      const styleId =
+        st.getAttribute('w:styleId') ||
+        st.getAttribute('styleId') ||
+        '';
+
+      if (!styleId) continue;
+
+      const nameEl = st.getElementsByTagNameNS('*', 'name')[0];
+      const name = nameEl ? (getAttr(nameEl, ['w:val', 'val']) || '') : '';
+
+      const basedOnEl = st.getElementsByTagNameNS('*', 'basedOn')[0];
+      const basedOn = basedOnEl ? (getAttr(basedOnEl, ['w:val', 'val']) || '') : '';
+
+      // outlineLvl can be stored on the style's pPr
+      const pPr = st.getElementsByTagNameNS('*', 'pPr')[0];
+      let outlineLvl = null;
+      if (pPr) {
+        const o = Array.from(pPr.getElementsByTagNameNS('*', 'outlineLvl'))[0];
+        const v = o ? getAttr(o, ['w:val', 'val']) : null;
+        if (v != null && /^\d+$/.test(v)) outlineLvl = parseInt(v, 10);
+      }
+
+      map.set(styleId, { styleId, name, basedOn, outlineLvl });
+    }
+    return map;
+  }
+
+  function resolveStyleHeadingLevel(styleId, styleMap) {
+    let cur = (styleId || '').trim();
+    if (!cur) return null;
+
+    const visited = new Set();
+    for (let depth = 0; depth < 25; depth++) {
+      if (!cur || visited.has(cur)) break;
+      visited.add(cur);
+
+      const info = styleMap.get(cur);
+
+      // direct match on styleId itself
+      const lvlFromId = matchHeadingLevelFromString(cur);
+      if (lvlFromId) return lvlFromId;
+
+      if (info) {
+        // If style defines outlineLvl, that's authoritative (0=>H1, 1=>H2, ...)
+        if (info.outlineLvl != null && info.outlineLvl >= 0 && info.outlineLvl <= 8) {
+          return info.outlineLvl + 1;
+        }
+
+        // try matching from style name
+        const lvlFromName = matchHeadingLevelFromString(info.name);
+        if (lvlFromName) return lvlFromName;
+
+        cur = (info.basedOn || '').trim();
+      } else {
+        break;
+      }
+    }
+    return null;
+  }
+
+  function detectHeadingLevel(p, styleMap) {
+    // 1) Prefer outlineLvl directly on paragraph
+    const outline = first(p, ['w\\:pPr w\\:outlineLvl', 'pPr outlineLvl', 'outlineLvl']);
+    const outlineVal = getAttr(outline, ['w:val', 'val']);
+    if (outlineVal != null && /^\d+$/.test(outlineVal)) {
+      const lvl = parseInt(outlineVal, 10) + 1;
+      if (lvl >= 1 && lvl <= 9) return lvl;
+    }
+
+    // 2) Paragraph style id
+    const pStyle = first(p, ['w\\:pPr w\\:pStyle', 'pPr pStyle', 'pStyle']);
+    const styleId = (getAttr(pStyle, ['w:val', 'val']) || '').trim();
+    if (!styleId) return null;
+
+    // 2a) direct match
+    const direct = matchHeadingLevelFromString(styleId);
+    if (direct) return direct;
+
+    // 2b) resolve via styles.xml chain
+    return resolveStyleHeadingLevel(styleId, styleMap);
+  }
+
+  function hashCode(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) {
+      h = ((h << 5) - h) + str.charCodeAt(i);
+      h |= 0;
+    }
+    return h;
+  }
+
+  NS.parsers.headings.parse = async function parseHeadingsFromDocx(arrayBuffer) {
+    const tr = TRACE('FormSuite.parsers.headings.parse', { len: arrayBuffer?.byteLength });
+    try {
+      if (!arrayBuffer || !arrayBuffer.byteLength) {
+        tr.end({ mode: 'empty-buffer', flat: 0 });
+        return { flat: [], tree: [], count: 0, debug: { mode: 'empty-buffer' } };
+      }
+      if (typeof JSZip === 'undefined') {
+        warn('[Headings] JSZip missing; cannot parse headings.');
+        tr.end({ mode: 'no-jszip', flat: 0 });
+        return { flat: [], tree: [], count: 0, debug: { mode: 'no-jszip' } };
+      }
+
+      const zip = await JSZip.loadAsync(arrayBuffer);
+
+      const docXmlFile = zip.file('word/document.xml');
+      if (!docXmlFile) {
+        warn('[Headings] word/document.xml not found in DOCX.');
+        tr.end({ mode: 'no-document-xml', flat: 0 });
+        return { flat: [], tree: [], count: 0, debug: { mode: 'no-document-xml' } };
+      }
+
+      const stylesXmlFile = zip.file('word/styles.xml');
+
+      const [docXml, stylesXml] = await Promise.all([
+        docXmlFile.async('string'),
+        stylesXmlFile ? stylesXmlFile.async('string') : Promise.resolve('')
+      ]);
+
+      const docDom = new DOMParser().parseFromString(docXml, 'application/xml');
+      const stylesDom = stylesXml ? new DOMParser().parseFromString(stylesXml, 'application/xml') : null;
+
+      const styleMap = buildStyleMap(stylesDom);
+
+      const paragraphs = Array.from(docDom.getElementsByTagNameNS('*', 'p'));
+      const flat = [];
+
+      // Debug counters
+      const styleCounts = new Map();
+      let withPStyle = 0;
+      let withOutlineDirect = 0;
+
+      let idx = 0;
+      for (let paraIndex = 0; paraIndex < paragraphs.length; paraIndex++) {
+        const p = paragraphs[paraIndex];
+
+        const outline = first(p, ['w\\:pPr w\\:outlineLvl', 'pPr outlineLvl', 'outlineLvl']);
+        const outlineVal = getAttr(outline, ['w:val', 'val']);
+        if (outlineVal != null && /^\d+$/.test(outlineVal)) withOutlineDirect++;
+
+        const pStyle = first(p, ['w\\:pPr w\\:pStyle', 'pPr pStyle', 'pStyle']);
+        const styleId = (getAttr(pStyle, ['w:val', 'val']) || '').trim();
+        if (styleId) {
+          withPStyle++;
+          styleCounts.set(styleId, (styleCounts.get(styleId) || 0) + 1);
+        }
+
+        const level = detectHeadingLevel(p, styleMap);
+        if (!level) continue;
+
+        const text = extractParagraphText(p);
+        if (!text) continue;
+
+        const uid = 'h_' + paraIndex + '_' + (Math.abs(hashCode(text)) >>> 0).toString(16);
+
+        flat.push({
+          level,
+          text,
+          label: text,
+          part: 'document',
+          idx: idx++,
+          uid,
+          paraIndex,
+          start: null,
+          end: null
+        });
+      }
+
+      const debug = {
+        mode: 'docx-xml+styles',
+        paragraphs: paragraphs.length,
+        withPStyle,
+        withOutlineDirect,
+        stylesXmlPresent: !!stylesXml,
+        uniqueStyles: styleCounts.size,
+        styleMapSize: styleMap.size
+      };
+
+      // Surface useful hints when 0 headings detected.
+      if (flat.length === 0) {
+        try {
+          const topStyles = Array.from(styleCounts.entries())
+            .sort((a,b)=>b[1]-a[1])
+            .slice(0, 25)
+            .map(([id,count]) => ({ id, count, name: styleMap.get(id)?.name || '', basedOn: styleMap.get(id)?.basedOn || '', outline: styleMap.get(id)?.outlineLvl }));
+          warn('[Headings Debug] 0 headings detected.', { ...debug, topStyles });
+        } catch {}
+      }
+
+      tr.end({ ...debug, flat: flat.length });
+      return { flat, tree: [], count: flat.length, debug };
+    } catch (e) {
+      tr.error('Headings parse failed', e);
+      tr.end({ mode: 'error', flat: 0 });
+      return { flat: [], tree: [], count: 0, debug: { mode: 'error', message: e?.message } };
+    }
+  };
+})();
+
+// Compatibility wrapper for existing code paths/logs.
+// Always async, always returns {headingsFlat, headingsTree, debug}.
 async function parseHeadings_JS(arrayBuffer) {
   const tr = TRACE('parseHeadings_JS', { len: arrayBuffer?.byteLength });
   try {
-    if (typeof window.parseHeadings_JS === 'function' && window.parseHeadings_JS !== parseHeadings_JS) {
-      const out = await window.parseHeadings_JS(arrayBuffer);
-      tr.end({ mode: 'window.parseHeadings_JS', flat: out?.flat?.length || 0 });
-      return out;
-    }
-    const out = { flat: [], tree: [], count: 0 };
-    tr.end({ mode: 'noop', flat: 0 });
-    return out;
+    const res = await (window.FormSuite?.parsers?.headings?.parse
+      ? window.FormSuite.parsers.headings.parse(arrayBuffer)
+      : Promise.resolve({ flat: [], tree: [], count: 0, debug: { mode: 'missing-parser' } }));
+
+    const flat = Array.isArray(res?.flat) ? res.flat : [];
+    const tree = Array.isArray(res?.tree) ? res.tree : [];
+
+    tr.end({ flat: flat.length, tree: tree.length, mode: res?.debug?.mode || 'ok' });
+    return { headingsFlat: flat, headingsTree: tree, debug: res?.debug || null };
   } catch (e) {
     tr.error('parseHeadings_JS failed', e);
-    tr.end();
-    return { flat: [], tree: [], count: 0 };
+    tr.end({ flat: 0 });
+    return { headingsFlat: [], headingsTree: [], debug: { mode: 'error', message: e?.message } };
   }
 }
+
 
 function buildHeadingTree(list) {
   const root = [];
@@ -1417,8 +1696,9 @@ async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
     const parsedSDTs = await parseSDTs_JS(bytesU8.buffer);
     renderSDTsView(parsedSDTs);
 
-    const headingsParsed = await parseHeadings_JS(bytesU8.buffer);
-    lastParsedHeadings = {
+    const headingsParsedWrap = await parseHeadings_JS(bytesU8.buffer);
+    const headingsParsed = { flat: headingsParsedWrap.headingsFlat || [], tree: headingsParsedWrap.headingsTree || [] };
+lastParsedHeadings = {
       flat: Array.isArray(headingsParsed?.flat) ? headingsParsed.flat : [],
       tree: Array.isArray(headingsParsed?.tree) ? headingsParsed.tree : []
     };
