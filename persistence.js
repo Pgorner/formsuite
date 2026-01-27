@@ -11,6 +11,7 @@
  *      - Tertiary: FileSystemHandle (optional; for rehydration)
  *  5) Identity is stable:
  *      - Prefer embedded DOC GUID in DOCX (docVar/custom prop)
+ *        BUT: detect collisions (copied templates) and mint a new docId
  *      - Else: handle mapping (IDB) if same file
  *      - Else: fingerprint map (LS) for exact bytes
  *      - Else: mint new fsdoc:UUID
@@ -970,6 +971,10 @@
    *  - sets active meta (LS + BC)
    *  - initializes state if missing
    *  - attempts safe hydration (if schema empty)
+   *
+   * IMPORTANT: copied templates can carry the same embedded FS_DOC_GUID.
+   * This function detects that collision and mints a new docId so opening a
+   * new file always gets a clean workspace.
    */
   async function setCurrentDoc({ bytes, handle, name }) {
     const tr = TRACE('setCurrentDoc', { hasBytes: !!bytes, hasHandle: !!handle, name });
@@ -987,30 +992,84 @@
 
       const u8 = (ab instanceof Uint8Array) ? ab : new Uint8Array(ab);
 
-      // Fingerprint
+      // Fingerprint (of the incoming file)
       const fp = await sha256Hex(u8);
       const fromFp = getMappedDocIdForFingerprint(fp);
 
-      // Determine docId
-      let docId = null;
-
-      // 1) embedded guid
+      // Embedded GUID (if any)
       const embedded = await readDocGuidFromDocx(u8);
-      if (embedded) docId = embedded;
 
-      // 2) handle mapping
-      if (!docId && handle) {
-        const mapped = await findDocIdByHandle(handle);
-        if (mapped) docId = mapped;
+      // Handle mapping (if any)
+      const mappedByHandle = handle ? (await findDocIdByHandle(handle)) : null;
+
+      // -----------------------------
+      // COLLISION GUARD (core fix)
+      // -----------------------------
+      // If the file has an embedded GUID that already has persisted bytes/state,
+      // but the incoming bytes are different (fingerprint mismatch), then this
+      // is very likely a copied template (same FS_DOC_GUID). We must mint a new docId.
+      let embeddedCollision = false;
+      let embeddedWhy = null;
+
+      if (embedded) {
+        // 1) If this handle is known under another docId, embedded is wrong for this file
+        if (mappedByHandle && normalizeStableDocId(mappedByHandle) && normalizeStableDocId(mappedByHandle) !== embedded) {
+          embeddedCollision = true;
+          embeddedWhy = { kind: 'handle-maps-elsewhere', mappedByHandle, embedded };
+        }
+
+        // 2) If fingerprint map says this file belongs to another docId, embedded is wrong
+        if (!embeddedCollision && fromFp && fromFp !== embedded) {
+          embeddedCollision = true;
+          embeddedWhy = { kind: 'fingerprint-maps-elsewhere', fromFp, embedded };
+        }
+
+        // 3) If persisted bytes exist for embedded docId and hash differs => collision
+        if (!embeddedCollision) {
+          // Fast existence check: OPFS/IDB bytes for embedded
+          const existingOpfs = await opfsGet(embedded);
+          const existingIdb = existingOpfs ? null : await idbGetBytes(embedded);
+          const existing = existingOpfs || existingIdb;
+
+          if (existing && existing.byteLength) {
+            const existingFp = await sha256Hex(existing);
+            if (existingFp !== '(hash-error)' && fp !== '(hash-error)' && existingFp !== fp) {
+              embeddedCollision = true;
+              embeddedWhy = { kind: 'embedded-bytes-mismatch', embedded, fp12: fp.slice(0, 12), existingFp12: existingFp.slice(0, 12) };
+            }
+          } else {
+            // Also treat "existing state with schema" as a hint of collision risk
+            // (optional soft-signal; does not trigger alone)
+          }
+        }
       }
 
-      // 3) fp mapping
+      if (embeddedCollision) {
+        tr.warn('embedded GUID collision detected; minting new docId', embeddedWhy);
+      }
+
+      // Determine docId (priority: embedded if SAFE, else handle, else fp, else mint)
+      let docId = null;
+
+      // 1) embedded guid (only if NOT colliding)
+      if (embedded && !embeddedCollision) docId = embedded;
+
+      // 2) handle mapping (same file)
+      if (!docId && mappedByHandle) docId = normalizeStableDocId(mappedByHandle);
+
+      // 3) fp mapping (exact bytes)
       if (!docId && fromFp) docId = fromFp;
 
       // 4) mint
       if (!docId) docId = makeStableDocId();
 
-      tr.step('identity', { docId, embedded: !!embedded, viaFp: !!fromFp, hasHandle: !!handle });
+      tr.step('identity', {
+        docId,
+        embedded: embedded || null,
+        embeddedCollision,
+        mappedByHandle: mappedByHandle || null,
+        viaFp: !!fromFp
+      });
 
       // Store handle mapping (optional)
       if (handle) {
@@ -1018,9 +1077,10 @@
         tr.step('idbPutHandle', { ok: okH });
       }
 
-      // Best-effort embed guid into working bytes if missing and writer exists
+      // Best-effort embed guid into working bytes:
+      // - if missing OR collision OR embedded != docId, write docId back
       let workingU8 = u8;
-      if (!embedded) {
+      if (!embedded || embeddedCollision || embedded !== docId) {
         const maybe = await writeDocGuidToDocx(u8, docId);
         if (maybe && maybe !== u8) {
           workingU8 = (maybe instanceof Uint8Array) ? maybe : new Uint8Array(maybe);
@@ -1063,7 +1123,6 @@
       await hydrateFromDocxIfEmpty(docId);
 
       // Final verification: can we read bytes back now?
-      // This is critical for diagnosing “bytes missing after open”.
       const verify = await getBytes(docId);
       tr.step('verify getBytes after setCurrentDoc', {
         ok: !!verify,
