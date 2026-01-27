@@ -220,33 +220,43 @@
   function computeTableRowCalcs(tableField, rowObj) {
     if (!tableField || !rowObj) return;
     const cols = Array.isArray(tableField.columns) ? tableField.columns : [];
+
     cols.forEach(col => {
       if (String(col?.type) !== 'number') return;
       const calc = (col && typeof col.calc === 'object' && col.calc) ? col.calc : null;
       if (!calc) return;
+
       const sources = Array.isArray(calc.sources) ? calc.sources.map(String).filter(Boolean) : [];
       const totalOf = String(calc.totalOf || '').trim();
       const decimals = (calc.decimals != null) ? (calc.decimals|0) : 1;
 
-      // computed mode only (sources selected)
-      if (sources.length) {
-        let sum = 0;
-        let hasAny = false;
-        sources.forEach(sid => {
-          const n = parseScalarNumber(rowObj[sid]);
-          if (n != null) { sum += n; hasAny = true; }
-        });
+      const mode = String(calc.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : 'readonly'));
 
-        let out = '';
-        if (totalOf) {
-          const denom = resolveTotalForTableRef(totalOf, rowObj);
-          if (hasAny && denom != null && denom !== 0) out = formatPercentString((sum / denom) * 100.0, decimals);
-          else out = '';
-        } else {
-          out = hasAny ? String(sum) : '';
-        }
-        rowObj[String(col.id)] = out;
+      if (mode === 'readonly') {
+        // locked / externally controlled
+        return;
       }
+
+      // computed mode (sources selected)
+      if (!sources.length) return;
+
+      let sum = 0;
+      let hasAny = false;
+      sources.forEach(sid => {
+        const n = parseScalarNumber(rowObj[sid]);
+        if (n != null) { sum += n; hasAny = true; }
+      });
+
+      let out = '';
+      if (mode === 'sum') {
+        out = hasAny ? String(sum) : '';
+      } else if (mode === 'percent') {
+        const denom = resolveTotalForTableRef(totalOf, rowObj);
+        if (hasAny && denom != null && denom !== 0) out = formatPercentString((sum / denom) * 100.0, decimals);
+        else out = '';
+      }
+
+      rowObj[String(col.id)] = out;
     });
   }
 
@@ -1306,16 +1316,16 @@
           const totalOf = String(cfg.totalOf || '').trim();
           const decimals = (cfg.decimals != null) ? (cfg.decimals|0) : 1;
 
-          // Manual partial mode: no sources, has totalOf
-          if (!sources.length && totalOf) {
+          const mode = String(cfg.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : 'normal'));
+
+          // percent manual partial mode (legacy / supported): no sources, has totalOf
+          if (mode === 'percent' && !sources.length && totalOf) {
             const total = parseScalarNumber(getValue(totalOf));
             const storedPct = getValue(fid);
             const pctNum = isPercentString(storedPct) ? parseScalarNumber(storedPct) : null;
 
-            // Update hint (always show stored % string if present)
             if (ref.hintEl) ref.hintEl.textContent = (typeof storedPct === 'string' && storedPct.trim()) ? storedPct : '—';
 
-            // Derive partial display from stored percent and current total
             if (ref.inputEl && document.activeElement !== ref.inputEl) {
               if (total != null && total !== 0 && pctNum != null) {
                 const partial = (pctNum / 100.0) * total;
@@ -1327,8 +1337,8 @@
             return;
           }
 
-          // Computed mode: sources selected (read-only)
-          if (sources.length) {
+          // computed mode: sources selected (sum / percent)
+          if ((mode === 'sum' || mode === 'percent') && sources.length) {
             let sum = 0;
             let hasAny = false;
             sources.forEach(sid => {
@@ -1337,16 +1347,12 @@
             });
 
             let out = '';
-            if (totalOf) {
-              const total = parseScalarNumber(getValue(totalOf));
-              if (hasAny && total != null && total !== 0) {
-                out = formatPercentString((sum / total) * 100.0, decimals);
-              } else {
-                out = '';
-              }
-            } else {
-              // no denominator -> store numeric sum as string
+            if (mode === 'sum') {
               out = hasAny ? String(sum) : '';
+            } else {
+              const total = parseScalarNumber(getValue(totalOf));
+              if (hasAny && total != null && total !== 0) out = formatPercentString((sum / total) * 100.0, decimals);
+              else out = '';
             }
 
             if (getValue(fid) !== out) { STATE.values[fid] = out; changed = true; }
@@ -1354,6 +1360,8 @@
             if (ref.hintEl) ref.hintEl.textContent = out || '—';
             return;
           }
+
+          // readonly: do nothing
         });
 
         if (changed) { markDirty(); scheduleSaveValues(); }
@@ -1412,10 +1420,8 @@
         const totalOf = String(cfg?.totalOf || '').trim();
         const decimals = (cfg?.decimals != null) ? (cfg.decimals|0) : 1;
 
-        const hasCalc = !!totalOf || sources.length > 0;
+        const mode = String(cfg?.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : (cfg ? 'readonly' : 'normal')));
 
-        // Manual partial mode (no sources, has totalOf): numeric input, stores "37%"
-        // Computed mode (sources): read-only text input with "37%"
         const input = document.createElement('input');
         input.id = f.id; input.name = f.id; input.style.width = '100%';
 
@@ -1424,7 +1430,19 @@
         hint.style.marginTop = '4px';
         hint.textContent = '—';
 
-        if (hasCalc && sources.length) {
+        if (mode === 'readonly') {
+          input.type = 'text';
+          input.readOnly = true;
+          input.disabled = true;
+          input.classList.add('kbd');
+          const stored = getValue(f.id);
+          input.value = (stored == null) ? '' : String(stored);
+          hint.textContent = input.value || '—';
+          wrap.appendChild(input);
+          wrap.appendChild(hint);
+
+        } else if ((mode === 'sum' || mode === 'percent') && sources.length) {
+          // computed: read-only
           input.type = 'text';
           input.readOnly = true;
           input.disabled = true;
@@ -1432,23 +1450,20 @@
           wrap.appendChild(input);
           wrap.appendChild(hint);
 
-          // register for recompute
-          percentRefs.push({ fieldId: String(f.id), inputEl: input, hintEl: hint, cfg: { sources, totalOf, decimals } });
-          // compute initial
+          percentRefs.push({ fieldId: String(f.id), inputEl: input, hintEl: hint, cfg: { mode, sources, totalOf, decimals } });
           setTimeout(() => { try { window.recomputePercentCalcs?.({ init: true }); } catch {} }, 0);
 
-        } else if (hasCalc && totalOf) {
+        } else if (mode === 'percent' && totalOf) {
+          // manual partial percent mode: numeric input, stores "37%"
           input.type = 'number';
           if (f.required) input.required = true;
 
-          // Initial display: derive partial from stored % and current total
           const stored = getValue(f.id);
           const tot = parseScalarNumber(getValue(totalOf));
           if (isPercentString(stored) && tot != null && tot !== 0) {
             const pct = parseScalarNumber(stored);
             if (pct != null) input.value = String((pct / 100.0) * tot);
           } else if (stored != null && stored !== '') {
-            // fallback: if somehow numeric stored, show it
             const n = parseScalarNumber(stored);
             if (n != null) input.value = String(n);
           }
@@ -1475,7 +1490,7 @@
           wrap.appendChild(input);
           wrap.appendChild(hint);
 
-          percentRefs.push({ fieldId: String(f.id), inputEl: input, hintEl: hint, cfg: { sources: [], totalOf, decimals } });
+          percentRefs.push({ fieldId: String(f.id), inputEl: input, hintEl: hint, cfg: { mode: 'percent', sources: [], totalOf, decimals } });
           setTimeout(() => { try { window.recomputePercentCalcs?.({ init: true }); } catch {} }, 0);
 
         } else {
@@ -1492,7 +1507,6 @@
           input.addEventListener('input', commit);
           input.addEventListener('change', commit);
           wrap.appendChild(input);
-          inputRefs[f.id] = input;
         }
 
         inputRefs[f.id] = input;
@@ -2204,6 +2218,7 @@
       drawTable();
     }
 
+    
     function syncEditorFromModel() {
       const model = currentModel();
       (field.columns || []).forEach(c => {
@@ -2224,7 +2239,9 @@
           const calc = c.calc;
           const sources = Array.isArray(calc.sources) ? calc.sources.map(String).filter(Boolean) : [];
           const totalOf = String(calc.totalOf || '').trim();
-          if (!sources.length && totalOf) {
+          const mode = String(calc.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : 'readonly'));
+
+          if (mode === 'percent' && !sources.length && totalOf) {
             // v is stored percent string (e.g. "37%"), show partial = % * total
             const pct = isPercentString(v) ? parseScalarNumber(v) : null;
             const denom = resolveTotalForTableRef(totalOf, model);
@@ -2235,10 +2252,9 @@
               el.value = '';
             }
           } else {
-            // computed mode or other: show raw stored string
+            // computed sum/percent or readonly: show raw stored string
             el.value = (v == null) ? '' : String(v);
           }
-
         } else {
           el.value = (v == null) ? '' : String(v);
         }
@@ -2260,7 +2276,8 @@
           if (String(c?.type) !== 'number') return;
           const calc = (c && typeof c.calc === 'object' && c.calc) ? c.calc : null;
           const sources = Array.isArray(calc?.sources) ? calc.sources.map(String).filter(Boolean) : [];
-          if (!sources.length) return;
+          const mode = String(calc?.mode || '').trim() || (String(calc?.totalOf||'').trim() ? 'percent' : (sources.length ? 'sum' : 'readonly'));
+          if (!(sources.length && (mode === 'sum' || mode === 'percent'))) return;
           const el2 = editorInputs[c.id];
           if (el2) el2.value = (model[c.id] == null) ? '' : String(model[c.id]);
         });
@@ -2343,9 +2360,9 @@
         const sources = Array.isArray(calc?.sources) ? calc.sources.map(String).filter(Boolean) : [];
         const totalOf = String(calc?.totalOf || '').trim();
         const decimals = (calc?.decimals != null) ? (calc.decimals|0) : 1;
+        const mode = String(calc?.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : (calc ? 'readonly' : 'normal')));
 
-        // computed mode (sources) -> show read-only "37%"
-        if (sources.length) {
+        if (mode === 'readonly') {
           el = document.createElement('input');
           el.type = 'text';
           el.readOnly = true;
@@ -2353,8 +2370,19 @@
           el.classList.add('kbd');
           el.style.minWidth = '140px';
           el.value = '';
-        } else if (totalOf) {
-          // manual partial mode -> numeric input, stores percent string in model
+
+        } else if ((mode === 'sum' || mode === 'percent') && sources.length) {
+          // computed -> show read-only
+          el = document.createElement('input');
+          el.type = 'text';
+          el.readOnly = true;
+          el.disabled = true;
+          el.classList.add('kbd');
+          el.style.minWidth = '140px';
+          el.value = '';
+
+        } else if (mode === 'percent' && totalOf) {
+          // manual partial mode
           el = document.createElement('input');
           el.type = 'number';
           el.style.minWidth = Math.max(120, Math.min(360, textPx('000000') + 20)) + 'px';
@@ -2373,6 +2401,7 @@
           };
           el.addEventListener('input', commitPartial);
           el.addEventListener('change', commitPartial);
+
         } else {
           el = document.createElement('input');
           el.type = 'number';

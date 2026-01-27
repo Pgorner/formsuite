@@ -611,56 +611,66 @@
       const div = document.createElement('div');
       div.innerHTML = `
         <div class="tdz-toolbar" style="margin-bottom:6px;">
-          <div><strong>Number</strong> <span class="tdz-muted">(optional % calculation)</span></div>
+          <div><strong>Number</strong> <span class="tdz-muted">(normal / sum / percent / read-only)</span></div>
         </div>
 
-        <label class="small">Sum sources (optional)</label><br/>
-        <select id="pCalcSources" multiple size="6" style="width:100%;"></select>
-        <div class="muted" style="margin-top:4px;">
-          If you select one or more sources, the field becomes read-only and stores a computed value.
-          If you select none, it stays editable.
-        </div>
+        <label class="small">Mode</label><br/>
+        <select id="pCalcMode" style="width:100%; max-width:360px;">
+          <option value="normal">normal (editable)</option>
+          <option value="sum">sum-of (read-only, sum of sources)</option>
+          <option value="percent">percent-of (manual or computed, stores %)</option>
+          <option value="readonly">computed read-only (locked)</option>
+        </select>
 
-        <div class="row" style="gap:10px; margin-top:10px; align-items:center;">
-          <div style="flex:1;">
-            <label class="small">Total-of (denominator) field</label><br/>
+        <div id="pCalcAdvanced" style="display:none; margin-top:10px;">
+          <div id="pCalcSrcBox">
+            <div class="small muted" style="margin-bottom:4px;">Summe aus Feldern</div>
+            <select id="pCalcSources" multiple size="6" style="width:100%;"></select>
+          </div>
+
+          <div id="pCalcTotalBox" style="margin-top:10px;">
+            <div class="small muted" style="margin-bottom:4px;">Total-of (Feld)</div>
             <select id="pCalcTotalOf" style="width:100%;"></select>
           </div>
-          <div style="width:160px;">
-            <label class="small">Decimals</label><br/>
+
+          <div id="pCalcDecBox" style="margin-top:10px; max-width:220px;">
+            <div class="small muted" style="margin-bottom:4px;">Dezimalstellen</div>
             <input id="pCalcDecimals" type="number" min="0" max="6" step="1" value="1" style="width:100%;" />
           </div>
-        </div>
 
-        <div class="muted" style="margin-top:6px;">
-          Storage: this feature stores the computed value as a string (e.g. <code>37%</code>).
-          Manual mode (no sources): you enter a partial numeric value; it is converted to a percentage of the selected total-of field.
+          <div class="muted" id="pCalcHint" style="margin-top:6px;"></div>
         </div>
       `;
       wrap.appendChild(div);
 
-      // Populate sources list with number fields (excluding current id)
+      const modeSel  = div.querySelector('#pCalcMode');
+      const adv      = div.querySelector('#pCalcAdvanced');
+      const srcBox   = div.querySelector('#pCalcSrcBox');
+      const totalBox = div.querySelector('#pCalcTotalBox');
+      const decBox   = div.querySelector('#pCalcDecBox');
+      const hintEl   = div.querySelector('#pCalcHint');
+
       const srcSel = div.querySelector('#pCalcSources');
       const totalSel = div.querySelector('#pCalcTotalOf');
 
       const curId = String(els.pId.value || '').trim();
       const numFields = (BUILDER.schema?.fields || []).filter(x => String(x?.type || '') === 'number' && String(x?.id||'').trim());
-      const ids = numFields.map(x => String(x.id));
+      const ids = numFields.map(x => String(x.id)).filter(Boolean);
 
-      // Total-of dropdown (allow blank)
+      // Total-of dropdown: ONLY single form fields (no table columns)
       totalSel.innerHTML = '';
       const optNone = document.createElement('option');
       optNone.value = '';
       optNone.textContent = '— none —';
       totalSel.appendChild(optNone);
-      ids.forEach(fid => {
+      ids.filter(fid => fid && fid !== curId).forEach(fid => {
         const o = document.createElement('option');
         o.value = fid;
         o.textContent = fid;
         totalSel.appendChild(o);
       });
 
-      // Sources multiselect
+      // Sources multiselect: other number fields
       srcSel.innerHTML = '';
       ids.filter(fid => fid && fid !== curId).forEach(fid => {
         const o = document.createElement('option');
@@ -669,26 +679,38 @@
         srcSel.appendChild(o);
       });
 
-    } else if (t === 'number') {
-      const srcEl = document.getElementById('pCalcSources');
-      const totalEl = document.getElementById('pCalcTotalOf');
-      const decEl = document.getElementById('pCalcDecimals');
-
-      const sources = srcEl ? Array.from(srcEl.selectedOptions || []).map(o => String(o.value)).filter(Boolean) : [];
-      const totalOf = totalEl ? String(totalEl.value || '').trim() : '';
-      const decimals = decEl ? (parseInt(decEl.value || '1', 10) || 0) : 1;
-
-      // Only persist calc block when configured
-      const hasCalc = (sources.length > 0) || !!totalOf;
-      if (hasCalc) {
-        f.calc = {
-          sources,
-          totalOf: totalOf || '',
-          decimals: Math.max(0, Math.min(6, decimals|0))
-        };
-      } else {
-        delete f.calc;
+      function setHint(mode) {
+        if (!hintEl) return;
+        if (mode === 'sum') {
+          hintEl.innerHTML = `Read-only. Stores the <em>sum</em> of the selected sources as a string.`;
+        } else if (mode === 'percent') {
+          hintEl.innerHTML = `Stores a percent string (e.g. <code>37%</code>).<br/>• With sources: computed as (sum(sources) / total-of) * 100.<br/>• Without sources: manual entry is treated as a partial amount; stored as % of total-of.`;
+        } else if (mode === 'readonly') {
+          hintEl.innerHTML = `Read-only. No automatic calculation is applied (value is locked).`;
+        } else {
+          hintEl.innerHTML = '';
+        }
       }
+
+      function toggleAdvanced() {
+        const mode = String(modeSel?.value || 'normal');
+        const show = (mode !== 'normal');
+        adv.style.display = show ? '' : 'none';
+
+        // per-mode sub-controls
+        const showSources = (mode === 'sum' || mode === 'percent');
+        const showTotal   = (mode === 'percent');
+        const showDec     = (mode === 'percent');
+
+        if (srcBox)   srcBox.style.display = showSources ? '' : 'none';
+        if (totalBox) totalBox.style.display = showTotal ? '' : 'none';
+        if (decBox)   decBox.style.display = showDec ? '' : 'none';
+
+        setHint(mode);
+      }
+
+      modeSel.addEventListener('change', toggleAdvanced);
+      toggleAdvanced();
 
     } else if (t === 'date') {
       const div = document.createElement('div');
@@ -1089,7 +1111,26 @@
         const cCalc = document.createElement('div');
         cCalc.className = 'tdz-col tdz-grow';
         cCalc.style.gridColumn = '1 / -1';
-        cCalc.innerHTML = `<label class="small">Berechnung (nur bei Number → %)</label>`;
+        cCalc.innerHTML = `<label class="small">Berechnung (Number)</label>`;
+
+        const modeRow = document.createElement('div');
+        modeRow.style.marginTop = '6px';
+        modeRow.innerHTML = `
+          <div class="small muted" style="margin-bottom:4px;">Mode</div>
+          <select class="tdz-input" style="width:100%; max-width:420px;" id="tdzCalcMode_${String(col.id).replace(/[^a-zA-Z0-9_\-]/g,'_')}">
+            <option value="normal">normal (editable)</option>
+            <option value="sum">sum-of (read-only)</option>
+            <option value="percent">percent-of (manual or computed, stores %) </option>
+            <option value="readonly">computed read-only (locked)</option>
+          </select>
+        `;
+        cCalc.appendChild(modeRow);
+
+        const modeSel = modeRow.querySelector('select');
+
+        const adv = document.createElement('div');
+        adv.style.display = 'none';
+        adv.style.marginTop = '10px';
 
         const calcWrap = document.createElement('div');
         calcWrap.style.display = 'grid';
@@ -1099,14 +1140,55 @@
 
         const srcBox = document.createElement('div');
         srcBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Summe aus Spalten</div>`;
-        const srcSel = document.createElement('select');
-        srcSel.multiple = true;
-        srcSel.size = 5;
-        srcSel.style.width = '100%';
-        srcBox.appendChild(srcSel);
 
-        const totalBox = document.createElement('div');
-        totalBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Total-of (Feld oder Spalte)</div>`;
+        // Checkbox multi-select (no Ctrl/Shift needed)
+        const srcList = document.createElement('div');
+        srcList.className = 'fs-checklist';
+        srcList.style.width = '100%';
+        srcList.style.maxHeight = '140px';
+        srcList.style.overflow = 'auto';
+        srcList.style.border = '1px solid var(--border, #e5e7eb)';
+        srcList.style.borderRadius = '6px';
+        srcList.style.padding = '6px 8px';
+        srcList.style.background = '#fff';
+        srcBox.appendChild(srcList);
+
+        function setSourcesOptions(items) {
+          srcList.innerHTML = '';
+          (items || []).forEach(it => {
+            const lab = document.createElement('label');
+            lab.style.display = 'flex';
+            lab.style.gap = '8px';
+            lab.style.alignItems = 'center';
+            lab.style.margin = '2px 0';
+
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = String(it.value ?? '');
+            cb.addEventListener('change', persistCalcFromUI);
+
+            const sp = document.createElement('span');
+            sp.textContent = String(it.label ?? it.value ?? '');
+
+            lab.appendChild(cb);
+            lab.appendChild(sp);
+            srcList.appendChild(lab);
+          });
+        }
+        function getSelectedSources() {
+          return Array.from(srcList.querySelectorAll('input[type="checkbox"]:checked'))
+            .map(cb => String(cb.value))
+            .filter(Boolean);
+        }
+        function setSelectedSources(srcs) {
+          const want = new Set((srcs || []).map(s => String(s)));
+          Array.from(srcList.querySelectorAll('input[type="checkbox"]')).forEach(cb => {
+            cb.checked = want.has(String(cb.value));
+          });
+        }
+
+const totalBox = document.createElement('div');
+        totalBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Total-of (Feld oder Spalte in der gleichen Zeile)</div>`;
         const totalSel = document.createElement('select');
         totalSel.style.width = '100%';
         totalBox.appendChild(totalSel);
@@ -1124,28 +1206,38 @@
         calcWrap.appendChild(srcBox);
         calcWrap.appendChild(totalBox);
         calcWrap.appendChild(decBox);
+        adv.appendChild(calcWrap);
 
         const calcHint = document.createElement('div');
         calcHint.className = 'muted';
         calcHint.style.marginTop = '6px';
-        calcHint.textContent = 'Wenn Quellen gewählt sind: read-only, Wert wird berechnet und als String (z.B. 37%) gespeichert. Ohne Quellen bleibt die Zelle editierbar und Eingabe wird als Anteil des Total-of in % gespeichert.';
+        adv.appendChild(calcHint);
 
-        cCalc.appendChild(calcWrap);
-        cCalc.appendChild(calcHint);
+        cCalc.appendChild(adv);
 
-        function fillCalcOptions() {
-          // sources: other columns (number only is ideal, but allow all except self)
-          srcSel.innerHTML = '';
+        function setHint(mode) {
+          if (mode === 'sum') {
+            calcHint.textContent = 'Read-only: sum of selected columns is stored as a string.';
+          } else if (mode === 'percent') {
+            calcHint.innerHTML = 'Stores a percent string (e.g. <code>37%</code>). With sources: (sum(sources) / total-of) * 100. Without sources: manual partial amount is stored as % of total-of.';
+          } else if (mode === 'readonly') {
+            calcHint.textContent = 'Read-only: no automatic calculation is applied (locked).';
+          } else {
+            calcHint.textContent = '';
+          }
+        }
+function fillCalcOptions() {
+          // sources: other NUMBER columns in this table (excluding self)
+          const _srcItems = [];
           (model || []).forEach(c2 => {
             if (!c2?.id) return;
             if (String(c2.id) === String(col.id)) return;
-            const o = document.createElement('option');
-            o.value = String(c2.id);
-            o.textContent = String(c2.id);
-            srcSel.appendChild(o);
+            if (String(c2.type) !== 'number') return;
+            _srcItems.push({ value: String(c2.id), label: String(c2.id) });
           });
+          setSourcesOptions(_srcItems);
 
-          // total-of: allow none; columns + external fields
+          // total-of: allow none; external NUMBER fields + NUMBER columns in the same row (excluding self)
           totalSel.innerHTML = '';
           const o0 = document.createElement('option');
           o0.value = '';
@@ -1161,9 +1253,11 @@
             totalSel.appendChild(o);
           });
 
-          // columns
+          // number columns in this table
           (model || []).forEach(c2 => {
             if (!c2?.id) return;
+            if (String(c2.id) === String(col.id)) return;
+            if (String(c2.type) !== 'number') return;
             const o = document.createElement('option');
             o.value = 'col:' + String(c2.id);
             o.textContent = 'col:' + String(c2.id);
@@ -1171,37 +1265,76 @@
           });
         }
 
-        function applyCalcModelToUI() {
+        function toggleAdvanced() {
+          const mode = String(modeSel?.value || 'normal');
+          const show = (mode !== 'normal');
+          adv.style.display = show ? '' : 'none';
+
+          const showSources = (mode === 'sum' || mode === 'percent');
+          const showTotal   = (mode === 'percent');
+          const showDec     = (mode === 'percent');
+
+          if (srcBox) srcBox.style.display = showSources ? '' : 'none';
+          if (totalBox) totalBox.style.display = showTotal ? '' : 'none';
+          if (decBox) decBox.style.display = showDec ? '' : 'none';
+          setHint(mode);
+        }
+
+function applyCalcModelToUI() {
           fillCalcOptions();
           const calc = (col && col.calc) ? col.calc : null;
+
+          const inferred =
+            String(calc?.mode || '').trim() ||
+            ((Array.isArray(calc?.sources) && calc.sources.length)
+              ? (String(calc?.totalOf||'').trim() ? 'percent' : 'sum')
+              : (String(calc?.totalOf||'').trim() ? 'percent' : (calc ? 'readonly' : 'normal')));
+
+          modeSel.value = (['normal','sum','percent','readonly'].includes(inferred) ? inferred : 'normal');
+
           const srcs = Array.isArray(calc?.sources) ? calc.sources.map(String) : [];
           const tot = String(calc?.totalOf || '');
           const dec = (calc?.decimals != null) ? String(calc.decimals) : '1';
+
           decIn.value = dec;
           totalSel.value = tot;
 
-          Array.from(srcSel.options || []).forEach(o => { o.selected = srcs.includes(String(o.value)); });
+          setSelectedSources(srcs);
+
+          toggleAdvanced();
         }
 
         function persistCalcFromUI() {
-          const sources = Array.from(srcSel.selectedOptions || []).map(o => String(o.value)).filter(Boolean);
+          const mode = String(modeSel?.value || 'normal');
+          const sources = getSelectedSources();
           const totalOf = String(totalSel.value || '').trim();
           const decimals = Math.max(0, Math.min(6, (parseInt(decIn.value || '1',10)||0)));
 
-          const has = sources.length > 0 || !!totalOf;
-          if (has) col.calc = { sources, totalOf: totalOf || '', decimals };
-          else col.calc = null;
+          if (mode === 'normal') {
+            col.calc = null;
+          } else if (mode === 'readonly') {
+            col.calc = { mode: 'readonly' };
+          } else if (mode === 'sum') {
+            if (sources.length) col.calc = { mode: 'sum', sources };
+            else col.calc = null;
+          } else if (mode === 'percent') {
+            const has = sources.length > 0 || !!totalOf;
+            if (has) col.calc = { mode: 'percent', sources, totalOf: totalOf || '', decimals };
+            else col.calc = null;
+          } else {
+            col.calc = null;
+          }
 
           api.serializeToHidden();
         }
 
-        srcSel.addEventListener('change', persistCalcFromUI);
+        modeSel.addEventListener('change', () => { toggleAdvanced(); persistCalcFromUI(); });
         totalSel.addEventListener('change', persistCalcFromUI);
         decIn.addEventListener('input', persistCalcFromUI);
 
         applyCalcModelToUI();
 
-        function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'none'; }
+function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'none'; }
         // update both toggles on type changes
         const prevSelHandler = sel.onchange;
         toggleCalc();
@@ -1904,17 +2037,27 @@
       }
 
     } else if (f.type === 'number') {
-      const srcEl = document.getElementById('pCalcSources');
+      const modeEl = document.getElementById('pCalcMode');
+      const srcEl  = document.getElementById('pCalcSources');
       const totalEl = document.getElementById('pCalcTotalOf');
-      const decEl = document.getElementById('pCalcDecimals');
+      const decEl  = document.getElementById('pCalcDecimals');
 
       const calc = (f && typeof f.calc === 'object') ? f.calc : null;
+      const mode =
+        String(calc?.mode || '').trim() ||
+        ((Array.isArray(calc?.sources) && calc.sources.length) ? (String(calc?.totalOf||'').trim() ? 'percent' : 'sum')
+          : (String(calc?.totalOf||'').trim() ? 'percent' : 'normal'));
+
+      if (modeEl) {
+        modeEl.value = (['normal','sum','percent','readonly'].includes(mode) ? mode : 'normal');
+        try { modeEl.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+      }
+
       const sources = Array.isArray(calc?.sources) ? calc.sources.map(String) : [];
       const totalOf = String(calc?.totalOf || '');
       const decimals = (calc?.decimals != null) ? String(calc.decimals) : '1';
 
       if (decEl) decEl.value = decimals;
-
       if (totalEl) totalEl.value = totalOf;
 
       if (srcEl) {
@@ -1946,76 +2089,103 @@
     tr.end();
   }
 
-  function parseFieldFromInputs() {
-    const tr = TRACE('parseFieldFromInputs', { type: els.pType.value });
-    const t  = els.pType.value;
-    const id = (els.pId.value || '').trim();
-    if (!id) { alert('Please enter a field id'); tr.end('missing-id'); return null; }
+ function parseFieldFromInputs() {
+  const tr = TRACE('parseFieldFromInputs', { type: els.pType.value });
+  const t  = els.pType.value;
+  const id = (els.pId.value || '').trim();
+  if (!id) { alert('Please enter a field id'); tr.end('missing-id'); return null; }
 
-    const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
+  const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
 
-    if (t === 'select') {
-      const raw = (document.getElementById('pOptions')?.value || '').trim();
-      f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
-      f.multiple = !!document.getElementById('pSelectMultiple')?.checked;
+  if (t === 'select') {
+    const raw = (document.getElementById('pOptions')?.value || '').trim();
+    f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    f.multiple = !!document.getElementById('pSelectMultiple')?.checked;
 
-    } else if (t === 'multichoice') {
-      const designer = window.MultiChoiceDesigner;
-      if (designer) {
-        const mc = designer.getModel();
-        const flat = designer.getFlatOptions();
-        f.mc = mc;
-        f.options = flat;
-      } else {
-        f.options = [];
-        f.mc = { groups: [] };
-      }
-
-    } else if (t === 'date') {
-      f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
-
-    } else if (t === 'table') {
-      const mr = parseInt(document.getElementById('pMinRows')?.value||'0',10);
-      const xr = parseInt(document.getElementById('pMaxRows')?.value||'0',10);
-
-      if (window.TableDesigner) {
-        f.columns = window.TableDesigner.getColumns();
-      } else {
-        const raw = (document.getElementById('pCols')?.value || '').trim();
-        f.columns = raw ? raw.split(',').map(s => s.trim()).filter(Boolean).map(seg => {
-          const [cid, label, ctype, opts] = seg.split(':');
-          const col = { id: (cid||'col').trim(), label: (label||cid||'col').trim() };
-          if (ctype) col.type = ctype.trim();
-          if (col.type === 'select' && opts) col.options = opts.split('/').map(s=>s.trim()).filter(Boolean);
-          return col;
-        }) : [];
-      }
-      if (mr>0) f.minRows = mr;
-      if (xr>0) f.maxRows = xr;
-
-    } else if (t === 'datediff') {
-      const fromId = (document.getElementById('pFromId')?.value || '').trim();
-      const toId   = (document.getElementById('pToId')?.value || '').trim();
-
-      const dateIds = (BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
-      if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
-        alert('Please choose two existing date fields for the datediff.');
-        tr.end('bad-datediff');
-        return null;
-      }
-      if (fromId === toId) {
-        alert('Please select two different date fields for the datediff.');
-        tr.end('same-datediff');
-        return null;
-      }
-      f.fromId = fromId;
-      f.toId   = toId;
-      f.required = false;
+  } else if (t === 'multichoice') {
+    const designer = window.MultiChoiceDesigner;
+    if (designer) {
+      const mc = designer.getModel();
+      const flat = designer.getFlatOptions();
+      f.mc = mc;
+      f.options = flat;
+    } else {
+      f.options = [];
+      f.mc = { groups: [] };
     }
 
-    tr.end({ id: f.id });
-    return f;
+  } else if (t === 'number') {
+    const mode = String(document.getElementById('pCalcMode')?.value || 'normal');
+    const srcEl = document.getElementById('pCalcSources');
+    const totalEl = document.getElementById('pCalcTotalOf');
+    const decEl = document.getElementById('pCalcDecimals');
+
+    const sources = srcEl ? Array.from(srcEl.selectedOptions || []).map(o => String(o.value)).filter(Boolean) : [];
+    const totalOf = totalEl ? String(totalEl.value || '').trim() : '';
+    const decimals = decEl ? (parseInt(decEl.value || '1', 10) || 0) : 1;
+    const decClamped = Math.max(0, Math.min(6, decimals | 0));
+
+    if (mode === 'readonly') {
+      f.calc = { mode: 'readonly' };
+    } else if (mode === 'sum') {
+      if (sources.length) f.calc = { mode: 'sum', sources };
+      else delete f.calc;
+    } else if (mode === 'percent') {
+      const has = (sources.length > 0) || !!totalOf;
+      if (has) f.calc = { mode: 'percent', sources, totalOf: totalOf || '', decimals: decClamped };
+      else delete f.calc;
+    } else {
+      delete f.calc;
+    }
+
+  } else if (t === 'date') {
+    f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
+
+  } else if (t === 'table') {
+    const mr = parseInt(document.getElementById('pMinRows')?.value || '0', 10);
+    const xr = parseInt(document.getElementById('pMaxRows')?.value || '0', 10);
+
+    if (window.TableDesigner) {
+      f.columns = window.TableDesigner.getColumns();
+    } else {
+      const raw = (document.getElementById('pCols')?.value || '').trim();
+      f.columns = raw
+        ? raw.split(',').map(s => s.trim()).filter(Boolean).map(seg => {
+            const [cid, label, ctype, opts] = seg.split(':');
+            const col = { id: (cid || 'col').trim(), label: (label || cid || 'col').trim() };
+            if (ctype) col.type = ctype.trim();
+            if (col.type === 'select' && opts) col.options = opts.split('/').map(s => s.trim()).filter(Boolean);
+            return col;
+          })
+        : [];
+    }
+    if (mr > 0) f.minRows = mr;
+    if (xr > 0) f.maxRows = xr;
+
+  } else if (t === 'datediff') {
+    const fromId = (document.getElementById('pFromId')?.value || '').trim();
+    const toId   = (document.getElementById('pToId')?.value || '').trim();
+
+    const dateIds = (BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
+    if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
+      alert('Please choose two existing date fields for the datediff.');
+      tr.end('bad-datediff');
+      return null;
+    }
+    if (fromId === toId) {
+      alert('Please select two different date fields for the datediff.');
+      tr.end('same-datediff');
+      return null;
+    }
+    f.fromId = fromId;
+    f.toId   = toId;
+    f.required = false;
   }
+
+  tr.end({ id: f.id });
+  return f;
+}
+
 
   // ============================================================
   // Editor actions
