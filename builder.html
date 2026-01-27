@@ -606,6 +606,90 @@
       window.MultiChoiceDesigner = createMultiChoiceDesigner({ hostEl: div.querySelector('#mcDesigner') });
       window.MultiChoiceDesigner.loadModel({ groups: [] });
 
+
+    } else if (t === 'number') {
+      const div = document.createElement('div');
+      div.innerHTML = `
+        <div class="tdz-toolbar" style="margin-bottom:6px;">
+          <div><strong>Number</strong> <span class="tdz-muted">(optional % calculation)</span></div>
+        </div>
+
+        <label class="small">Sum sources (optional)</label><br/>
+        <select id="pCalcSources" multiple size="6" style="width:100%;"></select>
+        <div class="muted" style="margin-top:4px;">
+          If you select one or more sources, the field becomes read-only and stores a computed value.
+          If you select none, it stays editable.
+        </div>
+
+        <div class="row" style="gap:10px; margin-top:10px; align-items:center;">
+          <div style="flex:1;">
+            <label class="small">Total-of (denominator) field</label><br/>
+            <select id="pCalcTotalOf" style="width:100%;"></select>
+          </div>
+          <div style="width:160px;">
+            <label class="small">Decimals</label><br/>
+            <input id="pCalcDecimals" type="number" min="0" max="6" step="1" value="1" style="width:100%;" />
+          </div>
+        </div>
+
+        <div class="muted" style="margin-top:6px;">
+          Storage: this feature stores the computed value as a string (e.g. <code>37%</code>).
+          Manual mode (no sources): you enter a partial numeric value; it is converted to a percentage of the selected total-of field.
+        </div>
+      `;
+      wrap.appendChild(div);
+
+      // Populate sources list with number fields (excluding current id)
+      const srcSel = div.querySelector('#pCalcSources');
+      const totalSel = div.querySelector('#pCalcTotalOf');
+
+      const curId = String(els.pId.value || '').trim();
+      const numFields = (BUILDER.schema?.fields || []).filter(x => String(x?.type || '') === 'number' && String(x?.id||'').trim());
+      const ids = numFields.map(x => String(x.id));
+
+      // Total-of dropdown (allow blank)
+      totalSel.innerHTML = '';
+      const optNone = document.createElement('option');
+      optNone.value = '';
+      optNone.textContent = '— none —';
+      totalSel.appendChild(optNone);
+      ids.forEach(fid => {
+        const o = document.createElement('option');
+        o.value = fid;
+        o.textContent = fid;
+        totalSel.appendChild(o);
+      });
+
+      // Sources multiselect
+      srcSel.innerHTML = '';
+      ids.filter(fid => fid && fid !== curId).forEach(fid => {
+        const o = document.createElement('option');
+        o.value = fid;
+        o.textContent = fid;
+        srcSel.appendChild(o);
+      });
+
+    } else if (t === 'number') {
+      const srcEl = document.getElementById('pCalcSources');
+      const totalEl = document.getElementById('pCalcTotalOf');
+      const decEl = document.getElementById('pCalcDecimals');
+
+      const sources = srcEl ? Array.from(srcEl.selectedOptions || []).map(o => String(o.value)).filter(Boolean) : [];
+      const totalOf = totalEl ? String(totalEl.value || '').trim() : '';
+      const decimals = decEl ? (parseInt(decEl.value || '1', 10) || 0) : 1;
+
+      // Only persist calc block when configured
+      const hasCalc = (sources.length > 0) || !!totalOf;
+      if (hasCalc) {
+        f.calc = {
+          sources,
+          totalOf: totalOf || '',
+          decimals: Math.max(0, Math.min(6, decimals|0))
+        };
+      } else {
+        delete f.calc;
+      }
+
     } else if (t === 'date') {
       const div = document.createElement('div');
       div.innerHTML = `
@@ -708,7 +792,12 @@
           label: String(c.label != null ? c.label : c.id || 'col'),
           type: TYPES.includes(c.type) ? c.type : 'text',
           options: Array.isArray(c.options) ? c.options.map(o => String(o)) : [],
-          multiple: !!c.multiple
+          multiple: !!c.multiple,
+          calc: (c && typeof c.calc === 'object' && c.calc) ? {
+            sources: Array.isArray(c.calc.sources) ? c.calc.sources.map(s => String(s)) : [],
+            totalOf: (c.calc.totalOf != null) ? String(c.calc.totalOf) : '',
+            decimals: (c.calc.decimals != null) ? (parseInt(c.calc.decimals,10)||0) : 1
+          } : null
         }));
         render();
       },
@@ -984,6 +1073,8 @@
             col.options = Array.isArray(col.options) ? col.options : [];
           }
           toggleOpts();
+          try { if (typeof toggleCalc==='function') toggleCalc(); } catch {}
+          try { if (typeof applyCalcModelToUI==='function') applyCalcModelToUI(); } catch {}
           api.serializeToHidden();
         });
         toggleOpts();
@@ -992,6 +1083,132 @@
         cOpts.appendChild(optAddWrap);
         cOpts.appendChild(multiWrap);
         row.appendChild(cOpts);
+
+
+        // Calc config (only for number)
+        const cCalc = document.createElement('div');
+        cCalc.className = 'tdz-col tdz-grow';
+        cCalc.style.gridColumn = '1 / -1';
+        cCalc.innerHTML = `<label class="small">Berechnung (nur bei Number → %)</label>`;
+
+        const calcWrap = document.createElement('div');
+        calcWrap.style.display = 'grid';
+        calcWrap.style.gridTemplateColumns = '1fr 1fr 140px';
+        calcWrap.style.gap = '8px';
+        calcWrap.style.alignItems = 'end';
+
+        const srcBox = document.createElement('div');
+        srcBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Summe aus Spalten</div>`;
+        const srcSel = document.createElement('select');
+        srcSel.multiple = true;
+        srcSel.size = 5;
+        srcSel.style.width = '100%';
+        srcBox.appendChild(srcSel);
+
+        const totalBox = document.createElement('div');
+        totalBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Total-of (Feld oder Spalte)</div>`;
+        const totalSel = document.createElement('select');
+        totalSel.style.width = '100%';
+        totalBox.appendChild(totalSel);
+
+        const decBox = document.createElement('div');
+        decBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Dezimalstellen</div>`;
+        const decIn = document.createElement('input');
+        decIn.type = 'number';
+        decIn.min = '0';
+        decIn.max = '6';
+        decIn.step = '1';
+        decIn.style.width = '100%';
+        decBox.appendChild(decIn);
+
+        calcWrap.appendChild(srcBox);
+        calcWrap.appendChild(totalBox);
+        calcWrap.appendChild(decBox);
+
+        const calcHint = document.createElement('div');
+        calcHint.className = 'muted';
+        calcHint.style.marginTop = '6px';
+        calcHint.textContent = 'Wenn Quellen gewählt sind: read-only, Wert wird berechnet und als String (z.B. 37%) gespeichert. Ohne Quellen bleibt die Zelle editierbar und Eingabe wird als Anteil des Total-of in % gespeichert.';
+
+        cCalc.appendChild(calcWrap);
+        cCalc.appendChild(calcHint);
+
+        function fillCalcOptions() {
+          // sources: other columns (number only is ideal, but allow all except self)
+          srcSel.innerHTML = '';
+          (model || []).forEach(c2 => {
+            if (!c2?.id) return;
+            if (String(c2.id) === String(col.id)) return;
+            const o = document.createElement('option');
+            o.value = String(c2.id);
+            o.textContent = String(c2.id);
+            srcSel.appendChild(o);
+          });
+
+          // total-of: allow none; columns + external fields
+          totalSel.innerHTML = '';
+          const o0 = document.createElement('option');
+          o0.value = '';
+          o0.textContent = '— none —';
+          totalSel.appendChild(o0);
+
+          // external number fields
+          const nf = (BUILDER.schema?.fields || []).filter(x => String(x?.type||'') === 'number' && String(x?.id||'').trim());
+          nf.forEach(fld => {
+            const o = document.createElement('option');
+            o.value = 'field:' + String(fld.id);
+            o.textContent = 'field:' + String(fld.id);
+            totalSel.appendChild(o);
+          });
+
+          // columns
+          (model || []).forEach(c2 => {
+            if (!c2?.id) return;
+            const o = document.createElement('option');
+            o.value = 'col:' + String(c2.id);
+            o.textContent = 'col:' + String(c2.id);
+            totalSel.appendChild(o);
+          });
+        }
+
+        function applyCalcModelToUI() {
+          fillCalcOptions();
+          const calc = (col && col.calc) ? col.calc : null;
+          const srcs = Array.isArray(calc?.sources) ? calc.sources.map(String) : [];
+          const tot = String(calc?.totalOf || '');
+          const dec = (calc?.decimals != null) ? String(calc.decimals) : '1';
+          decIn.value = dec;
+          totalSel.value = tot;
+
+          Array.from(srcSel.options || []).forEach(o => { o.selected = srcs.includes(String(o.value)); });
+        }
+
+        function persistCalcFromUI() {
+          const sources = Array.from(srcSel.selectedOptions || []).map(o => String(o.value)).filter(Boolean);
+          const totalOf = String(totalSel.value || '').trim();
+          const decimals = Math.max(0, Math.min(6, (parseInt(decIn.value || '1',10)||0)));
+
+          const has = sources.length > 0 || !!totalOf;
+          if (has) col.calc = { sources, totalOf: totalOf || '', decimals };
+          else col.calc = null;
+
+          api.serializeToHidden();
+        }
+
+        srcSel.addEventListener('change', persistCalcFromUI);
+        totalSel.addEventListener('change', persistCalcFromUI);
+        decIn.addEventListener('input', persistCalcFromUI);
+
+        applyCalcModelToUI();
+
+        function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'none'; }
+        // update both toggles on type changes
+        const prevSelHandler = sel.onchange;
+        toggleCalc();
+
+        row.appendChild(cCalc);
+
+        toggleCalc();
 
         cfg.listEl.appendChild(row);
       });
@@ -1684,6 +1901,24 @@
         const mc = f.mc && typeof f.mc === 'object' ? f.mc : null;
         const legacy = Array.isArray(f.options) ? f.options : [];
         designer.loadModel(mc, legacy);
+      }
+
+    } else if (f.type === 'number') {
+      const srcEl = document.getElementById('pCalcSources');
+      const totalEl = document.getElementById('pCalcTotalOf');
+      const decEl = document.getElementById('pCalcDecimals');
+
+      const calc = (f && typeof f.calc === 'object') ? f.calc : null;
+      const sources = Array.isArray(calc?.sources) ? calc.sources.map(String) : [];
+      const totalOf = String(calc?.totalOf || '');
+      const decimals = (calc?.decimals != null) ? String(calc.decimals) : '1';
+
+      if (decEl) decEl.value = decimals;
+
+      if (totalEl) totalEl.value = totalOf;
+
+      if (srcEl) {
+        Array.from(srcEl.options || []).forEach(o => { o.selected = sources.includes(String(o.value)); });
       }
 
     } else if (f.type === 'date') {
