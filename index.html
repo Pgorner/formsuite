@@ -38,7 +38,6 @@
   white-space: nowrap;
 }
 
-
 .fs-multi-menu {
   position: absolute;
   left: 0; right: 0;
@@ -216,7 +215,16 @@
 
   function rowIsEmpty(field, row) {
     try {
-      return !(field.columns || []).some(c => String(row?.[c.id] ?? '').trim() !== '');
+      return !(field.columns || []).some(c => {
+        const cid = String(c?.id || '');
+        if (!cid) return false;
+
+        const isMulti = (String(c?.type) === 'select' && !!c?.multiple);
+        const v = row?.[cid];
+
+        if (isMulti) return Array.isArray(v) ? v.length > 0 : String(v ?? '').trim() !== '';
+        return String(v ?? '').trim() !== '';
+      });
     } catch {
       return true;
     }
@@ -309,74 +317,68 @@
   // Sanitizer (canonical: utils + table enforcement)
   // ============================================================
   function sanitizeValues(schemaObj, vals) {
-  const tr = TRACE('sanitizeValues', {
-    hasUtils: !!U(),
-    hasSanitizer: !!U()?.sanitizeValues,
-    hasSchema: !!schemaObj
-  });
-
-  try {
-    const inVals = (vals && typeof vals === 'object') ? vals : {};
-
-    // Preserve non-scalar values (arrays/objects) that are part of the schema
-    // in case an upstream sanitizer drops non-scalars.
-    // - table => array of rows
-    // - multichoice => array of selected option values
-    // - select+multiple => array of selected option values
-    // - address => object (formatted + parts)
-    const preservedNonScalars = {};
-    if (schemaObj && Array.isArray(schemaObj.fields)) {
-      (schemaObj.fields || []).forEach(f => {
-        const fid = String(f?.id || '');
-        if (!fid) return;
-
-        const t = String(f?.type || '');
-        const isMultiSelect = (t === 'select' && !!f?.multiple);
-        const isMultiChoice = (t === 'multichoice');
-        const isTable       = (t === 'table');
-        const isAddress     = (t === 'address');
-
-        if (!(isTable || isMultiChoice || isMultiSelect || isAddress)) return;
-
-        const v = inVals[fid];
-        if (isAddress) {
-          if (v && typeof v === 'object' && !Array.isArray(v)) preservedNonScalars[fid] = v;
-          return;
-        }
-        if (Array.isArray(v)) preservedNonScalars[fid] = v;
-      });
-    }
-
-    let out = inVals;
-    if (U()?.sanitizeValues) out = U().sanitizeValues(schemaObj, inVals);
-    if (!out || typeof out !== 'object') out = {};
-
-    // Restore preserved non-scalars if missing after sanitize
-    for (const fid of Object.keys(preservedNonScalars)) {
-      const pv = preservedNonScalars[fid];
-      if (Array.isArray(pv)) {
-        if (!Array.isArray(out[fid])) out[fid] = pv;
-      } else {
-        if (!(out[fid] && typeof out[fid] === 'object' && !Array.isArray(out[fid]))) out[fid] = pv;
-      }
-    }
-
-    // Canonical: table arrays are always normalized and schema-enforced.
-    out = normalizeAllTablesInValues(schemaObj, out);
-
-    tr.end({
-      keys: Object.keys(out || {}).length,
-      preservedNonScalars: Object.keys(preservedNonScalars).length
+    const tr = TRACE('sanitizeValues', {
+      hasUtils: !!U(),
+      hasSanitizer: !!U()?.sanitizeValues,
+      hasSchema: !!schemaObj
     });
-    return out;
-  } catch (e) {
-    tr.warn('sanitize fallback', e);
-    const fallback = (vals && typeof vals === 'object') ? vals : {};
-    tr.end('fallback');
-    return normalizeAllTablesInValues(schemaObj, fallback);
-  }
-}
 
+    try {
+      const inVals = (vals && typeof vals === 'object') ? vals : {};
+
+      // Preserve non-scalar values (arrays/objects) that are part of the schema
+      const preservedNonScalars = {};
+      if (schemaObj && Array.isArray(schemaObj.fields)) {
+        (schemaObj.fields || []).forEach(f => {
+          const fid = String(f?.id || '');
+          if (!fid) return;
+
+          const t = String(f?.type || '');
+          const isMultiSelect = (t === 'select' && !!f?.multiple);
+          const isMultiChoice = (t === 'multichoice');
+          const isTable       = (t === 'table');
+          const isAddress     = (t === 'address');
+
+          if (!(isTable || isMultiChoice || isMultiSelect || isAddress)) return;
+
+          const v = inVals[fid];
+          if (isAddress) {
+            if (v && typeof v === 'object' && !Array.isArray(v)) preservedNonScalars[fid] = v;
+            return;
+          }
+          if (Array.isArray(v)) preservedNonScalars[fid] = v;
+        });
+      }
+
+      let out = inVals;
+      if (U()?.sanitizeValues) out = U().sanitizeValues(schemaObj, inVals);
+      if (!out || typeof out !== 'object') out = {};
+
+      // Restore preserved non-scalars if missing after sanitize
+      for (const fid of Object.keys(preservedNonScalars)) {
+        const pv = preservedNonScalars[fid];
+        if (Array.isArray(pv)) {
+          if (!Array.isArray(out[fid])) out[fid] = pv;
+        } else {
+          if (!(out[fid] && typeof out[fid] === 'object' && !Array.isArray(out[fid]))) out[fid] = pv;
+        }
+      }
+
+      // Canonical: table arrays are always normalized and schema-enforced.
+      out = normalizeAllTablesInValues(schemaObj, out);
+
+      tr.end({
+        keys: Object.keys(out || {}).length,
+        preservedNonScalars: Object.keys(preservedNonScalars).length
+      });
+      return out;
+    } catch (e) {
+      tr.warn('sanitize fallback', e);
+      const fallback = (vals && typeof vals === 'object') ? vals : {};
+      tr.end('fallback');
+      return normalizeAllTablesInValues(schemaObj, fallback);
+    }
+  }
 
   // ============================================================
   // Canonical setters (all UI writes go through these)
@@ -461,7 +463,6 @@
     try {
       if (!STATE.doc?.docId) { tr.end('no-doc'); return; }
       if (!STATE.schema || !Array.isArray(STATE.schema.fields)) {
-        // Still allow saving raw values if schema missing, but keep table normalization best-effort
         const snapshot0 = deepCloneSafe(STATE.values);
         const clean0 = sanitizeValues(STATE.schema || { title:'Form', fields:[] }, snapshot0);
         clearAndAssignObject(STATE.values, clean0);
@@ -472,16 +473,9 @@
         return;
       }
 
-      // Snapshot (so sanitizers cannot mutate live state)
       const snap = deepCloneSafe(STATE.values);
-
-      // Canonical sanitize (including: table filtering + min/max enforcement)
       const clean = sanitizeValues(STATE.schema, snap);
-
-      // Keep in-memory aligned WITHOUT changing object identity
       clearAndAssignObject(STATE.values, clean);
-
-      // Persist canonical state
       P()?.saveState?.(STATE.doc.docId, { values: clean });
 
       STATE.dirty = false;
@@ -582,7 +576,6 @@
 
     STATE.refreshLock = true;
     try {
-      // If we have unsaved changes, flush first so refresh cannot stomp in-memory edits.
       if (STATE.dirty) flushSaveNow();
 
       const meta = await P()?.getActiveDocMeta?.();
@@ -598,15 +591,11 @@
 
       const st = await P()?.loadState?.(STATE.doc.docId);
 
-      // Merge schema (identity stable) by replacement on STATE.schema ref:
-      // (schema is not mutated by UI the same way as values; safe to replace ref)
       STATE.schema = st?.schema || null;
 
-      // Values: identity stable merge
       const nextValues = (st?.values && typeof st.values === 'object') ? st.values : {};
       clearAndAssignObject(STATE.values, nextValues);
 
-      // Canonical: normalize tables immediately (removes empties, enforces min/max)
       normalizeAllTablesInValues(STATE.schema, STATE.values);
 
       const norm = normalizeRulesForCurrentState(st);
@@ -617,7 +606,7 @@
       await updateWriteAccessBanner();
 
       const ae = document.activeElement;
-      const isEditing = !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT'));
+      const isEditing = !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.tagName === 'BUTTON'));
 
       if (!isEditing) {
         renderForm();
@@ -890,6 +879,7 @@
         }
 
         if (t === 'select') {
+          // single-select only; multi uses fs-multi
           const sel = wrapEl.querySelector('select');
           if (sel) { sel.value = ''; STATE.values[fid] = ''; markDirty(); scheduleSaveValues(); }
           return;
@@ -974,11 +964,6 @@
     });
   }
 
-
-
-  // ==========================================
-  // Multi-select UI (shared by fields + table columns)
-  
   // ==========================================
   // Multi-select UI (shared by fields + table columns)
   // ==========================================
@@ -1131,6 +1116,7 @@
 
     return api;
   }
+
   // ============================================================
   // Render Form
   // ============================================================
@@ -1281,64 +1267,64 @@
       }
 
       // Select
-else if (f.type === 'select') {
-  const opts = normOptions(f);
-  const isMulti = !!f.multiple;
+      else if (f.type === 'select') {
+        const opts = normOptions(f);
+        const isMulti = !!f.multiple;
 
-  // Single-select: keep native <select>
-  if (!isMulti) {
-    const input = document.createElement('select');
-    input.id = f.id; input.name = f.id; input.style.width = '100%';
+        // Single-select: native <select>
+        if (!isMulti) {
+          const input = document.createElement('select');
+          input.id = f.id; input.name = f.id; input.style.width = '100%';
 
-    const empty = document.createElement('option');
-    empty.value = '';
-    empty.textContent = '— select —';
-    input.appendChild(empty);
+          const empty = document.createElement('option');
+          empty.value = '';
+          empty.textContent = '— select —';
+          input.appendChild(empty);
 
-    opts.forEach(({value,label}) => {
-      const o = document.createElement('option');
-      o.value = value;
-      o.textContent = label;
-      input.appendChild(o);
-    });
+          opts.forEach(({value,label}) => {
+            const o = document.createElement('option');
+            o.value = value;
+            o.textContent = label;
+            input.appendChild(o);
+          });
 
-    if (f.required) input.required = true;
+          if (f.required) input.required = true;
 
-    const cur = getValue(f.id);
-    if (cur != null) input.value = String(cur);
+          const cur = getValue(f.id);
+          if (cur != null) input.value = String(cur);
 
-    const commit = () => {
-      setValue(f.id, input.value);
-      applyFieldVisibility();
-    };
-    input.addEventListener('change', commit);
+          const commit = () => {
+            setValue(f.id, input.value);
+            applyFieldVisibility();
+          };
+          input.addEventListener('change', commit);
 
-    wrap.appendChild(input);
-    inputRefs[f.id] = input;
-  }
+          wrap.appendChild(input);
+          inputRefs[f.id] = input;
+        }
 
-  // Multi-select: custom dropdown with checkmarks (no Ctrl/⌘ required)
-  else {
-    const cur = getValue(f.id);
-    const selected = Array.isArray(cur)
-      ? cur.map(String)
-      : (cur != null && cur !== '' ? [String(cur)] : []);
+        // Multi-select: custom dropdown
+        else {
+          const cur = getValue(f.id);
+          const selected = Array.isArray(cur)
+            ? cur.map(String)
+            : (cur != null && cur !== '' ? [String(cur)] : []);
 
-    const api = createFsMultiSelectControl({
-      fid: f.id,
-      options: opts,
-      initialSelected: selected,
-      placeholder: '-- select --',
-      onChange: (arr) => {
-        setValue(f.id, arr);
-        applyFieldVisibility();
+          const api = createFsMultiSelectControl({
+            fid: f.id,
+            options: opts,
+            initialSelected: selected,
+            placeholder: '-- select --',
+            onChange: (arr) => {
+              setValue(f.id, arr);
+              applyFieldVisibility();
+            }
+          });
+
+          wrap.appendChild(api.el);
+          inputRefs[f.id] = api.el;
+        }
       }
-    });
-
-    wrap.appendChild(api.el);
-    inputRefs[f.id] = api.el;
-  }
-}
 
       // Date
       else if (f.type === 'date') {
@@ -1384,7 +1370,6 @@ else if (f.type === 'select') {
             onChange: (val) => { setValue(f.id, val); }
           });
         } else {
-          // Hard fallback: plain text input if component missing
           const input = document.createElement('input');
           input.type = 'text';
           input.id = f.id; input.name = f.id; input.style.width = '100%';
@@ -1396,7 +1381,7 @@ else if (f.type === 'select') {
         }
       }
 
-      // Table (FULL FIX: canonical persistence; no implicit writes; deterministic add/edit/delete)
+      // Table
       else if (f.type === 'table') {
         renderTableField(wrap, f);
       }
@@ -1425,6 +1410,7 @@ else if (f.type === 'select') {
 
       // Multichoice (kept; all writes through STATE)
       else if (f.type === 'multichoice') {
+        // (unchanged content from your file below)
         const mcContainer = document.createElement('div');
         mcContainer.className = 'mc-container';
         mcContainer.style.display = 'block';
@@ -1879,12 +1865,12 @@ else if (f.type === 'select') {
   }
 
   // ============================================================
-  // TABLE FIELD — FULL FIX
-  // Deterministic behavior:
-  //  - Table rows in STATE.values[field.id] are CANONICAL data (no draft rows)
-  //  - Editor has a separate draft buffer; draft is NOT persisted until "Add row"
-  //  - Editing existing rows persists immediately (like other fields)
-  //  - All saves go through STATE + canonical sanitizer (filters empties + min/max)
+  // TABLE FIELD — FULL FIX (updated toolbar wording/behavior)
+  // Requirements:
+  //  - When entering (draft mode): show "Zeile hinzufügen" + "Abbrechen"
+  //  - When editing existing row: show "Zeile löschen" + "Abbrechen" (+ "Neue Zeile")
+  //  - "Abbrechen" in draft mode clears draft (no row added)
+  //  - "Abbrechen" in edit mode ends editing (no undo; edits already persisted)
   // ============================================================
   function renderTableField(container, field) {
     const fid = String(field?.id || '');
@@ -1980,7 +1966,6 @@ else if (f.type === 'select') {
 
     function setSelected(idxOrNull) {
       selectedIndex = (typeof idxOrNull === 'number') ? idxOrNull : null;
-      // When selecting a row, editor shows that row. When clearing, editor shows draft.
       syncEditorFromModel();
       updateToolbar();
       drawTable();
@@ -1996,18 +1981,15 @@ else if (f.type === 'select') {
         const fallback = isMulti ? [] : '';
         const v = (model && Object.prototype.hasOwnProperty.call(model, c.id)) ? model[c.id] : fallback;
 
-        // Custom multi-select control
         if (isMulti && el.dataset.type === 'multiselect' && el.__fsMultiApi) {
           el.__fsMultiApi.setSelected(Array.isArray(v) ? v : [], false);
           return;
         }
 
-        // Native inputs/selects
         el.value = (v == null) ? '' : String(v);
         try { if (el._flatpickr && el.value) el._flatpickr.setDate(el.value, false); } catch {}
         try { if (el._flatpickr && !el.value) el._flatpickr.clear(); } catch {}
       });
-    
     }
 
     function syncModelFromEditor(colId, value) {
@@ -2015,15 +1997,14 @@ else if (f.type === 'select') {
       model[colId] = value;
 
       // Editing existing row is immediately canonical -> normalize & persist
-      if (typeof selectedIndex === 'number') {
+      if (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length) {
         rows[selectedIndex] = { ...emptyRow(field), ...(rows[selectedIndex] || {}) };
-        // canonical normalize + persist
         STATE.values[fid] = normalizeTableArray(field, rows);
         rows = STATE.values[fid];
         markDirty();
         scheduleSaveValues();
       } else {
-        // draft is transient; enable Add if non-empty
+        // draft is transient
         updateToolbar();
       }
       statusText = '';
@@ -2044,7 +2025,6 @@ else if (f.type === 'select') {
         const opts = Array.isArray(col.options) ? col.options : [];
         const isMulti = !!col.multiple;
 
-        // Single-select: native <select>
         if (!isMulti) {
           el = document.createElement('select');
           const empty = document.createElement('option');
@@ -2059,10 +2039,7 @@ else if (f.type === 'select') {
           });
           el.style.minWidth = Math.max(140, Math.min(360, textPx(longest(opts)) + 56)) + 'px';
           el.addEventListener('change', () => syncModelFromEditor(col.id, el.value));
-        }
-
-        // Multi-select: shared fs-multi control
-        else {
+        } else {
           const model = currentModel();
           const cur = model?.[col.id];
           const api = createFsMultiSelectControl({
@@ -2081,7 +2058,6 @@ else if (f.type === 'select') {
         el.dataset.type = 'date';
         el.style.minWidth = Math.max(140, Math.min(360, textPx('YYYY-MM-DD') + 20)) + 'px';
 
-        // Use pretty datepicker (consistent with other dates)
         createPrettyDatepicker(el, {
           dateFormat: 'Y-m-d',
           altInput: true,
@@ -2123,20 +2099,36 @@ else if (f.type === 'select') {
       const max = Math.max(0, parseInt(field.maxRows || 0, 10));
       const isEditingExisting = (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length);
 
-      // Add button is ONLY for draft
       const draftHasData = !rowIsEmpty(field, draft);
-      btnAdd.style.display = isEditingExisting ? 'none' : '';
-      btnAdd.disabled = !draftHasData || (!!max && committedCount() >= max);
 
-      // New row is available always; it clears selection and clears draft
+      // Draft mode: show Add + Cancel; hide Delete; hide New (per requirement)
+      if (!isEditingExisting) {
+        btnAdd.style.display = '';
+        btnAdd.textContent = 'Zeile hinzufügen';
+        btnAdd.disabled = !draftHasData || (!!max && committedCount() >= max);
+
+        btnCancel.style.display = '';
+        btnCancel.textContent = 'Abbrechen';
+        btnCancel.disabled = !draftHasData; // adjust if you want always enabled
+
+        btnNew.style.display = 'none';
+        btnDelete.style.display = 'none';
+        return;
+      }
+
+      // Edit mode: show New + Delete + Cancel; hide Add
+      btnAdd.style.display = 'none';
+
       btnNew.style.display = '';
+      btnNew.textContent = 'Änderungen speichern';
       btnNew.disabled = false;
 
-      // Delete/Cancel only if editing an existing row
-      btnDelete.style.display = isEditingExisting ? '' : 'none';
-      btnCancel.style.display = isEditingExisting ? '' : 'none';
+      btnDelete.style.display = '';
+      btnDelete.disabled = (!!min && committedCount() <= min);
 
-      btnDelete.disabled = !isEditingExisting || (!!min && committedCount() <= min);
+      btnCancel.style.display = '';
+      btnCancel.textContent = 'Abbrechen';
+      btnCancel.disabled = false;
     }
 
     function drawTable() {
@@ -2147,7 +2139,6 @@ else if (f.type === 'select') {
       tableWrap.style.display = hasAny ? '' : 'none';
 
       rows.forEach((row, idx) => {
-        // If schema padded minRows with empties, hide empties in preview
         if (rowIsEmpty(field, row)) return;
 
         const trEl = document.createElement('tr');
@@ -2160,7 +2151,6 @@ else if (f.type === 'select') {
         }
 
         trEl.addEventListener('click', () => {
-          // Select row for editing
           setSelected(idx);
           statusText = '';
           status.textContent = statusText;
@@ -2168,7 +2158,13 @@ else if (f.type === 'select') {
 
         (field.columns || []).forEach(col => {
           const td = document.createElement('td');
-          td.textContent = row[col.id] ?? '';
+
+          const isMulti = (String(col?.type) === 'select' && !!col?.multiple);
+          const v = row?.[col.id];
+
+          if (isMulti) td.textContent = Array.isArray(v) ? v.join(', ') : String(v ?? '');
+          else td.textContent = v ?? '';
+
           trEl.appendChild(td);
         });
 
@@ -2195,12 +2191,10 @@ else if (f.type === 'select') {
         return;
       }
 
-      // Commit draft into canonical rows
       rows.push({ ...emptyRow(field), ...draft });
       STATE.values[fid] = normalizeTableArray(field, rows);
       rows = STATE.values[fid];
 
-      // Clear draft and remain in draft mode (so next row can be entered)
       draft = emptyRow(field);
       syncEditorFromModel();
 
@@ -2215,7 +2209,7 @@ else if (f.type === 'select') {
     });
 
     btnNew.addEventListener('click', () => {
-      // Always go back to draft (new row entry)
+      // Go back to draft entry
       selectedIndex = null;
       draft = emptyRow(field);
       syncEditorFromModel();
@@ -2251,9 +2245,21 @@ else if (f.type === 'select') {
     });
 
     btnCancel.addEventListener('click', () => {
-      // Cancel editing existing row: drop selection, revert editor to draft (does not undo saved edits)
-      // (Edits are already persisted immediately; Cancel is just "stop editing this row")
+      const isEditingExisting = (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length);
+
+      // Draft mode cancel: clear draft inputs
+      if (!isEditingExisting) {
+        draft = emptyRow(field);
+        syncEditorFromModel();
+        updateToolbar();
+        statusText = 'Abgebrochen.';
+        status.textContent = statusText;
+        return;
+      }
+
+      // Edit mode cancel: stop editing row (no undo)
       selectedIndex = null;
+      draft = emptyRow(field);
       syncEditorFromModel();
       updateToolbar();
       drawTable();
@@ -2279,8 +2285,6 @@ else if (f.type === 'select') {
   // Expose for cross-callbacks
   // ============================================================
   try { window.applyFieldVisibility = applyFieldVisibility; } catch {}
-
-  // Keep existing behavior
   try { installLogoFocusNav(); } catch {}
   </script>
 </body>
