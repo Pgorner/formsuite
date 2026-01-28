@@ -93,6 +93,7 @@
         <div class="row" style="margin-top:10px; gap:8px; flex-wrap: wrap;">
           <span class="muted" id="builderStatus" style="margin-right:auto;"></span>
           <button id="btnAdd">Add / Update field</button>
+          <button id="btnDuplicate" class="ghost" disabled>Duplicate</button>
           <button id="btnCancel" class="ghost" disabled>Cancel</button>
           <button id="btnDelete" class="danger" disabled>Delete</button>
         </div>
@@ -177,6 +178,7 @@
     typeSpecific: document.getElementById('typeSpecific'),
 
     btnAdd: document.getElementById('btnAdd'),
+    btnDuplicate: document.getElementById('btnDuplicate'),
     btnDelete: document.getElementById('btnDelete'),
     btnCancel: document.getElementById('btnCancel'),
 
@@ -258,8 +260,6 @@
 
   // ============================================================
   // Canonical hydration: only via persistence helper
-  // - Purpose: if workspace is empty but DOCX contains payload, populate workspace
-  // - Safe: only runs when workspace is empty (persistence enforces this)
   // ============================================================
   async function hydrateWorkspaceIfEmpty(docId) {
     const tr = TRACE('hydrateWorkspaceIfEmpty', { docId });
@@ -276,7 +276,7 @@
   }
 
   // ============================================================
-  // Prune + migrate helpers (kept from original; now canonicalized)
+  // Prune + migrate helpers
   // ============================================================
   function slugifyMc(s) {
     return String(s || '')
@@ -340,7 +340,7 @@
         if (Array.isArray(rr.conditions)) {
           rr.conditions = rr.conditions.filter(c => {
             if (!c) return false;
-            const refId = c.fieldId || c.leftFieldId || c.rightFieldId;
+            const refId = c.fieldId || c.leftFieldId || c.rightFieldId || c.rightValueFieldId;
             return !refId || valid.has(String(refId));
           });
         }
@@ -380,6 +380,7 @@
             if (c.fieldId === oldId) c.fieldId = newId;
             if (c.leftFieldId === oldId) c.leftFieldId = newId;
             if (c.rightFieldId === oldId) c.rightFieldId = newId;
+            if (c.rightValueFieldId === oldId) c.rightValueFieldId = newId;
           });
         }
       }
@@ -428,7 +429,6 @@
         ae.tagName === 'SELECT' ||
         ae.tagName === 'BUTTON' ||
         ae.isContentEditable ||
-        // any element inside the type-specific area counts as editing
         (els.typeSpecific && els.typeSpecific.contains(ae)) ||
         ae === els.pType || ae === els.pId || ae === els.pLabel || ae === els.pRequired
       ));
@@ -436,12 +436,19 @@
       if (!isEditing) {
         BUILDER.schema = nextSchema || { title: 'Untitled form', fields: [] };
         els.formTitle.value = BUILDER.schema.title || '';
-        BUILDER.selectedIndex = -1;
+
+        // if we had an editing identity, keep selection pointing to it if still exists
+        if (BUILDER.editingFieldId) {
+          const keepIdx = (BUILDER.schema.fields || []).findIndex(x => x?.id === BUILDER.editingFieldId);
+          BUILDER.selectedIndex = keepIdx >= 0 ? keepIdx : -1;
+        } else {
+          BUILDER.selectedIndex = -1;
+        }
+
         renderAll({ persistFallback: false, full: true });
       } else {
-        // Minimal: update status + counts only; keep editor stable
         if (nextSchema && Array.isArray(nextSchema.fields)) {
-          BUILDER.schema = nextSchema; // safe; UI editor remains because we do not clear its inputs here
+          BUILDER.schema = nextSchema;
           els.fieldCount.textContent = `${(BUILDER.schema.fields || []).length} fields`;
         }
       }
@@ -465,10 +472,10 @@
     const tr = TRACE('hardResetBuilder', { reason });
     BUILDER.schema = { title: 'Untitled form', fields: [] };
     BUILDER.selectedIndex = -1;
+    BUILDER.editingFieldId = null;
 
     els.permNote.style.display = 'none';
 
-    // Load local fallback schema for doc-less mode
     const draft = loadLocalSchemaFallback();
     if (draft && typeof draft === 'object') {
       BUILDER.schema = draft;
@@ -487,7 +494,7 @@
   }
 
   // ============================================================
-  // Canonical listeners (single broadcast mechanism)
+  // Canonical listeners
   // ============================================================
   function installCanonicalListeners() {
     const tr = TRACE('installCanonicalListeners');
@@ -555,7 +562,7 @@
     if (f.type === 'date') return `Datepicker (${f.dateFormat || 'Y-m-d'})`;
     if (f.type === 'select') {
       const opts = Array.isArray(f.options) ? f.options : [];
-      return `Select: ${opts.join(', ') || '—'}`;
+      return `Select: ${opts.join(', ') || '—'}${f.multiple ? ' (multiple)' : ''}`;
     }
     if (f.type === 'multichoice') {
       const groups = Array.isArray(f.mc?.groups) ? f.mc.groups : [];
@@ -571,13 +578,73 @@
       return `Table with ${f.columns?.length||0} column(s)${(f.minRows||f.maxRows)?` ${f.minRows||0}–${f.maxRows||'∞'}`:''} → [ ${cols.join(' | ')} ]`;
     }
     if (f.type === 'datediff') return `Δ ${f.fromId || '—'} → ${f.toId || '—'} (D-M-Y)`;
+    if (f.type === 'number') {
+      const mode = String(f?.calc?.mode || '');
+      if (!mode || mode === 'normal') return '';
+      if (mode === 'sum') return `sum-of(${(f.calc?.sources||[]).join(', ') || '—'})`;
+      if (mode === 'percent') return `percent-of(${(f.calc?.sources||[]).join(', ') || '—'} / ${f.calc?.totalOf || '—'})`;
+      if (mode === 'readonly') return `computed read-only`;
+    }
     return '';
   }
 
   // ============================================================
-  // Type-specific UI (kept from original; legacy coordination removed)
+  // Helpers: checklist (checkbox multi-select)
+  // ============================================================
+  function ensureChecklistStylesOnce() {
+    if (document.getElementById('fs-checklist-style')) return;
+    const st = document.createElement('style');
+    st.id = 'fs-checklist-style';
+    st.textContent = `
+      .fs-checklist { width:100%; max-height:160px; overflow:auto; border:1px solid var(--border,#e5e7eb);
+                      border-radius:6px; padding:6px 8px; background:#fff; }
+      .fs-checklist label { display:flex; gap:8px; align-items:center; margin:2px 0; user-select:none; }
+      .fs-checklist input[type="checkbox"] { margin:0; }
+      tr.drop-target-above { box-shadow: inset 0 3px 0 0 rgba(59,130,246,.35); }
+      tr.drop-target-below { box-shadow: inset 0 -3px 0 0 rgba(59,130,246,.35); }
+      tr.is-active { outline: 2px solid rgba(59,130,246,.45); outline-offset: -2px; }
+    `;
+    document.head.appendChild(st);
+  }
+
+  function checklistSetOptions(containerEl, items, onChange) {
+    if (!containerEl) return;
+    containerEl.innerHTML = '';
+    (items || []).forEach(it => {
+      const lab = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.value = String(it.value ?? '');
+      cb.addEventListener('change', () => onChange && onChange());
+      const sp = document.createElement('span');
+      sp.textContent = String(it.label ?? it.value ?? '');
+      lab.appendChild(cb);
+      lab.appendChild(sp);
+      containerEl.appendChild(lab);
+    });
+  }
+
+  function checklistGetSelected(containerEl) {
+    if (!containerEl) return [];
+    return Array.from(containerEl.querySelectorAll('input[type="checkbox"]:checked'))
+      .map(cb => String(cb.value))
+      .filter(Boolean);
+  }
+
+  function checklistSetSelected(containerEl, values) {
+    if (!containerEl) return;
+    const want = new Set((values || []).map(v => String(v)));
+    Array.from(containerEl.querySelectorAll('input[type="checkbox"]')).forEach(cb => {
+      cb.checked = want.has(String(cb.value));
+    });
+  }
+
+  // ============================================================
+  // Type-specific UI
   // ============================================================
   function renderTypeSpecific() {
+    ensureChecklistStylesOnce();
+
     const t = els.pType.value;
     const wrap = els.typeSpecific;
     wrap.innerHTML = '';
@@ -616,7 +683,6 @@
       window.MultiChoiceDesigner = createMultiChoiceDesigner({ hostEl: div.querySelector('#mcDesigner') });
       window.MultiChoiceDesigner.loadModel({ groups: [] });
 
-
     } else if (t === 'number') {
       const div = document.createElement('div');
       div.innerHTML = `
@@ -635,7 +701,7 @@
         <div id="pCalcAdvanced" style="display:none; margin-top:10px;">
           <div id="pCalcSrcBox">
             <div class="small muted" style="margin-bottom:4px;">Summe aus Feldern</div>
-            <select id="pCalcSources" multiple size="6" style="width:100%;"></select>
+            <div id="pCalcSources" class="fs-checklist"></div>
           </div>
 
           <div id="pCalcTotalBox" style="margin-top:10px;">
@@ -660,7 +726,7 @@
       const decBox   = div.querySelector('#pCalcDecBox');
       const hintEl   = div.querySelector('#pCalcHint');
 
-      const srcSel = div.querySelector('#pCalcSources');
+      const srcList  = div.querySelector('#pCalcSources');
       const totalSel = div.querySelector('#pCalcTotalOf');
 
       const curId = String(els.pId.value || '').trim();
@@ -680,14 +746,9 @@
         totalSel.appendChild(o);
       });
 
-      // Sources multiselect: other number fields
-      srcSel.innerHTML = '';
-      ids.filter(fid => fid && fid !== curId).forEach(fid => {
-        const o = document.createElement('option');
-        o.value = fid;
-        o.textContent = fid;
-        srcSel.appendChild(o);
-      });
+      // Sources checklist: other number fields
+      const srcItems = ids.filter(fid => fid && fid !== curId).map(fid => ({ value: fid, label: fid }));
+      checklistSetOptions(srcList, srcItems, () => {/* saved on Add/Update */});
 
       function setHint(mode) {
         if (!hintEl) return;
@@ -707,7 +768,6 @@
         const show = (mode !== 'normal');
         adv.style.display = show ? '' : 'none';
 
-        // per-mode sub-controls
         const showSources = (mode === 'sum' || mode === 'percent');
         const showTotal   = (mode === 'percent');
         const showDec     = (mode === 'percent');
@@ -811,7 +871,7 @@
   }
 
   // ============================================================
-  // Table Designer (unchanged behavior; isolated UI module)
+  // Table Designer (as provided; includes checkbox sources for table calc)
   // ============================================================
   function createTableDesigner(cfg) {
     let model = [];
@@ -826,6 +886,7 @@
           options: Array.isArray(c.options) ? c.options.map(o => String(o)) : [],
           multiple: !!c.multiple,
           calc: (c && typeof c.calc === 'object' && c.calc) ? {
+            mode: String(c.calc.mode || '').trim(),
             sources: Array.isArray(c.calc.sources) ? c.calc.sources.map(s => String(s)) : [],
             totalOf: (c.calc.totalOf != null) ? String(c.calc.totalOf) : '',
             decimals: (c.calc.decimals != null) ? (parseInt(c.calc.decimals,10)||0) : 1
@@ -853,7 +914,7 @@
         let candidate = baseId;
         const ids = new Set(model.map(c => c.id));
         while (ids.has(candidate)) { n++; candidate = baseId + n; }
-        model.push({ id: candidate, label: candidate.toUpperCase(), type:'text', options:[] });
+        model.push({ id: candidate, label: candidate.toUpperCase(), type:'text', options:[], multiple:false, calc:null });
         render();
       },
       move(idx, dir) {
@@ -907,6 +968,7 @@
         row.appendChild(cType);
         row.appendChild(actions);
 
+        // Select options editor + multiple
         const cOpts = document.createElement('div');
         cOpts.className = 'tdz-col tdz-grow tdz-col--opts';
         cOpts.style.gridColumn = '1 / -1';
@@ -936,7 +998,6 @@
 
         multiWrap.appendChild(cbMulti);
         multiWrap.appendChild(cbTxt);
-
 
         const inOpt = document.createElement('input'); inOpt.placeholder = 'Option eingeben…';
         const btnAddOpt = document.createElement('button'); btnAddOpt.type='button'; btnAddOpt.textContent='Hinzufügen';
@@ -1116,7 +1177,6 @@
         cOpts.appendChild(multiWrap);
         row.appendChild(cOpts);
 
-
         // Calc config (only for number)
         const cCalc = document.createElement('div');
         cCalc.className = 'tdz-col tdz-grow';
@@ -1127,7 +1187,7 @@
         modeRow.style.marginTop = '6px';
         modeRow.innerHTML = `
           <div class="small muted" style="margin-bottom:4px;">Mode</div>
-          <select class="tdz-input" style="width:100%; max-width:420px;" id="tdzCalcMode_${String(col.id).replace(/[^a-zA-Z0-9_\-]/g,'_')}">
+          <select class="tdz-input" style="width:100%; max-width:420px;">
             <option value="normal">normal (editable)</option>
             <option value="sum">sum-of (read-only)</option>
             <option value="percent">percent-of (manual or computed, stores %) </option>
@@ -1151,53 +1211,21 @@
         const srcBox = document.createElement('div');
         srcBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Summe aus Spalten</div>`;
 
-        // Checkbox multi-select (no Ctrl/Shift needed)
         const srcList = document.createElement('div');
         srcList.className = 'fs-checklist';
-        srcList.style.width = '100%';
-        srcList.style.maxHeight = '140px';
-        srcList.style.overflow = 'auto';
-        srcList.style.border = '1px solid var(--border, #e5e7eb)';
-        srcList.style.borderRadius = '6px';
-        srcList.style.padding = '6px 8px';
-        srcList.style.background = '#fff';
         srcBox.appendChild(srcList);
 
         function setSourcesOptions(items) {
-          srcList.innerHTML = '';
-          (items || []).forEach(it => {
-            const lab = document.createElement('label');
-            lab.style.display = 'flex';
-            lab.style.gap = '8px';
-            lab.style.alignItems = 'center';
-            lab.style.margin = '2px 0';
-
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.value = String(it.value ?? '');
-            cb.addEventListener('change', persistCalcFromUI);
-
-            const sp = document.createElement('span');
-            sp.textContent = String(it.label ?? it.value ?? '');
-
-            lab.appendChild(cb);
-            lab.appendChild(sp);
-            srcList.appendChild(lab);
-          });
+          checklistSetOptions(srcList, items, persistCalcFromUI);
         }
         function getSelectedSources() {
-          return Array.from(srcList.querySelectorAll('input[type="checkbox"]:checked'))
-            .map(cb => String(cb.value))
-            .filter(Boolean);
+          return checklistGetSelected(srcList);
         }
         function setSelectedSources(srcs) {
-          const want = new Set((srcs || []).map(s => String(s)));
-          Array.from(srcList.querySelectorAll('input[type="checkbox"]')).forEach(cb => {
-            cb.checked = want.has(String(cb.value));
-          });
+          checklistSetSelected(srcList, srcs);
         }
 
-const totalBox = document.createElement('div');
+        const totalBox = document.createElement('div');
         totalBox.innerHTML = `<div class="small muted" style="margin-bottom:4px;">Total-of (Feld oder Spalte in der gleichen Zeile)</div>`;
         const totalSel = document.createElement('select');
         totalSel.style.width = '100%';
@@ -1236,7 +1264,8 @@ const totalBox = document.createElement('div');
             calcHint.textContent = '';
           }
         }
-function fillCalcOptions() {
+
+        function fillCalcOptions() {
           // sources: other NUMBER columns in this table (excluding self)
           const _srcItems = [];
           (model || []).forEach(c2 => {
@@ -1254,7 +1283,6 @@ function fillCalcOptions() {
           o0.textContent = '— none —';
           totalSel.appendChild(o0);
 
-          // external number fields
           const nf = (BUILDER.schema?.fields || []).filter(x => String(x?.type||'') === 'number' && String(x?.id||'').trim());
           nf.forEach(fld => {
             const o = document.createElement('option');
@@ -1263,7 +1291,6 @@ function fillCalcOptions() {
             totalSel.appendChild(o);
           });
 
-          // number columns in this table
           (model || []).forEach(c2 => {
             if (!c2?.id) return;
             if (String(c2.id) === String(col.id)) return;
@@ -1290,7 +1317,7 @@ function fillCalcOptions() {
           setHint(mode);
         }
 
-function applyCalcModelToUI() {
+        function applyCalcModelToUI() {
           fillCalcOptions();
           const calc = (col && col.calc) ? col.calc : null;
 
@@ -1344,15 +1371,10 @@ function applyCalcModelToUI() {
 
         applyCalcModelToUI();
 
-function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'none'; }
-        // update both toggles on type changes
-        const prevSelHandler = sel.onchange;
+        function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'none'; }
         toggleCalc();
 
         row.appendChild(cCalc);
-
-        toggleCalc();
-
         cfg.listEl.appendChild(row);
       });
 
@@ -1360,12 +1382,11 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
     }
 
     cfg.addBtn?.addEventListener('click', () => api.addEmpty());
-    cfg.addBtn2?.addEventListener('click', () => api.addEmpty());
     return api;
   }
 
   // ============================================================
-  // MultiChoice Designer (unchanged behavior; isolated UI module)
+  // MultiChoice Designer (unchanged; as provided)
   // ============================================================
   function createMultiChoiceDesigner(cfg) {
     let model = { groups: [] };
@@ -1428,8 +1449,6 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
       },
       destroy() {}
     };
-
-    function uid(prefix='id'){ return prefix + '_' + Math.random().toString(36).slice(2,8); }
 
     function render() {
       if (!cfg.hostEl) return;
@@ -1887,7 +1906,7 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
   }
 
   // ============================================================
-  // Fields list rendering (with DnD) — behavior preserved
+  // Fields list rendering (with DnD)
   // ============================================================
   function renderFields() {
     const trc = TRACE('renderFields', { fields: BUILDER.schema?.fields?.length, selected: BUILDER.selectedIndex });
@@ -1997,6 +2016,7 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
     BUILDER.selectedIndex = -1;
     els.btnDelete.disabled = true;
     els.btnCancel.disabled = true;
+    els.btnDuplicate.disabled = true;
     clearEditor();
 
     renderFields();
@@ -2013,6 +2033,7 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
     highlightSelectedRow();
     els.btnDelete.disabled = i < 0;
     els.btnCancel.disabled = i < 0;
+    els.btnDuplicate.disabled = i < 0;
   }
 
   function highlightSelectedRow() {
@@ -2029,8 +2050,9 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
   // ============================================================
   function loadFieldIntoEditor(f, idx = null) {
     const tr = TRACE('loadFieldIntoEditor', { id: f?.id, type: f?.type, idx });
-    // Keep a stable identity for the thing we're editing (index may reset during refreshes)
+
     if (f?.id) BUILDER.editingFieldId = f.id;
+
     els.pType.value = f.type;
     els.pId.value = f.id;
     els.pLabel.value = f.label || '';
@@ -2052,16 +2074,17 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
       }
 
     } else if (f.type === 'number') {
-      const modeEl = document.getElementById('pCalcMode');
-      const srcEl  = document.getElementById('pCalcSources');
+      const modeEl  = document.getElementById('pCalcMode');
+      const srcBox  = document.getElementById('pCalcSources'); // checklist container
       const totalEl = document.getElementById('pCalcTotalOf');
-      const decEl  = document.getElementById('pCalcDecimals');
+      const decEl   = document.getElementById('pCalcDecimals');
 
       const calc = (f && typeof f.calc === 'object') ? f.calc : null;
       const mode =
         String(calc?.mode || '').trim() ||
-        ((Array.isArray(calc?.sources) && calc.sources.length) ? (String(calc?.totalOf||'').trim() ? 'percent' : 'sum')
-          : (String(calc?.totalOf||'').trim() ? 'percent' : 'normal'));
+        ((Array.isArray(calc?.sources) && calc.sources.length)
+          ? (String(calc?.totalOf||'').trim() ? 'percent' : 'sum')
+          : (String(calc?.totalOf||'').trim() ? 'percent' : (calc ? 'readonly' : 'normal')));
 
       if (modeEl) {
         modeEl.value = (['normal','sum','percent','readonly'].includes(mode) ? mode : 'normal');
@@ -2075,9 +2098,7 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
       if (decEl) decEl.value = decimals;
       if (totalEl) totalEl.value = totalOf;
 
-      if (srcEl) {
-        Array.from(srcEl.options || []).forEach(o => { o.selected = sources.includes(String(o.value)); });
-      }
+      if (srcBox) checklistSetSelected(srcBox, sources);
 
     } else if (f.type === 'date') {
       document.getElementById('pDateFmt').value = f.dateFormat || 'Y-m-d';
@@ -2104,103 +2125,164 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
     tr.end();
   }
 
-function parseFieldFromInputs() {
-  const tr = TRACE('parseFieldFromInputs', { type: els.pType.value });
-  const t  = els.pType.value;
-  const id = (els.pId.value || '').trim();
-  if (!id) { alert('Please enter a field id'); tr.end('missing-id'); return null; }
+  function parseFieldFromInputs() {
+    const tr = TRACE('parseFieldFromInputs', { type: els.pType.value });
+    const t  = els.pType.value;
+    const id = (els.pId.value || '').trim();
+    if (!id) { alert('Please enter a field id'); tr.end('missing-id'); return null; }
 
-  const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
+    const f = { type: t, id, label: els.pLabel.value || id, required: !!els.pRequired.checked };
 
-  if (t === 'select') {
-    const raw = (document.getElementById('pOptions')?.value || '').trim();
-    f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
-    f.multiple = !!document.getElementById('pSelectMultiple')?.checked;
+    if (t === 'select') {
+      const raw = (document.getElementById('pOptions')?.value || '').trim();
+      f.options = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+      f.multiple = !!document.getElementById('pSelectMultiple')?.checked;
 
-  } else if (t === 'multichoice') {
-    const designer = window.MultiChoiceDesigner;
-    if (designer) {
-      const mc = designer.getModel();
-      const flat = designer.getFlatOptions();
-      f.mc = mc;
-      f.options = flat;
-    } else {
-      f.options = [];
-      f.mc = { groups: [] };
+    } else if (t === 'multichoice') {
+      const designer = window.MultiChoiceDesigner;
+      if (designer) {
+        const mc = designer.getModel();
+        const flat = designer.getFlatOptions();
+        f.mc = mc;
+        f.options = flat;
+      } else {
+        f.options = [];
+        f.mc = { groups: [] };
+      }
+
+    } else if (t === 'number') {
+      const mode = String(document.getElementById('pCalcMode')?.value || 'normal');
+      const srcBox = document.getElementById('pCalcSources'); // checklist container
+      const totalEl = document.getElementById('pCalcTotalOf');
+      const decEl = document.getElementById('pCalcDecimals');
+
+      const sources = srcBox ? checklistGetSelected(srcBox) : [];
+      const totalOf = totalEl ? String(totalEl.value || '').trim() : '';
+      const decimals = decEl ? (parseInt(decEl.value || '1', 10) || 0) : 1;
+      const decClamped = Math.max(0, Math.min(6, decimals | 0));
+
+      if (mode === 'readonly') {
+        f.calc = { mode: 'readonly' };
+      } else if (mode === 'sum') {
+        if (sources.length) f.calc = { mode: 'sum', sources };
+        else delete f.calc;
+      } else if (mode === 'percent') {
+        const has = (sources.length > 0) || !!totalOf;
+        if (has) f.calc = { mode: 'percent', sources, totalOf: totalOf || '', decimals: decClamped };
+        else delete f.calc;
+      } else {
+        delete f.calc;
+      }
+
+    } else if (t === 'date') {
+      f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
+
+    } else if (t === 'table') {
+      const mr = parseInt(document.getElementById('pMinRows')?.value || '0', 10);
+      const xr = parseInt(document.getElementById('pMaxRows')?.value || '0', 10);
+
+      if (window.TableDesigner) {
+        f.columns = window.TableDesigner.getColumns();
+      } else {
+        const raw = (document.getElementById('pCols')?.value || '').trim();
+        f.columns = raw
+          ? raw.split(',').map(s => s.trim()).filter(Boolean).map(seg => {
+              const [cid, label, ctype, opts] = seg.split(':');
+              const col = { id: (cid || 'col').trim(), label: (label || cid || 'col').trim() };
+              if (ctype) col.type = ctype.trim();
+              if (col.type === 'select' && opts) col.options = opts.split('/').map(s => s.trim()).filter(Boolean);
+              return col;
+            })
+          : [];
+      }
+      if (mr > 0) f.minRows = mr;
+      if (xr > 0) f.maxRows = xr;
+
+    } else if (t === 'datediff') {
+      const fromId = (document.getElementById('pFromId')?.value || '').trim();
+      const toId   = (document.getElementById('pToId')?.value || '').trim();
+
+      const dateIds = (BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
+      if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
+        alert('Please choose two existing date fields for the datediff.');
+        tr.end('bad-datediff');
+        return null;
+      }
+      if (fromId === toId) {
+        alert('Please select two different date fields for the datediff.');
+        tr.end('same-datediff');
+        return null;
+      }
+      f.fromId = fromId;
+      f.toId   = toId;
+      f.required = false;
     }
 
-  } else if (t === 'number') {
-    const mode = String(document.getElementById('pCalcMode')?.value || 'normal');
-    const srcEl = document.getElementById('pCalcSources');
-    const totalEl = document.getElementById('pCalcTotalOf');
-    const decEl = document.getElementById('pCalcDecimals');
-
-    const sources = srcEl ? Array.from(srcEl.selectedOptions || []).map(o => String(o.value)).filter(Boolean) : [];
-    const totalOf = totalEl ? String(totalEl.value || '').trim() : '';
-    const decimals = decEl ? (parseInt(decEl.value || '1', 10) || 0) : 1;
-    const decClamped = Math.max(0, Math.min(6, decimals | 0));
-
-    if (mode === 'readonly') {
-      f.calc = { mode: 'readonly' };
-    } else if (mode === 'sum') {
-      if (sources.length) f.calc = { mode: 'sum', sources };
-      else delete f.calc;
-    } else if (mode === 'percent') {
-      const has = (sources.length > 0) || !!totalOf;
-      if (has) f.calc = { mode: 'percent', sources, totalOf: totalOf || '', decimals: decClamped };
-      else delete f.calc;
-    } else {
-      delete f.calc;
-    }
-
-  } else if (t === 'date') {
-    f.dateFormat = (document.getElementById('pDateFmt')?.value || 'Y-m-d').trim();
-
-  } else if (t === 'table') {
-    const mr = parseInt(document.getElementById('pMinRows')?.value || '0', 10);
-    const xr = parseInt(document.getElementById('pMaxRows')?.value || '0', 10);
-
-    if (window.TableDesigner) {
-      f.columns = window.TableDesigner.getColumns();
-    } else {
-      const raw = (document.getElementById('pCols')?.value || '').trim();
-      f.columns = raw
-        ? raw.split(',').map(s => s.trim()).filter(Boolean).map(seg => {
-            const [cid, label, ctype, opts] = seg.split(':');
-            const col = { id: (cid || 'col').trim(), label: (label || cid || 'col').trim() };
-            if (ctype) col.type = ctype.trim();
-            if (col.type === 'select' && opts) col.options = opts.split('/').map(s => s.trim()).filter(Boolean);
-            return col;
-          })
-        : [];
-    }
-    if (mr > 0) f.minRows = mr;
-    if (xr > 0) f.maxRows = xr;
-
-  } else if (t === 'datediff') {
-    const fromId = (document.getElementById('pFromId')?.value || '').trim();
-    const toId   = (document.getElementById('pToId')?.value || '').trim();
-
-    const dateIds = (BUILDER.schema?.fields || []).filter(x => x.type === 'date').map(x => x.id);
-    if (!fromId || !toId || !dateIds.includes(fromId) || !dateIds.includes(toId)) {
-      alert('Please choose two existing date fields for the datediff.');
-      tr.end('bad-datediff');
-      return null;
-    }
-    if (fromId === toId) {
-      alert('Please select two different date fields for the datediff.');
-      tr.end('same-datediff');
-      return null;
-    }
-    f.fromId = fromId;
-    f.toId   = toId;
-    f.required = false;
+    tr.end({ id: f.id });
+    return f;
   }
 
-  tr.end({ id: f.id });
-  return f;
-}
+  // ============================================================
+  // Duplicate (full field duplication, id auto-increment)
+  // ============================================================
+  function nextDuplicateId(oldId, existingIds) {
+    const ids = new Set((existingIds || []).map(String));
+    const s = String(oldId || '').trim();
+    if (!s) return '';
 
+    const m = s.match(/^(.*?)(\d+)$/);
+    const base = m ? m[1] : s;
+    const start = m ? parseInt(m[2], 10) : 0;
+
+    let n = m ? (isFinite(start) ? start + 1 : 1) : 1;
+    let cand = `${base}${n}`;
+    while (ids.has(cand)) {
+      n += 1;
+      cand = `${base}${n}`;
+    }
+    return cand;
+  }
+
+  async function duplicateSelected() {
+    const tr = TRACE('duplicateSelected', { selectedIndex: BUILDER.selectedIndex, editingFieldId: BUILDER.editingFieldId });
+
+    let i = BUILDER.selectedIndex;
+    if (i < 0 && BUILDER.editingFieldId) {
+      const idx = (BUILDER.schema?.fields || []).findIndex(x => x?.id === BUILDER.editingFieldId);
+      if (idx >= 0) i = idx;
+    }
+    if (i < 0) { tr.end('none'); return; }
+
+    const list = BUILDER.schema.fields || [];
+    const src = list[i];
+    if (!src || !src.id) { tr.end('bad-src'); return; }
+
+    const existingIds = list.map(x => x?.id).filter(Boolean);
+    const newId = nextDuplicateId(src.id, existingIds);
+    if (!newId) { tr.end('no-newId'); return; }
+
+    const copy = deepClone(src);
+    copy.id = newId;
+
+    // if label is empty or equals old id, follow new id (keeps UI nice)
+    if (!copy.label || String(copy.label) === String(src.id)) copy.label = newId;
+
+    // Insert right after original
+    list.splice(i + 1, 0, copy);
+
+    // Select and load the new copy
+    BUILDER.selectedIndex = i + 1;
+    BUILDER.editingFieldId = copy.id;
+
+    renderFields();
+    selectRow(BUILDER.selectedIndex);
+    loadFieldIntoEditor(copy, BUILDER.selectedIndex);
+
+    await mirrorSchemaToWorkspace({ notify: true, reason: 'duplicate-field' });
+
+    setStatus(`Duplicated → ${newId}`, true);
+    tr.end({ newId });
+  }
 
   // ============================================================
   // Editor actions
@@ -2210,8 +2292,6 @@ function parseFieldFromInputs() {
     const f = parseFieldFromInputs();
     if (!f) { tr.end('no-field'); return; }
 
-    // Determine whether we're updating an existing field or adding a new one.
-    // IMPORTANT: selectedIndex can be reset by refresh logic; editingFieldId is the stable identity.
     let i = BUILDER.selectedIndex;
     let isUpdate = i >= 0;
 
@@ -2276,13 +2356,13 @@ function parseFieldFromInputs() {
 
     els.btnDelete.disabled = true;
     els.btnCancel.disabled = true;
+    els.btnDuplicate.disabled = true;
 
     els.pType.value = 'text';
     els.pId.value = '';
     els.pLabel.value = '';
     els.pRequired.checked = false;
 
-    // Tear down any designers cleanly
     try { window.TableDesigner?.destroy?.(); } catch {}
     try { window.MultiChoiceDesigner?.destroy?.(); } catch {}
 
@@ -2307,39 +2387,29 @@ function parseFieldFromInputs() {
   }
 
   // ============================================================
-  // Canonical save path (workspace only; local fallback only without active doc)
-  // - Migrates on rename
-  // - Prunes values/tagMap/rules against schema
-  // - Saves schema as canonical workspace patch
-  // - Broadcast handled by persistence.js via BC_PAYLOAD
+  // Canonical save path
   // ============================================================
   async function mirrorSchemaToWorkspace({ notify = false, reason = '', renamedFrom = null, renamedTo = null } = {}) {
     const tr = TRACE('mirrorSchemaToWorkspace', { notify, reason, docId: currentDoc?.docId, renamedFrom, renamedTo });
 
     try {
-      // keep schema title mirrored
       if (els.formTitle.value && BUILDER.schema) BUILDER.schema.title = els.formTitle.value;
 
-      // Always keep local fallback updated (safety net)
       saveLocalSchemaFallback(BUILDER.schema);
 
       if (!currentDoc?.docId) {
-        // No active doc: only local fallback
         if (notify) setStatus('Saved locally.', true);
         tr.end('local-only');
         return;
       }
 
-      // Rename migration (values/tagMap/rules)
       let migrated = null;
       if (renamedFrom && renamedTo && renamedFrom !== renamedTo) {
         migrated = await migrateWorkspaceOnFieldRename(currentDoc.docId, renamedFrom, renamedTo);
       }
 
-      // Prune against updated schema
       const pruned = await pruneWorkspaceOnSchemaChange(currentDoc.docId, BUILDER.schema);
 
-      // Prefer migrated if present, but keep prune safety
       const valuesToSave = migrated?.values || pruned.values || {};
       const tagMapToSave = migrated?.tagMap || pruned.tagMap || {};
       const rulesToSave  = migrated?.rules  || pruned.rules  || [];
@@ -2386,7 +2456,6 @@ function parseFieldFromInputs() {
     if (currentDoc?.docId) {
       await refreshFromCanonical({ reason: 'init' });
     } else {
-      // doc-less: load local fallback
       const draft = loadLocalSchemaFallback();
       if (draft && typeof draft === 'object') {
         BUILDER.schema = draft;
@@ -2395,14 +2464,11 @@ function parseFieldFromInputs() {
       renderAll({ persistFallback: false, full: true });
     }
 
-    // Type-specific UI initial paint
     renderTypeSpecific();
 
-    // Title mirroring
     els.formTitle.addEventListener('change', () => mirrorSchemaToWorkspace({ notify: true, reason: 'title-change' }));
     els.formTitle.addEventListener('input', () => mirrorSchemaToWorkspace({ notify: false, reason: 'title-typing' }).catch(()=>{}));
 
-    // Ensure local fallback is persisted on exit even if no doc
     window.addEventListener('beforeunload', () => {
       try { if (!currentDoc?.docId) saveLocalSchemaFallback(BUILDER.schema); } catch {}
     });
@@ -2415,6 +2481,7 @@ function parseFieldFromInputs() {
   // ============================================================
   els.pType.addEventListener('change', renderTypeSpecific);
   els.btnAdd.addEventListener('click', upsertField);
+  els.btnDuplicate.addEventListener('click', duplicateSelected);
   els.btnDelete.addEventListener('click', deleteSelected);
   els.btnCancel.addEventListener('click', cancelEditing);
 
