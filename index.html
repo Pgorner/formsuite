@@ -734,10 +734,6 @@
 
     els.permNote.style.display = 'none';
     setStatus(`No active document${reason ? ` (${reason})` : ''}. Open one in the <a href="extractor.html">Extractor</a>.`);
-
-    if (els.formMount) {
-      els.formMount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
-    }
     tr.end();
   }
 
