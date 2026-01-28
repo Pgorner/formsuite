@@ -2089,7 +2089,7 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
     tr.end();
   }
 
- function parseFieldFromInputs() {
+function parseFieldFromInputs() {
   const tr = TRACE('parseFieldFromInputs', { type: els.pType.value });
   const t  = els.pType.value;
   const id = (els.pId.value || '').trim();
