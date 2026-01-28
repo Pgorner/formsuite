@@ -197,6 +197,7 @@
   const BUILDER = {
     schema: { title: 'Untitled form', fields: [] },
     selectedIndex: -1,
+    editingFieldId: null,
   };
 
   // Local fallback (ONLY when no active doc) — matches index fallback key
@@ -421,7 +422,16 @@
 
       // Override-safe: if user is editing inputs, avoid clobbering by full reset.
       const ae = document.activeElement;
-      const isEditing = !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT'));
+      const isEditing = !!(ae && (
+        ae.tagName === 'INPUT' ||
+        ae.tagName === 'TEXTAREA' ||
+        ae.tagName === 'SELECT' ||
+        ae.tagName === 'BUTTON' ||
+        ae.isContentEditable ||
+        // any element inside the type-specific area counts as editing
+        (els.typeSpecific && els.typeSpecific.contains(ae)) ||
+        ae === els.pType || ae === els.pId || ae === els.pLabel || ae === els.pRequired
+      ));
 
       if (!isEditing) {
         BUILDER.schema = nextSchema || { title: 'Untitled form', fields: [] };
@@ -1997,9 +2007,12 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
 
   function selectRow(i) {
     BUILDER.selectedIndex = i;
+    const f = (Array.isArray(BUILDER.schema?.fields) && i >= 0) ? BUILDER.schema.fields[i] : null;
+    BUILDER.editingFieldId = f?.id || null;
+
     highlightSelectedRow();
-    els.btnDelete.disabled = false;
-    els.btnCancel.disabled = false;
+    els.btnDelete.disabled = i < 0;
+    els.btnCancel.disabled = i < 0;
   }
 
   function highlightSelectedRow() {
@@ -2014,8 +2027,10 @@ function toggleCalc() { cCalc.style.display = (sel.value === 'number') ? '' : 'n
   // ============================================================
   // Editor load/parse
   // ============================================================
-  function loadFieldIntoEditor(f) {
-    const tr = TRACE('loadFieldIntoEditor', { id: f?.id, type: f?.type });
+  function loadFieldIntoEditor(f, idx = null) {
+    const tr = TRACE('loadFieldIntoEditor', { id: f?.id, type: f?.type, idx });
+    // Keep a stable identity for the thing we're editing (index may reset during refreshes)
+    if (f?.id) BUILDER.editingFieldId = f.id;
     els.pType.value = f.type;
     els.pId.value = f.id;
     els.pLabel.value = f.label || '';
@@ -2191,12 +2206,22 @@ function parseFieldFromInputs() {
   // Editor actions
   // ============================================================
   async function upsertField() {
-    const tr = TRACE('upsertField', { selectedIndex: BUILDER.selectedIndex });
+    const tr = TRACE('upsertField', { selectedIndex: BUILDER.selectedIndex, editingFieldId: BUILDER.editingFieldId });
     const f = parseFieldFromInputs();
     if (!f) { tr.end('no-field'); return; }
 
-    const i = BUILDER.selectedIndex;
-    const isUpdate = i >= 0;
+    // Determine whether we're updating an existing field or adding a new one.
+    // IMPORTANT: selectedIndex can be reset by refresh logic; editingFieldId is the stable identity.
+    let i = BUILDER.selectedIndex;
+    let isUpdate = i >= 0;
+
+    if (!isUpdate && BUILDER.editingFieldId) {
+      const idx = (BUILDER.schema?.fields || []).findIndex(x => x?.id === BUILDER.editingFieldId);
+      if (idx >= 0) {
+        i = idx;
+        isUpdate = true;
+      }
+    }
 
     let oldId = null;
     if (isUpdate) {
@@ -2247,6 +2272,8 @@ function parseFieldFromInputs() {
 
   function clearEditor() {
     BUILDER.selectedIndex = -1;
+    BUILDER.editingFieldId = null;
+
     els.btnDelete.disabled = true;
     els.btnCancel.disabled = true;
 
@@ -2254,6 +2281,10 @@ function parseFieldFromInputs() {
     els.pId.value = '';
     els.pLabel.value = '';
     els.pRequired.checked = false;
+
+    // Tear down any designers cleanly
+    try { window.TableDesigner?.destroy?.(); } catch {}
+    try { window.MultiChoiceDesigner?.destroy?.(); } catch {}
 
     renderTypeSpecific();
     highlightSelectedRow();
