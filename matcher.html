@@ -1,17 +1,17 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8" />
-  <title>Form Suite — Tag ↔ Field mapping</title>
+  <title>Form Suite — Tag ↔ Feld-Zuordnung</title>
   <link rel="icon" href="favicon.ico" type="image/gif" sizes="32x32">
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <link rel="stylesheet" href="style.css">
 
-  <!-- SDT scan -->
+  <!-- SDT-Scan -->
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 
-  <!-- Canonical app plumbing -->
+  <!-- Zentrales App-Plumbing -->
   <script src="persistence.js"></script>
   <script src="fs-active-doc.js"></script>
   <script src="fs-focus-nav.js"></script>
@@ -20,53 +20,53 @@
   <header>
     <div class="row">
       <span class="brand logo-md">
-        <img src="logo.gif" alt="Form Suite logo" class="logo" />
+        <img src="logo.gif" alt="Form Suite Logo" class="logo" />
         <strong>Form Suite</strong>
       </span>
-      <span class="muted">·</span><a href="index.html">Form</a>
-      <span class="muted">·</span><a href="builder.html">Form Builder</a>
-      <span class="muted">·</span><span class="muted">Tag Matcher</span>
-      <span class="muted">·</span><a href="rules.html">Rules</a>
-      <span class="muted">·</span><a href="extractor.html">Extractor</a>
+      <span class="muted">·</span><a href="index.html">Formular</a>
+      <span class="muted">·</span><a href="builder.html">Formular-Builder</a>
+      <span class="muted">·</span><span class="muted">Tag-Zuordnung</span>
+      <span class="muted">·</span><a href="rules.html">Regeln</a>
+      <span class="muted">·</span><a href="extractor.html">Extraktor</a>
     </div>
   </header>
 
   <main>
-    <!-- Status row -->
+    <!-- Statuszeile -->
     <section class="panel">
       <div class="row" style="justify-content:space-between; align-items:center;">
         <div>
-          <span class="muted">Active schema:</span>
+          <span class="muted">Aktives Schema:</span>
           <span id="schema-pill" class="pill muted">—</span>
         </div>
         <div>
-          <span class="muted">Active DOCX:</span>
+          <span class="muted">Aktive DOCX:</span>
           <span id="doc-pill" class="pill">—</span>
         </div>
       </div>
 
       <div id="permNote" class="warn" style="margin-top:8px; display:none;">
-        Permission to the original file isn’t granted. You can still work from the cached copy.
-        <button id="btnRegrant" class="ghost" style="margin-left:8px;">Re-grant file access</button>
+        Zugriff auf die Originaldatei ist nicht gewährt. Du kannst weiterhin mit der zwischengespeicherten Kopie arbeiten.
+        <button id="btnRegrant" class="ghost" style="margin-left:8px;">Dateizugriff erneut erlauben</button>
       </div>
     </section>
 
-    <!-- Mapping table -->
+    <!-- Zuordnungstabelle -->
     <section class="panel">
-      <h3 style="margin:0 0 8px;">Tag ↔ Field mapping</h3>
+      <h3 style="margin:0 0 8px;">Tag ↔ Feld-Zuordnung</h3>
       <div style="overflow:auto;">
         <table id="map-table">
           <thead>
             <tr>
               <th class="nowrap">#</th>
               <th class="nowrap"><code>w:tag</code></th>
-              <th class="nowrap">alias</th>
-              <th>Current SDT text</th>
-              <th class="nowrap" style="width:320px">Map to field id</th>
+              <th class="nowrap">Alias</th>
+              <th>Aktueller SDT-Text</th>
+              <th class="nowrap" style="width:320px">Zu Feld-ID zuordnen</th>
             </tr>
           </thead>
           <tbody id="tbody">
-            <tr><td colspan="5" class="empty">No document loaded. Open a DOCX in <strong>Extractor</strong> first.</td></tr>
+            <tr><td colspan="5" class="empty">Kein Dokument geladen. Öffne zuerst eine DOCX im <strong>Extraktor</strong>.</td></tr>
           </tbody>
         </table>
       </div>
@@ -108,7 +108,7 @@
       $('#doc-pill').textContent = meta?.name || meta?.docTitle || '—';
     }
     function renderSchemaPill(info) {
-      $('#schema-pill').textContent = `${info.title} · ${info.count} ${info.count === 1 ? 'field' : 'fields'}`;
+      $('#schema-pill').textContent = `${info.title} · ${info.count} ${info.count === 1 ? 'Feld' : 'Felder'}`;
       $('#schema-pill').classList.toggle('muted', !(info.count >= 0));
     }
 
@@ -119,7 +119,7 @@
       const td = document.createElement('td');
       td.colSpan = 5;
       td.className = 'empty';
-      td.innerHTML = 'No document loaded. Open a DOCX in <strong>Extractor</strong> first.';
+      td.innerHTML = 'Kein Dokument geladen. Öffne zuerst eine DOCX im <strong>Extraktor</strong>.';
       tr.appendChild(td);
       tb.appendChild(tr);
     }
@@ -310,7 +310,7 @@
 
       const optNone = document.createElement('option');
       optNone.value = '';
-      optNone.textContent = '— not mapped —';
+      optNone.textContent = '— nicht zugeordnet —';
       frag.appendChild(optNone);
 
       for (const f of sorted) {
@@ -347,7 +347,7 @@
         const td = document.createElement('td');
         td.colSpan = 5;
         td.className = 'empty';
-        td.innerHTML = 'No SDTs with both <code>w:tag</code> and alias found.';
+        td.innerHTML = 'Keine SDTs mit sowohl <code>w:tag</code> als auch Alias gefunden.';
         tr.appendChild(td);
         tbody.appendChild(tr);
         return;

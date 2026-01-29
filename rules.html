@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8" />
-  <title>Form Suite — Rules</title>
+  <title>Form Suite — Regeln</title>
   <link rel="icon" href="favicon.ico" type="image/gif" sizes="32x32">
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -23,46 +23,46 @@
 <header>
   <div class="row">
     <span class="brand logo-md">
-      <img src="logo.gif" alt="Form Suite logo" class="logo" />
+      <img src="logo.gif" alt="Form Suite Logo" class="logo" />
       <strong>Form Suite</strong>
     </span>
-    <span class="muted">·</span><a href="index.html">Form</a>
-    <span class="muted">·</span><a href="builder.html">Form Builder</a>
-    <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
-    <span class="muted">·</span><span class="muted">Rules</span>
-    <span class="muted">·</span><a href="extractor.html">Extractor</a>
+    <span class="muted">·</span><a href="index.html">Formular</a>
+    <span class="muted">·</span><a href="builder.html">Formular-Builder</a>
+    <span class="muted">·</span><a href="matcher.html">Tag-Zuordnung</a>
+    <span class="muted">·</span><span class="muted">Regeln</span>
+    <span class="muted">·</span><a href="extractor.html">Extraktor</a>
   </div>
 </header>
 
 <main>
   <section class="panel">
     <div class="row" style="justify-content:space-between; align-items:center">
-      <h2 style="margin:0">Rules</h2>
+      <h2 style="margin:0">Regeln</h2>
 
       <div id="rulesTabs" class="row" style="margin-left:8px; gap:6px;">
-        <button id="tabHeadings" class="btn btn-secondary" aria-pressed="true">Headings</button>
-        <button id="tabFields" class="btn btn-ghost" aria-pressed="false">Fields</button>
+        <button id="tabHeadings" class="btn btn-secondary" aria-pressed="true">Überschriften</button>
+        <button id="tabFields" class="btn btn-ghost" aria-pressed="false">Felder</button>
       </div>
 
       <div class="row">
         <span id="status" class="muted" style="margin-right:10px"></span>
-        <button id="btnAddRule" class="btn btn-primary">Add rule</button>
+        <button id="btnAddRule" class="btn btn-primary">Regel hinzufügen</button>
       </div>
     </div>
 
     <div class="muted-note" id="rulesHint" style="margin-top:6px">
-      SHOW or HIDE specific headings/subheaders or form fields based on a field’s value(s).
+      Bestimmte Überschriften/Unterüberschriften oder Formularfelder abhängig von Feldwert(en) EIN- oder AUSBLENDEN.
     </div>
   </section>
 
   <section class="panel" id="editorMount">
-    <div class="empty">No rules yet — click “Add rule”.</div>
+    <div class="empty">Noch keine Regeln — klicke auf „Regel hinzufügen“.</div>
   </section>
 
   <section class="panel">
-    <h3 style="margin-top:0">Existing rules</h3>
+    <h3 style="margin-top:0">Vorhandene Regeln</h3>
     <div id="rulesList" class="rules-list">
-      <div class="empty">None.</div>
+      <div class="empty">Keine.</div>
     </div>
   </section>
 </main>
@@ -106,7 +106,7 @@ const isNumericLike = (t) => ['datediff','duration','number'].includes(t);
 // app state
 let gDoc = null;
 let gDocId = null;
-let gSchema = { title:"Form", fields:[] };
+let gSchema = { title:"Formular", fields:[] };
 let gHeadingsTree = [];
 let gHeadingsFlat = [];
 let gMode = 'headings'; // 'headings' | 'fields'
@@ -342,7 +342,7 @@ function buildHeadingTargetIndex(baseline) {
     else if (target && typeof target === 'object' && target.uid) normalized.uid = target.uid;
 
     const fallbackLabel = (target && typeof target === 'object') ? target.label : null;
-    const label = buildLabel(entry, fallbackLabel) || `Heading ${idx + 1}`;
+    const label = buildLabel(entry, fallbackLabel) || `Überschrift ${idx + 1}`;
     normalized.label = label;
 
     const number = entry?.number || entry?.num;
@@ -789,8 +789,8 @@ function applyTabUI(){
   els.tabFields.setAttribute('aria-pressed', String(!isHead));
   els.tabFields.className   = 'btn ' + (!isHead ? 'btn-secondary' : 'btn-ghost');
   els.rulesHint.textContent = isHead
-    ? 'SHOW or HIDE specific headings/subheaders based on a field’s selected value(s).'
-    : 'SHOW or HIDE specific form fields based on another field’s selected value(s).';
+    ? 'Bestimmte Überschriften/Unterüberschriften abhängig von Feldwert(en) EIN- oder AUSBLENDEN.'
+    : 'Bestimmte Formularfelder abhängig von Feldwert(en) eines anderen Feldes EIN- oder AUSBLENDEN.';
 }
 
 function summarizeCondition(rule){
@@ -800,24 +800,24 @@ function summarizeCondition(rule){
   const op = rule.op || 'equals';
   const v0 = Array.isArray(rule.values) ? rule.values[0] : rule.values;
 
-  if (!src) return `when ${srcLabel} ${op} ${JSON.stringify(v0)}`;
-  if (src.type==='boolean') return `when ${srcLabel} ${op} ${String(v0)}`;
-  if (src.type==='date')    return `when ${srcLabel} ${op} ${String(v0||'')}`;
-  if (src.type==='text')    return `when ${srcLabel} ${op} "${String(v0||'')}"`;
-  if (src.type==='number')  return `when ${srcLabel} ${op} ${String(v0)}`;
+  if (!src) return `wenn ${srcLabel} ${op} ${JSON.stringify(v0)}`;
+  if (src.type==='boolean') return `wenn ${srcLabel} ${op} ${String(v0)}`;
+  if (src.type==='date')    return `wenn ${srcLabel} ${op} ${String(v0||'')}`;
+  if (src.type==='text')    return `wenn ${srcLabel} ${op} "${String(v0||'')}"`;
+  if (src.type==='number')  return `wenn ${srcLabel} ${op} ${String(v0)}`;
   if (src.type==='select') {
     const base = (gSchema.fields||[]).find(ff => String(ff.id)===String(src.id));
     const options = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
     const label = options.find(o=>String(o.value)===String(v0))?.label ?? String(v0||'');
-    return `when ${srcLabel} ${op} "${label}"`;
+    return `wenn ${srcLabel} ${op} "${label}"`;
   }
-  return `when ${srcLabel} ${op}`;
+  return `wenn ${srcLabel} ${op}`;
 }
 
 function renderList(){
   els.rulesList.innerHTML = "";
   const list = gRules || [];
-  if (!list.length){ els.rulesList.innerHTML = '<div class="empty">None.</div>'; return; }
+  if (!list.length){ els.rulesList.innerHTML = '<div class="empty">Keine.</div>'; return; }
 
   list.forEach(r=>{
     const row = document.createElement('div'); row.className='item';
@@ -833,16 +833,16 @@ function renderList(){
           return getFieldLabelById(String(t));
         }).filter(Boolean);
 
-    left.innerHTML = `<strong>${r.action}</strong> — <em>${labels.join(', ') || '(no targets selected)'}</em> <span class="muted">${summarizeCondition(r)}</span>`;
+    left.innerHTML = `<strong>${r.action}</strong> — <em>${labels.join(', ') || '(keine Ziele ausgewählt)'}</em> <span class="muted">${summarizeCondition(r)}</span>`;
 
     const right = document.createElement('div'); right.style.display='flex'; right.style.gap='8px';
 
-    const edit = document.createElement('button'); edit.className='btn btn-ghost'; edit.textContent='Edit';
+    const edit = document.createElement('button'); edit.className='btn btn-ghost'; edit.textContent='Bearbeiten';
     edit.addEventListener('click', ()=>{ gDraft=null; gEditingId=r.id; renderEditor(); });
 
-    const del = document.createElement('button'); del.className='btn btn-danger'; del.textContent='Delete';
+    const del = document.createElement('button'); del.className='btn btn-danger'; del.textContent='Löschen';
     del.addEventListener('click', async ()=>{
-      if (!confirm('Delete this rule?')) return;
+      if (!confirm('Diese Regel löschen?')) return;
       const arr = (gMode==='headings') ? gRulesHeadings : gRulesFields;
       const idx = arr.findIndex(x=>x.id===r.id);
       if (idx>=0) arr.splice(idx,1);
@@ -879,7 +879,7 @@ function renderEditor(){
   const mount = els.editorMount;
   mount.innerHTML = "";
   const rule = currentEditorRule();
-  if (!rule){ mount.innerHTML = '<div class="empty">No rules yet — click “Add rule”.</div>'; return; }
+  if (!rule){ mount.innerHTML = '<div class="empty">Noch keine Regeln — klicke auf „Regel hinzufügen“.</div>'; return; }
 
   if (gMode==='headings') normalizeHeadingsRuleTargetsInPlace(rule);
   else normalizeFieldTargetsInPlace(rule);
@@ -888,13 +888,13 @@ function renderEditor(){
 
   if (gDraft){
     const top = document.createElement('div'); top.className='row'; top.style.justifyContent='flex-end'; top.style.gap='8px';
-    const btnCancel = document.createElement('button'); btnCancel.className='btn btn-ghost'; btnCancel.textContent='Cancel';
+    const btnCancel = document.createElement('button'); btnCancel.className='btn btn-ghost'; btnCancel.textContent='Abbrechen';
     btnCancel.addEventListener('click', ()=>{ gDraft=null; renderEditor(); });
 
-    const btnSave = document.createElement('button'); btnSave.className='btn btn-primary'; btnSave.textContent='Save rule';
+    const btnSave = document.createElement('button'); btnSave.className='btn btn-primary'; btnSave.textContent='Regel speichern';
     btnSave.disabled = !isRuleValid(rule);
     btnSave.addEventListener('click', async ()=>{
-      if (!isRuleValid(rule)){ alert('Please complete the rule.'); return; }
+      if (!isRuleValid(rule)){ alert('Bitte vervollständige die Regel.'); return; }
       rule.id = "r_"+Math.random().toString(36).slice(2,8);
       if (gMode==='headings') gRulesHeadings.push(rule); else gRulesFields.push(rule);
       gDraft=null;
@@ -913,9 +913,9 @@ function renderEditor(){
 
   // Action
   const pAction = document.createElement('div'); pAction.className='pair';
-  const lblA = document.createElement('label'); lblA.textContent='Action';
+  const lblA = document.createElement('label'); lblA.textContent='Aktion';
   const selA = document.createElement('select');
-  const defAct = document.createElement('option'); defAct.value=''; defAct.textContent='Select…';
+  const defAct = document.createElement('option'); defAct.value=''; defAct.textContent='Auswählen…';
   if (gDraft && !rule.action) selA.appendChild(defAct);
   ['SHOW','HIDE'].forEach(a=>{
     const o=document.createElement('option'); o.value=a; o.textContent=a;
@@ -932,9 +932,9 @@ function renderEditor(){
   // Effect (fields only)
   if (gMode==='fields'){
     const pEffect = document.createElement('div'); pEffect.className='pair';
-    const lblE = document.createElement('label'); lblE.textContent='Effect';
+    const lblE = document.createElement('label'); lblE.textContent='Effekt';
     const selE = document.createElement('select');
-    ;[{v:'hide',t:'hide (remove)'},{v:'disable',t:'disable (greyed)'}].forEach(({v,t})=>{
+    ;[{v:'hide',t:'ausblenden (entfernen)'},{v:'disable',t:'deaktivieren (ausgegraut)'}].forEach(({v,t})=>{
       const o=document.createElement('option'); o.value=v; o.textContent=t;
       if((rule.hideMode||'hide')===v) o.selected=true; selE.appendChild(o);
     });
@@ -948,7 +948,7 @@ function renderEditor(){
 
   // When picker
   const pField = document.createElement('div'); pField.className='pair';
-  const lblF = document.createElement('label'); lblF.textContent='When';
+  const lblF = document.createElement('label'); lblF.textContent='Wenn';
 
   const pickWrap = document.createElement('div');
   pickWrap.style.position = 'relative';
@@ -960,7 +960,7 @@ function renderEditor(){
   btnPick.textContent = (() => {
     const srcsFlat = buildConditionSources(gSchema);
     const cur = srcsFlat.find(s => String(s.id) === String(rule.fieldId));
-    return cur ? cur.label : 'Select source…';
+    return cur ? cur.label : 'Quelle auswählen…';
   })();
 
   pickWrap.appendChild(btnPick);
@@ -999,7 +999,7 @@ function renderEditor(){
             else if (src.type==='select'){ rule.op='equals'; rule.values=['']; }
             else { rule.op='equals'; rule.values=['']; }
           }
-          btnPick.textContent = src ? src.label : 'Select source…';
+          btnPick.textContent = src ? src.label : 'Quelle auswählen…';
           if (!gDraft){ await persistRules('change:fieldId'); renderEditor(); renderList(); }
           else { renderEditor(); }
           closePop();
@@ -1023,7 +1023,7 @@ function renderEditor(){
   if (chosenSource){
     const row2 = document.createElement('div'); row2.className='rule-row';
     const pCond = document.createElement('div'); pCond.className='pair';
-    const lblC = document.createElement('label'); lblC.textContent='Condition'; pCond.appendChild(lblC);
+    const lblC = document.createElement('label'); lblC.textContent='Bedingung'; pCond.appendChild(lblC);
 
     const src = chosenSource;
     if (!Array.isArray(rule.values)) rule.values = [];
@@ -1047,14 +1047,14 @@ function renderEditor(){
       });
       pCond.appendChild(opSel);
     } else {
-      const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='is';
+      const spanIs = document.createElement('span'); spanIs.className='muted'; spanIs.textContent='ist';
       pCond.appendChild(spanIs);
       rule.op = 'equals';
     }
 
     if (src.type==='boolean'){
       const sel=document.createElement('select');
-      ;[{v:true,l:'true'},{v:false,l:'false'}].forEach(({v,l})=>{
+      ;[{v:true,l:'wahr'},{v:false,l:'falsch'}].forEach(({v,l})=>{
         const o=document.createElement('option'); o.value=String(v); o.textContent=l;
         if(String(rule.values?.[0])===String(v)) o.selected=true;
         sel.appendChild(o);
@@ -1067,7 +1067,7 @@ function renderEditor(){
       pCond.appendChild(sel);
     } else if (src.type==='date'){
       const inp=document.createElement('input');
-      inp.type='text'; inp.placeholder='YYYY-MM-DD';
+      inp.type='text'; inp.placeholder='JJJJ-MM-TT';
       inp.style.minWidth='140px';
       inp.value=String(rule.values?.[0]||'');
       setTimeout(()=>{ try{ flatpickr(inp,{ allowInput:true, dateFormat:'Y-m-d', onChange:async()=>{ rule.values=[inp.value]; if(!gDraft){ await persistRules('change:value'); renderList(); } card._updateSave?.(); } }); }catch{} },0);
@@ -1083,7 +1083,7 @@ function renderEditor(){
       pCond.appendChild(inp);
     } else if (src.type==='select'){
       const sel=document.createElement('select');
-      const def=document.createElement('option'); def.value=''; def.textContent='Select value…'; sel.appendChild(def);
+      const def=document.createElement('option'); def.value=''; def.textContent='Wert auswählen…'; sel.appendChild(def);
       const base=(gSchema.fields||[]).find(ff=>String(ff.id)===String(src.id));
       const opts = base ? normOptions(base) : (src.options||[]).map(x=>({value:String(x),label:String(x)}));
       opts.forEach(opt=>{
@@ -1111,9 +1111,9 @@ function renderEditor(){
   if (gMode==='headings'){
     const row3=document.createElement('div'); row3.className='rule-row';
     const pair=document.createElement('div'); pair.className='pair';
-    const lbl=document.createElement('label'); lbl.textContent='Add heading';
+    const lbl=document.createElement('label'); lbl.textContent='Überschrift hinzufügen';
     const wrap=document.createElement('div'); wrap.style.position='relative'; wrap.style.display='inline-block';
-    const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Open headings…';
+    const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Überschriften öffnen…';
     wrap.appendChild(btn);
 
     const pop=document.createElement('div');
@@ -1139,7 +1139,7 @@ function renderEditor(){
 
             const hIdx = currentHeadingIndex();
             const entry = hIdx.resolve({ idx }) || null;
-            const label = hIdx.buildLabel(entry, `Heading ${idx + 1}`);
+            const label = hIdx.buildLabel(entry, `Überschrift ${idx + 1}`);
 
             rule.targets = rule.targets || [];
             rule.targets.push({ idx, key: idx, label });
@@ -1158,10 +1158,10 @@ function renderEditor(){
   } else {
     const row3=document.createElement('div'); row3.className='rule-row';
     const pair=document.createElement('div'); pair.className='pair';
-    const lbl=document.createElement('label'); lbl.textContent='Add field';
+    const lbl=document.createElement('label'); lbl.textContent='Feld hinzufügen';
     const wrap=document.createElement('div'); wrap.style.position='relative'; wrap.style.display='inline-block';
 
-    const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Open fields…';
+    const btn=document.createElement('button'); btn.type='button'; btn.className='btn'; btn.textContent='Felder öffnen…';
     wrap.appendChild(btn);
 
     const pop=document.createElement('div');
@@ -1226,7 +1226,7 @@ function renderEditor(){
   // Selected pills
   const row4=document.createElement('div'); row4.className='rule-row';
   const lblSel=document.createElement('div'); lblSel.className='muted';
-  lblSel.textContent=(gMode==='headings'?'Selected headings:':'Selected fields:');
+  lblSel.textContent=(gMode==='headings'?'Ausgewählte Überschriften:':'Ausgewählte Felder:');
   const pills=document.createElement('div'); pills.className='pills';
 
   (rule.targets||[]).forEach(t=>{
@@ -1252,7 +1252,7 @@ function renderEditor(){
 
     const pill=document.createElement('span'); pill.className='pill'; pill.title=uniqId;
     const txt=document.createElement('span'); txt.textContent=labelText || uniqId;
-    const x=document.createElement('button'); x.setAttribute('aria-label','Remove'); x.textContent='×';
+    const x=document.createElement('button'); x.setAttribute('aria-label','Entfernen'); x.textContent='×';
     x.addEventListener('click', async ()=>{
       if (isHead){
         rule.targets=(rule.targets||[]).filter(z=>{
@@ -1273,7 +1273,7 @@ function renderEditor(){
   });
 
   if (!pills.children.length){
-    const none=document.createElement('span'); none.className='empty'; none.textContent='(none)';
+    const none=document.createElement('span'); none.className='empty'; none.textContent='(keine)';
     pills.appendChild(none);
   }
 
@@ -1310,7 +1310,7 @@ async function reloadState(reason){
     gRules = (gMode==='headings') ? gRulesHeadings.slice() : gRulesFields.slice();
     if (!gRules.find(r=>r?.id===gEditingId)) gEditingId = null;
 
-    setStatus(`Loaded — fields: ${(gSchema.fields||[]).length}, headings: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'heading-rules':'field-rules'}: ${gRules.length}`);
+    setStatus(`Geladen — Felder: ${(gSchema.fields||[]).length}, Überschriften: ${(gHeadingsTree||[]).length}, ${gMode==='headings'?'Überschriften-Regeln':'Feld-Regeln'}: ${gRules.length}`);
     renderEditor(); renderList();
 
     await debugLogPayload(`reload:${reason}`);
@@ -1368,7 +1368,7 @@ if (typeof installActiveDocListener === 'function') {
     gDraft = null;
     gEditingId = null;
     applyTabUI();
-    if (!gDocId) { setStatus('No active document. Open one first.'); return; }
+    if (!gDocId) { setStatus('Kein aktives Dokument. Öffne zuerst eins.'); return; }
     await reloadState('active-doc');
   });
 }
@@ -1399,13 +1399,13 @@ window.addEventListener('focus', async () => { await reloadState('focus'); });
   try{
     try { window.formSuitePersist?.ensureHydrated?.(); } catch {}
     gDoc = (typeof readActiveDocSync === 'function') ? readActiveDocSync() : null;
-    if (!gDoc?.docId){ setStatus("No active document. Open one first."); return; }
+    if (!gDoc?.docId){ setStatus("Kein aktives Dokument. Öffne zuerst eins."); return; }
     gDocId = gDoc.docId;
     applyTabUI();
     reloadState("boot");
   } catch(e){
     console.error("boot failed:", e);
-    setStatus("Failed to load state.");
+    setStatus("Status konnte nicht geladen werden.");
   }
 })();
 

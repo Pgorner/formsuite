@@ -86,43 +86,43 @@
       <img src="logo.gif" alt="Form Suite logo" class="logo" />
       <strong>Form Suite</strong>
     </span>
-    <span class="muted">·</span><a href="index.html">Form</a>
-    <span class="muted">·</span><a href="builder.html" id="openBuilder">Form Builder</a>
-    <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
-    <span class="muted">·</span><a href="rules.html">Rules</a>
+    <span class="muted">·</span><a href="index.html">Formular</a>
+    <span class="muted">·</span><a href="builder.html" id="openBuilder">Formular-Builder</a>
+    <span class="muted">·</span><a href="matcher.html">Tag-Matcher</a>
+    <span class="muted">·</span><a href="rules.html">Regeln</a>
     <span class="muted">·</span><span class="muted">Extractor</span>
   </div>
 </header>
 
 <main>
   <section class="panel">
-    <h2 style="margin:0 0 10px">Inspect SDTs & store manual form payload in the DOCX</h2>
+    <h2 style="margin:0 0 10px">SDTs prüfen &amp; manuelles Formular-Payload im DOCX speichern</h2>
     <div class="row" style="gap:8px;flex-wrap:wrap">
-      <button id="btnOpen">Open DOCX…</button>
-      <button id="btnSave" disabled>Save (payload only)</button>
-      <span class="muted" id="status" style="margin-left:auto">Idle</span>
+      <button id="btnOpen">DOCX öffnen…</button>
+      <button id="btnSave" disabled>Speichern (nur Payload)</button>
+      <span class="muted" id="status" style="margin-left:auto">Leerlauf</span>
     </div>
 
     <div id="permNote" class="note warn" style="display:none;margin-top:10px">
-      This DOCX was opened via picker but I don’t have write permission to the original file.
-      Clicking <em>Save</em> will write to a copy instead of the original.
-      <button id="btnRegrant" class="ghost" style="margin-left:8px">Grant write access</button>
+      Dieses DOCX wurde über den Picker geöffnet, aber ich habe keine Schreibberechtigung für die Originaldatei.
+      Ein Klick auf <em>Speichern</em> schreibt daher in eine Kopie statt ins Original.
+      <button id="btnRegrant" class="ghost" style="margin-left:8px">Schreibzugriff gewähren</button>
     </div>
 
     <!-- DEBUG PANEL -->
     <details class="panel" style="margin-top:12px;">
-      <summary><strong>Debug (Bytes/Handle/Persistence)</strong></summary>
+      <summary><strong>Debug (Bytes/Handle/Persistenz)</strong></summary>
       <div class="row" style="gap:8px; flex-wrap:wrap; margin-top:10px;">
-        <button id="btnDbgSnap" class="secondary">Snapshot now</button>
-        <button id="btnDbgClear" class="ghost">Clear debug log</button>
+        <button id="btnDbgSnap" class="secondary">Snapshot jetzt</button>
+        <button id="btnDbgClear" class="ghost">Debug-Log leeren</button>
         <label class="row" style="gap:6px; align-items:center;">
           <input type="checkbox" id="dbgVerbose" checked />
-          <span class="muted">Verbose</span>
+          <span class="muted">Ausführlich</span>
         </label>
       </div>
       <textarea id="dbgLog" spellcheck="false" style="width:100%; min-height:220px; margin-top:10px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></textarea>
       <div class="muted" style="margin-top:8px; font-size:0.85rem;">
-        Tip: reproduce the issue, then copy/paste this log. Look for “diagPersist” and “getWorkingDocBytesU8” fallbacks.
+        Tipp: reproduziere das Problem und kopiere dann dieses Log. Achte auf „diagPersist“ und die „getWorkingDocBytesU8“-Fallbacks.
       </div>
     </details>
   </section>
@@ -130,7 +130,7 @@
   <div class="grid-3">
     <section class="panel">
       <details open>
-        <summary><strong>Found SDTs</strong></summary>
+        <summary><strong>Gefundene SDTs</strong></summary>
         <div style="overflow:auto;">
           <table id="sdt-table">
             <thead>
@@ -150,10 +150,10 @@
 
     <section class="panel">
       <details open>
-        <summary><strong>CRONOS_PAYLOAD Preview</strong></summary>
+        <summary><strong>CRONOS_PAYLOAD-Vorschau</strong></summary>
         <textarea id="payloadPreview" spellcheck="false" style="min-height:420px"></textarea>
         <div class="row" style="margin-top:6px; gap:8px;">
-          <button id="btnSaveFromPreview" class="secondary" disabled>Apply JSON & Save</button>
+          <button id="btnSaveFromPreview" class="secondary" disabled>JSON anwenden &amp; speichern</button>
           <span class="muted" id="previewStatus"></span>
         </div>
       </details>
@@ -161,14 +161,14 @@
 
     <section class="panel">
       <details>
-        <summary><strong>Headers/Subheaders</strong></summary>
+        <summary><strong>Überschriften/Unterüberschriften</strong></summary>
         <div id="headersTree" class="tree" style="max-height:420px;overflow:auto;padding:6px 4px;"></div>
       </details>
     </section>
 
     <section class="panel">
       <details open>
-        <summary><strong>Live Form (from payload schema)</strong></summary>
+        <summary><strong>Live-Formular (aus Payload-Schema)</strong></summary>
         <div id="formMount"></div>
       </details>
     </section>
@@ -336,7 +336,7 @@ function assertDeps() {
 
     if (miss.length) {
       console.error('[Extractor] Missing deps:', miss);
-      setStatus('Error: missing core dependencies (see console).');
+      setStatus('Fehler: Core-Abhängigkeiten fehlen (siehe Konsole).');
       tr.end({ ok: false, miss });
       return false;
     }
@@ -381,7 +381,7 @@ let currentDoc = null;           // {docId, name}
 let currentHandle = null;        // FileSystemFileHandle (best-effort cache)
 let currentBytesU8 = null;       // Uint8Array (best-effort cache)
 
-let schema = { title: 'Form', fields: [] };
+let schema = { title: 'Formular', fields: [] };
 let values = {};
 let tagMap = {};
 let headingsBaseline = { flat: [], tree: [] };
@@ -565,14 +565,14 @@ async function updateWriteAccessBanner({ tryPrompt = false } = {}) {
 /* ============================================================
    UI reset
    ============================================================ */
-function clearUi(message = 'Idle') {
+function clearUi(message = 'Leerlauf') {
   const tr = TRACE('clearUi', { message });
   try {
-    els.tableBody.innerHTML = '<tr><td colspan="5" class="empty">No document loaded.</td></tr>';
-    els.formMount.innerHTML = '<div class="empty">No schema found.</div>';
+    els.tableBody.innerHTML = '<tr><td colspan="5" class="empty">Kein Dokument geladen.</td></tr>';
+    els.formMount.innerHTML = '<div class="empty">Kein Schema gefunden.</div>';
     els.payloadPreview.value = '';
     els.previewStatus.textContent = '';
-    if (els.headersTree) els.headersTree.innerHTML = '<div class="empty">No headings.</div>';
+    if (els.headersTree) els.headersTree.innerHTML = '<div class="empty">Keine Überschriften.</div>';
     els.btnSave.disabled = true;
     els.btnSaveFromPreview.disabled = true;
     els.permNote.style.display = 'none';
@@ -615,7 +615,7 @@ async function readPayloadFromDocx(bytesU8) {
 async function writePayloadToDocx(bytesU8, payloadObj) {
   const tr = TRACE('writePayloadToDocx', { inLen: bytesU8?.byteLength, fields: payloadObj?.fields?.length || 0 });
   try {
-    if (!bytesU8?.byteLength) throw new Error('No bytes to write');
+    if (!bytesU8?.byteLength) throw new Error('Keine Bytes zum Schreiben');
     const json = JSON.stringify(payloadObj || {}, null, 0);
 
     let out = null;
@@ -633,7 +633,7 @@ async function writePayloadToDocx(bytesU8, payloadObj) {
       } catch (e) { tr.warn('writeDocVarCustom failed', e); }
     }
 
-    if (!out) throw new Error('No docx writer available (writeDocVarSettings/writeDocVarCustom missing).');
+    if (!out) throw new Error('Kein DOCX-Writer verfügbar (writeDocVarSettings/writeDocVarCustom fehlt).');
 
     const outU8 = (out instanceof Uint8Array) ? out : new Uint8Array(out);
     tr.end({ outLen: outU8.byteLength, outSha: (await sha256Hex(outU8)).slice(0, 12) });
@@ -697,7 +697,7 @@ async function saveWorkspaceMirror(docId, payloadObj, { baseline } = {}) {
     if (!docId) return;
 
     const patch = {
-      schema: { title: payloadObj.title || 'Form', fields: Array.isArray(payloadObj.fields) ? payloadObj.fields : [] },
+      schema: { title: payloadObj.title || 'Formular', fields: Array.isArray(payloadObj.fields) ? payloadObj.fields : [] },
       values: payloadObj.values || {},
       tagMap: payloadObj.tagMap || {},
       rules: Array.isArray(payloadObj.rules) ? payloadObj.rules : [],
@@ -799,7 +799,7 @@ function renderSDTsView(parsed) {
       const td = document.createElement('td');
       td.colSpan = 5;
       td.className = 'empty';
-      td.textContent = 'No SDTs found in this document.';
+      td.textContent = 'Keine SDTs in diesem Dokument gefunden.';
       trEl.appendChild(td);
       els.tableBody.appendChild(trEl);
       return;
@@ -1158,7 +1158,7 @@ function renderHeadingsTreeView(tree) {
     els.headersTree.innerHTML = '';
 
     if (!tree || !tree.length) {
-      els.headersTree.innerHTML = '<div class="empty">No headings found (no paragraphs styled as headings).</div>';
+      els.headersTree.innerHTML = '<div class="empty">Keine Überschriften gefunden (keine Absätze als Überschrift formatiert).</div>';
       tr.end('empty');
       return;
     }
@@ -1289,7 +1289,7 @@ function schedulePreviewUpdate() {
       }
 
       await updatePreview();
-      setStatus('Unsaved changes — press Save to update DOCX.');
+      setStatus('Ungespeicherte Änderungen — „Speichern“ drücken, um das DOCX zu aktualisieren.');
     } catch (e) {
       tr.error('preview tick failed', e);
     } finally {
@@ -1303,7 +1303,7 @@ function buildForm(container, schema, values) {
   try {
     container.innerHTML = '';
     if (!schema || !Array.isArray(schema.fields) || schema.fields.length === 0) {
-      container.innerHTML = '<div class="empty">No manual schema. Create one in the Builder, or load a DOCX that already contains a payload schema.</div>';
+      container.innerHTML = '<div class="empty">Kein manuelles Schema. Erstelle eins im Builder oder lade ein DOCX, das bereits ein Payload-Schema enthält.</div>';
       tr.end('empty schema');
       return;
     }
@@ -1333,13 +1333,13 @@ function buildForm(container, schema, values) {
       label.style.alignItems = 'center';
 
       const labelText = document.createElement('span');
-      labelText.textContent = f.label || f.id || '(field)';
+      labelText.textContent = f.label || f.id || '(Feld)';
       label.appendChild(labelText);
 
       if (f.required) {
         const star = document.createElement('span');
         star.textContent = '•';
-        star.title = 'Required';
+        star.title = 'Pflichtfeld';
         star.style.fontWeight = '600';
         star.style.color = '#ef4444';
         label.appendChild(star);
@@ -1446,7 +1446,7 @@ function buildForm(container, schema, values) {
       if (!selected.length) {
         const ph = document.createElement('span');
         ph.className = 'fs-multi-placeholder';
-        ph.textContent = '-- select --';
+        ph.textContent = '-- auswählen --';
         btn.appendChild(ph);
       } else {
         const labels = selected.map(v => labelByValue.get(String(v)) ?? String(v));
@@ -1566,7 +1566,7 @@ function buildForm(container, schema, values) {
           if (window.AddressAuto && typeof window.AddressAuto.mount === 'function') {
             window.AddressAuto.mount(mountDiv, {
               id: f.id,
-              label: f.label || 'Address',
+              label: f.label || 'Adresse',
               required: !!f.required,
               value: initial || null,
               onChange: (val) => { __addressValues[f.id] = val; schedulePreviewUpdate(); }
@@ -1579,7 +1579,7 @@ function buildForm(container, schema, values) {
           fallback.type = 'text';
           fallback.id = f.id;
           fallback.name = f.id;
-          fallback.placeholder = 'Address';
+          fallback.placeholder = 'Adresse';
           if (initial?.formatted) fallback.value = initial.formatted;
           fallback.addEventListener('input', () => {
             __addressValues[f.id] = { formatted: fallback.value };
@@ -1656,7 +1656,7 @@ async function updatePreview() {
     const payload = st.payload?.CRONOS_PAYLOAD || null;
 
     const effectiveSchema = payload?.fields?.length
-      ? { title: payload.title || 'Form', fields: payload.fields }
+      ? { title: payload.title || 'Formular', fields: payload.fields }
       : (st.schema?.fields?.length ? st.schema : schema);
 
     const effectiveValues = payload?.values ? payload.values : (st.values || values || {});
@@ -1666,7 +1666,7 @@ async function updatePreview() {
     const pruned = pruneBySchema(effectiveSchema, effectiveValues, effectiveTagMap);
 
     const previewObj = {
-      title: effectiveSchema?.title || 'Form',
+      title: effectiveSchema?.title || 'Formular',
       fields: effectiveSchema?.fields || [],
       values: pruned.values,
       tagMap: pruned.tagMap,
@@ -1689,9 +1689,9 @@ async function updatePreview() {
 async function renderFromBytes(bytesU8, { prefix = '' } = {}) {
   const tr = TRACE('renderFromBytes', { prefix, len: bytesU8?.byteLength, docId: currentDoc?.docId });
   try {
-    if (!bytesU8?.byteLength) { setStatus('No DOCX loaded.'); return; }
+    if (!bytesU8?.byteLength) { setStatus('Kein DOCX geladen.'); return; }
 
-    setStatus((prefix || '') + 'Parsing…');
+    setStatus((prefix || '') + 'Analysiere…');
 
     const parsedSDTs = await parseSDTs_JS(bytesU8.buffer);
     renderSDTsView(parsedSDTs);
@@ -1718,10 +1718,10 @@ lastParsedHeadings = {
 
     const wsSchema = st.schema;
     const docSchema = (Array.isArray(payloadFromDoc?.fields) && payloadFromDoc.fields.length)
-      ? { title: payloadFromDoc.title || 'Form', fields: payloadFromDoc.fields }
+      ? { title: payloadFromDoc.title || 'Formular', fields: payloadFromDoc.fields }
       : null;
 
-    const chosenSchema = (wsSchema?.fields?.length ? wsSchema : (docSchema || { title: 'Form', fields: [] }));
+    const chosenSchema = (wsSchema?.fields?.length ? wsSchema : (docSchema || { title: 'Formular', fields: [] }));
 
     const mergedValues = Object.assign({}, payloadFromDoc?.values || {}, st.values || {});
     const mergedTagMap = Object.assign({}, payloadFromDoc?.tagMap || {}, st.tagMap || {});
@@ -1737,7 +1737,7 @@ lastParsedHeadings = {
     headingsBaseline = baseline;
 
     const payloadObj = {
-      title: schema.title || 'Form',
+      title: schema.title || 'Formular',
       fields: schema.fields || [],
       values,
       tagMap,
@@ -1754,11 +1754,11 @@ lastParsedHeadings = {
     els.btnSave.disabled = !docId;
     els.btnSaveFromPreview.disabled = !docId;
 
-    setStatus('Ready.');
+    setStatus('Bereit.');
     tr.end({ fields: schema?.fields?.length || 0 });
   } catch (e) {
     tr.error('renderFromBytes failed', e);
-    setStatus('Error while parsing (see console).');
+    setStatus('Fehler beim Parsen (siehe Konsole).');
     tr.end();
   }
 }
@@ -1781,7 +1781,7 @@ async function rehydrateOnForeground(source) {
     if (!bytes) { tr.end('no bytes'); return; }
 
     currentBytesU8 = bytes;
-    await renderFromBytes(bytes, { prefix: `(${source} refreshed) ` });
+    await renderFromBytes(bytes, { prefix: `(${source} aktualisiert) ` });
     await updateWriteAccessBanner();
 
     await diagPersist(currentDoc?.docId, `rehydrateOnForeground:${source}:post`);
@@ -1808,7 +1808,7 @@ async function applyPayloadObject(obj) {
   try {
     if (!obj || typeof obj !== 'object') return false;
 
-    const nextSchema = { title: obj.title || 'Form', fields: Array.isArray(obj.fields) ? obj.fields : [] };
+    const nextSchema = { title: obj.title || 'Formular', fields: Array.isArray(obj.fields) ? obj.fields : [] };
     const rawValues  = (obj.values && typeof obj.values === 'object') ? obj.values : {};
     const rawTagMap  = (obj.tagMap && typeof obj.tagMap === 'object') ? obj.tagMap : {};
     const rawRules   = Array.isArray(obj.rules) ? obj.rules : [];
@@ -1825,7 +1825,7 @@ async function applyPayloadObject(obj) {
     tagMap = pruned.tagMap;
 
     const payloadObj = {
-      title: schema.title || 'Form',
+      title: schema.title || 'Formular',
       fields: schema.fields || [],
       values,
       tagMap,
@@ -1843,7 +1843,7 @@ async function applyPayloadObject(obj) {
     await updatePreview();
 
     if (els.previewStatus) {
-      els.previewStatus.textContent = 'Applied';
+      els.previewStatus.textContent = 'Angewendet';
       setTimeout(() => { els.previewStatus.textContent = ''; }, 900);
     }
 
@@ -1851,7 +1851,7 @@ async function applyPayloadObject(obj) {
     return true;
   } catch (e) {
     tr.error('applyPayloadObject failed', e);
-    if (els.previewStatus) els.previewStatus.textContent = 'Apply failed (see console)';
+    if (els.previewStatus) els.previewStatus.textContent = 'Anwenden fehlgeschlagen (siehe Konsole)';
     tr.end({ ok: false });
     return false;
   }
@@ -1863,7 +1863,7 @@ async function applyPayloadObject(obj) {
 async function doSave() {
   const tr = TRACE('doSave', { docId: currentDoc?.docId });
   try {
-    if (!currentDoc?.docId) { setStatus('No active document.'); return; }
+    if (!currentDoc?.docId) { setStatus('Kein aktives Dokument.'); return; }
 
     const docId = currentDoc.docId;
 
@@ -1905,7 +1905,7 @@ async function doSave() {
     const pruned = pruneBySchema(schema, values, tagMap);
 
     const payloadObj = {
-      title: schema.title || 'Form',
+      title: schema.title || 'Formular',
       fields: schema.fields || [],
       values: pruned.values,
       tagMap: pruned.tagMap,
@@ -1932,7 +1932,7 @@ async function doSave() {
 
     const inBytes = await getWorkingDocBytesU8();
     if (!inBytes) {
-      setStatus('No bytes / no permission (cannot save).');
+      setStatus('Keine Bytes / keine Berechtigung (Speichern nicht möglich).');
       tr.end('no-bytes');
       return;
     }
@@ -1965,7 +1965,7 @@ async function doSave() {
     if (!wroteToOriginal) {
       const wt = TRACE('doSave:saveAsCopy');
       try {
-        if (!supportsFS) throw new Error('File System Access API not supported');
+        if (!supportsFS) throw new Error('File System Access API wird nicht unterstützt');
 
         const suggested = (currentDoc?.name ? splitNameAndExt(currentDoc.name).base : 'document') + '.docx';
 
@@ -1973,7 +1973,7 @@ async function doSave() {
           suggestedName: suggested,
           excludeAcceptAllOption: true,
           types: [{
-            description: 'Word document',
+            description: 'Word-Dokument',
             accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] }
           }]
         });
@@ -2000,7 +2000,7 @@ async function doSave() {
         wt.end({ ok: true, newDocId: meta.docId, name: meta.name });
       } catch (e) {
         wt.error('saveAsCopy failed', e);
-        setStatus('Save failed (no permission). See console.');
+        setStatus('Speichern fehlgeschlagen (keine Berechtigung). Siehe Konsole.');
         wt.end({ ok: false });
         return;
       }
@@ -2015,11 +2015,11 @@ async function doSave() {
 
     await diagPersist(currentDoc.docId, 'doSave:post');
 
-    setStatus('Saved payload to DOCX.');
+    setStatus('Payload im DOCX gespeichert.');
     tr.end({ ok: true });
   } catch (e) {
     tr.error('doSave failed', e);
-    setStatus('Save failed (see console).');
+    setStatus('Speichern fehlgeschlagen (siehe Konsole).');
     tr.end({ ok: false });
   }
 }
@@ -2031,18 +2031,18 @@ async function doOpen() {
   const tr = TRACE('doOpen');
   try {
     if (!supportsFS) {
-      alert('This browser does not support the File System Access API.');
+      alert('Dieser Browser unterstützt die File System Access API nicht.');
       tr.end('unsupported');
       return;
     }
 
-    clearUi('Opening…');
+    clearUi('Öffne…');
 
     const [handle] = await showOpenFilePicker({
       multiple: false,
       excludeAcceptAllOption: true,
       types: [{
-        description: 'Word document',
+        description: 'Word-Dokument',
         accept: {
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx', '.docm', '.dotx', '.dotm']
         }
@@ -2079,9 +2079,9 @@ async function doOpen() {
 
     tr.end({ ok: true });
   } catch (e) {
-    if (e?.name === 'AbortError') { setStatus('Idle'); tr.end('canceled'); return; }
+    if (e?.name === 'AbortError') { setStatus('Leerlauf'); tr.end('canceled'); return; }
     tr.error('doOpen failed', e);
-    setStatus('Error opening file (see console).');
+    setStatus('Fehler beim Öffnen (siehe Konsole).');
     tr.end({ ok: false });
   }
 }
@@ -2095,7 +2095,7 @@ async function switchToDoc(meta) {
 
     if (currentDoc?.docId === meta.docId && currentBytesU8?.byteLength) { tr.end('already active'); return; }
 
-    clearUi('Switching document…');
+    clearUi('Wechsle Dokument…');
 
     // NOTE: do NOT immediately discard mem cache before we know we can hydrate.
     const prev = { doc: currentDoc, handle: currentHandle, bytesLen: currentBytesU8?.byteLength || 0 };
@@ -2106,7 +2106,7 @@ async function switchToDoc(meta) {
     const bytes = await getWorkingDocBytesU8();
     if (!bytes) {
       window.__DBG?.log('[switchToDoc] hydrate failed, keeping previous in-memory cache', prev);
-      clearUi('No bytes / no permission.');
+      clearUi('Keine Bytes / keine Berechtigung.');
       await diagPersist(meta.docId, 'switchToDoc:no-bytes');
       tr.end('no-bytes');
       return;
@@ -2116,7 +2116,7 @@ async function switchToDoc(meta) {
     currentHandle = null;        // will be rederived by getWorkingDocBytesU8 if needed
     currentBytesU8 = bytes;
 
-    await renderFromBytes(bytes, { prefix: '(switched) ' });
+    await renderFromBytes(bytes, { prefix: '(gewechselt) ' });
     await updateWriteAccessBanner();
     els.btnSave.disabled = false;
     els.btnSaveFromPreview.disabled = false;
@@ -2125,7 +2125,7 @@ async function switchToDoc(meta) {
     tr.end({ ok: true });
   } catch (e) {
     tr.error('switchToDoc failed', e);
-    setStatus('Switch failed (see console).');
+    setStatus('Wechsel fehlgeschlagen (siehe Konsole).');
     tr.end({ ok: false });
   }
 }
@@ -2160,10 +2160,10 @@ bc?.addEventListener('message', async (ev) => {
       currentDoc = null;
       currentHandle = null;
       currentBytesU8 = null;
-      schema = { title: 'Form', fields: [] };
+      schema = { title: 'Formular', fields: [] };
       values = {};
       tagMap = {};
-      clearUi('Cleared.');
+      clearUi('Zurückgesetzt.');
       return;
     }
 
@@ -2189,7 +2189,7 @@ installActiveDocListener(async (meta) => {
   try {
     if (!meta?.docId) {
       currentDoc = null;
-      clearUi('No active document. Open one.');
+      clearUi('Kein aktives Dokument. Öffne eins.');
       tr.end('cleared');
       return;
     }
@@ -2212,7 +2212,7 @@ els.payloadPreview?.addEventListener('input', () => {
   __previewDirty = true;
   if (!els.previewStatus) return;
   const obj = tryParseJSON(els.payloadPreview.value);
-  els.previewStatus.textContent = obj ? 'JSON ok' : 'Invalid JSON';
+  els.previewStatus.textContent = obj ? 'JSON ok' : 'Ungültiges JSON';
 });
 
 els.btnSaveFromPreview?.addEventListener('click', async () => {
@@ -2220,7 +2220,7 @@ els.btnSaveFromPreview?.addEventListener('click', async () => {
   try {
     const obj = tryParseJSON(els.payloadPreview.value);
     if (!obj) {
-      if (els.previewStatus) els.previewStatus.textContent = 'Invalid JSON';
+      if (els.previewStatus) els.previewStatus.textContent = 'Ungültiges JSON';
       tr.end('invalid-json');
       return;
     }
@@ -2298,17 +2298,17 @@ window.addEventListener('beforeunload', async () => {
     await diagPersist(meta?.docId || null, 'boot:after-readActiveDocSync');
 
     if (!meta?.docId) {
-      clearUi('Idle');
+      clearUi('Leerlauf');
       tr.end('no-meta');
       return;
     }
 
     currentDoc = meta;
-    clearUi('Restoring document…');
+    clearUi('Stelle Dokument wieder her…');
 
     const bytes = await getWorkingDocBytesU8();
     if (!bytes) {
-      clearUi('No bytes / no permission.');
+      clearUi('Keine Bytes / keine Berechtigung.');
       await diagPersist(meta.docId, 'boot:no-bytes');
       tr.end('no-bytes');
       return;
@@ -2323,7 +2323,7 @@ window.addEventListener('beforeunload', async () => {
       sha: (await sha256Hex(bytes)).slice(0, 12)
     });
 
-    await renderFromBytes(bytes, { prefix: '(restored) ' });
+    await renderFromBytes(bytes, { prefix: '(wiederhergestellt) ' });
     await updateWriteAccessBanner();
 
     els.btnSave.disabled = false;
@@ -2334,7 +2334,7 @@ window.addEventListener('beforeunload', async () => {
     tr.end('ok');
   } catch (e) {
     tr.error('boot failed', e);
-    clearUi('Boot failed (see console).');
+    clearUi('Boot fehlgeschlagen (siehe Konsole).');
     tr.end('fail');
   }
 })();
