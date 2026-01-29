@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8" />
-  <title>Form Suite — Form</title>
+  <title>Form Suite — Formular</title>
   <link rel="icon" href="favicon.ico" type="image/gif" sizes="32x32">
   <link rel="shortcut icon" href="favicon.ico" type="image/gif">
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -69,14 +69,14 @@
   <header>
     <div class="row">
       <span class="brand logo-md">
-        <img src="logo.gif" alt="Form Suite logo" class="logo" />
+        <img src="logo.gif" alt="Form Suite Logo" class="logo" />
         <strong>Form Suite</strong>
       </span>
-      <span class="muted">·</span><span class="muted">Form</span>
-      <span class="muted">·</span><a href="builder.html">Form Builder</a>
-      <span class="muted">·</span><a href="matcher.html">Tag Matcher</a>
-      <span class="muted">·</span><a href="rules.html">Rules</a>
-      <span class="muted">·</span><a href="extractor.html">Extractor</a>
+      <span class="muted">·</span><span class="muted">Formular</span>
+      <span class="muted">·</span><a href="builder.html">Formular-Builder</a>
+      <span class="muted">·</span><a href="matcher.html">Tag-Zuordnung</a>
+      <span class="muted">·</span><a href="rules.html">Regeln</a>
+      <span class="muted">·</span><a href="extractor.html">Extraktor</a>
     </div>
   </header>
 
@@ -84,12 +84,13 @@
     <section class="panel">
       <div class="title-row"></div>
       <div class="row" style="margin-top:8px;">
-        <span id="docStatus" class="muted">No active document. Open one in the <a href="extractor.html">Extractor</a>.</span>
+        <span id="docStatus" class="muted">Kein aktives Dokument. Öffne eines im <a href="extractor.html">Extraktor</a>.</span>
       </div>
       <div id="permNote" class="note warn" style="display:none; margin-top:10px">
-        This DOCX was opened via picker but I don’t have write permission to the original file.
-        You can still work from the cached copy, but changes cannot be written back until permission is granted.
-        <button id="btnRegrant" class="ghost" style="margin-left:8px">Grant write access</button>
+        Dieses DOCX wurde über den Dateiauswahldialog geöffnet, aber ich habe keinen Schreibzugriff auf die Originaldatei.
+        Du kannst trotzdem mit der zwischengespeicherten Kopie arbeiten, aber Änderungen können erst zurückgeschrieben werden,
+        wenn der Zugriff gewährt wurde.
+        <button id="btnRegrant" class="ghost" style="margin-left:8px">Schreibzugriff erlauben</button>
       </div>
     </section>
 
@@ -99,6 +100,8 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <!-- Flatpickr German locale (for German day/month names) -->
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/de.js"></script>
 
   <!-- Canonical single coordination layer -->
   <script src="persistence.js"></script>
@@ -213,7 +216,6 @@
     return r;
   }
 
-
   // ============================================================
   // TABLE % calcs (row-level)
   // ============================================================
@@ -259,7 +261,6 @@
       rowObj[String(col.id)] = out;
     });
   }
-
 
   function rowIsEmpty(field, row) {
     try {
@@ -489,7 +490,6 @@
     return parseScalarNumber(rowObj ? rowObj[ref] : null);
   }
 
-
   function ensureTableValue(field) {
     const fid = String(field?.id || '');
     if (!fid) return [];
@@ -559,7 +559,7 @@
       if (!STATE.doc?.docId) { tr.end('no-doc'); return; }
       if (!STATE.schema || !Array.isArray(STATE.schema.fields)) {
         const snapshot0 = deepCloneSafe(STATE.values);
-        const clean0 = sanitizeValues(STATE.schema || { title:'Form', fields:[] }, snapshot0);
+        const clean0 = sanitizeValues(STATE.schema || { title:'Formular', fields:[] }, snapshot0);
         clearAndAssignObject(STATE.values, clean0);
         P()?.saveState?.(STATE.doc.docId, { values: clean0 });
         STATE.dirty = false;
@@ -626,7 +626,7 @@
         tree: Array.isArray(st?.headingsTree) ? st.headingsTree : [],
       };
 
-      const schemaForDerive = st?.schema || STATE.schema || { title: 'Form', fields: [] };
+      const schemaForDerive = st?.schema || STATE.schema || { title: 'Formular', fields: [] };
 
       const normalized = window.deriveNormalizedRulesForDoc(st || {}, schemaForDerive, baseline) || {};
       const nextHeadingRules = Array.isArray(normalized.headingRules)
@@ -677,7 +677,7 @@
       STATE.doc = (meta && meta.docId) ? meta : null;
 
       if (!STATE.doc?.docId) {
-        await hardResetOpenForm(`no active doc${reason ? ' ('+reason+')' : ''}`);
+        await hardResetOpenForm(`kein aktives Dokument${reason ? ' ('+reason+')' : ''}`);
         tr.end('no-doc');
         return;
       }
@@ -696,7 +696,7 @@
       const norm = normalizeRulesForCurrentState(st);
       STATE.fieldRules = norm.fieldRules || [];
 
-      setStatus(`Active DOCX: <span class="kbd">${STATE.doc.name || STATE.doc.docId}</span>${STATE.schema ? '' : ' — <span class="muted">no schema yet</span>'}`);
+      setStatus(`Aktives DOCX: <span class="kbd">${STATE.doc.name || STATE.doc.docId}</span>${STATE.schema ? '' : ' — <span class="muted">noch kein Schema</span>'}`);
 
       await updateWriteAccessBanner();
 
@@ -733,7 +733,7 @@
     STATE.dirty = false;
 
     els.permNote.style.display = 'none';
-    setStatus(`No active document${reason ? ` (${reason})` : ''}. Open one in the <a href="extractor.html">Extractor</a>.`);
+    setStatus(`Kein aktives Dokument${reason ? ` (${reason})` : ''}. Öffne eines im <a href="extractor.html">Extraktor</a>.`);
     tr.end();
   }
 
@@ -852,6 +852,40 @@
     return years;
   }
 
+  // --- NEW: calendar-safe adders for sensible remainder breakdown ---
+  function addYears(d, years) {
+    const y = d.getFullYear() + (years|0);
+    const m = d.getMonth();
+    const day = d.getDate();
+    const lastDay = new Date(y, m + 1, 0).getDate();
+    return new Date(y, m, Math.min(day, lastDay));
+  }
+  function addMonths(d, months) {
+    const baseY = d.getFullYear();
+    const baseM = d.getMonth();
+    const day = d.getDate();
+
+    const totalM = baseM + (months|0);
+    const y = baseY + Math.floor(totalM / 12);
+    const m = ((totalM % 12) + 12) % 12;
+
+    const lastDay = new Date(y, m + 1, 0).getDate();
+    return new Date(y, m, Math.min(day, lastDay));
+  }
+
+  function formatDurationYMD({ years, months, days }) {
+    const parts = [];
+    const push = (n, unitSingular, unitPlural) => {
+      const nn = (n|0);
+      if (!nn) return;
+      parts.push(`${nn} ${nn === 1 ? unitSingular : unitPlural}`);
+    };
+    push(years, 'Jahr', 'Jahre');
+    push(months, 'Monat', 'Monate');
+    push(days, 'Tag', 'Tage');
+    return parts.length ? parts.join(' ') : '0 Tage';
+  }
+
   function createPrettyDatepicker(input, extraOpts = {}) {
     if (!document.getElementById('fp-zindex-fix')) {
       const st = document.createElement('style');
@@ -864,6 +898,7 @@
     }
 
     const baseOpts = {
+      locale: (window.flatpickr && window.flatpickr.l10ns && window.flatpickr.l10ns.de) ? window.flatpickr.l10ns.de : undefined,
       dateFormat: 'Y-m-d',
       altInput: true,
       altFormat: 'D, j M Y',
@@ -1058,7 +1093,7 @@
   // ==========================================
   // Multi-select UI (shared by fields + table columns)
   // ==========================================
-  function createFsMultiSelectControl({ fid = null, options = [], initialSelected = [], placeholder = '— select —', onChange = null }) {
+  function createFsMultiSelectControl({ fid = null, options = [], initialSelected = [], placeholder = '— auswählen —', onChange = null }) {
     const opts = (Array.isArray(options) ? options : []).map(o => {
       if (o && typeof o === 'object') {
         const value = String(o.value ?? o.id ?? o.key ?? o.code ?? o);
@@ -1237,7 +1272,7 @@
     mount.innerHTML = '';
 
     if (!STATE.schema || !Array.isArray(STATE.schema.fields) || !STATE.schema.fields.length) {
-      mount.innerHTML = `<div class="muted">No schema found. Create one in the <a href="builder.html">Builder</a>.</div>`;
+      mount.innerHTML = `<div class="muted">Kein Schema gefunden. Erstelle eines im <a href="builder.html">Builder</a>.</div>`;
       tr.end('no-schema');
       return;
     }
@@ -1276,6 +1311,9 @@
       return null;
     }
 
+    // ============================================================
+    // DATEDIFF (UPDATED): sensible calendar remainder breakdown
+    // ============================================================
     function recomputeDatediffs() {
       datediffRefs.forEach(({ storeKey, outEl, resolve }) => {
         const { a, b } = resolve();
@@ -1284,18 +1322,37 @@
           STATE.values[storeKey] = null;
           return;
         }
-        const days = diffInDays(a, b);
-        const months = diffInMonths(a, b);
+
+        const totalDays = diffInDays(a, b);
+
         const years = diffInYears(a, b);
-        const display = `${days}D ${months}M ${years}Y (${days} Days total)`;
+        const aAfterYears = addYears(a, years);
+
+        const months = diffInMonths(aAfterYears, b);
+        const aAfterMonths = addMonths(aAfterYears, months);
+
+        const remDays = diffInDays(aAfterMonths, b);
+
+        const pretty = formatDurationYMD({ years, months, days: remDays });
+        const display = `${pretty} (${totalDays} ${totalDays === 1 ? 'Tag' : 'Tage'} gesamt)`;
+
         outEl.textContent = display;
-        STATE.values[storeKey] = { days, months, years, formatted: display };
+
+        // Backward compatibility: "days" remains TOTAL days like before
+        STATE.values[storeKey] = {
+          days: totalDays,
+          months,
+          years,
+          remDays,
+          totalDays,
+          formatted: display
+        };
       });
+
       markDirty();
       scheduleSaveValues();
     }
     window.recomputeDatediffs = recomputeDatediffs;
-
 
     // ============================================================
     // % calcs (number + derived table cells store "37%")
@@ -1366,7 +1423,6 @@
       }
     }
     window.recomputePercentCalcs = recomputePercentCalcs;
-
 
     // ---- Fields ----
     (STATE.schema.fields || []).forEach(f => {
@@ -1508,7 +1564,6 @@
         inputRefs[f.id] = input;
       }
 
-
       // Select
       else if (f.type === 'select') {
         const opts = normOptions(f);
@@ -1521,7 +1576,7 @@
 
           const empty = document.createElement('option');
           empty.value = '';
-          empty.textContent = '— select —';
+          empty.textContent = '— auswählen —';
           input.appendChild(empty);
 
           opts.forEach(({value,label}) => {
@@ -1557,7 +1612,7 @@
             fid: f.id,
             options: opts,
             initialSelected: selected,
-            placeholder: '-- select --',
+            placeholder: '— auswählen —',
             onChange: (arr) => {
               setValue(f.id, arr);
               applyFieldVisibility();
@@ -1607,7 +1662,7 @@
         if (window.AddressAuto?.mount) {
           AddressAuto.mount(host, {
             id: f.id,
-            label: f.label || 'Address',
+            label: f.label || 'Adresse',
             required: !!f.required,
             value: initial || null,
             onChange: (val) => { setValue(f.id, val); }
@@ -1651,7 +1706,7 @@
         guardPairs.push({ fromId, toId });
       }
 
-      // Multichoice (kept; all writes through STATE)
+      // Multichoice
       else if (f.type === 'multichoice') {
         // (unchanged content from your file below)
         const mcContainer = document.createElement('div');
@@ -2109,11 +2164,6 @@
 
   // ============================================================
   // TABLE FIELD — FULL FIX (updated toolbar wording/behavior)
-  // Requirements:
-  //  - When entering (draft mode): show "Zeile hinzufügen" + "Abbrechen"
-  //  - When editing existing row: show "Zeile löschen" + "Abbrechen" (+ "Neue Zeile")
-  //  - "Abbrechen" in draft mode clears draft (no row added)
-  //  - "Abbrechen" in edit mode ends editing (no undo; edits already persisted)
   // ============================================================
   function renderTableField(container, field) {
     const fid = String(field?.id || '');
@@ -2214,7 +2264,6 @@
       drawTable();
     }
 
-    
     function syncEditorFromModel() {
       const model = currentModel();
       (field.columns || []).forEach(c => {
@@ -2259,7 +2308,6 @@
         try { if (el._flatpickr && !el.value) el._flatpickr.clear(); } catch {}
       });
     }
-
 
     function syncModelFromEditor(colId, value) {
       const model = currentModel();
@@ -2329,7 +2377,7 @@
             fid: null,
             options: opts,
             initialSelected: Array.isArray(cur) ? cur : [],
-            placeholder: '-- select --',
+            placeholder: '— auswählen —',
             onChange: (arr) => syncModelFromEditor(col.id, arr)
           });
           el = api.el;
@@ -2440,7 +2488,7 @@
 
         btnCancel.style.display = '';
         btnCancel.textContent = 'Abbrechen';
-        btnCancel.disabled = !draftHasData; // adjust if you want always enabled
+        btnCancel.disabled = !draftHasData;
 
         btnNew.style.display = 'none';
         btnDelete.style.display = 'none';
@@ -2531,7 +2579,6 @@
     const onValuesChanged = () => recomputeAndRefreshFromOutside();
     window.addEventListener('fs-values-changed', onValuesChanged);
 
-
     // Actions
     btnAdd.addEventListener('click', () => {
       rows = ensureTableValue(field);
@@ -2551,7 +2598,7 @@
         return;
       }
 
-            const newRow = { ...emptyRow(field), ...draft };
+      const newRow = { ...emptyRow(field), ...draft };
       try { computeTableRowCalcs(field, newRow); } catch {}
       rows.push(newRow);
       STATE.values[fid] = normalizeTableArray(field, rows);
