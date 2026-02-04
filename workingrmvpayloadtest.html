@@ -1,0 +1,877 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>DOCX Baseline Rebuilder – Live-Vorschau + Diff</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{
+    --ink:#0f172a;--muted:#6b7280;--card:#fff;--bg:#f8fafc;--border:#e5e7eb;--accent:#3b82f6;
+    --l1:#2563eb; --l2:#16a34a; --l3:#f59e0b; --l4:#ef4444; --l5:#7c3aed; --l6:#0ea5e9;
+    --removed-bg: rgba(239, 68, 68, .12);
+    --ok:#16a34a; --warn:#b45309
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,Arial}
+  header{padding:16px 20px;border-bottom:1px solid var(--border);background:#fff;position:sticky;top:0;z-index:1}
+  h1{font-size:18px;margin:0}
+  main{max-width:1280px;margin:20px auto;padding:0 16px 64px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.spacer{flex:1}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;box-shadow:0 1px 0 rgba(0,0,0,.03);padding:16px;margin:16px 0}
+  input[type="file"]{padding:8px;border:1px dashed var(--border);border-radius:8px;background:#fff}
+  button{border:1px solid var(--border);background:#fff;border-radius:8px;padding:10px 14px;cursor:pointer}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)} button:disabled{opacity:.6;cursor:not-allowed}
+  .muted{color:var(--muted)} #status{white-space:pre-wrap;font:12px ui-monospace,Consolas,Menlo}
+  .tree{max-height:560px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:6px 8px;background:#fff}
+  .tree ul{margin:0;padding-left:18px}
+  .node{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;border-left:3px solid transparent}
+  .node:hover{background:#f1f5f9}
+  .num{font-variant-numeric:tabular-nums;opacity:.9;min-width:3.5ch;text-align:right}
+  .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:62ch}
+  .lvl-1 .title{font-weight:700}.lvl-2 .title{font-weight:600}.lvl-3 .title{font-weight:500}
+  .badge{margin-left:auto;font-size:11px;color:#334155;background:#e2e8f0;border-radius:999px;padding:2px 6px;border:1px solid var(--border)}
+  .grid{display:grid;grid-template-columns:360px 1fr;gap:16px}
+  .pane{border:1px solid var(--border);border-radius:10px;background:#fff;overflow:hidden;display:flex;flex-direction:column;min-height:420px}
+  .pane header{position:initial;border-bottom:1px solid var(--border);padding:10px 12px;background:#f9fafb}
+  .pane .content{padding:14px;overflow:auto;flex:1}
+  .preview-wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .preview{border:1px solid var(--border);border-radius:10px;min-height:420px;background:#fff;overflow:auto}
+  .preview header{padding:10px 12px;border-bottom:1px solid var(--border);background:#f9fafb}
+  .doc{max-width:70ch;margin:0 auto;padding:16px}
+  .doc h1,.doc h2,.doc h3,.doc h4,.doc h5,.doc h6{line-height:1.2;margin:1em 0 .4em;padding-left:.6rem;border-left:4px solid transparent}
+  .doc p{margin:.5em 0}
+  .legend{font-size:12px;color:var(--muted)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:#fff}
+  .pill.ok{border-color:#bbf7d0;background:#f0fdf4;color:var(--ok)}
+  textarea{width:100%;min-height:140px;font:12px ui-monospace,Consolas,Menlo;border:1px solid var(--border);border-radius:10px;padding:10px}
+  .note{font-size:12px;color:var(--muted)}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>DOCX Baseline Rebuilder</h1>
+  <div class="muted">
+    Live-Vorschau: <b>Baseline</b> links &nbsp;|&nbsp; <b>Ergebnis (Sektionen entfernt)</b> rechts. Vollständiges Backup im DOCX eingebettet.
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <div class="row">
+      <input id="fileInput" type="file" accept=".docx" />
+      <button id="btnLoad" class="primary">Laden</button>
+      <div class="spacer"></div>
+
+      <label title="TOCs als Feld neu einsetzen, damit Word die Inhalte neu berechnet">
+        <input id="chkRebuildToc" type="checkbox" checked/> TOC neu setzen
+      </label>
+
+      <button id="btnSelectAll">Alle wählen</button>
+      <button id="btnClearAll">Alle abwählen</button>
+      <button id="btnExport" class="primary" disabled>Export</button>
+      <button id="btnRestore" title="Setzt word/document.xml aus dem eingebetteten Original zurück" disabled>Original wiederherstellen</button>
+    </div>
+
+    <div style="margin-top:12px">
+      <div class="row" style="align-items:flex-start">
+        <div style="flex:1; min-width:520px">
+          <div class="row" style="margin-bottom:6px">
+            <strong>CRONOS_PAYLOAD (JSON)</strong>
+            <span class="spacer"></span>
+            <button id="btnApplyPayload">Payload anwenden</button>
+            <button id="btnClearPayload" class="ghost">Feld leeren</button>
+          </div>
+          <textarea id="payloadInput" placeholder="Hier CRONOS_PAYLOAD JSON einfügen (Copy/Paste)…"></textarea>
+          <div class="note" style="margin-top:6px">
+            Hinweis: Heading-Regeln aus <code>payload.rules</code> werden zu Checkbox-Auswahl (Entfernen) gemappt.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="muted" style="margin-top:10px"></div>
+  </div>
+
+  <div class="grid">
+    <div class="pane">
+      <header class="toolbar">
+        <strong>Überschriften (Baseline)</strong>
+        <span class="spacer"></span>
+        <span class="legend">Haken = Abschnitt im Export <em>entfernen</em></span>
+      </header>
+      <div id="tree" class="content tree"></div>
+    </div>
+
+    <div class="pane">
+      <header class="toolbar">
+        <strong>Vorschau</strong>
+        <span class="spacer"></span>
+        <span class="pill ok">Modus: Entfernen + eingebettetes Backup</span>
+      </header>
+      <div class="content">
+        <div class="preview-wrap">
+          <div class="preview" id="prevBase">
+            <header><strong>Baseline</strong> <span class="legend">Rot = wird entfernt</span></header>
+            <div class="doc" id="docBase"><em class="muted">Noch keine Datei geladen.</em></div>
+          </div>
+          <div class="preview" id="prevTrans">
+            <header>
+              <strong>Ergebnis</strong>
+              <span class="legend">Keine Platzhalter, keine Tabellenskelette</span>
+            </header>
+            <div class="doc" id="docTrans"><em class="muted">Noch keine Datei geladen.</em></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ===== Namespaces & Paths ===== */
+const W_NS="http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const BASE_PATH='customXml/originalDocument.xml';
+const INDEX_PATH='customXml/sections.json';
+const SEL_PATH='customXml/selection.json';
+const META_PATH='customXml/rebuilder_meta.json';
+
+let zip=null, fileNameBase='document';
+let styleMap={};
+let activeDoc=null;
+let baseDoc=null;
+let settingsDoc=null;
+
+let allParasBase=[], headingsFlat=[], treeRoot=[];
+let lastPayload = null;
+
+/* NEW: maps + table meta so we only remove tables that were impacted by removals */
+let baseParaIndex = null;        // WeakMap(w:p -> global index)
+let baseTableMeta = [];          // [{ord, pMin, pMax}] based on baseDoc
+
+const statusEl=document.getElementById('status'), treeEl=document.getElementById('tree');
+const setStatus=s=>statusEl.textContent=s;
+
+const docBaseEl = document.getElementById('docBase');
+const docTransEl = document.getElementById('docTrans');
+
+function debounce(fn, ms=100){ let t=0; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+function normalizeText(s){ return String(s||'').replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim(); }
+
+/* ===== slugify ===== */
+function slugify(s){
+  return String(s||'')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-zA-Z0-9]+/g,'_')
+    .replace(/^_+|_+$/g,'')
+    .toLowerCase();
+}
+
+/* ===== Style map detection ===== */
+function levelFromStyleHint(str){
+  if(!str) return 0; const s=String(str).trim().toLowerCase();
+  const ps=[/heading\s*([1-9])/,/überschrift\s*([1-9])/,/titre\s*([1-9])/,/t[ií]tulo\s*([1-9])/,/encabezado\s*([1-9])/,/rubrik\s*([1-9])/,/zagolovok\s*([1-9])/,/заголовок\s*([1-9])/];
+  for(const re of ps){ const m=s.match(re); if(m) return +m[1]; }
+  const m2=s.match(/^heading([1-9])$/i); return m2?+m2[1]:0;
+}
+async function buildStyleMap(zip){
+  const f=zip.file('word/styles.xml'); if(!f) return {};
+  const xml=new DOMParser().parseFromString(await f.async('string'),"application/xml");
+  const byId={}, styles=xml.getElementsByTagNameNS(W_NS,'style');
+  for(let i=0;i<styles.length;i++){
+    const st=styles[i]; if((st.getAttributeNS(W_NS,'type')||st.getAttribute('w:type'))!=='paragraph') continue;
+    const id=st.getAttributeNS(W_NS,'styleId')||st.getAttribute('w:styleId')||''; if(!id) continue;
+    const nameEl=st.getElementsByTagNameNS(W_NS,'name')[0];
+    const name=nameEl?(nameEl.getAttributeNS(W_NS,'val')||nameEl.getAttribute('w:val')||''):'';
+    const basedEl=st.getElementsByTagNameNS(W_NS,'basedOn')[0];
+    const basedOn=basedEl?((basedEl.getAttributeNS && basedEl.getAttributeNS(W_NS,'val'))||(basedEl.getAttribute && basedEl.getAttribute('w:val'))||''):'';
+    let lvl=0; const pPr=st.getElementsByTagNameNS(W_NS,'pPr')[0];
+    if(pPr){
+      const ol=pPr.getElementsByTagNameNS(W_NS,'outlineLvl')[0];
+      if(ol){
+        const v=ol.getAttributeNS(W_NS,'val')||ol.getAttribute('w:val');
+        if(v!=null&&v!==''){ const n=+v; if(Number.isFinite(n)) lvl=Math.max(1,Math.min(9,n+1)); }
+      }
+    }
+    if(!lvl) lvl=levelFromStyleHint(id)||levelFromStyleHint(name)||0;
+    byId[id]={basedOn, rawLevel:lvl};
+  }
+  const res={}, resolve=(id,d=0)=>{
+    if(!id||!byId[id]||d>12) return 0;
+    if(res[id]!=null) return res[id];
+    const info=byId[id];
+    if(info.rawLevel){ res[id]=info.rawLevel; return res[id]; }
+    return res[id]=resolve(info.basedOn, d+1)||0;
+  };
+  Object.keys(byId).forEach(id=>resolve(id));
+  return res;
+}
+
+/* ===== Paragraph utils ===== */
+function textOfPara(p){
+  const ts=p.getElementsByTagNameNS(W_NS,'t'); let s='';
+  for(let i=0;i<ts.length;i++) s+=ts[i].textContent;
+  return normalizeText(s);
+}
+function detectHeadingLevel(p){
+  const pPr=p.getElementsByTagNameNS(W_NS,'pPr')[0];
+  if(pPr){
+    const ol=pPr.getElementsByTagNameNS(W_NS,'outlineLvl')[0];
+    if(ol){
+      const v=ol.getAttributeNS(W_NS,'val')||ol.getAttribute('w:val');
+      if(v!=null&&v!==''){ const n=+v; if(Number.isFinite(n)) return Math.max(1,Math.min(9,n+1)); }
+    }
+    const pStyle=pPr.getElementsByTagNameNS(W_NS,'pStyle')[0];
+    if(pStyle){
+      const id=pStyle.getAttributeNS(W_NS,'val')||pStyle.getAttribute('w:val')||'';
+      const lvl=styleMap?.[id];
+      if(lvl) return lvl;
+    }
+  }
+  return 0;
+}
+function stripLeadingNumber(s){
+  return String(s||'').replace(/^[\s\t\u00A0]*\d+(?:[.\u00A0 \t]+\d+)*[.\u00A0 \t]*/,'').trim();
+}
+
+/* ===== Baseline sections & tree ===== */
+function collectAllParagraphsBase(){
+  allParasBase = Array.from(baseDoc.getElementsByTagNameNS(W_NS,'p'));
+
+  // NEW: index map for base paragraphs
+  baseParaIndex = new WeakMap();
+  for(let i=0;i<allParasBase.length;i++) baseParaIndex.set(allParasBase[i], i);
+}
+
+/* NEW: table meta so we only remove tables impacted by removal ranges */
+function buildBaseTableMeta(){
+  baseTableMeta = [];
+  const tbls = Array.from(baseDoc.getElementsByTagNameNS(W_NS,'tbl'));
+  for(let ord=0; ord<tbls.length; ord++){
+    const tbl = tbls[ord];
+    const ps = Array.from(tbl.getElementsByTagNameNS(W_NS,'p'));
+    let pMin = Infinity, pMax = -Infinity;
+    for(const p of ps){
+      const idx = baseParaIndex.get(p);
+      if(idx == null) continue;
+      if(idx < pMin) pMin = idx;
+      if(idx > pMax) pMax = idx;
+    }
+    // if table has no paragraphs (rare), treat as no range
+    if(!Number.isFinite(pMin) || pMax < 0){
+      baseTableMeta.push({ ord, pMin: null, pMax: null });
+    } else {
+      baseTableMeta.push({ ord, pMin, pMax });
+    }
+  }
+}
+
+function computeSectionsFromBase(){
+  headingsFlat=[];
+  for(let i=0;i<allParasBase.length;i++){
+    const p=allParasBase[i], lvl=detectHeadingLevel(p); if(!lvl) continue;
+    const t=textOfPara(p); if(!t) continue;
+    headingsFlat.push({
+      id:`sec_${i.toString().padStart(6,'0')}`,
+      pIdx:i, level:lvl, title:t,
+      normTitle:stripLeadingNumber(t),
+      start:i, end:allParasBase.length
+    });
+  }
+  for(let i=0;i<headingsFlat.length;i++){
+    const cur=headingsFlat[i]; let end=allParasBase.length;
+    for(let j=i+1;j<headingsFlat.length;j++){
+      if(headingsFlat[j].level<=cur.level){ end=headingsFlat[j].pIdx; break; }
+    }
+    cur.end=end;
+  }
+}
+function buildTree(){
+  treeRoot=[]; const st=[];
+  for(const h of headingsFlat){
+    const n={...h, children:[], selected:false, num:""};
+    while(st.length && st[st.length-1].level>=n.level) st.pop();
+    if(!st.length) treeRoot.push(n); else st[st.length-1].children.push(n);
+    st.push(n);
+  }
+}
+function renumberTree(root){
+  const c=Array(10).fill(0);
+  (function walk(list){
+    for(const n of list){
+      c[n.level]++; for(let k=n.level+1;k<10;k++) c[k]=0;
+      n.num=Array.from({length:n.level},(_,i)=>String(c[i+1])).join('.');
+      if(n.children?.length) walk(n.children);
+    }
+  })(root);
+}
+function renderTree(){
+  renumberTree(treeRoot);
+  treeEl.innerHTML=''; const top=document.createElement('ul');
+
+  const onAnyChange = ()=> updatePreview();
+
+  function mk(list){
+    const ul=document.createElement('ul');
+    for(const n of list){
+      const li=document.createElement('li');
+      const row=document.createElement('div'); row.className=`node lvl-${Math.min(n.level,6)}`;
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=n.selected;
+      cb.addEventListener('change',()=>{
+        n.selected=cb.checked;
+        if(n.children) markChildren(n.children, cb.checked);
+        onAnyChange();
+      });
+      const num=document.createElement('span'); num.className='num'; num.textContent=n.num;
+      const title=document.createElement('span'); title.className='title'; title.textContent=n.title;
+      const badge=document.createElement('span'); badge.className='badge'; badge.textContent=`H${n.level}`;
+      row.append(cb,num,title,badge); li.appendChild(row);
+      if(n.children?.length) li.appendChild(mk(n.children));
+      ul.appendChild(li);
+    }
+    return ul;
+  }
+  function markChildren(list,val){ for(const x of list){ x.selected=val; if(x.children) markChildren(x.children,val); } }
+  top.appendChild(mk(treeRoot)); treeEl.appendChild(top);
+}
+
+/* ===== Selection helpers ===== */
+function getSelectionFromTree(){
+  const ids=[];
+  (function walk(list){ for(const n of list){ if(n.selected) ids.push(n.id); if(n.children) walk(n.children); } })(treeRoot);
+  return ids;
+}
+
+/* ===== Baseline/Index ===== */
+async function ensureBaselineAndIndex(){
+  if(!zip.file(BASE_PATH)){
+    const docText = await zip.file('word/document.xml').async('string');
+    zip.file(BASE_PATH, docText);
+    zip.file(META_PATH, JSON.stringify({ version:1, baselineCreated: new Date().toISOString() }, null, 2));
+  }
+  if(!zip.file(INDEX_PATH)){
+    const baseText = await zip.file(BASE_PATH).async('string');
+    baseDoc = new DOMParser().parseFromString(baseText,"application/xml");
+    collectAllParagraphsBase();
+    computeSectionsFromBase();
+    buildBaseTableMeta();
+    const idx = {version:1, sections: headingsFlat.map(h=>({id:h.id,start:h.start,end:h.end,level:h.level,title:h.title}))};
+    zip.file(INDEX_PATH, JSON.stringify(idx, null, 2));
+  }
+}
+async function loadBaselineAndIndex(){
+  const baseText = await zip.file(BASE_PATH).async('string');
+  baseDoc = new DOMParser().parseFromString(baseText,"application/xml");
+  collectAllParagraphsBase();
+  computeSectionsFromBase();
+  buildBaseTableMeta();
+}
+
+/* ===== Cleanup helpers ===== */
+function hasAnyText(node){
+  const ts = node.getElementsByTagNameNS(W_NS,'t');
+  for(let i=0;i<ts.length;i++){ if((normalizeText(ts[i].textContent)||'')!=='') return true; }
+  return false;
+}
+function paragraphHasNontrivialContent(p){
+  if(p.getElementsByTagNameNS(W_NS,'fldSimple').length) return true;
+  if(p.getElementsByTagNameNS(W_NS,'drawing').length) return true;
+  if(p.getElementsByTagNameNS(W_NS,'object').length) return true;
+  if(p.getElementsByTagNameNS(W_NS,'pict').length) return true;
+  return hasAnyText(p);
+}
+function isEmptyParagraph(p){
+  if(p.namespaceURI!==W_NS || p.localName!=='p') return false;
+  if (paragraphHasNontrivialContent(p)) return false;
+  return true;
+}
+function pruneEmptySDTs(doc){
+  const sdts = Array.from(doc.getElementsByTagNameNS(W_NS,'sdt'));
+  for(const sdt of sdts){
+    if(sdt.getElementsByTagNameNS(W_NS,'tbl').length>0) continue;
+    const ps = sdt.getElementsByTagNameNS(W_NS,'p');
+    let hasMeaning=false;
+    for(let i=0;i<ps.length;i++){
+      if(paragraphHasNontrivialContent(ps[i])){ hasMeaning=true; break; }
+    }
+    if(!hasMeaning && sdt.parentNode) sdt.parentNode.removeChild(sdt);
+  }
+}
+
+/* NEW: determine if a table is effectively empty */
+function tableHasNontrivialContent(tbl){
+  // Anything meaningful inside table?
+  if(tbl.getElementsByTagNameNS(W_NS,'drawing').length) return true;
+  if(tbl.getElementsByTagNameNS(W_NS,'object').length) return true;
+  if(tbl.getElementsByTagNameNS(W_NS,'pict').length) return true;
+  if(tbl.getElementsByTagNameNS(W_NS,'fldSimple').length) return true;
+
+  const ps = tbl.getElementsByTagNameNS(W_NS,'p');
+  for(let i=0;i<ps.length;i++){
+    if(paragraphHasNontrivialContent(ps[i])) return true;
+  }
+  // also catch stray text nodes in weird places
+  const ts = tbl.getElementsByTagNameNS(W_NS,'t');
+  for(let i=0;i<ts.length;i++){
+    if((normalizeText(ts[i].textContent)||'')!=='') return true;
+  }
+  return false;
+}
+
+/* NEW: remove empty table skeletons only if the table was impacted by removals */
+function pruneEmptyTables(doc, impactedTableOrdSet){
+  const tbls = Array.from(doc.getElementsByTagNameNS(W_NS,'tbl'));
+  for(let ord=0; ord<tbls.length; ord++){
+    const tbl = tbls[ord];
+    if(impactedTableOrdSet && !impactedTableOrdSet.has(ord)) continue;
+    if(!tableHasNontrivialContent(tbl)){
+      if(tbl.parentNode) tbl.parentNode.removeChild(tbl);
+    }
+  }
+}
+
+function compactWhitespace(doc){
+  const body = doc.getElementsByTagNameNS(W_NS,'body')[0] || doc.documentElement;
+  let n = body.firstChild;
+  while(n){
+    const next = n.nextSibling;
+    if(n.namespaceURI===W_NS && n.localName==='p'){
+      if(isEmptyParagraph(n)){ body.removeChild(n); }
+    }
+    n = next;
+  }
+}
+
+/* ===== Transform – REMOVE (document-order safe) ===== */
+function rangesOverlap(a0,a1,b0,b1){
+  return a0 < b1 && b0 < a1;
+}
+function computeRemovedRanges(selectedIdsSet){
+  return headingsFlat
+    .filter(h => selectedIdsSet.has(h.id))
+    .map(h => ({ start:h.start, end:h.end }))
+    .sort((a,b)=>a.start-b.start);
+}
+function computeImpactedTableOrds(removedRanges){
+  const impacted = new Set();
+  if(!removedRanges?.length) return impacted;
+  for(const tm of baseTableMeta){
+    if(tm.pMin == null || tm.pMax == null) continue;
+    // table range in paragraph indices: [pMin, pMax+1)
+    const t0 = tm.pMin, t1 = tm.pMax + 1;
+    for(const r of removedRanges){
+      if(rangesOverlap(t0,t1,r.start,r.end)){ impacted.add(tm.ord); break; }
+    }
+  }
+  return impacted;
+}
+
+function transformRemoveFromBase(selectedIdsSet){
+  const d = new DOMParser().parseFromString(new XMLSerializer().serializeToString(baseDoc), "application/xml");
+
+  const removedRanges = computeRemovedRanges(selectedIdsSet);
+  const impactedTableOrds = computeImpactedTableOrds(removedRanges);
+
+  function paragraphList(){ return Array.from(d.getElementsByTagNameNS(W_NS,'p')); }
+
+  // Remove by paragraph indices from the base-based ranges
+  const work = removedRanges.slice().sort((a,b)=>b.start-a.start);
+  for(const { start, end } of work){
+    let paras = paragraphList();
+    if(start < 0 || start >= paras.length) continue;
+    const e = Math.min(end, paras.length);
+    for(let i = e - 1; i >= start; i--){
+      const p = paras[i];
+      if(p && p.parentNode) p.parentNode.removeChild(p);
+    }
+  }
+
+  pruneEmptySDTs(d);
+  pruneEmptyTables(d, impactedTableOrds);  // <<< FIX: remove empty skeleton tables (only if impacted)
+  compactWhitespace(d);
+
+  return d;
+}
+
+/* ===== TOC ===== */
+function findAncestor(node, names){ const set=new Set(names); let n=node; while(n){ if(n.namespaceURI===W_NS && set.has(n.localName)) return n; n=n.parentNode; } return null; }
+function nextNodeInDocOrder(node, root){
+  if(!node) return null;
+  if(node.firstChild) return node.firstChild;
+  while(node && node!==root){ if(node.nextSibling) return node.nextSibling; node=node.parentNode; }
+  return null;
+}
+function nextAfter(node, root){ if(!node) return null; if(node.nextSibling) return node.nextSibling; let p=node.parentNode; while(p && p!==root){ if(p.nextSibling) return p.nextSibling; p=p.parentNode; } return null; }
+function findAllTOCRanges(docx){
+  const ranges=[]; const body=docx.getElementsByTagNameNS(W_NS,'body')[0]||docx.documentElement;
+  const fldChars=Array.from(docx.getElementsByTagNameNS(W_NS,'fldChar'));
+  for(const begin of fldChars){
+    if(begin.getAttributeNS(W_NS,'val')!=='begin') continue;
+    let cur=begin, instr='', hasTOC=false, separate=null, end=null;
+    while(cur){ cur=nextNodeInDocOrder(cur,body); if(!cur) break;
+      if(cur.namespaceURI===W_NS && cur.localName==='instrText'){ instr+=cur.textContent||''; const u=normalizeText(instr).toUpperCase(); if(u.includes(' TOC ')||u.startsWith('TOC ')||u.includes('TOC\\')||u.includes('TOC "')) hasTOC=true; }
+      if(cur.namespaceURI===W_NS && cur.localName==='fldChar'){ const t=cur.getAttributeNS(W_NS,'val'); if(t==='separate') separate=cur; if(t==='end'){ end=cur; break; } }
+    }
+    if(hasTOC && separate && end) ranges.push({begin,separate,end,instr});
+  }
+  return ranges;
+}
+function rebuildTOCs(docx){
+  const body=docx.getElementsByTagNameNS(W_NS,'body')[0]||docx.documentElement;
+  for(const rg of findAllTOCRanges(docx)){
+    const switches=(rg.instr && rg.instr.match(/TOC[\s\S]*$/i)?.[0]) || `TOC \\o "1-3" \\h \\z \\u`;
+    const sdt=findAncestor(rg.begin,['sdt']);
+    const container=sdt || findAncestor(rg.begin,['p']); if(!container||!container.parentNode) continue;
+    const p=docx.createElementNS(W_NS,'w:p');
+    const fldSimple=docx.createElementNS(W_NS,'w:fldSimple'); fldSimple.setAttributeNS(W_NS,'w:instr',switches);
+    const r=docx.createElementNS(W_NS,'w:r'); const t=docx.createElementNS(W_NS,'w:t'); t.textContent=''; r.appendChild(t); fldSimple.appendChild(r); p.appendChild(fldSimple);
+    container.parentNode.insertBefore(p, container); container.parentNode.removeChild(container);
+    if(!sdt){
+      let cur=nextAfter(rg.separate, body);
+      while(cur && cur!==rg.end){ const nxt=nextAfter(cur, body); if(cur.parentNode) cur.parentNode.removeChild(cur); cur=nxt; }
+    }
+  }
+}
+
+/* ===== Export helper ===== */
+async function exportFromDoc(newDoc){
+  if(!settingsDoc){
+    const s = zip.file('word/settings.xml');
+    settingsDoc = s
+      ? new DOMParser().parseFromString(await s.async('string'), "application/xml")
+      : new DOMParser().parseFromString(`<w:settings xmlns:w="${W_NS}"/>`, "application/xml");
+  }
+  {
+    const root = settingsDoc.documentElement;
+    let upd = root.getElementsByTagNameNS(W_NS,'updateFields')[0];
+    if(!upd){ upd = settingsDoc.createElementNS(W_NS,'w:updateFields'); root.appendChild(upd); }
+    upd.setAttributeNS(W_NS,'w:val','true');
+  }
+
+  const selectedIds = getSelectionFromTree();
+  const selectionJson = JSON.stringify({version:1, removedIds:selectedIds}, null, 2);
+  const meta = zip.file(META_PATH) ? JSON.parse(await zip.file(META_PATH).async('string')) : {version:1};
+  meta.lastExport = new Date().toISOString();
+  zip.file(META_PATH, JSON.stringify(meta, null, 2));
+
+  if(!zip.file(BASE_PATH)){
+    const original = await zip.file('word/document.xml').async('string');
+    zip.file(BASE_PATH, original);
+  }
+
+  if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+  pruneEmptySDTs(newDoc);
+  // NOTE: table pruning already happens in transformRemoveFromBase() with correct impacted-set.
+  compactWhitespace(newDoc);
+
+  const out = new JSZip();
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    if (name === 'word/document.xml' || name === 'word/settings.xml' || name === SEL_PATH) continue;
+    out.file(name, await zip.file(name).async('arraybuffer'));
+  }
+  out.file('word/document.xml', new XMLSerializer().serializeToString(newDoc));
+  out.file('word/settings.xml', new XMLSerializer().serializeToString(settingsDoc));
+  out.file(SEL_PATH, selectionJson);
+
+  const blob = await out.generateAsync({ type:'blob' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${fileNameBase}-removed.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ===== Restore helper ===== */
+async function exportRestoredOriginal(){
+  if(!zip.file(BASE_PATH)){ alert('Kein eingebettetes Backup gefunden (customXml/originalDocument.xml).'); return; }
+  const originalXml = await zip.file(BASE_PATH).async('string');
+
+  const out = new JSZip();
+  for (const [name, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    if (name === 'word/document.xml') continue;
+    out.file(name, await zip.file(name).async('arraybuffer'));
+  }
+  out.file('word/document.xml', originalXml);
+
+  const blob = await out.generateAsync({ type:'blob' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${fileNameBase}-restored.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ===== Minimal DOCX -> HTML preview ===== */
+function esc(s){ return s.replace(/[&<>]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+
+/* Important: preview indices must match headingsFlat indices => iterate paragraph list directly */
+function renderDocxToHtml(doc, options={}){
+  const { annotateMask=null } = options;
+  const paras = Array.from(doc.getElementsByTagNameNS(W_NS,'p'));
+  let html = '';
+
+  function textOf(node){
+    const ts = node.getElementsByTagNameNS(W_NS,'t');
+    let t=''; for(let i=0;i<ts.length;i++) t+=ts[i].textContent;
+    return normalizeText(t);
+  }
+
+  for(let pIndex=0; pIndex<paras.length; pIndex++){
+    const p = paras[pIndex];
+    const lvl = detectHeadingLevel(p);
+    const t = textOf(p);
+    if(!t) continue;
+
+    const cls = (annotateMask && annotateMask.has(pIndex)) ? 'removed' : '';
+    const h = Math.min(Math.max(lvl||0,0),6);
+
+    if(lvl && h>=1) html += `<h${h} class="${cls}">${esc(t)}</h${h}>`;
+    else html += `<p class="${cls}">${esc(t)}</p>`;
+  }
+
+  return html || `<p class="muted">Keine darstellbaren Inhalte gefunden.</p>`;
+}
+
+/* ===== Build baseline highlight mask ===== */
+function buildAnnotationMask(selectedIdsSet){
+  const mask = new Set();
+  for(const h of headingsFlat){
+    if(!selectedIdsSet.has(h.id)) continue;
+    for(let i=h.start;i<h.end;i++) mask.add(i);
+  }
+  return mask;
+}
+
+/* ===== Rule evaluation for CRONOS_PAYLOAD heading rules ===== */
+function getPayloadValue(payload, fid){
+  if(!payload || typeof payload !== 'object') return undefined;
+  const vals = payload.values;
+  if(!vals || typeof vals !== 'object') return undefined;
+  return vals[fid];
+}
+
+function evalRuleCondition(payload, rule){
+  const fieldId = String(rule?.fieldId || '');
+  const op = String(rule?.op || 'equals').toLowerCase();
+  const wantArr = Array.isArray(rule?.values) ? rule.values : [rule?.value];
+  const want = wantArr[0];
+
+  const m = fieldId.match(/^(.*)__opt__(.+)$/i);
+  if(m){
+    const base = String(m[1] || '').trim();
+    const optSlug = String(m[2] || '').trim().toLowerCase();
+
+    const v = getPayloadValue(payload, base);
+    const selected = Array.isArray(v) ? v.map(String) : (v != null && v !== '' ? [String(v)] : []);
+    const isOn = selected.some(x => slugify(x) === optSlug);
+
+    if(op === 'equals') return Boolean(isOn) === Boolean(want);
+    if(op === 'not_equals') return Boolean(isOn) !== Boolean(want);
+    if(op === 'includes') return Boolean(isOn) === true;
+    return Boolean(isOn) === Boolean(want);
+  }
+
+  const v = getPayloadValue(payload, fieldId);
+
+  if(op === 'equals') return String(v) === String(want);
+  if(op === 'not_equals') return String(v) !== String(want);
+
+  if(op === 'includes'){
+    if(Array.isArray(v)) return v.map(String).includes(String(want));
+    return String(v || '').includes(String(want));
+  }
+
+  return String(v) === String(want);
+}
+
+function resolveHeadingTargetsToIds(payload, rule){
+  const ids = new Set();
+  const targets = Array.isArray(rule?.targets) ? rule.targets : [];
+
+  for(const t of targets){
+    const idx = Number.isFinite(+t?.idx) ? (+t.idx) : null;
+    if(idx != null && idx >= 0 && idx < headingsFlat.length){
+      ids.add(headingsFlat[idx].id);
+      continue;
+    }
+
+    const label = stripLeadingNumber(String(t?.label || '')).trim();
+    if(label){
+      const needle = normalizeText(label);
+      const found = headingsFlat.find(h => normalizeText(stripLeadingNumber(h.title)) === needle);
+      if(found) ids.add(found.id);
+    }
+  }
+  return ids;
+}
+
+function applyPayloadToSelection(payload){
+  if(!payload || typeof payload !== 'object') return { applied:false, reason:'no payload' };
+  if(!headingsFlat.length || !treeRoot.length) return { applied:false, reason:'no headings' };
+
+  const rules = Array.isArray(payload.rules) ? payload.rules : [];
+  let matchedRules = 0;
+  let removedIds = new Set();
+
+  for(const r of rules){
+    const action = String(r?.action || '').toUpperCase();
+    if(action !== 'HIDE' && action !== 'REMOVE') continue;
+
+    const ok = evalRuleCondition(payload, r);
+    if(!ok) continue;
+
+    matchedRules++;
+    const ids = resolveHeadingTargetsToIds(payload, r);
+    ids.forEach(id => removedIds.add(id));
+  }
+
+  (function walk(list){
+    for(const n of list){
+      n.selected = removedIds.has(n.id);
+      if(n.children) walk(n.children);
+    }
+  })(treeRoot);
+
+  return { applied:true, matchedRules, removedCount: removedIds.size, removedIds: Array.from(removedIds) };
+}
+
+/* ===== Live preview ===== */
+const updatePreview = debounce(()=>{
+  if(!baseDoc) return;
+  const selectedIds = new Set(getSelectionFromTree());
+
+  const mask = buildAnnotationMask(selectedIds);
+  docBaseEl.innerHTML = renderDocxToHtml(baseDoc, { annotateMask: mask });
+
+  let newDoc = transformRemoveFromBase(selectedIds);
+  if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+  pruneEmptySDTs(newDoc);
+  compactWhitespace(newDoc);
+
+  docTransEl.innerHTML = renderDocxToHtml(newDoc, { });
+}, 60);
+
+/* ===== UI wiring ===== */
+document.getElementById('btnLoad').addEventListener('click', async ()=>{
+  const f=document.getElementById('fileInput').files?.[0]; if(!f){ alert('Bitte .docx wählen'); return; }
+  fileNameBase=f.name.replace(/\.docx$/i,'')||'document';
+  setStatus('Lade DOCX …');
+  zip=await JSZip.loadAsync(f);
+  styleMap=await buildStyleMap(zip);
+
+  activeDoc=new DOMParser().parseFromString(await zip.file('word/document.xml').async('string'),"application/xml");
+  const s=zip.file('word/settings.xml');
+  settingsDoc=s?new DOMParser().parseFromString(await s.async('string'),"application/xml"):null;
+
+  await ensureBaselineAndIndex();
+  await loadBaselineAndIndex();
+
+  buildTree();
+  renderTree();
+
+  document.getElementById('btnExport').disabled = headingsFlat.length===0;
+  document.getElementById('btnRestore').disabled = !zip.file(BASE_PATH);
+
+  setStatus(`Baseline ✓  • Überschriften: ${headingsFlat.length}`);
+
+  tryApplyPayloadFromTextarea({ silent: true });
+  updatePreview();
+});
+
+document.getElementById('btnSelectAll').addEventListener('click', ()=>{
+  (function mark(list){ for(const n of list){ n.selected=true; if(n.children) mark(n.children);} })(treeRoot);
+  renderTree(); updatePreview();
+});
+document.getElementById('btnClearAll').addEventListener('click', ()=>{
+  (function mark(list){ for(const n of list){ n.selected=false; if(n.children) mark(n.children);} })(treeRoot);
+  renderTree(); updatePreview();
+});
+
+document.getElementById('chkRebuildToc').addEventListener('change', ()=> updatePreview());
+
+document.getElementById('btnExport').addEventListener('click', async ()=>{
+  if(!baseDoc){ alert('Bitte zuerst laden.'); return; }
+  const idsSet = new Set(getSelectionFromTree());
+  let newDoc = transformRemoveFromBase(idsSet);
+  if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+  pruneEmptySDTs(newDoc);
+  compactWhitespace(newDoc);
+  await exportFromDoc(newDoc);
+  setStatus('Entfernen exportiert. Auswahl gespeichert (customXml/selection.json).');
+});
+
+document.getElementById('btnRestore').addEventListener('click', async ()=>{
+  await exportRestoredOriginal();
+  setStatus('Wiederhergestellt: Original aus eingebettetem Backup exportiert.');
+});
+
+/* ===== Payload UI ===== */
+function parsePayloadFromTextarea(){
+  const raw = String(document.getElementById('payloadInput').value || '').trim();
+  if(!raw) return null;
+  const i = raw.indexOf('{');
+  const j = raw.lastIndexOf('}');
+  const jsonText = (i >= 0 && j > i) ? raw.slice(i, j+1) : raw;
+  return JSON.parse(jsonText);
+}
+
+function tryApplyPayloadFromTextarea({ silent=false } = {}){
+  if(!baseDoc || !headingsFlat.length) { if(!silent) alert('Bitte zuerst DOCX laden.'); return; }
+
+  let payload = null;
+  try { payload = parsePayloadFromTextarea(); }
+  catch(e){ if(!silent) alert('Payload ist kein gültiges JSON.'); return; }
+
+  lastPayload = payload;
+
+  const res = applyPayloadToSelection(payload);
+
+  renderTree();
+  updatePreview();
+
+  if(!silent){
+    setStatus(
+      `Payload angewendet:\n`+
+      `- Regeln gesamt: ${(Array.isArray(payload.rules)?payload.rules.length:0)}\n`+
+      `- Matching Regeln (TRUE): ${res.matchedRules || 0}\n`+
+      `- Entfernte Sektionen: ${res.removedCount || 0}\n`+
+      (res.removedCount ? `- Entfernte IDs: ${res.removedIds.join(', ')}` : '')
+    );
+  } else {
+    if(res?.removedCount){
+      setStatus(`Baseline ✓  • Überschriften: ${headingsFlat.length}\nPayload-Regeln angewendet → Entfernt: ${res.removedCount}`);
+    }
+  }
+}
+
+document.getElementById('btnApplyPayload').addEventListener('click', ()=> tryApplyPayloadFromTextarea({ silent:false }));
+document.getElementById('btnClearPayload').addEventListener('click', ()=>{
+  document.getElementById('payloadInput').value='';
+  lastPayload=null;
+  setStatus('Payload-Feld geleert.');
+});
+
+/* ===== Small CSS for removed in preview ===== */
+(function injectRemovedStyle(){
+  const st=document.createElement('style');
+  st.textContent = `
+    .doc .removed{
+      background: var(--removed-bg);
+      border-left-color: #ef4444 !important;
+      text-decoration: line-through;
+    }
+  `;
+  document.head.appendChild(st);
+})();
+</script>
+</body>
+</html>
