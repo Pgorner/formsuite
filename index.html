@@ -97,6 +97,15 @@
     <section class="panel">
       <div id="formMount"></div>
     </section>
+
+
+    <section class="panel">
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <span class="muted" style="margin-right:auto;">Export: nutzt aktives DOCX + aktuelles CRONOS_PAYLOAD</span>
+        <button id="btnExport" class="primary">Export</button>
+      </div>
+    </section>
+
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
@@ -152,6 +161,7 @@
     formMount:  document.getElementById('formMount'),
     permNote:   document.getElementById('permNote'),
     btnRegrant: document.getElementById('btnRegrant'),
+    btnExport:  document.getElementById('btnExport'),
   };
   function setStatus(html) { els.docStatus.innerHTML = html; }
 
@@ -534,6 +544,86 @@
     if (p === 'granted') await refreshFromCanonical({ reason: 'regrant' });
     tr.end();
   });
+
+
+  // ============================================================
+  // Export (send CRONOS_PAYLOAD + active DOCX to workingrmvpayloadtest)
+  // ============================================================
+  const BC_EXPORT = 'fs-export-v1';
+  const LS_EXPORT_LAST = 'FS_EXPORT_LAST_V1';
+
+  async function buildCronosPayloadSnapshot() {
+    const docId = STATE.doc?.docId;
+    if (!docId) return null;
+
+    // ensure latest values are persisted
+    try { flushSaveNow(); } catch {}
+
+    const st = await P()?.loadState?.(docId);
+
+    const payload = {
+      version: 1,
+      docId,
+      name: STATE.doc?.name || st?.name || docId,
+      schema: st?.schema || STATE.schema || null,
+      values: (st?.values && typeof st.values === 'object') ? st.values : (STATE.values || {}),
+      // NOTE: workingrmvpayloadtest maps payload.rules (heading rules) => removal selection
+      rules: Array.isArray(st?.rules) ? st.rules : [],
+      fieldRules: Array.isArray(st?.fieldRules) ? st.fieldRules : (STATE.fieldRules || []),
+      tagMap: st?.tagMap || null,
+      meta: { exportedAt: new Date().toISOString() }
+    };
+
+    return payload;
+  }
+
+  async function openExportToolAndSend(payload) {
+    const tr = TRACE('openExportToolAndSend', { docId: payload?.docId });
+
+    // Open tool first (popup blockers require direct user gesture)
+    const w = window.open('workingrmvpayloadtest.html#auto', '_blank');
+    if (!w) {
+      alert('Popup blockiert: Bitte Popups erlauben oder workingrmvpayloadtest.html manuell öffnen.');
+      tr.end('popup-blocked');
+      return;
+    }
+
+    const msg = { t: 'export', docId: payload.docId, name: payload.name, payload };
+
+    // localStorage fallback (if BC is missed)
+    try { localStorage.setItem(LS_EXPORT_LAST, JSON.stringify({ ...msg, ts: Date.now() })); } catch {}
+
+    // BroadcastChannel primary
+    try {
+      const bc = new BroadcastChannel(BC_EXPORT);
+      bc.postMessage(msg);
+      // also retry shortly (gives new tab time to attach listener)
+      setTimeout(() => { try { bc.postMessage(msg); } catch {} }, 250);
+      setTimeout(() => { try { bc.postMessage(msg); } catch {} }, 900);
+      tr.end('sent');
+    } catch (e) {
+      tr.warn('BroadcastChannel failed', e);
+      tr.end('bc-failed');
+    }
+  }
+
+  els.btnExport?.addEventListener('click', async () => {
+    const tr = TRACE('btnExport click', { docId: STATE.doc?.docId });
+    try {
+      if (!STATE.doc?.docId) { alert('Kein aktives Dokument. Öffne zuerst ein DOCX im Extraktor.'); tr.end('no-doc'); return; }
+
+      const payload = await buildCronosPayloadSnapshot();
+      if (!payload) { alert('Konnte Payload nicht erstellen.'); tr.end('no-payload'); return; }
+
+      await openExportToolAndSend(payload);
+      tr.end('ok');
+    } catch (e) {
+      tr.error('failed', e);
+      alert('Export fehlgeschlagen (siehe Konsole).');
+      tr.end('error');
+    }
+  });
+
 
   // ============================================================
   // Canonical save (workspace only; stable identities; deterministic)

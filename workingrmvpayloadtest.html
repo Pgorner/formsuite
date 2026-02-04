@@ -47,6 +47,7 @@
   .note{font-size:12px;color:var(--muted)}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="persistence.js"></script>
 </head>
 <body>
 <header>
@@ -144,6 +145,114 @@ let settingsDoc=null;
 
 let allParasBase=[], headingsFlat=[], treeRoot=[];
 let lastPayload = null;
+
+/* ===== Canonical persistence bridge (auto-load from active doc) ===== */
+function P(){ return window.formSuitePersist; }
+const BC_EXPORT = 'fs-export-v1';
+const LS_EXPORT_LAST = 'FS_EXPORT_LAST_V1';
+
+async function loadDocxFromDocId(docId){
+  if(!docId) throw new Error('missing docId');
+
+  // Preferred: use the same FileSystemHandle the app already has for this doc
+  const h = await P()?.getHandle?.(docId);
+  if(h?.getFile){
+    // Try to ensure we have permission; requestPermission may fail without user gesture
+    try {
+      if(h.queryPermission){
+        const p = await h.queryPermission({ mode:'read' });
+        if(p !== 'granted' && h.requestPermission){
+          try { await h.requestPermission({ mode:'read' }); } catch {}
+        }
+      }
+    } catch {}
+    const f = await h.getFile();
+    const buf = await f.arrayBuffer();
+    await loadFromArrayBuffer(buf, f.name || 'document.docx');
+    return true;
+  }
+
+  throw new Error('No file handle available for this docId (manual load required).');
+}
+
+/* ===== Load pipeline for ArrayBuffer (same as file input) ===== */
+async function loadFromArrayBuffer(buf, name='document.docx'){
+  fileNameBase = String(name||'document').replace(/\.docx$/i,'') || 'document';
+  setStatus('Lade DOCX …');
+
+  zip = await JSZip.loadAsync(buf);
+  styleMap = await buildStyleMap(zip);
+
+  activeDoc = new DOMParser().parseFromString(await zip.file('word/document.xml').async('string'), "application/xml");
+  const s = zip.file('word/settings.xml');
+  settingsDoc = s ? new DOMParser().parseFromString(await s.async('string'), "application/xml") : null;
+
+  await ensureBaselineAndIndex();
+  await loadBaselineAndIndex();
+
+  buildTree();
+  renderTree();
+
+  document.getElementById('btnExport').disabled = headingsFlat.length===0;
+  document.getElementById('btnRestore').disabled = !zip.file(BASE_PATH);
+
+  setStatus(`Baseline ✓  • Überschriften: ${headingsFlat.length}`);
+
+  // apply payload if already present
+  tryApplyPayloadFromTextarea({ silent: true });
+  updatePreview();
+}
+
+/* ===== Auto receive export request ===== */
+function installExportReceiver(){
+  try{
+    const bc = new BroadcastChannel(BC_EXPORT);
+    bc.addEventListener('message', (ev)=>{
+      const msg = ev?.data || {};
+      if(msg?.t !== 'export') return;
+      handleIncomingExport(msg).catch(e=>{
+        console.error('[Rebuilder] auto export failed', e);
+        setStatus('Auto-Import fehlgeschlagen (siehe Konsole). Bitte DOCX manuell laden.');
+      });
+    });
+  } catch(e){
+    console.warn('[Rebuilder] BroadcastChannel unavailable', e);
+  }
+
+  // fallback: read last payload from localStorage once
+  try{
+    const raw = localStorage.getItem(LS_EXPORT_LAST);
+    if(raw){
+      const msg = JSON.parse(raw);
+      if(msg?.t === 'export') handleIncomingExport(msg).catch(()=>{});
+    }
+  } catch {}
+}
+
+async function handleIncomingExport(msg){
+  const docId = msg.docId;
+  const payload = msg.payload;
+
+  if(payload){
+    try { document.getElementById('payloadInput').value = JSON.stringify(payload, null, 2); } catch {}
+  }
+
+  if(docId){
+    try{
+      await loadDocxFromDocId(docId);
+      setStatus(`Auto-Import ✓  • DOCX geladen (${payload?.name || docId})`);
+    } catch(e){
+      console.warn('[Rebuilder] could not auto-load DOCX from docId', e);
+      setStatus('Payload übernommen. Bitte DOCX manuell laden (kein Zugriff auf Datei-Handle).');
+    }
+  } else {
+    setStatus('Payload übernommen. Bitte DOCX manuell laden.');
+  }
+}
+
+installExportReceiver();
+
+
 
 /* NEW: maps + table meta so we only remove tables that were impacted by removals */
 let baseParaIndex = null;        // WeakMap(w:p -> global index)
@@ -763,28 +872,7 @@ const updatePreview = debounce(()=>{
 /* ===== UI wiring ===== */
 document.getElementById('btnLoad').addEventListener('click', async ()=>{
   const f=document.getElementById('fileInput').files?.[0]; if(!f){ alert('Bitte .docx wählen'); return; }
-  fileNameBase=f.name.replace(/\.docx$/i,'')||'document';
-  setStatus('Lade DOCX …');
-  zip=await JSZip.loadAsync(f);
-  styleMap=await buildStyleMap(zip);
-
-  activeDoc=new DOMParser().parseFromString(await zip.file('word/document.xml').async('string'),"application/xml");
-  const s=zip.file('word/settings.xml');
-  settingsDoc=s?new DOMParser().parseFromString(await s.async('string'),"application/xml"):null;
-
-  await ensureBaselineAndIndex();
-  await loadBaselineAndIndex();
-
-  buildTree();
-  renderTree();
-
-  document.getElementById('btnExport').disabled = headingsFlat.length===0;
-  document.getElementById('btnRestore').disabled = !zip.file(BASE_PATH);
-
-  setStatus(`Baseline ✓  • Überschriften: ${headingsFlat.length}`);
-
-  tryApplyPayloadFromTextarea({ silent: true });
-  updatePreview();
+  await loadFromArrayBuffer(await f.arrayBuffer(), f.name);
 });
 
 document.getElementById('btnSelectAll').addEventListener('click', ()=>{
