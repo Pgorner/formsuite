@@ -881,15 +881,38 @@ function isEmptyParagraph(p){
 }
 function pruneEmptySDTs(doc){
   const sdts = Array.from(doc.getElementsByTagNameNS(W_NS,'sdt'));
+  let removed = 0;
+
   for(const sdt of sdts){
+    // Never remove SDTs that contain tables; table cleanup is handled elsewhere.
     if(sdt.getElementsByTagNameNS(W_NS,'tbl').length>0) continue;
+
+    // If there is ANY visible text anywhere in the SDT, it is not empty.
+    // (Many SDTs contain runs directly without wrapping paragraphs.)
+    if(hasAnyText(sdt)) continue;
+
+    // Keep SDTs that contain non-text visible content.
+    if(sdt.getElementsByTagNameNS(W_NS,'fldSimple').length) continue;
+    if(sdt.getElementsByTagNameNS(W_NS,'drawing').length) continue;
+    if(sdt.getElementsByTagNameNS(W_NS,'object').length) continue;
+    if(sdt.getElementsByTagNameNS(W_NS,'pict').length) continue;
+
+    // Paragraph-based meaning check (extra safeguard)
     const ps = sdt.getElementsByTagNameNS(W_NS,'p');
-    let hasMeaning=false;
+    let hasMeaning = false;
     for(let i=0;i<ps.length;i++){
       if(paragraphHasNontrivialContent(ps[i])){ hasMeaning=true; break; }
     }
-    if(!hasMeaning && sdt.parentNode) sdt.parentNode.removeChild(sdt);
+    if(hasMeaning) continue;
+
+    if(sdt.parentNode){
+      sdt.parentNode.removeChild(sdt);
+      removed++;
+    }
   }
+
+  // Always-on log to catch "cleanup nuked my content" issues.
+  try{ console.log('[FSDBG][pruneEmptySDTs] removed', removed, 'of', sdts.length); }catch{}
 }
 
 /* NEW: determine if a table is effectively empty */
@@ -1264,13 +1287,33 @@ const updatePreview = debounce(()=>{
   if(!baseDoc) return;
   const selectedIds = new Set(getSelectionFromTree());
 
+  // Baseline preview: show baseline with removal annotations, but keep full text.
   const mask = buildAnnotationMask(selectedIds);
   docBaseEl.innerHTML = renderDocxToHtml(baseDoc, { annotateMask: mask });
 
+  // Export preview: reflect the ACTUAL export pipeline:
+  // 1) apply removals
+  // 2) rebuild TOC (optional)
+  // 3) apply tag replacements (payload)
+  // 4) prune empty SDTs after tag replacement
+  // 5) compact whitespace
   let newDoc = transformRemoveFromBase(selectedIds);
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
+
+  // Always apply payload the same way export does
+  applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true });
+
+  // Cleanup after replacement (never before)
   pruneEmptySDTs(newDoc);
   compactWhitespace(newDoc);
+
+  // Lightweight always-on diagnostics
+  try{
+    console.log('[FSDBG][preview] payload?', !!lastPayload,
+      'tagMap', (lastPayload?.tagMap ? Object.keys(lastPayload.tagMap).length : 0),
+      'values', (lastPayload?.values ? Object.keys(lastPayload.values).length : 0),
+      'removedIds', (selectedIds.size||0));
+  }catch{}
 
   docTransEl.innerHTML = renderDocxToHtml(newDoc, { });
 }, 60);
@@ -1294,11 +1337,15 @@ document.getElementById('chkRebuildToc').addEventListener('change', ()=> updateP
 
 document.getElementById('btnExport').addEventListener('click', async ()=>{
   if(!baseDoc){ alert('Bitte zuerst laden.'); return; }
+
   const idsSet = new Set(getSelectionFromTree());
   let newDoc = transformRemoveFromBase(idsSet);
+
+  // IMPORTANT (bulletproof): do NOT prune SDTs / whitespace here.
+  // Tag replacement happens inside exportFromDoc() and must run BEFORE pruning,
+  // otherwise SDT-bound placeholders (and even matched values) can get removed.
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
-  pruneEmptySDTs(newDoc);
-  compactWhitespace(newDoc);
+
   await exportFromDoc(newDoc);
   setStatus('Entfernen exportiert. Auswahl gespeichert (customXml/selection.json).');
 });
