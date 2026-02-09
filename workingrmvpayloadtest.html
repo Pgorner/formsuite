@@ -338,30 +338,38 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
 
   const __stats = {
     sdtTotal:0, sdtTokenResolved:0, sdtTokenUnresolved:0, sdtRemoved:0, sdtInserted:0,
-    mustacheHits:0, mustacheRunsTouched:0, mustacheReplaced:0, mustacheRemoved:0
+    mustacheHits:0, mustacheContainersTouched:0, mustacheContainersChanged:0, mustacheRemoved:0
   };
   const __unresolved = new Map(); // token -> count
   const __resolved = new Map();   // token -> {count, value}
   const recUnres = (tok)=>{ tok=String(tok||'').trim()||'(empty-token)'; __unresolved.set(tok, (__unresolved.get(tok)||0)+1); };
   const recRes = (tok, val)=>{ tok=String(tok||'').trim()||'(empty-token)'; const cur=__resolved.get(tok)||{count:0, value:val}; cur.count++; cur.value=val; __resolved.set(tok, cur); };
 
-  // IMPORTANT:
-  // Many Word placeholders are SDTs whose w:tag / w:alias is EMPTY, while the visible content contains {{ token }}.
-  // If we remove unresolved SDTs before mustache replacement, we delete the only place where {{token}} exists.
-  // Therefore: (1) replace {{...}} in *all* w:t first, (2) only then do SDT token-based replacement, and
-  // (3) never remove SDTs solely because their token is empty.
-  //
-  // After this, pruneEmptySDTs() can safely delete SDTs that are actually empty.
+  // ============================================================
+  // 1) Bulletproof mustache replacement across split runs:
+  //    Word often splits "{{ token }}" across multiple <w:t>.
+  //    We therefore operate per-paragraph: concatenate all descendant w:t,
+  //    replace globally, then write back into the first w:t and clear the rest.
+  //    This updates ALL occurrences in that paragraph (not "first only").
+  // ============================================================
 
-  // 1) Replace literal {{...}} inside any text runs
-  const tsAll = Array.from(doc.getElementsByTagNameNS(W_NS,'t'));
-  for(const t of tsAll){
-    const before = t.textContent||'';
-    const ms = before.match(/\{\{\s*[^}]+?\s*\}\}/g);
-    if(ms) __stats.mustacheHits += ms.length;
-    if(ms) __stats.mustacheRunsTouched++;
+  const psAll = Array.from(doc.getElementsByTagNameNS(W_NS,'p'));
+  for(const p of psAll){
+    const ts = Array.from(p.getElementsByTagNameNS(W_NS,'t'));
+    if(!ts.length) continue;
 
+    // Build combined paragraph text in document order
+    let combined = '';
+    for(const t of ts) combined += (t.textContent || '');
+
+    if(!/\{\{/.test(combined)) continue;
+
+    __stats.mustacheContainersTouched++;
+
+    // Count hits + record resolved/unresolved
+    const ms = combined.match(/\{\{\s*[^}]+?\s*\}\}/g);
     if(ms){
+      __stats.mustacheHits += ms.length;
       for(const mm of ms){
         const inner = (mm.match(/\{\{\s*([^}]+?)\s*\}\}/)||[])[1] || '';
         const rv = resolveValueByToken(inner, ctx);
@@ -370,19 +378,27 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
       }
     }
 
-    const after = replaceMustachesInText(before, ctx, { removeUnmatched });
-    if(after!==before){
-      __stats.mustacheReplaced++;
+    const replaced = replaceMustachesInText(combined, ctx, { removeUnmatched });
+
+    if(replaced !== combined){
+      __stats.mustacheContainersChanged++;
+
       if(removeUnmatched){
-        // rough: count if placeholder disappeared and resulting text is shorter/empty
-        if(/\{\{/.test(before) && !/\{\{/.test(after) && (after||'').trim()==='') __stats.mustacheRemoved++;
+        // If placeholders disappeared and resulting text is blank, count as removed
+        if(/\{\{/.test(combined) && !/\{\{/.test(replaced) && (replaced||'').trim()==='') __stats.mustacheRemoved++;
       }
-      t.textContent = after;
+
+      // Write back: first <w:t> gets full text, remaining cleared
+      ts[0].textContent = replaced;
+      for(let i=1;i<ts.length;i++) ts[i].textContent = '';
     }
   }
 
-  // 2) SDTs: if they have a resolvable token in w:tag or w:alias, replace their visible content with that value.
-  // If they DON'T have a token (empty tag/alias), leave them alone; their inner {{...}} already got processed above.
+  // ============================================================
+  // 2) SDT token replacement (w:tag or w:alias):
+  //    Only applies when SDT has a non-empty token.
+  //    Tokenless SDTs are left alone (their inner {{...}} already processed).
+  // ============================================================
   const sdts = Array.from(doc.getElementsByTagNameNS(W_NS,'sdt'));
   __stats.sdtTotal = sdts.length;
 
@@ -406,7 +422,6 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
     if(v==null){
       __stats.sdtTokenUnresolved++;
       recUnres(token);
-      // We do NOT remove unresolved token SDTs here; pruneEmptySDTs will clean up if they're empty after mustache pass.
       continue;
     }
 
@@ -432,13 +447,11 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
     dbg('stats', __stats);
     const unres = Array.from(__unresolved.entries()).sort((a,b)=>b[1]-a[1]).slice(0,50);
     const res = Array.from(__resolved.entries()).sort((a,b)=>b[1].count-a[1].count).slice(0,50);
-    dbg('top unresolved tokens (token,count)', unres);
-    dbg('top resolved tokens (token,{count,value})', res);
+    dbg('top unresolved (token,count)', unres);
+    dbg('top resolved (token,count,value)', res.map(([k,v])=>[k,v.count,v.value]));
   });
 }
 
-
-let lastParsedSDTs = null;
 
 function renderTagDiagnostics(){
   const body = document.getElementById('tagDiagBody');
