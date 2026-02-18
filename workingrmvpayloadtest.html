@@ -57,6 +57,22 @@
   .tagdiag .warn{color:var(--warn);font-weight:700}
   .tagdiag .mono{font-family: ui-monospace,Consolas,Menlo,monospace}
 
+  /* ===== Preview: highlight inserted tag values (SDT + {{...}}) ===== */
+  .tagval{
+    background: rgba(59,130,246,.14);
+    border: 1px solid rgba(59,130,246,.35);
+    padding: 0 3px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+  }
+  .tagval.mustache{
+    background: rgba(16,185,129,.14);
+    border-color: rgba(16,185,129,.35);
+  }
+  .tagval.sdt{
+    background: rgba(245,158,11,.16);
+    border-color: rgba(245,158,11,.38);
+  }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script src="persistence.js"></script>
@@ -178,7 +194,6 @@
 <script>
 /* ===== Namespaces & Paths ===== */
 const W_NS="http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
 const DOCX_NS = W_NS; // for SDT scanning
 
 /* ===== SDT parsing (ported from extractor.html) ===== */
@@ -236,7 +251,6 @@ async function parseSDTs_JS(arrayBuffer){
 function normTagToken(s){
   s = String(s||'').trim();
   if(!s) return '';
-  // If token contains {{...}}, normalize inner text
   const m = s.match(/\{\{\s*([^}]+?)\s*\}\}/);
   if(m) s = m[1];
   return s.replace(/\s+/g,' ').trim().toLowerCase();
@@ -256,17 +270,11 @@ function payloadTagMapIndex(payload){
 function formatValue(v){
   if(v==null) return '';
   if(Array.isArray(v)){
-    // tables = array of objects; multiselect = array of strings
     if(v.length && typeof v[0]==='object' && !Array.isArray(v[0])) return `[Tabelle: ${v.length} Zeilen]`;
     return v.map(x=>formatValue(x)).filter(Boolean).join(', ');
   }
   if(typeof v==='object'){
     if(typeof v.formatted==='string' && v.formatted.trim()) return v.formatted.trim();
-    // address-like
-    if(typeof v.formatted==='string') return v.formatted;
-    // datediff-like
-    if(typeof v.formatted==='string') return v.formatted;
-    // fallback
     try{ return JSON.stringify(v); }catch{ return String(v); }
   }
   return String(v);
@@ -283,16 +291,14 @@ function resolveValueByToken(token, ctx){
   const k = normTagToken(raw);
   if(!k) return null;
 
-  // Preferred: payload.tagMap → fieldId → values[fieldId]
   const hit = ctx.idx.get(k);
   if(hit && hit.fieldId){
     const v = ctx.values[hit.fieldId];
     return formatValue(v);
   }
 
-  // Fallback: direct values lookup by (normalized) key variants
   if(ctx.values[raw]!=null) return formatValue(ctx.values[raw]);
-  // case-insensitive / space-normalized lookup
+
   for(const key of Object.keys(ctx.values)){
     if(normTagToken(key)===k) return formatValue(ctx.values[key]);
   }
@@ -306,6 +312,20 @@ function replaceMustachesInText(text, ctx, opts={}){
     return removeUnmatched ? '' : m;
   });
 }
+
+/* ===== FIX: helpers to avoid rewriting SDT-contained runs during paragraph mustache collapse ===== */
+function hasAncestorW(n, localName){
+  while(n){
+    if(n.nodeType === 1 && n.namespaceURI === W_NS && n.localName === localName) return true;
+    n = n.parentNode;
+  }
+  return false;
+}
+function tNodesOutsideSDT(p){
+  const all = Array.from(p.getElementsByTagNameNS(W_NS,'t'));
+  return all.filter(t => !hasAncestorW(t, 'sdt'));
+}
+
 function textOfNodeWithSDT(node, ctx){
   let out='';
   const rec = (n)=>{
@@ -325,13 +345,13 @@ function textOfNodeWithSDT(node, ctx){
       }
       const v = resolveValueByToken(tagVal||alias, ctx);
       if(v!=null){ out+=v; return; }
-      // no match: fall back to its visible text content
     }
     for(const ch of n.childNodes) rec(ch);
   };
   rec(node);
   return out;
 }
+
 function applyTagReplacementsToDoc(doc, payload, opts={}){
   const ctx = buildTagCtx(payload||{});
   const { removeUnmatched=false } = opts || {};
@@ -346,19 +366,14 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
   const recRes = (tok, val)=>{ tok=String(tok||'').trim()||'(empty-token)'; const cur=__resolved.get(tok)||{count:0, value:val}; cur.count++; cur.value=val; __resolved.set(tok, cur); };
 
   // ============================================================
-  // 1) Bulletproof mustache replacement across split runs:
-  //    Word often splits "{{ token }}" across multiple <w:t>.
-  //    We therefore operate per-paragraph: concatenate all descendant w:t,
-  //    replace globally, then write back into the first w:t and clear the rest.
-  //    This updates ALL occurrences in that paragraph (not "first only").
+  // 1) FIXED mustache replacement across split runs:
+  //    Only operate on <w:t> OUTSIDE any <w:sdt>.
   // ============================================================
-
   const psAll = Array.from(doc.getElementsByTagNameNS(W_NS,'p'));
   for(const p of psAll){
-    const ts = Array.from(p.getElementsByTagNameNS(W_NS,'t'));
+    const ts = tNodesOutsideSDT(p);
     if(!ts.length) continue;
 
-    // Build combined paragraph text in document order
     let combined = '';
     for(const t of ts) combined += (t.textContent || '');
 
@@ -366,7 +381,6 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
 
     __stats.mustacheContainersTouched++;
 
-    // Count hits + record resolved/unresolved
     const ms = combined.match(/\{\{\s*[^}]+?\s*\}\}/g);
     if(ms){
       __stats.mustacheHits += ms.length;
@@ -384,20 +398,16 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
       __stats.mustacheContainersChanged++;
 
       if(removeUnmatched){
-        // If placeholders disappeared and resulting text is blank, count as removed
         if(/\{\{/.test(combined) && !/\{\{/.test(replaced) && (replaced||'').trim()==='') __stats.mustacheRemoved++;
       }
 
-      // Write back: first <w:t> gets full text, remaining cleared
       ts[0].textContent = replaced;
       for(let i=1;i<ts.length;i++) ts[i].textContent = '';
     }
   }
 
   // ============================================================
-  // 2) SDT token replacement (w:tag or w:alias):
-  //    Only applies when SDT has a non-empty token.
-  //    Tokenless SDTs are left alone (their inner {{...}} already processed).
+  // 2) SDT token replacement (w:tag or w:alias)
   // ============================================================
   const sdts = Array.from(doc.getElementsByTagNameNS(W_NS,'sdt'));
   __stats.sdtTotal = sdts.length;
@@ -413,10 +423,7 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
     const alias  = aEl ? (aEl.getAttributeNS(W_NS,'val') || aEl.getAttribute('w:val') || '') : '';
     const token = (tagVal||alias||'').trim();
 
-    if(!token){
-      // Critical: do NOT remove tokenless SDTs; mustache pass handles their inner text.
-      continue;
-    }
+    if(!token) continue;
 
     const v = resolveValueByToken(token, ctx);
     if(v==null){
@@ -452,7 +459,7 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
   });
 }
 
-
+/* ===== Tag diagnostics table ===== */
 function renderTagDiagnostics(){
   const body = document.getElementById('tagDiagBody');
   const status = document.getElementById('tagDiagStatus');
@@ -505,7 +512,6 @@ function renderTagDiagnostics(){
 async function rescanTagsFromCurrentDoc(){
   try{
     if(!zip){ renderTagDiagnostics(); return; }
-    // Scan the currently opened DOCX bytes (from zip) without relying on baseline changes.
     const bytes = await zip.generateAsync({ type:'arraybuffer' });
     lastParsedSDTs = await parseSDTs_JS(bytes);
     renderTagDiagnostics();
@@ -527,6 +533,7 @@ let settingsDoc=null;
 
 let allParasBase=[], headingsFlat=[], treeRoot=[];
 let lastPayload = null;
+let lastParsedSDTs = null;
 
 /* ===== Canonical persistence bridge (auto-load from active doc) ===== */
 function P(){ return window.formSuitePersist; }
@@ -536,10 +543,8 @@ const LS_EXPORT_LAST = 'FS_EXPORT_LAST_V1';
 async function loadDocxFromDocId(docId){
   if(!docId) throw new Error('missing docId');
 
-  // Preferred: use the same FileSystemHandle the app already has for this doc
   const h = await P()?.getHandle?.(docId);
   if(h?.getFile){
-    // Try to ensure we have permission; requestPermission may fail without user gesture
     try {
       if(h.queryPermission){
         const p = await h.queryPermission({ mode:'read' });
@@ -557,15 +562,15 @@ async function loadDocxFromDocId(docId){
   throw new Error('No file handle available for this docId (manual load required).');
 }
 
-/* ===== Load pipeline for ArrayBuffer (same as file input) ===== */
 async function loadFromArrayBuffer(buf, name='document.docx'){
   fileNameBase = String(name||'document').replace(/\.docx$/i,'') || 'document';
   setStatus('Lade DOCX …');
 
   zip = await JSZip.loadAsync(buf);
-  // SDT scan (Content Controls) — this is how extractor finds tags
+
   lastParsedSDTs = await parseSDTs_JS(buf);
   renderTagDiagnostics();
+
   styleMap = await buildStyleMap(zip);
 
   activeDoc = new DOMParser().parseFromString(await zip.file('word/document.xml').async('string'), "application/xml");
@@ -583,7 +588,6 @@ async function loadFromArrayBuffer(buf, name='document.docx'){
 
   setStatus(`Baseline ✓  • Überschriften: ${headingsFlat.length}`);
 
-  // apply payload if already present
   tryApplyPayloadFromTextarea({ silent: true });
   updatePreview();
 }
@@ -604,7 +608,6 @@ function installExportReceiver(){
     console.warn('[Rebuilder] BroadcastChannel unavailable', e);
   }
 
-  // fallback: read last payload from localStorage once
   try{
     const raw = localStorage.getItem(LS_EXPORT_LAST);
     if(raw){
@@ -620,7 +623,6 @@ async function handleIncomingExport(msg){
 
   if(payload){
     try { document.getElementById('payloadInput').value = JSON.stringify(payload, null, 2); } catch {}
-    // Ensure baseline/export use the incoming payload without requiring a manual click.
     try { await tryApplyPayloadFromTextarea({ silent:true }); } catch(e){ console.warn('[Rebuilder] auto-apply payload failed', e); }
   }
 
@@ -639,11 +641,9 @@ async function handleIncomingExport(msg){
 
 installExportReceiver();
 
-
-
 /* NEW: maps + table meta so we only remove tables that were impacted by removals */
-let baseParaIndex = null;        // WeakMap(w:p -> global index)
-let baseTableMeta = [];          // [{ord, pMin, pMax}] based on baseDoc
+let baseParaIndex = null;
+let baseTableMeta = [];
 
 const statusEl=document.getElementById('status'), treeEl=document.getElementById('tree');
 const setStatus=s=>statusEl.textContent=s;
@@ -744,13 +744,9 @@ function stripLeadingNumber(s){
 /* ===== Baseline sections & tree ===== */
 function collectAllParagraphsBase(){
   allParasBase = Array.from(baseDoc.getElementsByTagNameNS(W_NS,'p'));
-
-  // NEW: index map for base paragraphs
   baseParaIndex = new WeakMap();
   for(let i=0;i<allParasBase.length;i++) baseParaIndex.set(allParasBase[i], i);
 }
-
-/* NEW: table meta so we only remove tables impacted by removal ranges */
 function buildBaseTableMeta(){
   baseTableMeta = [];
   const tbls = Array.from(baseDoc.getElementsByTagNameNS(W_NS,'tbl'));
@@ -764,7 +760,6 @@ function buildBaseTableMeta(){
       if(idx < pMin) pMin = idx;
       if(idx > pMax) pMax = idx;
     }
-    // if table has no paragraphs (rare), treat as no range
     if(!Number.isFinite(pMin) || pMax < 0){
       baseTableMeta.push({ ord, pMin: null, pMax: null });
     } else {
@@ -897,20 +892,13 @@ function pruneEmptySDTs(doc){
   let removed = 0;
 
   for(const sdt of sdts){
-    // Never remove SDTs that contain tables; table cleanup is handled elsewhere.
     if(sdt.getElementsByTagNameNS(W_NS,'tbl').length>0) continue;
-
-    // If there is ANY visible text anywhere in the SDT, it is not empty.
-    // (Many SDTs contain runs directly without wrapping paragraphs.)
     if(hasAnyText(sdt)) continue;
-
-    // Keep SDTs that contain non-text visible content.
     if(sdt.getElementsByTagNameNS(W_NS,'fldSimple').length) continue;
     if(sdt.getElementsByTagNameNS(W_NS,'drawing').length) continue;
     if(sdt.getElementsByTagNameNS(W_NS,'object').length) continue;
     if(sdt.getElementsByTagNameNS(W_NS,'pict').length) continue;
 
-    // Paragraph-based meaning check (extra safeguard)
     const ps = sdt.getElementsByTagNameNS(W_NS,'p');
     let hasMeaning = false;
     for(let i=0;i<ps.length;i++){
@@ -924,13 +912,10 @@ function pruneEmptySDTs(doc){
     }
   }
 
-  // Always-on log to catch "cleanup nuked my content" issues.
   try{ console.log('[FSDBG][pruneEmptySDTs] removed', removed, 'of', sdts.length); }catch{}
 }
 
-/* NEW: determine if a table is effectively empty */
 function tableHasNontrivialContent(tbl){
-  // Anything meaningful inside table?
   if(tbl.getElementsByTagNameNS(W_NS,'drawing').length) return true;
   if(tbl.getElementsByTagNameNS(W_NS,'object').length) return true;
   if(tbl.getElementsByTagNameNS(W_NS,'pict').length) return true;
@@ -940,7 +925,6 @@ function tableHasNontrivialContent(tbl){
   for(let i=0;i<ps.length;i++){
     if(paragraphHasNontrivialContent(ps[i])) return true;
   }
-  // also catch stray text nodes in weird places
   const ts = tbl.getElementsByTagNameNS(W_NS,'t');
   for(let i=0;i<ts.length;i++){
     if((normalizeText(ts[i].textContent)||'')!=='') return true;
@@ -948,7 +932,6 @@ function tableHasNontrivialContent(tbl){
   return false;
 }
 
-/* NEW: remove empty table skeletons only if the table was impacted by removals */
 function pruneEmptyTables(doc, impactedTableOrdSet){
   const tbls = Array.from(doc.getElementsByTagNameNS(W_NS,'tbl'));
   for(let ord=0; ord<tbls.length; ord++){
@@ -987,7 +970,6 @@ function computeImpactedTableOrds(removedRanges){
   if(!removedRanges?.length) return impacted;
   for(const tm of baseTableMeta){
     if(tm.pMin == null || tm.pMax == null) continue;
-    // table range in paragraph indices: [pMin, pMax+1)
     const t0 = tm.pMin, t1 = tm.pMax + 1;
     for(const r of removedRanges){
       if(rangesOverlap(t0,t1,r.start,r.end)){ impacted.add(tm.ord); break; }
@@ -1004,7 +986,6 @@ function transformRemoveFromBase(selectedIdsSet){
 
   function paragraphList(){ return Array.from(d.getElementsByTagNameNS(W_NS,'p')); }
 
-  // Remove by paragraph indices from the base-based ranges
   const work = removedRanges.slice().sort((a,b)=>b.start-a.start);
   for(const { start, end } of work){
     let paras = paragraphList();
@@ -1017,7 +998,7 @@ function transformRemoveFromBase(selectedIdsSet){
   }
 
   pruneEmptySDTs(d);
-  pruneEmptyTables(d, impactedTableOrds);  // <<< FIX: remove empty skeleton tables (only if impacted)
+  pruneEmptyTables(d, impactedTableOrds);
   compactWhitespace(d);
 
   return d;
@@ -1091,7 +1072,6 @@ async function exportFromDoc(newDoc){
 
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
 
-    // Always-on export diagnostics (even if Debug unchecked)
   try {
     console.log('[FSDBG][export] lastPayload?', !!lastPayload,
       'tagMap', (lastPayload?.tagMap ? Object.keys(lastPayload.tagMap).length : 0),
@@ -1099,7 +1079,7 @@ async function exportFromDoc(newDoc){
       'removedIds', (getSelectionFromTree()?.length || 0));
   } catch {}
 
-dbgGroup('Export: payload snapshot', ()=>{
+  dbgGroup('Export: payload snapshot', ()=>{
     dbg('lastPayload present?', !!lastPayload);
     dbg('payload keys', lastPayload ? Object.keys(lastPayload) : []);
     dbg('tagMap size', lastPayload?.tagMap ? Object.keys(lastPayload.tagMap).length : 0);
@@ -1108,11 +1088,8 @@ dbgGroup('Export: payload snapshot', ()=>{
     dbg('selection removedIds count', selectedIds?.length || 0);
   });
 
-  // Tag policy: fill matched tags; drop unmatched placeholders entirely (SDTs + {{...}})
   applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true });
-  // Clean up now-empty controls/runs after tag application
   pruneEmptySDTs(newDoc);
-  // NOTE: table pruning already happens in transformRemoveFromBase() with correct impacted-set.
   compactWhitespace(newDoc);
 
   const out = new JSZip();
@@ -1161,10 +1138,118 @@ async function exportRestoredOriginal(){
 }
 
 /* ===== Minimal DOCX -> HTML preview ===== */
-function esc(s){ return s.replace(/[&<>]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+function esc(s){ return String(s||'').replace(/[&<>]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+function escAttr(s){
+  return String(s||'')
+    .replace(/&/g,'&amp;')
+    .replace(/"/g,'&quot;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+/* PREVIEW: render node text, but wrap resolved SDTs with spans */
+function htmlOfNodeWithSDTHighlight(node, ctx){
+  let out = '';
+  const rec = (n)=>{
+    if(!n) return;
+
+    if(n.nodeType === 3){
+      out += esc(n.nodeValue || '');
+      return;
+    }
+    if(n.nodeType !== 1) return;
+
+    const ln = n.localName;
+
+    if(ln === 'br' || ln === 'cr') { out += '\n'; return; }
+
+    if(ln === 't'){
+      out += esc(n.textContent || '');
+      return;
+    }
+
+    if(ln === 'sdt'){
+      const pr = n.getElementsByTagNameNS(W_NS,'sdtPr')[0];
+      let tagVal='', alias='';
+      if(pr){
+        const tEl = pr.getElementsByTagNameNS(W_NS,'tag')[0];
+        if(tEl) tagVal = tEl.getAttributeNS(W_NS,'val') || tEl.getAttribute('w:val') || '';
+        const aEl = pr.getElementsByTagNameNS(W_NS,'alias')[0];
+        if(aEl) alias = aEl.getAttributeNS(W_NS,'val') || aEl.getAttribute('w:val') || '';
+      }
+      const tok = (tagVal || alias || '').trim();
+      const v = resolveValueByToken(tok, ctx);
+      if(v != null){
+        out += `<span class="tagval sdt" title="SDT: ${escAttr(tok)}">${esc(String(v))}</span>`;
+        return;
+      }
+      // unresolved SDT -> render visible content
+    }
+
+    for(const ch of n.childNodes) rec(ch);
+  };
+  rec(node);
+  return out;
+}
+
+/* PREVIEW: replace {{...}} inside HTML, preserving existing tags/spans by operating on text nodes */
+function highlightMustachesInHtml(html, ctx){
+  const host = document.createElement('div');
+  host.innerHTML = html;
+
+  const tw = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, {
+    acceptNode(node){
+      if(!node || !node.nodeValue) return NodeFilter.FILTER_REJECT;
+      if(!node.nodeValue.includes('{{')) return NodeFilter.FILTER_REJECT;
+      // don't process inside already inserted values
+      let p = node.parentNode;
+      while(p){
+        if(p.nodeType === 1 && p.classList && p.classList.contains('tagval')) return NodeFilter.FILTER_REJECT;
+        p = p.parentNode;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  const toProcess = [];
+  while(tw.nextNode()) toProcess.push(tw.currentNode);
+
+  for(const tn of toProcess){
+    const s = tn.nodeValue || '';
+    const re = /\{\{\s*([^}]+?)\s*\}\}/g;
+    let m, last = 0;
+    const frag = document.createDocumentFragment();
+
+    while((m = re.exec(s))){
+      const a = m.index;
+      const b = m.index + m[0].length;
+      const inner = (m[1] || '').trim();
+
+      if(a > last) frag.appendChild(document.createTextNode(s.slice(last, a)));
+
+      const v = resolveValueByToken(inner, ctx);
+      if(v != null){
+        const sp = document.createElement('span');
+        sp.className = 'tagval mustache';
+        sp.title = `{{ ${inner} }}`;
+        sp.textContent = String(v);
+        frag.appendChild(sp);
+      } else {
+        frag.appendChild(document.createTextNode(m[0]));
+      }
+
+      last = b;
+    }
+
+    if(last < s.length) frag.appendChild(document.createTextNode(s.slice(last)));
+
+    if(tn.parentNode) tn.parentNode.replaceChild(frag, tn);
+  }
+
+  return host.innerHTML;
+}
 
 /* Important: preview indices must match headingsFlat indices => iterate paragraph list directly */
-
 function renderDocxToHtml(doc, options={}){
   const { annotateMask=null } = options;
   const paras = Array.from(doc.getElementsByTagNameNS(W_NS,'p'));
@@ -1175,18 +1260,21 @@ function renderDocxToHtml(doc, options={}){
     const p = paras[pIndex];
     const lvl = detectHeadingLevel(p);
 
-    // Build visible paragraph text, but replace SDTs and {{...}} with payload values.
-    let t = textOfNodeWithSDT(p, ctx);
-    t = replaceMustachesInText(t, ctx);
-    t = normalizeText(t);
+    // Build HTML with SDT highlights then mustache highlights
+    let rawHtml = htmlOfNodeWithSDTHighlight(p, ctx);
+    rawHtml = highlightMustachesInHtml(rawHtml, ctx);
 
-    if(!t) continue;
+    // Decide emptiness based on text content (not HTML)
+    const tmp = document.createElement('div');
+    tmp.innerHTML = rawHtml;
+    const plain = normalizeText(tmp.textContent || '');
+    if(!plain) continue;
 
     const cls = (annotateMask && annotateMask.has(pIndex)) ? 'removed' : '';
     const h = Math.min(Math.max(lvl||0,0),6);
 
-    if(lvl && h>=1) html += `<h${h} class="${cls}">${esc(t)}</h${h}>`;
-    else html += `<p class="${cls}">${esc(t)}</p>`;
+    if(lvl && h>=1) html += `<h${h} class="${cls}">${rawHtml}</h${h}>`;
+    else html += `<p class="${cls}">${rawHtml}</p>`;
   }
 
   return html || `<p class="muted">Keine darstellbaren Inhalte gefunden.</p>`;
@@ -1300,27 +1388,17 @@ const updatePreview = debounce(()=>{
   if(!baseDoc) return;
   const selectedIds = new Set(getSelectionFromTree());
 
-  // Baseline preview: show baseline with removal annotations, but keep full text.
   const mask = buildAnnotationMask(selectedIds);
   docBaseEl.innerHTML = renderDocxToHtml(baseDoc, { annotateMask: mask });
 
-  // Export preview: reflect the ACTUAL export pipeline:
-  // 1) apply removals
-  // 2) rebuild TOC (optional)
-  // 3) apply tag replacements (payload)
-  // 4) prune empty SDTs after tag replacement
-  // 5) compact whitespace
   let newDoc = transformRemoveFromBase(selectedIds);
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
 
-  // Always apply payload the same way export does
   applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true });
 
-  // Cleanup after replacement (never before)
   pruneEmptySDTs(newDoc);
   compactWhitespace(newDoc);
 
-  // Lightweight always-on diagnostics
   try{
     console.log('[FSDBG][preview] payload?', !!lastPayload,
       'tagMap', (lastPayload?.tagMap ? Object.keys(lastPayload.tagMap).length : 0),
@@ -1354,9 +1432,6 @@ document.getElementById('btnExport').addEventListener('click', async ()=>{
   const idsSet = new Set(getSelectionFromTree());
   let newDoc = transformRemoveFromBase(idsSet);
 
-  // IMPORTANT (bulletproof): do NOT prune SDTs / whitespace here.
-  // Tag replacement happens inside exportFromDoc() and must run BEFORE pruning,
-  // otherwise SDT-bound placeholders (and even matched values) can get removed.
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
 
   await exportFromDoc(newDoc);
@@ -1418,6 +1493,8 @@ document.getElementById('btnClearPayload').addEventListener('click', ()=>{
   document.getElementById('payloadInput').value='';
   lastPayload=null;
   setStatus('Payload-Feld geleert.');
+  renderTagDiagnostics();
+  updatePreview();
 });
 
 /* ===== Small CSS for removed in preview ===== */

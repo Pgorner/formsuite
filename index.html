@@ -2293,9 +2293,11 @@
     thead.appendChild(trh);
 
     const tbody = document.createElement('tbody');
+    const tfoot = document.createElement('tfoot');
 
     table.appendChild(thead);
     table.appendChild(tbody);
+    table.appendChild(tfoot);
     tableWrap.appendChild(table);
 
     // Buttons
@@ -2401,6 +2403,46 @@
 
     function syncModelFromEditor(colId, value) {
       const model = currentModel();
+
+      // Guard: for percent columns, prevent total > 100% (visual + UX constraint)
+      try {
+        const col = (field.columns || []).find(c => String(c?.id) === String(colId));
+        if (col && isPercentCol(col)) {
+          const dec = percentDecimalsForCol(col);
+          const proposedPct = (typeof value === 'number' && isFinite(value)) ? value : (isPercentString(value) ? parseScalarNumber(value) : null);
+
+          // Allow clearing
+          if (value === '' || value == null) {
+            // ok
+          } else if (proposedPct != null) {
+            const excludeIdx = (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length) ? selectedIndex : null;
+            const { sum: otherSum } = sumPercentColumn(String(colId), excludeIdx);
+
+            const allowed = Math.max(0, 100 - otherSum);
+
+            if (proposedPct > allowed + 1e-9) {
+              value = formatPercentString(allowed, dec);
+
+              // If this is "manual partial" percent mode, adjust the editor's numeric input accordingly.
+              const calc = (col && typeof col.calc === 'object' && col.calc) ? col.calc : null;
+              const sources = Array.isArray(calc?.sources) ? calc.sources.map(String).filter(Boolean) : [];
+              const totalOf = String(calc?.totalOf || '').trim();
+              const mode = String(calc?.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : 'readonly'));
+
+              if (mode === 'percent' && !sources.length && totalOf && editorInputs[colId] && editorInputs[colId].type === 'number') {
+                const denom = resolveTotalForTableRef(totalOf, model);
+                if (denom != null && denom !== 0) {
+                  editorInputs[colId].value = String((allowed / 100.0) * denom);
+                }
+              }
+
+              statusText = `Maximal 100% erlaubt (Rest: ${formatPercentString(allowed, dec)}).`;
+              status.textContent = statusText;
+            }
+          }
+        }
+      } catch {}
+
       model[colId] = value;
 
       // Apply computed calc columns (sources -> read-only outputs)
@@ -2523,8 +2565,24 @@
 
           const commitPartial = () => {
             const raw = el.value;
-            const partial = (raw === '' ? null : Number(raw));
+            let partial = (raw === '' ? null : Number(raw));
             const denom = resolveTotalForTableRef(totalOf, currentModel());
+
+            // Cap by numerator so the SUM of this percent column across rows cannot exceed 100%.
+            if (partial != null && !isNaN(partial) && denom != null && denom !== 0) {
+              const excludeIdx = (typeof selectedIndex === 'number' && selectedIndex >= 0 && selectedIndex < rows.length) ? selectedIndex : null;
+              const { sum: otherPartial } = sumPercentColumnAsPartial(String(col.id), denom, excludeIdx);
+              const allowedPartial = Math.max(0, denom - otherPartial);
+
+              if (partial > allowedPartial + 1e-9) {
+                partial = allowedPartial;
+                el.value = String(allowedPartial);
+
+                statusText = `Maximal 100% erlaubt (Rest: ${formatPercentString((allowedPartial / denom) * 100.0, decimals)}).`;
+                status.textContent = statusText;
+              }
+            }
+
             let out = '';
             if (partial != null && !isNaN(partial) && denom != null && denom !== 0) {
               out = formatPercentString((partial / denom) * 100.0, decimals);
@@ -2639,7 +2697,113 @@
 
         tbody.appendChild(trEl);
       });
+
+      // footer sums (visual check) - always recompute on any table change
+      renderPercentFooter();
     }
+// ----------------------------------------------------------
+    // TABLE % SUM FOOTER (visual only; NOT persisted)
+    // - For number columns with calc.mode === 'percent' (or inferred percent mode),
+    //   show a Σ sum below the column.
+    // - Also used by input-guarding to keep total <= 100%.
+    // ----------------------------------------------------------
+    function isPercentCol(col) {
+      if (!col || String(col.type) !== 'number') return false;
+      const calc = (col && typeof col.calc === 'object' && col.calc) ? col.calc : null;
+      if (!calc) return false;
+      const sources = Array.isArray(calc.sources) ? calc.sources.map(String).filter(Boolean) : [];
+      const totalOf = String(calc.totalOf || '').trim();
+      const mode = String(calc.mode || '').trim() || (totalOf ? 'percent' : (sources.length ? 'sum' : 'readonly'));
+      return (mode === 'percent');
+    }
+
+    function percentDecimalsForCol(col) {
+      const calc = (col && typeof col.calc === 'object' && col.calc) ? col.calc : null;
+      const d = (calc && calc.decimals != null) ? (calc.decimals|0) : 1;
+      return Math.max(0, Math.min(6, d));
+    }
+
+    function sumPercentColumn(colId, excludeRowIdx) {
+      let sum = 0;
+      let hasAny = false;
+      rows = ensureTableValue(field);
+      rows.forEach((r, i) => {
+        if (excludeRowIdx != null && i === excludeRowIdx) return;
+        const v = r ? r[colId] : null;
+
+        // percent columns may store either "12.3%" strings or raw numbers (12.3)
+        let n = null;
+        if (typeof v === 'number' && isFinite(v)) n = v;
+        else if (isPercentString(v)) n = parseScalarNumber(v);
+
+        if (n != null) { sum += n; hasAny = true; }
+      });
+
+      return { sum, hasAny };
+    }
+
+    // Convert percent column values to their underlying "partial" (numerator) for a shared denominator.
+    // Useful for capping by the value that is used to calculate the percentage.
+    function sumPercentColumnAsPartial(colId, denom, excludeRowIdx) {
+      if (denom == null || denom === 0) return { sum: 0, hasAny: false };
+      const { sum: pctSum, hasAny } = sumPercentColumn(colId, excludeRowIdx);
+      return { sum: (pctSum / 100.0) * denom, hasAny };
+    }
+
+    function renderPercentFooter() {
+      rows = ensureTableValue(field);
+      const cols = Array.isArray(field.columns) ? field.columns : [];
+      const percentCols = cols.filter(isPercentCol);
+
+      if (!percentCols.length) {
+        tfoot.innerHTML = '';
+        tfoot.style.display = 'none';
+        return;
+      }
+
+      tfoot.innerHTML = '';
+      tfoot.style.display = '';
+
+      const trf = document.createElement('tr');
+
+      cols.forEach((col, ci) => {
+        const td = document.createElement('td');
+        td.style.borderTop = '2px solid rgba(0,0,0,.15)';
+        td.style.paddingTop = '6px';
+
+        if (ci === 0) {
+          td.className = 'muted';
+          td.style.fontWeight = '600';
+          td.textContent = 'Summe';
+        }
+
+        if (isPercentCol(col)) {
+          const dec = percentDecimalsForCol(col);
+          const { sum, hasAny } = sumPercentColumn(String(col.id), null);
+          if (hasAny) {
+            td.textContent = formatPercentString(sum, dec);
+
+            if (sum > 100 + 1e-9) {
+              td.style.color = '#b91c1c';
+              td.title = 'Summe > 100%';
+            } else if (sum > 100 - 1e-9) {
+              td.style.color = '#065f46';
+              td.title = 'Summe = 100%';
+            }
+          } else {
+            td.textContent = '—';
+            td.className = 'muted';
+          }
+        } else {
+          if (ci !== 0) td.textContent = '';
+        }
+
+        trf.appendChild(td);
+      });
+
+      tfoot.appendChild(trf);
+    }
+
 
     // Recompute computed columns if external values (e.g. total-of fields) change
     function recomputeAndRefreshFromOutside() {
