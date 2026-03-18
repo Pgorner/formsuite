@@ -991,6 +991,213 @@ async function writeDocVar(bytesU8, key, jsonStr) {
   }
 }
 
+
+
+function _nodeLocalName(node) {
+  return node ? (node.localName || String(node.nodeName || '').replace(/^.*:/, '')) : '';
+}
+function _childElements(node) {
+  const out = [];
+  if (!node) return out;
+  for (let c = node.firstChild; c; c = c.nextSibling) if (c.nodeType === 1) out.push(c);
+  return out;
+}
+function _findSdtTagValue(sdt) {
+  const pr = _firstNS(sdt, 'sdtPr');
+  const tagEl = _firstNS(pr, 'tag');
+  return tagEl ? (_getAttr(tagEl, 'w:val') || '') : '';
+}
+function _xmlEscapeText(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+function _setXmlSpaceIfNeeded(tEl, text) {
+  if (!tEl) return;
+  const s = String(text == null ? '' : text);
+  if (/^\s|\s$/.test(s) || /  +/.test(s)) {
+    tEl.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
+  }
+}
+function _createTextParagraph(doc, text) {
+  const p = doc.createElementNS(_DOCX_W_NS, 'w:p');
+  const r = doc.createElementNS(_DOCX_W_NS, 'w:r');
+  const t = doc.createElementNS(_DOCX_W_NS, 'w:t');
+  const s = String(text == null ? '' : text);
+  t.textContent = s;
+  _setXmlSpaceIfNeeded(t, s);
+  r.appendChild(t);
+  p.appendChild(r);
+  return p;
+}
+function _appendTextCell(doc, tr, text, widthTwips, header = false) {
+  const tc = doc.createElementNS(_DOCX_W_NS, 'w:tc');
+  const tcPr = doc.createElementNS(_DOCX_W_NS, 'w:tcPr');
+  if (widthTwips && Number.isFinite(widthTwips) && widthTwips > 0) {
+    const tcW = doc.createElementNS(_DOCX_W_NS, 'w:tcW');
+    tcW.setAttributeNS(_DOCX_W_NS, 'w:w', String(Math.round(widthTwips)));
+    tcW.setAttributeNS(_DOCX_W_NS, 'w:type', 'dxa');
+    tcPr.appendChild(tcW);
+  }
+  if (header) {
+    const shd = doc.createElementNS(_DOCX_W_NS, 'w:shd');
+    shd.setAttributeNS(_DOCX_W_NS, 'w:val', 'clear');
+    shd.setAttributeNS(_DOCX_W_NS, 'w:fill', 'EDEDED');
+    tcPr.appendChild(shd);
+  }
+  tc.appendChild(tcPr);
+  tc.appendChild(_createTextParagraph(doc, text));
+  tr.appendChild(tc);
+}
+function _coerceTableCellDisplay(col, value) {
+  const isMulti = String(col?.type || '') === 'select' && !!col?.multiple;
+  if (isMulti) {
+    if (Array.isArray(value)) return value.map(v => String(v)).filter(Boolean).join(', ');
+    return String(value == null ? '' : value);
+  }
+  return String(value == null ? '' : value);
+}
+function _buildWordTableElement(doc, tableBinding) {
+  const tbl = doc.createElementNS(_DOCX_W_NS, 'w:tbl');
+
+  const columns = Array.isArray(tableBinding?.field?.columns)
+    ? tableBinding.field.columns.filter(c => c && String(c.id || '').trim())
+    : [];
+  const rows = Array.isArray(tableBinding?.rows) ? tableBinding.rows : [];
+  const totalCols = Math.max(1, columns.length || 1);
+  const widthPerCol = Math.floor(9000 / totalCols);
+
+  const tblPr = doc.createElementNS(_DOCX_W_NS, 'w:tblPr');
+  const tblStyle = doc.createElementNS(_DOCX_W_NS, 'w:tblStyle');
+  tblStyle.setAttributeNS(_DOCX_W_NS, 'w:val', 'TableGrid');
+  tblPr.appendChild(tblStyle);
+
+  const tblW = doc.createElementNS(_DOCX_W_NS, 'w:tblW');
+  tblW.setAttributeNS(_DOCX_W_NS, 'w:w', '0');
+  tblW.setAttributeNS(_DOCX_W_NS, 'w:type', 'auto');
+  tblPr.appendChild(tblW);
+
+  const borders = doc.createElementNS(_DOCX_W_NS, 'w:tblBorders');
+  for (const edge of ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']) {
+    const el = doc.createElementNS(_DOCX_W_NS, `w:${edge}`);
+    el.setAttributeNS(_DOCX_W_NS, 'w:val', 'single');
+    el.setAttributeNS(_DOCX_W_NS, 'w:sz', '4');
+    el.setAttributeNS(_DOCX_W_NS, 'w:space', '0');
+    el.setAttributeNS(_DOCX_W_NS, 'w:color', 'auto');
+    borders.appendChild(el);
+  }
+  tblPr.appendChild(borders);
+
+  const look = doc.createElementNS(_DOCX_W_NS, 'w:tblLook');
+  look.setAttributeNS(_DOCX_W_NS, 'w:firstRow', '1');
+  look.setAttributeNS(_DOCX_W_NS, 'w:lastRow', '0');
+  look.setAttributeNS(_DOCX_W_NS, 'w:firstColumn', '0');
+  look.setAttributeNS(_DOCX_W_NS, 'w:lastColumn', '0');
+  look.setAttributeNS(_DOCX_W_NS, 'w:noHBand', '0');
+  look.setAttributeNS(_DOCX_W_NS, 'w:noVBand', '1');
+  look.setAttributeNS(_DOCX_W_NS, 'w:val', '04A0');
+  tblPr.appendChild(look);
+  tbl.appendChild(tblPr);
+
+  const tblGrid = doc.createElementNS(_DOCX_W_NS, 'w:tblGrid');
+  for (let i = 0; i < totalCols; i++) {
+    const gc = doc.createElementNS(_DOCX_W_NS, 'w:gridCol');
+    gc.setAttributeNS(_DOCX_W_NS, 'w:w', String(widthPerCol));
+    tblGrid.appendChild(gc);
+  }
+  tbl.appendChild(tblGrid);
+
+  if (columns.length) {
+    const tr = doc.createElementNS(_DOCX_W_NS, 'w:tr');
+    const trPr = doc.createElementNS(_DOCX_W_NS, 'w:trPr');
+    const hdr = doc.createElementNS(_DOCX_W_NS, 'w:tblHeader');
+    trPr.appendChild(hdr);
+    tr.appendChild(trPr);
+    columns.forEach(col => _appendTextCell(doc, tr, col.label || col.id || '', widthPerCol, true));
+    tbl.appendChild(tr);
+  }
+
+  if (rows.length && columns.length) {
+    rows.forEach(rowObj => {
+      const tr = doc.createElementNS(_DOCX_W_NS, 'w:tr');
+      columns.forEach(col => {
+        _appendTextCell(doc, tr, _coerceTableCellDisplay(col, rowObj?.[col.id]), widthPerCol, false);
+      });
+      tbl.appendChild(tr);
+    });
+  } else if (!columns.length) {
+    const tr = doc.createElementNS(_DOCX_W_NS, 'w:tr');
+    _appendTextCell(doc, tr, '', widthPerCol, false);
+    tbl.appendChild(tr);
+  }
+
+  return tbl;
+}
+function _replaceNode(oldNode, newNode) {
+  if (!oldNode || !newNode || !oldNode.parentNode) return false;
+  oldNode.parentNode.replaceChild(newNode, oldNode);
+  return true;
+}
+function _replaceSdtWithBlock(sdt, blockNode) {
+  if (!sdt || !blockNode) return false;
+  const parentName = _nodeLocalName(sdt.parentNode);
+  if (parentName === 'body' || parentName === 'tc' || parentName === 'sdtContent') {
+    return _replaceNode(sdt, blockNode);
+  }
+  let p = sdt;
+  while (p && _nodeLocalName(p) !== 'p' && _nodeLocalName(p) !== 'body' && _nodeLocalName(p) !== 'tc') p = p.parentNode;
+  if (p && _nodeLocalName(p) === 'p') return _replaceNode(p, blockNode);
+  const sdtContent = _firstNS(sdt, 'sdtContent');
+  if (sdtContent) {
+    while (sdtContent.firstChild) sdtContent.removeChild(sdtContent.firstChild);
+    sdtContent.appendChild(blockNode);
+    return true;
+  }
+  return false;
+}
+async function writeStructuredSDTs(bytesU8, structuredBindings) {
+  const bindings = (structuredBindings && typeof structuredBindings === 'object') ? structuredBindings : {};
+  if (!Object.keys(bindings).length) return _toU8(bytesU8);
+
+  const zip = await _loadZip(bytesU8);
+  const partNames = Object.keys(zip.files || {}).filter(name => /^word\/(document|header\d+|footer\d+)\.xml$/i.test(name));
+  let touched = false;
+
+  for (const partName of partNames) {
+    const f = zip.file(partName);
+    if (!f) continue;
+
+    let xml = '';
+    try { xml = await f.async('string'); } catch { continue; }
+    if (!xml) continue;
+
+    let doc;
+    try { doc = _xmlParse(xml); } catch { continue; }
+
+    const sdts = Array.from(doc.getElementsByTagNameNS(_DOCX_W_NS, 'sdt') || []);
+    let partTouched = false;
+
+    for (const sdt of sdts) {
+      const tag = _findSdtTagValue(sdt);
+      if (!tag || !Object.prototype.hasOwnProperty.call(bindings, tag)) continue;
+      const binding = bindings[tag];
+      if (!binding || String(binding.kind || '') !== 'table') continue;
+
+      const tbl = _buildWordTableElement(doc, binding);
+      if (_replaceSdtWithBlock(sdt, tbl)) partTouched = true;
+    }
+
+    if (partTouched) {
+      zip.file(partName, _xmlSerialize(doc));
+      touched = true;
+    }
+  }
+
+  if (!touched) return _toU8(bytesU8);
+  return await _zipToU8(zip);
+}
+
 // ---- SDT writing ----
 async function writeSDTs(bytesU8, tagToTextMap) {
   await ensurePy();
@@ -1141,6 +1348,7 @@ if (typeof window !== 'undefined') {
     writeDocVarSettings,
     writeDocVarCustom,
     writeSDTs,
+    writeStructuredSDTs,
     serializeVisibilityMapForPython,
     inspectRemovalPlan,
     applyRemovalWithBackup,
@@ -1156,6 +1364,7 @@ if (typeof window !== 'undefined') {
     writeDocVarSettings,
     writeDocVarCustom,
     writeSDTs,
+    writeStructuredSDTs,
     serializeVisibilityMapForPython,
     inspectRemovalPlan,
     applyRemovalWithBackup,

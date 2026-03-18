@@ -612,6 +612,43 @@ async function readPayloadFromDocx(bytesU8) {
   }
 }
 
+
+function buildStructuredBindingsFromPayload(payloadObj) {
+  const fields = Array.isArray(payloadObj?.fields) ? payloadObj.fields : [];
+  const valuesObj = (payloadObj?.values && typeof payloadObj.values === 'object') ? payloadObj.values : {};
+  const tagMapObj = (payloadObj?.tagMap && typeof payloadObj.tagMap === 'object') ? payloadObj.tagMap : {};
+  const fieldById = new Map(fields.map(f => [String(f?.id || ''), f]).filter(([id]) => !!id));
+  const out = {};
+
+  for (const [tag, fieldIdRaw] of Object.entries(tagMapObj)) {
+    const fieldId = String(fieldIdRaw || '');
+    const field = fieldById.get(fieldId);
+    if (!field || String(field.type || '') !== 'table') continue;
+
+    const rawRows = Array.isArray(valuesObj[fieldId]) ? valuesObj[fieldId] : [];
+    const rows = rawRows
+      .filter(r => r && typeof r === 'object')
+      .map(r => {
+        const obj = {};
+        (Array.isArray(field.columns) ? field.columns : []).forEach(col => {
+          const cid = String(col?.id || '');
+          if (!cid) return;
+          obj[cid] = Object.prototype.hasOwnProperty.call(r, cid) ? r[cid] : (col?.type === 'select' && col?.multiple ? [] : '');
+        });
+        return obj;
+      });
+
+    out[String(tag)] = {
+      kind: 'table',
+      fieldId,
+      field,
+      rows
+    };
+  }
+
+  return out;
+}
+
 async function writePayloadToDocx(bytesU8, payloadObj) {
   const tr = TRACE('writePayloadToDocx', { inLen: bytesU8?.byteLength, fields: payloadObj?.fields?.length || 0 });
   try {
@@ -635,7 +672,20 @@ async function writePayloadToDocx(bytesU8, payloadObj) {
 
     if (!out) throw new Error('Kein DOCX-Writer verfügbar (writeDocVarSettings/writeDocVarCustom fehlt).');
 
-    const outU8 = (out instanceof Uint8Array) ? out : new Uint8Array(out);
+    let outU8 = (out instanceof Uint8Array) ? out : new Uint8Array(out);
+
+    try {
+      const structuredBindings = buildStructuredBindingsFromPayload(payloadObj);
+      if (Object.keys(structuredBindings).length && typeof window.writeStructuredSDTs === 'function') {
+        outU8 = await window.writeStructuredSDTs(outU8, structuredBindings);
+        tr.step('structured SDTs applied', { count: Object.keys(structuredBindings).length });
+      } else if (Object.keys(structuredBindings).length) {
+        tr.warn('writeStructuredSDTs fehlt; Tabellen-Tags werden nicht in document.xml geschrieben.');
+      }
+    } catch (e) {
+      tr.warn('structured SDT write failed', e);
+    }
+
     tr.end({ outLen: outU8.byteLength, outSha: (await sha256Hex(outU8)).slice(0, 12) });
     return outU8;
   } catch (e) {
