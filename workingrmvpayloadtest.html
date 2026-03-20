@@ -75,6 +75,7 @@
   }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="docx-core.js"></script>
 <script src="persistence.js"></script>
 </head>
 <body>
@@ -280,12 +281,16 @@ function formatValue(v){
   return String(v);
 }
 function buildTagCtx(payload){
+  const fields = Array.isArray(payload?.fields) ? payload.fields : [];
+  const fieldById = new Map(fields.map(f => [String(f?.id || ''), f]).filter(([id]) => !!id));
   return {
     idx: payloadTagMapIndex(payload||{}),
-    values: (payload && payload.values && typeof payload.values==='object') ? payload.values : {}
+    values: (payload && payload.values && typeof payload.values==='object') ? payload.values : {},
+    fieldById
   };
 }
-function resolveValueByToken(token, ctx){
+function resolveValueByToken(token, ctx, opts={}){
+  const { skipTables=false } = opts || {};
   const raw = String(token||'').trim();
   if(!raw) return null;
   const k = normTagToken(raw);
@@ -293,7 +298,15 @@ function resolveValueByToken(token, ctx){
 
   const hit = ctx.idx.get(k);
   if(hit && hit.fieldId){
+    const field = ctx.fieldById?.get?.(String(hit.fieldId || ''));
     const v = ctx.values[hit.fieldId];
+
+    if(field && String(field.type || '') === 'table'){
+      if(skipTables) return null;
+      const rows = Array.isArray(v) ? v : [];
+      return `[Tabelle: ${rows.length} Zeilen]`;
+    }
+
     return formatValue(v);
   }
 
@@ -304,10 +317,53 @@ function resolveValueByToken(token, ctx){
   }
   return null;
 }
+function buildStructuredBindingsFromPayloadFS(payloadObj){
+  const fields = Array.isArray(payloadObj?.fields) ? payloadObj.fields : [];
+  const valuesObj = (payloadObj?.values && typeof payloadObj.values === 'object') ? payloadObj.values : {};
+  const tagMapObj = (payloadObj?.tagMap && typeof payloadObj.tagMap === 'object') ? payloadObj.tagMap : {};
+  const fieldById = new Map(fields.map(f => [String(f?.id || ''), f]).filter(([id]) => !!id));
+  const out = {};
+
+  for(const [tag, fieldIdRaw] of Object.entries(tagMapObj)){
+    const fieldId = String(fieldIdRaw || '');
+    const field = fieldById.get(fieldId);
+    if(!field || String(field.type || '') !== 'table') continue;
+
+    const rawRows = Array.isArray(valuesObj[fieldId]) ? valuesObj[fieldId] : [];
+    const columns = Array.isArray(field.columns) ? field.columns : [];
+
+    out[String(tag)] = {
+      kind: 'table',
+      fieldId,
+      field: {
+        columns: columns.map((col, idx) => ({
+          id: String(col?.id || `col_${idx+1}`),
+          label: String(col?.label || col?.id || `col_${idx+1}`),
+          type: String(col?.type || 'text'),
+          multiple: !!col?.multiple
+        }))
+      },
+      rows: rawRows
+        .filter(r => r && typeof r === 'object')
+        .map(r => {
+          const obj = {};
+          columns.forEach((col, idx) => {
+            const cid = String(col?.id || `col_${idx+1}`);
+            obj[cid] = Object.prototype.hasOwnProperty.call(r, cid)
+              ? r[cid]
+              : (col?.type === 'select' && col?.multiple ? [] : '');
+          });
+          return obj;
+        })
+    };
+  }
+
+  return out;
+}
 function replaceMustachesInText(text, ctx, opts={}){
-  const { removeUnmatched=false } = opts || {};
+  const { removeUnmatched=false, skipTables=false } = opts || {};
   return String(text||'').replace(/\{\{\s*([^}]+?)\s*\}\}/g, (m, inner)=>{
-    const v = resolveValueByToken(inner, ctx);
+    const v = resolveValueByToken(inner, ctx, { skipTables });
     if(v!=null) return v;
     return removeUnmatched ? '' : m;
   });
@@ -354,7 +410,7 @@ function textOfNodeWithSDT(node, ctx){
 
 function applyTagReplacementsToDoc(doc, payload, opts={}){
   const ctx = buildTagCtx(payload||{});
-  const { removeUnmatched=false } = opts || {};
+  const { removeUnmatched=false, skipTables=false } = opts || {};
 
   const __stats = {
     sdtTotal:0, sdtTokenResolved:0, sdtTokenUnresolved:0, sdtRemoved:0, sdtInserted:0,
@@ -392,7 +448,7 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
       }
     }
 
-    const replaced = replaceMustachesInText(combined, ctx, { removeUnmatched });
+    const replaced = replaceMustachesInText(combined, ctx, { removeUnmatched, skipTables });
 
     if(replaced !== combined){
       __stats.mustacheContainersChanged++;
@@ -425,7 +481,7 @@ function applyTagReplacementsToDoc(doc, payload, opts={}){
 
     if(!token) continue;
 
-    const v = resolveValueByToken(token, ctx);
+    const v = resolveValueByToken(token, ctx, { skipTables });
     if(v==null){
       __stats.sdtTokenUnresolved++;
       recUnres(token);
@@ -1088,7 +1144,7 @@ async function exportFromDoc(newDoc){
     dbg('selection removedIds count', selectedIds?.length || 0);
   });
 
-  applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true });
+  applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true, skipTables:true });
   pruneEmptySDTs(newDoc);
   compactWhitespace(newDoc);
 
@@ -1102,7 +1158,46 @@ async function exportFromDoc(newDoc){
   out.file('word/settings.xml', new XMLSerializer().serializeToString(settingsDoc));
   out.file(SEL_PATH, selectionJson);
 
-  const blob = await out.generateAsync({ type:'blob' });
+  let outU8 = await out.generateAsync({ type:'uint8array' });
+
+  if(lastPayload){
+    const json = JSON.stringify(lastPayload, null, 0);
+
+    if(typeof window.writeDocVarSettings === 'function'){
+      try {
+        outU8 = await window.writeDocVarSettings(outU8, 'CRONOS_PAYLOAD', json);
+        console.log('[FSDBG][export] payload written via writeDocVarSettings');
+      } catch(e){
+        console.warn('[FSDBG][export] writeDocVarSettings failed', e);
+      }
+    } else if(typeof window.writeDocVarCustom === 'function'){
+      try {
+        outU8 = await window.writeDocVarCustom(outU8, 'CRONOS_PAYLOAD', json);
+        console.log('[FSDBG][export] payload written via writeDocVarCustom');
+      } catch(e){
+        console.warn('[FSDBG][export] writeDocVarCustom failed', e);
+      }
+    }
+
+    const structuredBindings = buildStructuredBindingsFromPayloadFS(lastPayload);
+    console.log('[FSDBG][export] structuredBindings', {
+      count: Object.keys(structuredBindings).length,
+      tags: Object.keys(structuredBindings)
+    });
+
+    if(Object.keys(structuredBindings).length){
+      if(typeof window.writeStructuredSDTs !== 'function'){
+        console.warn('[FSDBG][export] writeStructuredSDTs missing');
+      } else {
+        outU8 = await window.writeStructuredSDTs(outU8, structuredBindings);
+        console.log('[FSDBG][export] structured SDTs applied', {
+          count: Object.keys(structuredBindings).length
+        });
+      }
+    }
+  }
+
+  const blob = new Blob([outU8], { type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
