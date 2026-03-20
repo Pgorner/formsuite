@@ -991,8 +991,6 @@ async function writeDocVar(bytesU8, key, jsonStr) {
   }
 }
 
-
-
 function _nodeLocalName(node) {
   return node ? (node.localName || String(node.nodeName || '').replace(/^.*:/, '')) : '';
 }
@@ -1198,6 +1196,98 @@ async function writeStructuredSDTs(bytesU8, structuredBindings) {
   return await _zipToU8(zip);
 }
 
+// ------------------------------
+// Structured table helpers
+// ------------------------------
+function buildStructuredBindingsFromPayload(payload) {
+  const out = {};
+  if (!payload || typeof payload !== 'object') return out;
+
+  const tables = payload.tables && typeof payload.tables === 'object'
+    ? payload.tables
+    : null;
+  if (!tables) return out;
+
+  for (const [tag, tableDef] of Object.entries(tables)) {
+    if (!tag || !tableDef || typeof tableDef !== 'object') continue;
+
+    const rawRows = Array.isArray(tableDef.rows) ? tableDef.rows : [];
+    const rawColumns = Array.isArray(tableDef.columns) ? tableDef.columns : [];
+
+    let columns = [];
+    if (rawColumns.length) {
+      columns = rawColumns.map((col, idx) => {
+        if (col && typeof col === 'object') {
+          const id = String(col.id || col.key || col.name || col.label || `col_${idx + 1}`).trim();
+          const label = String(col.label || col.name || col.id || id).trim();
+          return {
+            id,
+            label,
+            type: col.type || 'text',
+            multiple: !!col.multiple
+          };
+        }
+        const s = String(col ?? '').trim();
+        return {
+          id: s || `col_${idx + 1}`,
+          label: s || `col_${idx + 1}`,
+          type: 'text',
+          multiple: false
+        };
+      }).filter(c => c && c.id);
+    } else if (rawRows.length && rawRows[0] && typeof rawRows[0] === 'object' && !Array.isArray(rawRows[0])) {
+      columns = Object.keys(rawRows[0]).map((key) => ({
+        id: String(key),
+        label: String(key),
+        type: 'text',
+        multiple: false
+      }));
+    }
+
+    const normalizedRows = rawRows.map((row) => {
+      if (Array.isArray(row)) {
+        const obj = {};
+        columns.forEach((col, i) => {
+          obj[col.id] = row[i] ?? '';
+        });
+        return obj;
+      }
+      if (row && typeof row === 'object') {
+        const obj = {};
+        columns.forEach((col) => {
+          obj[col.id] = row[col.id] ?? row[col.label] ?? '';
+        });
+        return obj;
+      }
+      const obj = {};
+      if (columns[0]) obj[columns[0].id] = row ?? '';
+      return obj;
+    });
+
+    out[tag] = {
+      kind: 'table',
+      field: {
+        columns
+      },
+      rows: normalizedRows
+    };
+  }
+
+  return out;
+}
+
+function stripStructuredTagsFromTextMap(tagToTextMap, structuredBindings) {
+  const cleaned = { ...(tagToTextMap || {}) };
+  if (!structuredBindings || typeof structuredBindings !== 'object') return cleaned;
+
+  for (const tag of Object.keys(structuredBindings)) {
+    if (Object.prototype.hasOwnProperty.call(cleaned, tag)) {
+      delete cleaned[tag];
+    }
+  }
+  return cleaned;
+}
+
 // ---- SDT writing ----
 async function writeSDTs(bytesU8, tagToTextMap) {
   await ensurePy();
@@ -1349,6 +1439,8 @@ if (typeof window !== 'undefined') {
     writeDocVarCustom,
     writeSDTs,
     writeStructuredSDTs,
+    buildStructuredBindingsFromPayload,
+    stripStructuredTagsFromTextMap,
     serializeVisibilityMapForPython,
     inspectRemovalPlan,
     applyRemovalWithBackup,
@@ -1365,6 +1457,8 @@ if (typeof window !== 'undefined') {
     writeDocVarCustom,
     writeSDTs,
     writeStructuredSDTs,
+    buildStructuredBindingsFromPayload,
+    stripStructuredTagsFromTextMap,
     serializeVisibilityMapForPython,
     inspectRemovalPlan,
     applyRemovalWithBackup,
