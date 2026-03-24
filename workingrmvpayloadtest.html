@@ -73,6 +73,16 @@
     background: rgba(245,158,11,.16);
     border-color: rgba(245,158,11,.38);
   }
+  .preview-table.inserted-table{
+    outline: 3px solid rgba(245,158,11,.55);
+    background: rgba(245,158,11,.08);
+    box-shadow: 0 0 0 6px rgba(245,158,11,.12);
+    border-radius: 6px;
+  }
+  .preview-table.inserted-table th,
+  .preview-table.inserted-table td{
+    background-clip: padding-box;
+  }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script src="docx-core.js"></script>
@@ -1395,30 +1405,33 @@ function previewCellText(v){
   }
   return String(v);
 }
-function renderPreviewTable(binding){
+function renderPreviewTable(binding, options={}){
   const cols = Array.isArray(binding?.field?.columns) ? binding.field.columns : [];
   const rows = Array.isArray(binding?.rows) ? binding.rows : [];
+  const classes = ['preview-table'];
+  if(options?.highlightInserted !== false) classes.push('inserted-table');
   const thead = cols.map(c => `<th>${esc(c?.label || c?.id || '')}</th>`).join('');
   const tbody = rows.map(r => `<tr>${cols.map(c => `<td>${esc(previewCellText(r?.[String(c?.id||'')]))}</td>`).join('')}</tr>`).join('');
-  return `<table class="preview-table"><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table>`;
+  return `<table class="${classes.join(' ')}"><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table>`;
 }
 
 /* Important: preview indices must match headingsFlat indices => iterate paragraph list directly */
 function renderDocxToHtml(doc, options={}){
-  const { annotateMask=null } = options;
+  const { annotateMask=null, usePayload=true, highlightInsertedTables=true } = options;
   const paras = Array.from(doc.getElementsByTagNameNS(W_NS,'p'));
-  const ctx = buildTagCtx(lastPayload || {});
-  const structuredBindings = buildStructuredBindingsFromPayloadFS(lastPayload || {});
+  const payload = usePayload ? (lastPayload || {}) : {};
+  const ctx = buildTagCtx(payload);
+  const structuredBindings = usePayload ? buildStructuredBindingsFromPayloadFS(payload) : {};
   let html = '';
 
   for(let pIndex=0; pIndex<paras.length; pIndex++){
     const p = paras[pIndex];
     const lvl = detectHeadingLevel(p);
 
-    const tableBinding = findStructuredBindingInParagraph(p, structuredBindings);
+    const tableBinding = usePayload ? findStructuredBindingInParagraph(p, structuredBindings) : null;
     if(tableBinding){
       const cls = (annotateMask && annotateMask.has(pIndex)) ? 'removed' : '';
-      html += `<div class="${cls}">${renderPreviewTable(tableBinding)}</div>`;
+      html += `<div class="${cls}">${renderPreviewTable(tableBinding, { highlightInserted: highlightInsertedTables })}</div>`;
       continue;
     }
 
@@ -1551,7 +1564,11 @@ const updatePreview = debounce(()=>{
   const selectedIds = new Set(getSelectionFromTree());
 
   const mask = buildAnnotationMask(selectedIds);
-  docBaseEl.innerHTML = renderDocxToHtml(baseDoc, { annotateMask: mask });
+  docBaseEl.innerHTML = renderDocxToHtml(baseDoc, {
+    annotateMask: mask,
+    usePayload: false,
+    highlightInsertedTables: false
+  });
 
   let newDoc = transformRemoveFromBase(selectedIds);
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
