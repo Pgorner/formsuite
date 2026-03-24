@@ -267,6 +267,19 @@ function payloadTagMapIndex(payload){
   return idx;
 }
 
+function normalizePayloadShape(payload){
+  const p = (payload && typeof payload === 'object') ? payload : {};
+  const schema = (p.schema && typeof p.schema === 'object') ? p.schema : {};
+  return {
+    ...p,
+    title: p.title ?? schema.title ?? '',
+    fields: Array.isArray(p.fields) ? p.fields : (Array.isArray(schema.fields) ? schema.fields : []),
+    values: (p.values && typeof p.values === 'object') ? p.values : {},
+    tagMap: (p.tagMap && typeof p.tagMap === 'object') ? p.tagMap : {},
+    rules: Array.isArray(p.rules) ? p.rules : []
+  };
+}
+
 /* ===== Tag replacement helpers (preview + export) ===== */
 function formatValue(v){
   if(v==null) return '';
@@ -281,11 +294,12 @@ function formatValue(v){
   return String(v);
 }
 function buildTagCtx(payload){
-  const fields = Array.isArray(payload?.fields) ? payload.fields : [];
+  const np = normalizePayloadShape(payload);
+  const fields = Array.isArray(np.fields) ? np.fields : [];
   const fieldById = new Map(fields.map(f => [String(f?.id || ''), f]).filter(([id]) => !!id));
   return {
-    idx: payloadTagMapIndex(payload||{}),
-    values: (payload && payload.values && typeof payload.values==='object') ? payload.values : {},
+    idx: payloadTagMapIndex(np||{}),
+    values: (np && np.values && typeof np.values==='object') ? np.values : {},
     fieldById
   };
 }
@@ -318,9 +332,10 @@ function resolveValueByToken(token, ctx, opts={}){
   return null;
 }
 function buildStructuredBindingsFromPayloadFS(payloadObj){
-  const fields = Array.isArray(payloadObj?.fields) ? payloadObj.fields : [];
-  const valuesObj = (payloadObj?.values && typeof payloadObj.values === 'object') ? payloadObj.values : {};
-  const tagMapObj = (payloadObj?.tagMap && typeof payloadObj.tagMap === 'object') ? payloadObj.tagMap : {};
+  const np = normalizePayloadShape(payloadObj);
+  const fields = Array.isArray(np.fields) ? np.fields : [];
+  const valuesObj = (np.values && typeof np.values === 'object') ? np.values : {};
+  const tagMapObj = (np.tagMap && typeof np.tagMap === 'object') ? np.tagMap : {};
   const fieldById = new Map(fields.map(f => [String(f?.id || ''), f]).filter(([id]) => !!id));
   const out = {};
 
@@ -399,7 +414,7 @@ function textOfNodeWithSDT(node, ctx){
         const aEl = pr.getElementsByTagNameNS(W_NS,'alias')[0];
         if(aEl) alias = aEl.getAttributeNS(W_NS,'val') || aEl.getAttribute('w:val') || '';
       }
-      const v = resolveValueByToken(tagVal||alias, ctx);
+      const v = resolveValueByToken(tagVal||alias, ctx, { skipTables:true });
       if(v!=null){ out+=v; return; }
     }
     for(const ch of n.childNodes) rec(ch);
@@ -599,6 +614,12 @@ const LS_EXPORT_LAST = 'FS_EXPORT_LAST_V1';
 async function loadDocxFromDocId(docId){
   if(!docId) throw new Error('missing docId');
 
+  const bytes = await P()?.getBytes?.(docId);
+  if(bytes && (bytes.byteLength || bytes.length)){
+    await loadFromArrayBuffer(bytes, 'document.docx');
+    return true;
+  }
+
   const h = await P()?.getHandle?.(docId);
   if(h?.getFile){
     try {
@@ -615,7 +636,7 @@ async function loadDocxFromDocId(docId){
     return true;
   }
 
-  throw new Error('No file handle available for this docId (manual load required).');
+  throw new Error('No file bytes/handle available for this docId (manual load required).');
 }
 
 async function loadFromArrayBuffer(buf, name='document.docx'){
@@ -675,9 +696,10 @@ function installExportReceiver(){
 
 async function handleIncomingExport(msg){
   const docId = msg.docId;
-  const payload = msg.payload;
+  const payload = normalizePayloadShape(msg.payload);
+  try{ console.log('[FSDBG][incomingExport] payload normalized', { fields:(payload.fields||[]).length, tagMap:Object.keys(payload.tagMap||{}).length, values:Object.keys(payload.values||{}).length }); }catch{}
 
-  if(payload){
+  if(payload && (Object.keys(payload).length || Array.isArray(payload.fields))){
     try { document.getElementById('payloadInput').value = JSON.stringify(payload, null, 2); } catch {}
     try { await tryApplyPayloadFromTextarea({ silent:true }); } catch(e){ console.warn('[Rebuilder] auto-apply payload failed', e); }
   }
@@ -1273,7 +1295,7 @@ function htmlOfNodeWithSDTHighlight(node, ctx){
         if(aEl) alias = aEl.getAttributeNS(W_NS,'val') || aEl.getAttribute('w:val') || '';
       }
       const tok = (tagVal || alias || '').trim();
-      const v = resolveValueByToken(tok, ctx);
+      const v = resolveValueByToken(tok, ctx, { skipTables:true });
       if(v != null){
         out += `<span class="tagval sdt" title="SDT: ${escAttr(tok)}">${esc(String(v))}</span>`;
         return;
@@ -1322,7 +1344,7 @@ function highlightMustachesInHtml(html, ctx){
 
       if(a > last) frag.appendChild(document.createTextNode(s.slice(last, a)));
 
-      const v = resolveValueByToken(inner, ctx);
+      const v = resolveValueByToken(inner, ctx, { skipTables:true });
       if(v != null){
         const sp = document.createElement('span');
         sp.className = 'tagval mustache';
@@ -1344,16 +1366,61 @@ function highlightMustachesInHtml(html, ctx){
   return host.innerHTML;
 }
 
+function findStructuredBindingInParagraph(p, structuredBindings){
+  const sdts = Array.from(p.getElementsByTagNameNS(W_NS,'sdt'));
+  for(const sdt of sdts){
+    const pr = sdt.getElementsByTagNameNS(W_NS,'sdtPr')[0];
+    let tagVal='', alias='';
+    if(pr){
+      const tEl = pr.getElementsByTagNameNS(W_NS,'tag')[0];
+      if(tEl) tagVal = tEl.getAttributeNS(W_NS,'val') || tEl.getAttribute('w:val') || '';
+      const aEl = pr.getElementsByTagNameNS(W_NS,'alias')[0];
+      if(aEl) alias = aEl.getAttributeNS(W_NS,'val') || aEl.getAttribute('w:val') || '';
+    }
+    const raw = String(tagVal || alias || '').trim();
+    const norm = normTagToken(raw);
+    if(raw && structuredBindings[raw] && structuredBindings[raw].kind === 'table') return structuredBindings[raw];
+    for(const [k,v] of Object.entries(structuredBindings||{})){
+      if(v && v.kind === 'table' && normTagToken(k) === norm) return v;
+    }
+  }
+  return null;
+}
+function previewCellText(v){
+  if(v == null) return '';
+  if(Array.isArray(v)) return v.map(previewCellText).filter(Boolean).join(', ');
+  if(typeof v === 'object'){
+    if(typeof v.formatted === 'string') return v.formatted;
+    try{ return JSON.stringify(v); }catch{ return String(v); }
+  }
+  return String(v);
+}
+function renderPreviewTable(binding){
+  const cols = Array.isArray(binding?.field?.columns) ? binding.field.columns : [];
+  const rows = Array.isArray(binding?.rows) ? binding.rows : [];
+  const thead = cols.map(c => `<th>${esc(c?.label || c?.id || '')}</th>`).join('');
+  const tbody = rows.map(r => `<tr>${cols.map(c => `<td>${esc(previewCellText(r?.[String(c?.id||'')]))}</td>`).join('')}</tr>`).join('');
+  return `<table class="preview-table"><thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody></table>`;
+}
+
 /* Important: preview indices must match headingsFlat indices => iterate paragraph list directly */
 function renderDocxToHtml(doc, options={}){
   const { annotateMask=null } = options;
   const paras = Array.from(doc.getElementsByTagNameNS(W_NS,'p'));
   const ctx = buildTagCtx(lastPayload || {});
+  const structuredBindings = buildStructuredBindingsFromPayloadFS(lastPayload || {});
   let html = '';
 
   for(let pIndex=0; pIndex<paras.length; pIndex++){
     const p = paras[pIndex];
     const lvl = detectHeadingLevel(p);
+
+    const tableBinding = findStructuredBindingInParagraph(p, structuredBindings);
+    if(tableBinding){
+      const cls = (annotateMask && annotateMask.has(pIndex)) ? 'removed' : '';
+      html += `<div class="${cls}">${renderPreviewTable(tableBinding)}</div>`;
+      continue;
+    }
 
     // Build HTML with SDT highlights then mustache highlights
     let rawHtml = htmlOfNodeWithSDTHighlight(p, ctx);
@@ -1489,7 +1556,7 @@ const updatePreview = debounce(()=>{
   let newDoc = transformRemoveFromBase(selectedIds);
   if(document.getElementById('chkRebuildToc').checked) rebuildTOCs(newDoc);
 
-  applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true });
+  applyTagReplacementsToDoc(newDoc, lastPayload||{}, { removeUnmatched:true, skipTables:true });
 
   pruneEmptySDTs(newDoc);
   compactWhitespace(newDoc);
@@ -1498,6 +1565,9 @@ const updatePreview = debounce(()=>{
     console.log('[FSDBG][preview] payload?', !!lastPayload,
       'tagMap', (lastPayload?.tagMap ? Object.keys(lastPayload.tagMap).length : 0),
       'values', (lastPayload?.values ? Object.keys(lastPayload.values).length : 0),
+      'fields', (normalizePayloadShape(lastPayload).fields || []).length,
+      'structuredBindings', Object.keys(buildStructuredBindingsFromPayloadFS(lastPayload||{})).length,
+      'structuredTags', Object.keys(buildStructuredBindingsFromPayloadFS(lastPayload||{})),
       'removedIds', (selectedIds.size||0));
   }catch{}
 
@@ -1555,7 +1625,7 @@ function tryApplyPayloadFromTextarea({ silent=false } = {}){
   try { payload = parsePayloadFromTextarea(); }
   catch(e){ if(!silent) alert('Payload ist kein gültiges JSON.'); return; }
 
-  lastPayload = payload;
+  lastPayload = normalizePayloadShape(payload);
   renderTagDiagnostics();
 
   const res = applyPayloadToSelection(payload);

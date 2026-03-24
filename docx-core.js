@@ -1154,9 +1154,23 @@ function _replaceSdtWithBlock(sdt, blockNode) {
   }
   return false;
 }
+
+function _normStructuredTag(s) {
+  s = String(s || '').trim();
+  if (!s) return '';
+  const m = s.match(/\{\{\s*([^}]+?)\s*\}\}/);
+  if (m) s = m[1];
+  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+}
 async function writeStructuredSDTs(bytesU8, structuredBindings) {
   const bindings = (structuredBindings && typeof structuredBindings === 'object') ? structuredBindings : {};
   if (!Object.keys(bindings).length) return _toU8(bytesU8);
+
+  const normalizedBindings = new Map();
+  for (const [k, v] of Object.entries(bindings)) {
+    const nk = _normStructuredTag(k);
+    if (nk && !normalizedBindings.has(nk)) normalizedBindings.set(nk, v);
+  }
 
   const zip = await _loadZip(bytesU8);
   const partNames = Object.keys(zip.files || {}).filter(name => /^word\/(document|header\d+|footer\d+)\.xml$/i.test(name));
@@ -1178,8 +1192,11 @@ async function writeStructuredSDTs(bytesU8, structuredBindings) {
 
     for (const sdt of sdts) {
       const tag = _findSdtTagValue(sdt);
-      if (!tag || !Object.prototype.hasOwnProperty.call(bindings, tag)) continue;
-      const binding = bindings[tag];
+      if (!tag) continue;
+      const binding = Object.prototype.hasOwnProperty.call(bindings, tag)
+        ? bindings[tag]
+        : normalizedBindings.get(_normStructuredTag(tag));
+      if (!binding) continue;
       if (!binding || String(binding.kind || '') !== 'table') continue;
 
       const tbl = _buildWordTableElement(doc, binding);
